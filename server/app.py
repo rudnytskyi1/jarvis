@@ -628,7 +628,10 @@ class Connection:
         self.camera_state = {"persons": persons, "objects": objects, "ts": time.time()}
         self.presence.note_persons(persons)
         if previous.get("persons") != persons or previous.get("objects") != objects:
-            log.info(
+            # Only person-count changes earn a console line; object-label churn
+            # (a phone appearing/disappearing) goes to DEBUG to keep it readable.
+            log.log(
+                logging.INFO if previous.get("persons") != persons else logging.DEBUG,
                 "Camera state from %s: %d person(s), objects: %s",
                 self.peer,
                 persons,

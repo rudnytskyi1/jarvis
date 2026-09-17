@@ -139,6 +139,10 @@ THINKING_VOLUME = 0.14
 #: command said in one breath ("rowan, turn on the light") is not cut off.
 BEEP_ECHO_GUARD_MS = 250
 
+#: After a proactive message (a greeting that asks a question) the client
+#: listens this long WITHOUT the wake word, so the person can just answer.
+PROACTIVE_LISTEN_S = 8.0
+
 RESULT_OK = "ok"
 RESULT_NO_SPEECH = "no_speech"
 RESULT_ERROR = "error"
@@ -295,6 +299,8 @@ class JarvisClient:
         self._last_say = ""
         #: Server's follow-up window request from the last reply (say.listen_s).
         self._listen_hint_s = 0.0
+        #: Set when a proactive message finished playing: answer without wake word.
+        self._proactive_listen_s = 0.0
 
         # -- v1.4: one reader task owns the socket -----------------------
         #: Messages belonging to the utterance in flight (text and binary).
@@ -631,8 +637,17 @@ class JarvisClient:
             log.debug("Error while finishing the unprompted playback: %s", exc)
         finally:
             if not self._idle_stream_active:
+                interrupted = self._idle_interrupted
                 self._idle_playing = False
                 self._idle_interrupted = False
+                if not interrupted and self._idle_tts_bytes:
+                    # The greeting asked a question: give the person a window to
+                    # simply answer instead of demanding the wake word first.
+                    self._proactive_listen_s = PROACTIVE_LISTEN_S
+                    log.info(
+                        "Proactive message finished - listening for an answer "
+                        "for %.0f s without the wake word", PROACTIVE_LISTEN_S,
+                    )
 
     def _interrupt_idle_playback(self) -> bool:
         """Cut an unprompted message short; ``True`` if there was one.
@@ -694,11 +709,13 @@ class JarvisClient:
         """One wake-word trigger plus any follow-up turns."""
         if not await self._wait_for_wakeword():
             return
+        proactive = self._proactive_listen_s
+        self._proactive_listen_s = 0.0
         pre_roll = self.preroll.snapshot()
         self.preroll.clear()
         await self._beep(BEEP_FREQ_HZ, BEEP_MS)
         pre_roll += self._drain_beep_window()
-        lead_in: Optional[float] = None
+        lead_in: Optional[float] = proactive if proactive > 0 else None
         while not self._stopping:
             result = await self._handle_utterance(pre_roll, lead_in)
             if result == RESULT_BARGE_IN:
@@ -762,6 +779,10 @@ class JarvisClient:
                 self.preroll.clear()
                 self.wake.reset()
                 log.info("Waiting for the wake word '%s'...", word)
+            if self._proactive_listen_s > 0:
+                log.info("Answer window after a proactive message - no wake word needed")
+                self.wake.reset()
+                return True
             frame = await self.audio_in.read_frame(timeout=0.5)
             if not frame:
                 continue

@@ -436,6 +436,9 @@ class CameraService:
             source=frame,
             conf=CONF_THRESHOLD,
             verbose=False,
+            device=0,
+            half=True,
+            imgsz=640,
         )
         counts: Dict[str, int] = {}
         for result in results or []:
@@ -492,7 +495,12 @@ class CameraService:
             "persons": int(persons),
             "objects": {label: int(count) for label, count in sorted(objects.items())},
         }
-        log.info(
+        # Person-count changes are worth a console line; object-label churn
+        # (a phone appearing/disappearing) only spams it - keep that at DEBUG.
+        persons_changed = getattr(self, "_last_logged_persons", None) != int(persons)
+        self._last_logged_persons = int(persons)
+        log.log(
+            logging.INFO if persons_changed else logging.DEBUG,
             "Camera: %d person(s), objects: %s",
             persons,
             ", ".join(f"{label} x{count}" for label, count in sorted(objects.items())) or "none",
