@@ -17,7 +17,9 @@ def test_llm_invariants(cfg):
     llm = cfg.server.llm
     assert llm.provider == "ollama_native"
     assert llm.think is False
-    assert llm.model == llm.vision_model, "one multimodal model - no VRAM swapping"
+    # chat and vision are now SEPARATE models (both kept resident via
+    # OLLAMA_MAX_LOADED_MODELS); the vision one must just be set.
+    assert llm.vision_model, "a vision model must be configured"
     assert llm.max_tool_rounds >= 4
     assert llm.num_ctx >= 4096
     assert llm.keep_alive

@@ -191,6 +191,20 @@ class ImageFrame:
 Screenshot = ImageFrame
 
 
+def _should_show_detections(count: int, show_requested: bool) -> bool:
+    """True when find_object's annotated photo should be pushed (BUG 4).
+
+    Always for a successful match (``count > 0``, unchanged from before), and
+    ALSO when the user explicitly asked to see/show the result
+    (``show_requested``, the tool's ``show`` argument) even though nothing was
+    found — a flat "nothing found" is a lot less convincing than the actual
+    photo of an empty desk. Pure and side-effect free on purpose: it is the
+    one piece of :meth:`Connection._run_find_object` worth unit-testing
+    without a whole fake connection.
+    """
+    return count > 0 or bool(show_requested)
+
+
 def _positive_int(value: Any) -> int | None:
     """Return ``value`` as a positive int, or ``None`` when it is missing/bogus."""
     try:
@@ -371,6 +385,22 @@ class PresenceTracker:
         if entry is None:
             return 0.0
         return max(0.0, time.monotonic() - entry.first_seen)
+
+    def has_fresh_unknown_face(self) -> bool:
+        """True when a CURRENTLY-FRESH unknown FACE match is on record (BUG 2).
+
+        "Fresh" means :meth:`note_faces` recorded it (a real face-engine
+        detection that matched no enrolled profile) and it has not yet expired
+        (:meth:`_expire` runs first, dropping anything last seen more than
+        ``ttl_s`` ago). Deliberately narrower than ``unknown_count`` or
+        ``unknown_present_for`` being non-zero would already imply: this is
+        the single source of truth the proactive greeting gates on, so it
+        must never be satisfied by a bare YOLO person count (``note_persons``
+        never touches :attr:`_seen`) or by a stale label that lingered past
+        its ttl.
+        """
+        self._expire()
+        return LABEL_UNKNOWN in self._seen
 
 
 _config: Any = None
@@ -1341,7 +1371,18 @@ class Connection:
         return any(label != LABEL_UNKNOWN for label in present)
 
     def _may_greet(self, greet_after_s: float, cooldown_s: float) -> bool:
-        """True when an unknown face has waited long enough and the room is idle."""
+        """True when an unknown face has waited long enough and the room is idle.
+
+        BUG 2: gated STRICTLY on the presence tracker holding a
+        CURRENTLY-FRESH unknown FACE match (:meth:`PresenceTracker.has_fresh_unknown_face`)
+        — a face the face engine actually detected and could not match to any
+        enrolled profile within the last ``presence_ttl_s`` — never on a bare
+        YOLO person count (which never touches the tracker's unknown bucket,
+        see :meth:`PresenceTracker.note_persons`) and never on a label that
+        has already expired. If the face engine is unavailable or disabled
+        this returns ``False`` unconditionally: no face engine means no face
+        was ever really seen, so there is nothing to greet.
+        """
         engine = _face
         if not self.face_enabled or engine is None or not engine.available:
             return False
@@ -1365,6 +1406,8 @@ class Connection:
         ):
             return False
         if self._known_face_alone():
+            return False
+        if not self.presence.has_fresh_unknown_face():
             return False
         return self.presence.unknown_present_for() >= greet_after_s
 
@@ -1406,9 +1449,20 @@ class Connection:
             # Start the cooldown before speaking: a failed greeting must not be
             # retried every second either.
             self._last_greeting_at = time.monotonic()
+            engine = _face
+            # BUG 2: log every input the gate decided on, so a wrong greeting
+            # (or a missing one) can be diagnosed from the log alone.
             log.info(
-                "Greeting an unknown face (present %.0f s)",
+                "Greeting decision: fresh_unknown_face=%s present_for=%.0fs "
+                "greet_after_s=%.0f cooldown_s=%.0f face_enabled=%s "
+                "face_available=%s known_face_alone=%s",
+                self.presence.has_fresh_unknown_face(),
                 self.presence.unknown_present_for(),
+                greet_after_s,
+                cooldown_s,
+                self.face_enabled,
+                bool(engine is not None and engine.available),
+                self._known_face_alone(),
             )
             try:
                 result = await brain.generate(
@@ -1648,13 +1702,16 @@ class Connection:
         inference is blocking CUDA work and must never touch the event loop.
         A camera pull asks for FULL resolution (SPEC v1.6): the detector
         should see the frame the way the C920 actually captured it, not the
-        <=1280px size presence pulls use. On a successful match (count > 0)
-        the boxes are drawn on the frame and pushed to the room screen (v1.6).
+        <=1280px size presence pulls use. The boxes are drawn on the frame and
+        pushed to the room screen (v1.6) whenever :func:`_should_show_detections`
+        says so — a successful match (count > 0), OR the user explicitly asked
+        to see/show the result even when nothing was found (BUG 4).
         """
         target = " ".join(str(args.get("target") or "").split())
         source = str(args.get("source") or SOURCE_CAMERA).strip().lower()
         if source not in (SOURCE_CAMERA, SOURCE_SCREEN):
             source = SOURCE_CAMERA
+        show_requested = bool(args.get("show"))
 
         if source == SOURCE_SCREEN:
             frame_id = f"s{self._screenshot_seq}"
@@ -1691,7 +1748,7 @@ class Connection:
                 result["summary"] = "found 1 match"
             else:
                 result["summary"] = f"found {count} matches"
-            if count > 0:
+            if _should_show_detections(count, show_requested):
                 await self._push_detections_photo(captured, target, result)
         record["result"] = result
         return result
@@ -1711,7 +1768,12 @@ class Connection:
             )
             title = f"{target} - {count} found"
             await self._send_image_show(annotated, frame.w, frame.h, title, IMAGE_SHOW_TTL_S)
-            result["note"] = "the annotated photo is now on the room screen - mention it"
+            # BUG 4: worded as a direct instruction (not just a fact) so the
+            # model reliably says it out loud instead of only saying "Done".
+            result["note"] = (
+                "an annotated photo was just put on the room screen - tell the "
+                "user you put the photo on the screen"
+            )
         except (WebSocketDisconnect, RuntimeError):
             raise
         except Exception:

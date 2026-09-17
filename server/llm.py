@@ -62,6 +62,92 @@ _WHITESPACE_RE = re.compile(r"\s+")
 #: Space left in front of punctuation after markdown was stripped ("Done , sir").
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.!?;:…])")
 
+# -- BUG 3: the model must never SAY it saw something it did not look at ---
+#: Tools that actually look at the room/screen this turn. A reply making a
+#: first-person sight claim without one of these having run is fabrication —
+#: see :func:`contains_sight_claim` and :meth:`LlmClient.generate`.
+VISION_TOOLS: frozenset[str] = frozenset({"look_at_camera", "look_at_screen", "find_object"})
+
+#: Phrase list for :data:`_SIGHT_CLAIM_RE` — kept as its own constant so it is
+#: easy to read, test and extend independently of the compiled pattern.
+SIGHT_CLAIM_PHRASES: tuple[str, ...] = (
+    r"\bi\s+can\s+see\b",
+    r"\bi\s+see\b",
+    r"\bi(?:'m| am)\s+seeing\b",
+    r"\byou(?:'re| are)\s+holding\b",
+    r"\bon\s+(?:the|your)\s+screen\b",
+    r"\bin\s+your\s+hand\b",
+    r"\byou(?:'re| are)\s+wearing\b",
+    r"\bi\s+notice\s+(?:a|an|the)\b",
+    r"\blooking\s+at\s+(?:the|your)\s+(?:screen|camera|room)\b",
+    r"\bthere\s+(?:is|are|'s)\s+[\w\s]{0,40}?\b"
+    r"(?:bottle|person|people|cup|phone|laptop|chair|bag|backpack|book|dog|cat)\b",
+)
+_SIGHT_CLAIM_RE = re.compile("|".join(SIGHT_CLAIM_PHRASES), re.IGNORECASE)
+#: A sight-claim phrase preceded closely by one of these is a DISCLAIMER, not a
+#: claim ("I haven't seen anything on the screen yet") — see
+#: :func:`contains_sight_claim`.
+_NEGATION_RE = re.compile(
+    r"\b(?:not|n't|cannot|can't|no|never|didn't|doesn't|isn't|aren't|haven't|hasn't)\b",
+    re.IGNORECASE,
+)
+#: How many characters before a sight-claim match are scanned for a negation.
+_NEGATION_WINDOW_CHARS = 30
+
+#: BUG 3: the one-off correction injected as a user turn when the reply claims
+#: sight without having looked this turn (SPEC: one forced retry, ever).
+FORCE_LOOK_MESSAGE = (
+    "[system: you described something you did not actually look at. Call "
+    "look_at_camera or look_at_screen NOW, then answer only from the result.]"
+)
+
+#: A reply that ANNOUNCES a future action ("I'll open it", "let me do that now")
+#: while calling no tool this round is a broken promise: the action never
+#: happens. Detected by these phrases and forced to actually act, once.
+FUTURE_INTENT_PHRASES: tuple[str, ...] = (
+    r"\bi(?:'ll| will|'m going to| am going to| shall)\b",
+    r"\blet me (?:do|open|close|search|check|find|play|start|type|click|look|run|set|turn)\b",
+    r"\bi(?:'m| am) (?:going to|about to|now) \w+ing\b",
+    r"\bone (?:moment|sec|second)\b",
+    r"\bhold on\b",
+    r"\bright away\b",
+    r"\bdoing (?:that|this|it) now\b",
+)
+_FUTURE_INTENT_RE = re.compile("|".join(FUTURE_INTENT_PHRASES), re.IGNORECASE)
+#: Injected once when the model promised an action but ran no tool this turn.
+FORCE_ACT_MESSAGE = (
+    "[system: you announced an action but did not call any tool, so nothing "
+    "happened. Do it NOW by calling the right tool. If it truly cannot be done, "
+    "say so plainly instead of promising.]"
+)
+
+
+def announces_undone_action(text: str) -> bool:
+    """True when ``text`` promises a future action (see FUTURE_INTENT_PHRASES)."""
+    if not text:
+        return False
+    return _FUTURE_INTENT_RE.search(text) is not None
+
+
+def contains_sight_claim(text: str) -> bool:
+    """True when ``text`` makes a first-person sight claim (BUG 3).
+
+    Matches :data:`SIGHT_CLAIM_RE`'s phrases, but skips a match that is really
+    a disclaimer: when one of :data:`_NEGATION_RE`'s words appears in the
+    :data:`_NEGATION_WINDOW_CHARS` characters right before the match, e.g. "I
+    haven't seen anything on the screen" must NOT trigger the guard the way "I
+    can see on the screen" does. Pure string matching — never raises, and safe
+    to call on an empty or ``None`` string.
+    """
+    if not text:
+        return False
+    for match in _SIGHT_CLAIM_RE.finditer(text):
+        window_start = max(0, match.start() - _NEGATION_WINDOW_CHARS)
+        if _NEGATION_RE.search(text[window_start : match.start()]):
+            continue
+        return True
+    return False
+
 
 @dataclass
 class ToolCall:
@@ -447,6 +533,14 @@ class LlmClient:
         executed: list[ToolCall] = []
 
         artifact_retried = False
+        # BUG 3: caps the forced "you didn't actually look" retry to exactly
+        # ONE per utterance (per call to generate()), so a model that keeps
+        # fabricating sight claims after being corrected still gets a final
+        # answer instead of looping forever.
+        forced_look_retried = False
+        # Same idea for a promised-but-undone action ("I'll open it"): force it
+        # to act once instead of only talking about it.
+        forced_act_retried = False
         for round_index in range(1, self.max_tool_rounds + 1):
             text, calls = await self._chat(history, with_tools=True)
             if (
@@ -470,6 +564,43 @@ class LlmClient:
                 ", ".join(call.name for call in calls) or "-",
             )
             if not calls:
+                # BUG 3: the reply is about to be spoken as final — this is
+                # where result.text gets finalized, so it is the last chance to
+                # catch "I see a bottle on your desk" when no vision tool ran
+                # this turn. round_index < max_tool_rounds guarantees there is
+                # a round left for the forced retry to use.
+                if (
+                    not forced_look_retried
+                    and round_index < self.max_tool_rounds
+                    and contains_sight_claim(text)
+                    and not any(call.name in VISION_TOOLS for call in executed)
+                ):
+                    forced_look_retried = True
+                    log.warning(
+                        "Reply claims to have seen something without a vision "
+                        "tool call this turn - forcing one retry: %r",
+                        text,
+                    )
+                    history.append({"role": "assistant", "content": text})
+                    history.append({"role": "user", "content": FORCE_LOOK_MESSAGE})
+                    continue
+                # A promised action ("I'll do that now") with NO tool executed
+                # this whole turn is a broken promise: force one real attempt.
+                if (
+                    not forced_act_retried
+                    and round_index < self.max_tool_rounds
+                    and announces_undone_action(text)
+                    and not executed
+                ):
+                    forced_act_retried = True
+                    log.warning(
+                        "Reply promises an action but ran no tool - forcing one "
+                        "retry: %r",
+                        text,
+                    )
+                    history.append({"role": "assistant", "content": text})
+                    history.append({"role": "user", "content": FORCE_ACT_MESSAGE})
+                    continue
                 return LlmResult(text=text, tool_calls=executed, rounds=round_index)
 
             history.append(self._assistant_message(text, calls))
@@ -507,6 +638,10 @@ __all__ = [
     "looks_like_unfinished_reasoning",
     "native_base_url",
     "normalize_tool_calls",
+    "contains_sight_claim",
+    "SIGHT_CLAIM_PHRASES",
+    "VISION_TOOLS",
+    "FORCE_LOOK_MESSAGE",
     "PROVIDER_OLLAMA_NATIVE",
     "PROVIDER_OPENAI",
     "REQUEST_TIMEOUT_S",

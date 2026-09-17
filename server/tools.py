@@ -401,6 +401,17 @@ TOOLS: list[dict[str, Any]] = [
                             "looks at the room PC's screen."
                         ),
                     },
+                    "show": {
+                        "type": "boolean",
+                        "description": (
+                            "Set true ONLY when the user explicitly asked to SEE, "
+                            "show or look at a picture of the result (e.g. 'show "
+                            "me', 'let me see it') rather than just asking a count "
+                            "or a location. When true, the annotated photo is put "
+                            "on the room screen even if nothing matching was "
+                            "found. Omit or leave false otherwise."
+                        ),
+                    },
                 },
                 "required": ["target"],
             },

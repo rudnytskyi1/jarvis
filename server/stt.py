@@ -13,6 +13,77 @@ log = logging.getLogger("jarvis.server.stt")
 WHISPER_SAMPLE_RATE = 16000
 _INT16_SCALE = 32768.0
 
+# -- BUG 1: noisy-room hallucination filter --------------------------------
+# faster-whisper on room noise / near-silence tends to invent short phrases
+# ("Thank you.", "Gracias.", "Bye.") instead of reporting no speech. Two
+# layers of defense, both tuned against exactly that failure mode:
+#
+# 1. these thresholds are passed straight to ``WhisperModel.transcribe`` so
+#    its own VAD/decoding rejects more no-speech audio up front;
+NO_SPEECH_THRESHOLD = 0.6
+LOG_PROB_THRESHOLD = -1.0
+COMPRESSION_RATIO_THRESHOLD = 2.4
+#
+# 2. :func:`is_probable_noise` is a second, coarser pass over whatever
+#    segments still come out of that call (see :meth:`SttEngine.transcribe_pcm`):
+#: Drop the transcript when the MEAN ``avg_logprob`` across every segment is
+#: below this (the model was not confident about what it "heard").
+LOGPROB_MIN = -1.0
+#: Drop the transcript when the WORST (max) ``no_speech_prob`` across every
+#: segment is above this (whisper itself thought that stretch was silence).
+NO_SPEECH_MAX = 0.6
+#: Classic 1-2 word hallucination shape ("Thank you.", "Bye."): a SINGLE short
+#: segment gets a stricter (less negative) confidence bar than the mean check
+#: above, since one bad short segment does not move a multi-segment mean much.
+SHORT_SEGMENT_MAX_WORDS = 2
+SHORT_SEGMENT_LOGPROB_MIN = -0.7
+
+
+def _segment_noise_stats(segments: list[Any]) -> tuple[float, float]:
+    """``(mean avg_logprob, max no_speech_prob)`` across ``segments``.
+
+    ``(0.0, 0.0)`` for an empty list — callers only use this after already
+    checking there is something to score.
+    """
+    if not segments:
+        return 0.0, 0.0
+    avg_logprobs = [float(getattr(seg, "avg_logprob", 0.0) or 0.0) for seg in segments]
+    no_speech_probs = [float(getattr(seg, "no_speech_prob", 0.0) or 0.0) for seg in segments]
+    return sum(avg_logprobs) / len(avg_logprobs), max(no_speech_probs)
+
+
+def is_probable_noise(segments: list[Any]) -> bool:
+    """True when whisper's own ``Segment`` objects look like hallucinated noise.
+
+    Pure and side-effect free so it can be fed fake segment-like objects in
+    tests (anything with ``.text``, ``.avg_logprob``, ``.no_speech_prob``
+    attributes — a ``types.SimpleNamespace`` works fine). Three checks, ANY of
+    which drops the whole transcript (SPEC BUG 1):
+
+    * the MEAN ``avg_logprob`` across every segment is below :data:`LOGPROB_MIN`;
+    * the MAX ``no_speech_prob`` across every segment is above :data:`NO_SPEECH_MAX`;
+    * there is exactly ONE segment, it is :data:`SHORT_SEGMENT_MAX_WORDS` words
+      or fewer, and its ``avg_logprob`` is below :data:`SHORT_SEGMENT_LOGPROB_MIN`
+      — the classic "Thank you." / "Bye." hallucination out of near-silence,
+      which a healthy multi-segment mean would otherwise dilute.
+
+    An empty segment list is never noise: :meth:`SttEngine.transcribe_pcm`
+    already returns early for empty audio, so this only ever sees a case where
+    whisper genuinely produced zero segments for real audio, which is not
+    something to flag as "probable noise" — there is simply nothing to drop.
+    """
+    if not segments:
+        return False
+    mean_logprob, max_no_speech = _segment_noise_stats(segments)
+    if mean_logprob < LOGPROB_MIN or max_no_speech > NO_SPEECH_MAX:
+        return True
+    if len(segments) == 1:
+        words = str(getattr(segments[0], "text", "") or "").split()
+        avg_logprob = float(getattr(segments[0], "avg_logprob", 0.0) or 0.0)
+        if len(words) <= SHORT_SEGMENT_MAX_WORDS and avg_logprob < SHORT_SEGMENT_LOGPROB_MIN:
+            return True
+    return False
+
 
 def _register_cuda_dlls() -> None:
     """Make the CUDA runtime DLLs visible to ctranslate2 on Windows.
@@ -130,6 +201,10 @@ class SttEngine:
             beam_size=5,
             vad_filter=True,
             condition_on_previous_text=False,
+            # BUG 1: reject more no-speech/noise audio at the whisper level.
+            no_speech_threshold=NO_SPEECH_THRESHOLD,
+            log_prob_threshold=LOG_PROB_THRESHOLD,
+            compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
         )
         segments, info = self._model.transcribe(audio, language=requested, **kwargs)
 
@@ -155,9 +230,24 @@ class SttEngine:
             )
             segments, info = self._model.transcribe(audio, language=forced, **kwargs)
 
+        # Materialize once: it is a lazy generator, and BUG 1's noise check
+        # below needs to walk it before/independently of building the text.
+        segments = list(segments)
         parts = [segment.text.strip() for segment in segments if segment.text]
         text = " ".join(part for part in parts if part).strip()
         detected = _clean_language(getattr(info, "language", None)) or requested or ""
+
+        if is_probable_noise(segments):
+            mean_logprob, max_no_speech = _segment_noise_stats(segments)
+            log.info(
+                "Dropped a transcript as probable noise: %r (mean avg_logprob=%.2f, "
+                "max no_speech_prob=%.2f)",
+                text,
+                mean_logprob,
+                max_no_speech,
+            )
+            return "", detected
+
         log.info(
             "Transcribed %.1f s of audio [%s]: %r",
             duration_s,
