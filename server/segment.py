@@ -57,6 +57,25 @@ LOAD_FREE_VRAM_BYTES = int(6 * _GIB)
 RUN_FREE_VRAM_BYTES = int(2 * _GIB)
 
 
+def free_vram_bytes() -> int | None:
+    """Bytes free on the GPU, or ``None`` when that cannot be read.
+
+    Module level so the connection layer can decide whether it needs to free
+    something up before asking for a segmentation, without importing torch
+    itself or reaching into :class:`Sam3Engine`.
+    """
+    try:
+        import torch  # noqa: PLC0415 - lazy, heavy
+
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        return int(free)
+    except Exception:  # noqa: BLE001 - a driver that will not answer is not fatal
+        log.debug("Could not read free GPU memory", exc_info=True)
+        return None
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     """True for any flavour of CUDA out-of-memory, whatever class it arrives as.
 

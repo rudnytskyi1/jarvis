@@ -320,7 +320,7 @@ items, args verbatim; result = the client's `action_result`). `look_at_screen`,
    `{"device": str, "action": "on"|"off"|"press"|"toggle"}`
    (Bots in press mode treat "toggle"/"on"/"off" as a single press.)
 3. **`pc_control`** — control the room PC (the client machine itself).
-   `{"command": "volume_set"|"volume_up"|"volume_down"|"mute"|"unmute"|"media_play_pause"|"media_next"|"media_prev"|"display_off"|"display_on"|"sleep"|"open_app"|"close_app"|"minimize_app"|"focus_app"|"type_text"|"hotkey", "value": str|int|null}`
+   `{"command": "volume_set"|"volume_up"|"volume_down"|"mute"|"unmute"|"media_play_pause"|"media_next"|"media_prev"|"display_off"|"display_on"|"sleep"|"open_app"|"close_app"|"minimize_app"|"focus_app"|"type_text"|"hotkey"|"scroll", "value": str|int|null}`
    `minimize_app` minimizes all top-level windows of the named app (resolved
    like `close_app`; works for UWP apps too via window enumeration by process;
    console/terminal aliases minimize the shell windows hosting the client).
@@ -333,6 +333,10 @@ items, args verbatim; result = the client's `action_result`). `look_at_screen`,
    first, then fuzzy match over ALL installed apps; unknown → error result naming
    the closest candidates. `type_text` types `value` as unicode text into the
    focused window; `hotkey` presses a combo given as `"ctrl+shift+t"`-style string.
+   `scroll` (v1.7) turns the real mouse wheel over the window under the cursor:
+   `value` is a direction with an optional amount (`"down"`, `"up"`, `"down 5"`,
+   a bare signed number). Empty means down by `DEFAULT_SCROLL_NOTCHES` (3);
+   the amount is capped at `MAX_SCROLL_NOTCHES` (30) per call.
 4. **`run_command`** — run an arbitrary PowerShell command on the room PC.
    `{"command": str}`. Client executes `powershell -NoProfile -Command <command>`
    with a 30 s timeout, captures stdout+stderr, truncates to 4000 chars, returns it

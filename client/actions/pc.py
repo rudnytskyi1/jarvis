@@ -62,6 +62,7 @@ CMD_MAXIMIZE_APP = "maximize_app"
 CMD_FOCUS_APP = "focus_app"
 CMD_TYPE_TEXT = "type_text"
 CMD_HOTKEY = "hotkey"
+CMD_SCROLL = "scroll"
 
 PC_COMMANDS = frozenset(
     {
@@ -83,6 +84,7 @@ PC_COMMANDS = frozenset(
         CMD_FOCUS_APP,
         CMD_TYPE_TEXT,
         CMD_HOTKEY,
+        CMD_SCROLL,
     }
 )
 
@@ -154,6 +156,10 @@ _MOUSEEVENTF_LEFTDOWN = 0x0002
 _MOUSEEVENTF_LEFTUP = 0x0004
 _MOUSEEVENTF_RIGHTDOWN = 0x0008
 _MOUSEEVENTF_RIGHTUP = 0x0010
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSEEVENTF_HWHEEL = 0x01000
+#: One wheel notch, as Windows counts it (WHEEL_DELTA).
+_WHEEL_DELTA = 120
 
 #: button name -> (press flag, release flag); "double" reuses the left pair
 _MOUSE_BUTTON_EVENTS: dict[str, tuple[int, int]] = {
@@ -459,6 +465,26 @@ def _mouse_move_event(dx: int, dy: int) -> _INPUT:
     )
 
 
+def _mouse_wheel_event(notches: int, horizontal: bool = False) -> _INPUT:
+    """One wheel event at the cursor: positive is up / right, negative is down / left."""
+
+    return _INPUT(
+        type=_INPUT_MOUSE,
+        union=_INPUTUNION(
+            mi=_MOUSEINPUT(
+                dx=0,
+                dy=0,
+                # mouseData is a SIGNED amount, but the field is DWORD: hand
+                # Windows the two's-complement value for a downward scroll.
+                mouseData=(notches * _WHEEL_DELTA) & 0xFFFFFFFF,
+                dwFlags=_MOUSEEVENTF_HWHEEL if horizontal else _MOUSEEVENTF_WHEEL,
+                time=0,
+                dwExtraInfo=0,
+            )
+        ),
+    )
+
+
 def _mouse_button_event(flags: int) -> _INPUT:
     """A button press/release at the cursor's current position (no movement)."""
 
@@ -689,6 +715,75 @@ def parse_hotkey(combo: Any) -> tuple[list[int], list[tuple[int, bool]], str]:
     if not modifiers and not keys:
         raise PCActionError(f"hotkey '{text}' has no keys to press ({_HOTKEY_HELP})")
     return modifiers, keys, "+".join(labels)
+
+
+#: How many wheel notches "scroll down" means when no amount is given. Three is
+#: what a physical wheel flick does and roughly a third of a page in a browser.
+DEFAULT_SCROLL_NOTCHES = 3
+#: Ceiling per call, so a model that asks to scroll "1000" cannot send the page
+#: into orbit; it can always call scroll again.
+MAX_SCROLL_NOTCHES = 30
+
+_SCROLL_DOWN_WORDS = frozenset({"down", "d", "under", "below", "вниз", "ниже"})
+_SCROLL_UP_WORDS = frozenset({"up", "u", "above", "back", "вверх", "выше"})
+_SCROLL_HELP = "say for example 'down', 'up', 'down 5'"
+
+
+def parse_scroll(value: Any) -> tuple[int, str]:
+    """Read ``value`` into signed wheel notches plus a label for the reply.
+
+    Accepts a direction (``"down"``, ``"up"``), a direction with an amount
+    (``"down 5"``), or a bare signed number where negative means down. Pure
+    parsing so it can be unit-tested without a desktop.
+
+    :raises PCActionError: nothing usable in ``value``.
+    """
+    text = " ".join(str(value or "").split()).lower()
+    if not text:
+        return -DEFAULT_SCROLL_NOTCHES, f"down {DEFAULT_SCROLL_NOTCHES}"
+
+    direction = 0
+    amount: int | None = None
+    for part in text.replace(",", " ").split():
+        if part in _SCROLL_DOWN_WORDS:
+            direction = -1
+            continue
+        if part in _SCROLL_UP_WORDS:
+            direction = 1
+            continue
+        try:
+            number = int(float(part))
+        except ValueError:
+            continue
+        amount = abs(number)
+        if direction == 0 and number < 0:
+            direction = -1
+        elif direction == 0 and number > 0:
+            # A bare positive number after no direction word means "down N":
+            # asking to "scroll 5" on a page always means further down it.
+            direction = -1
+
+    if direction == 0 and amount is None:
+        raise PCActionError(f"unclear scroll {value!r} ({_SCROLL_HELP})")
+    if direction == 0:
+        direction = -1
+    if amount is None or amount <= 0:
+        amount = DEFAULT_SCROLL_NOTCHES
+    amount = min(amount, MAX_SCROLL_NOTCHES)
+    return direction * amount, f"{'up' if direction > 0 else 'down'} {amount}"
+
+
+def _sync_scroll(notches: int) -> None:
+    """Send ``notches`` wheel events, one at a time.
+
+    One event per notch rather than a single big one: browsers and Explorer
+    animate smooth scrolling per event, and a single 30-notch event either
+    jumps the whole way at once or gets clamped.
+    """
+    step = 1 if notches > 0 else -1
+    for _ in range(abs(notches)):
+        _send_input(_mouse_wheel_event(step))
+        time.sleep(0.01)
 
 
 def _sync_hotkey(modifiers: Sequence[int], keys: Sequence[tuple[int, bool]]) -> None:
@@ -1241,6 +1336,9 @@ class PCController:
         if name == CMD_HOTKEY:
             return await self._hotkey(value)
 
+        if name == CMD_SCROLL:
+            return await self._scroll(value)
+
         if name == CMD_OPEN_APP:
             return await self._open_app(value)
 
@@ -1420,6 +1518,13 @@ class PCController:
         await asyncio.to_thread(_sync_hotkey, modifiers, keys)
         log.info("pc_control: pressed %s", label)
         return PCResult(f"pressed {label}")
+
+    async def _scroll(self, value: Any) -> PCResult:
+        """Turn the mouse wheel over whatever window is under the cursor."""
+        notches, label = parse_scroll(value)
+        await asyncio.to_thread(_sync_scroll, notches)
+        log.info("pc_control: scrolled %s", label)
+        return PCResult(f"scrolled {label}")
 
     async def _resolve_app(self, value: Any) -> AppEntry:
         """Resolve an app name through the index, or raise with close matches."""

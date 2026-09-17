@@ -27,7 +27,14 @@ from .dispatcher import (
     TOOLS,
     Dispatcher,
 )
-from .pc import PC_COMMANDS, PCActionError, PCController, PCResult, parse_hotkey
+from .pc import (
+    PC_COMMANDS,
+    PCActionError,
+    PCController,
+    PCResult,
+    parse_hotkey,
+    parse_scroll,
+)
 
 __all__ = [
     "AppEntry",
@@ -47,4 +54,5 @@ __all__ = [
     "TOOL_SET_LIGHT",
     "TOOL_SET_SWITCH",
     "parse_hotkey",
+    "parse_scroll",
 ]

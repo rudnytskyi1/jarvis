@@ -54,9 +54,10 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from common import protocol as proto
 from common.config import load_config
+from server import segment as segment_mod
 from server import speaker as speaker_mod
 from server.face import FaceEngine
-from server.llm import LlmClient
+from server.llm import LlmClient, is_imperative_request
 from server.segment import Sam3Engine, draw_boxes
 from server.session import NO_PRESENCE_TEXT, Session
 from server.speaker import VoiceRegistry
@@ -129,6 +130,10 @@ GREET_BLOCK_LOG_S = 20.0
 #: v1.7: two people walking in together should both be greeted, but not in the
 #: same breath - this is the floor between any two proactive greetings.
 GREETING_MIN_GAP_S = 20.0
+#: Ceiling on one Whisper transcription. Measured turns run 550-2800 ms, so this
+#: is ~16x the worst seen and can only fire when the GPU has genuinely stopped
+#: answering - which once left the assistant deaf to its wake word for minutes.
+STT_TIMEOUT_S = 45.0
 #: v1.6: how long an annotated detections photo stays on the room screen.
 IMAGE_SHOW_TTL_S = 60.0
 
@@ -2011,6 +2016,39 @@ class Connection:
             await self._stream_tts(voice, text)
         log.info("Said unprompted: %r", text)
 
+    async def _make_room_for_segmentation(self) -> None:
+        """Free enough VRAM for SAM3 by evicting the vision model if need be.
+
+        The GPU holds the chat model (~21 GB) and the vision model (~5 GB) for
+        hours on purpose, so nothing has to swap mid-conversation. SAM3 needs
+        roughly five gigabytes that do not exist under that arrangement, and
+        asking anyway is what once took the whole assistant down. The vision
+        model is the cheap one to give up: Ollama reloads it in a few seconds
+        the next time somebody asks what is on screen, whereas find_object
+        simply cannot run without the room.
+
+        Best-effort throughout - if the VRAM figure cannot be read, or Ollama
+        will not unload, SAM3's own pre-flight check still refuses cleanly.
+        """
+        if _segment is None or _vision is None or _segment.loaded:
+            return
+        free = segment_mod.free_vram_bytes()
+        if free is None or free >= segment_mod.LOAD_FREE_VRAM_BYTES:
+            return
+        log.info(
+            "Only %.1f GB free for SAM3 - evicting the vision model to make room",
+            free / (1024 ** 3),
+        )
+        if not await asyncio.to_thread(_vision.unload):
+            return
+        for _ in range(10):  # Ollama frees asynchronously; give it a moment
+            await asyncio.sleep(0.3)
+            freed = segment_mod.free_vram_bytes()
+            if freed is None or freed >= segment_mod.LOAD_FREE_VRAM_BYTES:
+                break
+        log.info("Free GPU memory after evicting the vision model: %.1f GB",
+                 (segment_mod.free_vram_bytes() or 0) / (1024 ** 3))
+
     async def _run_find_object(self, args: dict[str, Any]) -> dict[str, Any]:
         """Count and locate objects described by ``target`` with SAM3 (v1.5).
 
@@ -2057,6 +2095,7 @@ class Connection:
         if isinstance(captured, str):
             return fail(captured)
 
+        await self._make_room_for_segmentation()
         result = await asyncio.to_thread(_segment.segment, captured.jpeg, target)
         if result.get("ok"):
             count = int(result.get("count") or 0)
@@ -2345,14 +2384,32 @@ class Connection:
         started_at = datetime.now()
         t_start = time.perf_counter()
 
-        # 1. STT
+        # 1. STT, bounded. Be honest about what this timeout does and does not
+        # do: asyncio.wait_for cannot interrupt a worker thread already inside
+        # ctranslate2's native CUDA call, so that thread stays lost for the
+        # life of the process. What it DOES buy back is everything the freeze
+        # took away - this turn ends, the reply lock is released, the client is
+        # told, and the wake word works again instead of the assistant going
+        # deaf until somebody restarts the server by hand.
         try:
-            text, language = await asyncio.to_thread(
-                engine.transcribe_pcm,
-                pcm,
-                self.sample_rate,
-                self.cfg.server.stt.language,
+            text, language = await asyncio.wait_for(
+                asyncio.to_thread(
+                    engine.transcribe_pcm,
+                    pcm,
+                    self.sample_rate,
+                    self.cfg.server.stt.language,
+                ),
+                timeout=STT_TIMEOUT_S,
             )
+        except asyncio.TimeoutError:
+            log.error(
+                "Speech recognition did not return after %.0f s - that worker "
+                "thread is stuck in CUDA and is gone for good. The GPU is "
+                "probably out of memory; restart the server if this repeats.",
+                STT_TIMEOUT_S,
+            )
+            await self.send_error("stt timed out")
+            return
         except Exception:
             log.exception("Speech recognition failed")
             await self.send_error("stt failed")
@@ -2452,10 +2509,18 @@ class Connection:
                 log.exception("LLM request failed")
                 await self.send_error("llm failed")
                 return
-            # Self-check ("judge"): only after a turn that actually CHANGED
-            # something (not plain chat, not a pure look) - re-prompt the model
-            # to confirm it did everything asked/promised and finish any gap.
-            if getattr(self.cfg.server.llm, "verify_actions", True) and self._turn_changed_state():
+            # Self-check ("judge"): after a turn that CHANGED something, and
+            # also after a turn where the owner plainly ORDERED a change and
+            # no tool ran at all. That second case is the one that kept
+            # biting: asked to close the photo, the model answered "the photo
+            # is no longer displayed on the screen", called nothing, and the
+            # picture stayed on the TV. Gating on the owner's own words is
+            # what makes this stick - the model re-words its excuses every
+            # time a phrase list catches one, but the request never changes.
+            judge_needed = self._turn_changed_state() or (
+                is_imperative_request(text) and not self._utterance_actions
+            )
+            if getattr(self.cfg.server.llm, "verify_actions", True) and judge_needed:
                 try:
                     verified = await asyncio.wait_for(
                         brain.verify(result.history, result.text, self._execute_tool),

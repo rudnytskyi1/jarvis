@@ -129,7 +129,12 @@ VERIFY_MESSAGE = (
     "did everything they asked and everything you said you would. Look at the "
     "real tool results above, not your intentions. If anything the user "
     "requested or you promised did NOT happen, do it NOW by calling the right "
-    "tools. When everything is truly done, reply with the final one or two "
+    "tools. You cannot know the state of the screen or the room from memory - "
+    "if you are about to tell them something is open, closed, hidden, playing "
+    "or switched, and no tool result above shows you doing it, then it did not "
+    "happen. If the thing they asked for was ALREADY true and there was "
+    "genuinely nothing to do, say exactly that instead of claiming you did it. "
+    "When everything is truly done, reply with the final one or two "
     "spoken sentences for the user - do not mention this self-check.]"
 )
 

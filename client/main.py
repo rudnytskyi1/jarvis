@@ -217,6 +217,18 @@ class _Stopping(Exception):
     """Internal: Ctrl+C was pressed, unwind the audio loops."""
 
 
+class _BargedIn(Exception):
+    """Internal: the owner said the wake word, abandon whatever we are waiting for.
+
+    Raised from inside the inbox poll rather than checked between messages.
+    Waiting for the NEXT message is exactly where a wedged turn parks, and the
+    old code only looked at the barge-in flag after a message had arrived — so
+    a server that went quiet swallowed the wake word for the whole 420 s
+    receive timeout, which is precisely what "I say rowan and he does not
+    care" looked like from the room.
+    """
+
+
 def _attr(obj: Any, name: str) -> Any:
     """Read ``name`` from a pydantic model / dataclass / mapping."""
     if isinstance(obj, Mapping):
@@ -794,6 +806,11 @@ class JarvisClient:
             except (asyncio.TimeoutError, TimeoutError):
                 if self._stopping:
                     raise _Stopping()
+                if self._barged:
+                    # Checked HERE, inside the wait, not between messages: a
+                    # server that is wedged never sends another message, and
+                    # the owner is standing in the room repeating the name.
+                    raise _BargedIn()
                 if not self._reader_alive() and self._inbox.empty():
                     raise WSDisconnected("the connection was lost while waiting for the reply")
                 if loop.time() >= deadline:
@@ -1085,6 +1102,14 @@ class JarvisClient:
                     log.debug("The server sent ready")
                 else:
                     log.warning("Unknown message type from the server: %r", mtype)
+        except _BargedIn:
+            log.info(
+                "Turn interrupted by the wake word while waiting on the server "
+                "- abandoning the reply"
+            )
+            self._tts_active = False
+            self.audio_out.cancel_pending()
+            result = RESULT_BARGE_IN
         finally:
             await self._stop_thinking()
             await self._stop_barge_watch()

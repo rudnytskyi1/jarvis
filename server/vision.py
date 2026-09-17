@@ -209,6 +209,30 @@ class VisionClient:
         self._client = httpx.Client(timeout=REQUEST_TIMEOUT_S)
         log.info("Vision model: %s via %s", self.model, self.base_url)
 
+    # ------------------------------------------------------------------ vram
+
+    def unload(self) -> bool:
+        """Ask Ollama to drop the vision model from VRAM right now.
+
+        Blocking, so callers use ``asyncio.to_thread``. The model is normally
+        pinned for ``keep_alive`` hours precisely so nothing has to swap, but
+        SAM3 needs several gigabytes that simply do not exist while both Ollama
+        models are resident - and a vision question that has to reload costs a
+        few seconds, where a find_object that cannot run costs the whole
+        feature. Returns True when Ollama accepted the request.
+        """
+        try:
+            response = self._client.post(
+                f"{self.base_url}/api/chat",
+                json={"model": self.model, "messages": [], "keep_alive": 0},
+            )
+            response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001 - freeing memory is best-effort
+            log.warning("Could not unload the vision model %s: %s", self.model, exc)
+            return False
+        log.info("Unloaded the vision model %s to free GPU memory", self.model)
+        return True
+
     # ------------------------------------------------------------------ request
 
     def _request(

@@ -27,19 +27,27 @@ from __future__ import annotations
 
 import io
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Any, Tuple
 
 log = logging.getLogger(__name__)
 
 #: Longest edge of the sent image along X; taller screens keep their aspect ratio.
-# 1024 px keeps the whole UI legible to the vision model while cutting its image
-# prefill from ~1400 to ~600 tokens (measured 8.7 s -> 1.0 s at millard-qwen4).
-# Grounding stays accurate: click coordinates come back on a 0-1000 grid and are
-# normalized, so they do not depend on the pixel size of the screenshot.
-MAX_WIDTH_PX = 1024
-#: JPEG quality used for the encoded screenshot.
-JPEG_QUALITY = 80
+# The room TV is 3840x2160, so 1024 px was a 3.75x linear (14x pixel) reduction
+# and it cost real accuracy, not just sharpness: asked to click YouTube's search
+# box, the vision model answered y=0.069 and the cursor landed in the browser's
+# address bar one row above it, so the typed query became a Google search. The
+# earlier 1024 px choice was made when images went to the 22 GB chat model and
+# its prefill dominated the reply (8.7 s -> 1.0 s); screenshots now go to a
+# separate 7B vision model, where ~1800 image tokens instead of ~780 costs a
+# fraction of a second. 1600x900 also stays well inside that model's 4096-token
+# context (~1836 image + ~220 prompt + 200 reserved for the answer).
+MAX_WIDTH_PX = 1600
+#: JPEG quality used for the encoded screenshot. Costs LAN bytes and nothing
+#: else - the token cost of an image depends on its pixel size, not its file
+#: size - and q80's chroma subsampling was smearing thin UI glyph strokes.
+JPEG_QUALITY = 92
 #: Value of the ``format`` field in the ``screenshot`` header (SPEC §4, C->S #6).
 SCREENSHOT_FORMAT = "jpeg"
 
@@ -75,6 +83,32 @@ class Capture:
     screen_h: int
 
 
+def _ensure_dpi_aware() -> None:
+    """Declare this process per-monitor DPI aware, once, best-effort.
+
+    A process Windows considers DPI-unaware is handed a VIRTUALIZED desktop by
+    GDI: on this 3840x2160 TV at 300% scaling that would be a 1280x720 grab
+    which the OS then stretches, and every pixel coordinate the vision model
+    returns would be measured against the wrong geometry. CPython's own
+    manifest already declares awareness today, so this changes nothing on the
+    current interpreter - it is here so a future embedded/frozen build cannot
+    silently start capturing a blurry, wrongly-scaled screen.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes  # noqa: PLC0415 - lazy, Windows only
+
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2. Fails harmlessly (E_ACCESSDENIED)
+        # when awareness was already set by the manifest, which is the norm.
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:  # noqa: BLE001 - older Windows, or already set
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:  # noqa: BLE001 - nothing more to try
+            pass
+
+
 def _load_pillow() -> Tuple[Any, Any]:
     """Import Pillow lazily so a missing dependency cannot break client startup."""
     try:
@@ -105,6 +139,7 @@ def capture_jpeg(max_width: int = MAX_WIDTH_PX, quality: int = JPEG_QUALITY) -> 
     :raises ScreenCaptureError: capture or encoding failed — the message is
         meant to be sent to the server as ``screenshot_error.error``.
     """
+    _ensure_dpi_aware()
     image_module, grab_module = _load_pillow()
 
     try:

@@ -119,6 +119,10 @@ TOOLS: list[dict[str, Any]] = [
                 "focus_app the target application first. Browser tabs are closed with "
                 "focus_app on the browser followed by hotkey ctrl+w — never by closing "
                 "or minimising the whole app. "
+                "Use scroll to move a page or a list up and down: it turns the real "
+                "mouse wheel over the window under the cursor, so click the page first "
+                "if something else has focus. Scroll whenever the user asks to see more, "
+                "to go further down, or to look at what is below. "
                 + _COMMON_HINT
             ),
             "parameters": {
@@ -145,6 +149,7 @@ TOOLS: list[dict[str, Any]] = [
                             "focus_app",
                             "type_text",
                             "hotkey",
+                            "scroll",
                         ],
                         "description": "The command for the PC.",
                     },
@@ -156,6 +161,9 @@ TOOLS: list[dict[str, Any]] = [
                             "example chrome, spotify, steam). "
                             "type_text: the text to type into the focused window. "
                             "hotkey: a combo such as ctrl+shift+t or alt+f4. "
+                            "scroll: a direction and optionally how far, such as "
+                            "'down', 'up' or 'down 5' (one notch is about a third of a "
+                            "screen; the default is 3). "
                             "Omit it for every other command."
                         ),
                     },
