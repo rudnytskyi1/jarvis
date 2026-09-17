@@ -18,11 +18,17 @@ Client -> Server
 * v1.4 camera: ``{"type": MSG_CAMERA_STATE, "persons": int, "objects": {label: count}}``
   -- state only, no video, sent when the picture changes (debounced).
 * v1.4 camera: ``{"type": MSG_CAMERA_FRAME, "id": str, "reason": "presence" | "request",
-  "w": int, "h": int}`` followed by exactly ONE binary frame with the JPEG bytes.
-  ``reason: "presence"`` frames are unsolicited (one every
-  ``client.camera.face_check_interval_s`` while somebody is visible);
-  ``reason: "request"`` answers a :data:`MSG_CAMERA_REQUEST`. On capture failure:
-  ``{"type": MSG_CAMERA_ERROR, "id": str, "error": str}`` with no binary frame.
+  "w": int, "h": int, "seq": int, "of": int}`` followed by exactly ONE binary frame
+  with the JPEG bytes. ``seq``/``of`` (burst extension) are 1-based: several
+  ``camera_frame`` header+binary pairs share the same ``id`` -- ``of`` frames total,
+  this one is number ``seq`` -- sent back to back under the client's wire lock so
+  nothing else interleaves with them. A plain single frame is simply ``seq=1, of=1``.
+  ``reason: "presence"`` frames are unsolicited mini-bursts (one burst of
+  :data:`CAMERA_BURST_DEFAULT`-or-more frames every ``client.camera.face_check_interval_s``
+  while somebody is visible); ``reason: "request"`` answers a :data:`MSG_CAMERA_REQUEST`,
+  whose own ``burst`` field says how many frames were asked for. On capture failure:
+  ``{"type": MSG_CAMERA_ERROR, "id": str, "error": str}`` with no binary frame (ends
+  the whole burst, however many pairs already went out).
 
 Server -> Client
 ----------------
@@ -31,7 +37,10 @@ Server -> Client
 * ``{"type": MSG_ACTIONS, "items": [{"id": str, "tool": str, "args": {...}}]}``
   -- may be sent several times per utterance (one per tool round).
 * ``{"type": MSG_SCREENSHOT_REQUEST, "id": str}``
-* ``{"type": MSG_CAMERA_REQUEST, "id": str}`` -- v1.4: pull one camera frame.
+* ``{"type": MSG_CAMERA_REQUEST, "id": str, "burst": int}`` -- v1.4: pull one or more
+  camera frames. ``burst`` is optional (default :data:`CAMERA_BURST_DEFAULT`, capped at
+  :data:`CAMERA_BURST_MAX`); the client answers with that many ``camera_frame``
+  header+binary pairs sharing ``id`` (see the seq/of note above).
 * ``{"type": MSG_SAY, "text": str}``
 * ``{"type": MSG_TTS_START, "sr": int, "format": "pcm_s16le", "channels": 1}``
   followed by binary PCM frames and ``{"type": MSG_TTS_END}``
@@ -46,7 +55,9 @@ reading the socket while idle and plays such audio only when it is not busy.
 
 Binary-frame disambiguation: the client sends binary frames only between
 ``utterance_start``/``utterance_end`` and as the single frame announced by a
-``screenshot`` or ``camera_frame`` header; they never overlap.
+``screenshot`` or ``camera_frame`` header; they never overlap. A ``camera_frame``
+burst is several header+binary pairs sent back to back under the client's wire
+lock, so this rule still holds pair by pair.
 """
 
 from __future__ import annotations
@@ -104,6 +115,15 @@ CAMERA_REASON_PRESENCE = "presence"
 
 #: v1.4: a camera frame answering a :data:`MSG_CAMERA_REQUEST`.
 CAMERA_REASON_REQUEST = "request"
+
+#: Burst extension (v1.4): default/absent ``burst`` on a ``camera_request`` -
+#: a single frame, ``seq=1, of=1`` -- unchanged behaviour for old call sites.
+CAMERA_BURST_DEFAULT = 1
+
+#: Burst extension (v1.4): the most frames one ``camera_request`` may ask for
+#: (and the most a presence mini-burst push carries), so a misbehaving caller
+#: cannot turn one request into an unbounded stream of frames.
+CAMERA_BURST_MAX = 5
 
 #: Error message the server sends when STT produced nothing (false wake-word).
 ERR_EMPTY_TRANSCRIPT = "empty transcript"
@@ -168,6 +188,8 @@ __all__ = [
     "CAMERA_FORMAT",
     "CAMERA_REASON_PRESENCE",
     "CAMERA_REASON_REQUEST",
+    "CAMERA_BURST_DEFAULT",
+    "CAMERA_BURST_MAX",
     "ERR_EMPTY_TRANSCRIPT",
     "ERR_CLIENT_TIMEOUT",
     "CLIENT_MESSAGE_TYPES",

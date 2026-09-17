@@ -7,6 +7,11 @@ frame into 512-d embeddings with insightface's ``buffalo_l`` pack and matches
 them by cosine similarity against the ``face_embeddings`` stored in
 ``data/people.json`` by :mod:`server.speaker`.
 
+Camera requests and presence pushes now arrive as multi-frame bursts (SPEC
+v1.4's burst extension). :meth:`FaceEngine.best_face` picks the single best
+detection across such a burst (used by staged face enrollment) by ranking
+every detection with the pure, easily tested :func:`select_best_face`.
+
 Two hard rules, because the voice pipeline must keep working without a camera:
 
 * insightface, onnxruntime and the model pack are imported and loaded LAZILY,
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import threading
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -119,6 +125,17 @@ def provider_candidates() -> tuple[tuple[tuple[str, ...], int, str], ...]:
     CPU-only wheel — so the GPU attempt is only made when the runtime really
     offers ``CUDAExecutionProvider``.
     """
+    cpu = (CPU_PROVIDERS, -1, "CPU")
+    # CPU on purpose: the onnxruntime CUDA session was strangling Ollama on
+    # the same GPU - chat generation dropped from ~150 to ~10 tok/s whenever
+    # presence matching was active (measured 2026-09-17). A face match takes
+    # ~300 ms on the CPU once per presence burst, which nobody notices.
+    log.info("insightface runs on the CPU (GPU is reserved for the LLM and Whisper)")
+    return (cpu,)
+
+
+def _unused_gpu_candidates() -> tuple[tuple[tuple[str, ...], int, str], ...]:
+    """The old GPU-first order, kept for reference/manual experiments."""
     gpu = (CUDA_PROVIDERS, 0, "CUDA")
     cpu = (CPU_PROVIDERS, -1, "CPU")
     try:
@@ -136,6 +153,15 @@ def provider_candidates() -> tuple[tuple[tuple[str, ...], int, str], ...]:
         ", ".join(sorted(available)) or "none",
     )
     return (cpu,)
+
+
+def _det_score(face: Any) -> float:
+    """insightface's own detection confidence for one face (0.0 when unusable)."""
+    try:
+        value = float(getattr(face, "det_score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return value if np.isfinite(value) else 0.0
 
 
 def _bbox_area(bbox: Any) -> float:
@@ -159,6 +185,45 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     if denom <= 0.0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+def select_best_face(
+    per_frame_detections: Iterable[Iterable[tuple[float, float, Any]]] | None,
+) -> tuple[Any, float] | None:
+    """Pick the best ``(det_score, bbox_area, embedding)`` across several frames.
+
+    SPEC v1.4's burst extension: a person's better angle (mid head-turn during
+    enrollment, or simply a frame where they were not moving) should win over a
+    worse one from another frame of the same burst, instead of the pipeline
+    always keeping whatever frame #1 happened to show. The ranking is
+    ``det_score * sqrt(bbox_area)`` -- a large, confidently-detected face beats
+    a small or blurry one.
+
+    ``per_frame_detections`` is one iterable of detections per frame (as
+    :meth:`FaceEngine.best_face` builds from a JPEG burst), so this function
+    itself never decodes an image or touches insightface -- it is plain
+    arithmetic over whatever tuples are handed to it, which is what makes it
+    testable with fake detections. A malformed row is skipped, never raised.
+
+    :returns: ``(embedding, score)`` of the winning detection, or ``None`` when
+        nothing usable was found in any frame.
+    """
+    best_embedding: Any = None
+    best_score = -1.0
+    for frame_detections in per_frame_detections or []:
+        for row in frame_detections or []:
+            try:
+                det_score, bbox_area, embedding = row
+                score = float(det_score) * math.sqrt(max(float(bbox_area), 0.0))
+            except (TypeError, ValueError):
+                log.warning("Skipping a malformed detection row: %r", row)
+                continue
+            if score > best_score:
+                best_score = score
+                best_embedding = embedding
+    if best_embedding is None:
+        return None
+    return best_embedding, best_score
 
 
 class FaceEngine:
@@ -256,13 +321,13 @@ class FaceEngine:
 
     # ------------------------------------------------------------------ detection
 
-    def detect_and_embed(self, jpeg_bytes: bytes) -> list[tuple[float, np.ndarray]]:
-        """Embed every face in one JPEG frame.
+    def _face_detections(self, jpeg_bytes: bytes) -> list[tuple[float, float, np.ndarray]]:
+        """Every face of one frame as ``(det_score, bbox_area_px, embedding)``.
 
-        :returns: ``[(bbox_area_px, embedding), …]`` sorted by area, largest
-            face first — the person closest to the camera. Empty when face
-            recognition is off, the frame is undecodable, nobody is in it or
-            anything at all went wrong. Never raises.
+        The shared decode + insightface call behind both :meth:`detect_and_embed`
+        (keeps only the bbox area, for the "largest face" single-frame path) and
+        :meth:`best_face` (needs the raw detection score too, for the burst
+        ranking). Never raises.
         """
         if not self.enabled or not jpeg_bytes:
             return []
@@ -278,7 +343,7 @@ class FaceEngine:
             log.exception("insightface failed on a %d byte frame", len(jpeg_bytes))
             return []
 
-        found: list[tuple[float, np.ndarray]] = []
+        found: list[tuple[float, float, np.ndarray]] = []
         for face in faces or []:
             raw = getattr(face, "normed_embedding", None)
             if raw is None:
@@ -292,11 +357,39 @@ class FaceEngine:
                 continue
             if vector.size == 0 or not np.isfinite(vector).all():
                 continue
-            found.append((_bbox_area(getattr(face, "bbox", None)), vector))
+            found.append(
+                (_det_score(face), _bbox_area(getattr(face, "bbox", None)), vector)
+            )
+        return found
 
+    def detect_and_embed(self, jpeg_bytes: bytes) -> list[tuple[float, np.ndarray]]:
+        """Embed every face in one JPEG frame.
+
+        :returns: ``[(bbox_area_px, embedding), …]`` sorted by area, largest
+            face first — the person closest to the camera. Empty when face
+            recognition is off, the frame is undecodable, nobody is in it or
+            anything at all went wrong. Never raises.
+        """
+        found = [
+            (area, vector) for _score, area, vector in self._face_detections(jpeg_bytes)
+        ]
         found.sort(key=lambda item: item[0], reverse=True)
         log.debug("Detected %d face(s) in a %d byte frame", len(found), len(jpeg_bytes))
         return found
+
+    def best_face(self, frames_jpegs: Iterable[bytes]) -> tuple[np.ndarray, float] | None:
+        """Pick the single best face across a burst of JPEG frames (SPEC v1.4).
+
+        Runs detection on every frame and ranks every detection found with
+        :func:`select_best_face` (``det_score * sqrt(bbox_area)``), so a
+        person's best angle across the burst wins the sample instead of always
+        frame #1 — used by staged face enrollment.
+
+        :returns: ``(embedding, score)`` of the winning detection, or ``None``
+            when no frame had a usable face. Never raises.
+        """
+        per_frame = [self._face_detections(jpeg) for jpeg in (frames_jpegs or [])]
+        return select_best_face(per_frame)
 
     # ------------------------------------------------------------------ matching
 
@@ -360,4 +453,5 @@ __all__ = [
     "decode_jpeg",
     "insightface_installed",
     "provider_candidates",
+    "select_best_face",
 ]
