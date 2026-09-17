@@ -11,11 +11,11 @@ if not exist config.yaml (
     echo [i] config.yaml created from config.example.yaml - check the settings
 )
 
-echo [i] Starting ngrok: https://dorm-smart-un-iversity-of-nebr-omaha.ngrok.app -^> localhost:8765
+echo [i] Starting ngrok: https://dorm-smart-un-iversity-of-nebr-omaha.ngrok.app -^> localhost:8770
 echo [i] If the ngrok window shows ERR_NGROK_334 "already online", the tunnel is already up
 echo     (for example from your always-on agent via default.internal). That is NOT an error,
 echo     just close that window - the server will work through the existing tunnel.
-start "Jarvis ngrok" cmd /k "%NGROK%" http --url=dorm-smart-un-iversity-of-nebr-omaha.ngrok.app 8765
+start "Jarvis ngrok" cmd /k "%NGROK%" http --url=dorm-smart-un-iversity-of-nebr-omaha.ngrok.app 8770
 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run-server.ps1
 
