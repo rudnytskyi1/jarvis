@@ -4,8 +4,9 @@
 int16 PCM — the client captures exactly 30 ms frames, so frames go straight
 from :mod:`client.audio` into the VAD.
 
-An utterance ends after ``silence_ms`` of consecutive non-speech frames or when
-``max_utterance_s`` of speech has been recorded. If no speech starts within the
+An utterance ends once the last ``silence_ms`` worth of frames is (almost)
+entirely non-speech — sporadic false "speech" frames from a noisy mic are
+tolerated — or when ``max_utterance_s`` of speech has been recorded. If no speech starts within the
 lead-in timeout (5 s by default, or the follow-up window), the recorder returns
 ``None``.
 """
@@ -143,8 +144,14 @@ class VadRecorder:
         window: Deque[bool] = collections.deque(maxlen=self.onset_window)
         started = False
         finished = False
-        silence_frames = 0
         silence_limit = max(1, int(round(self.silence_ms / self.frame_ms)))
+        # End-of-utterance detection tolerates sporadic false "speech" frames:
+        # requiring silence_limit CONSECUTIVE non-speech frames lets a noisy mic
+        # (webcam AGC, TV hum) reset the counter over and over, stretching the
+        # 0.8 s tail into many seconds. Instead the utterance ends when at most
+        # 10% of the last silence_ms worth of frames were flagged as speech.
+        tail: Deque[bool] = collections.deque(maxlen=silence_limit)
+        tail_allowed_speech = max(0, int(silence_limit * 0.1))
         speech_started_at = 0.0
         now = time.monotonic()
         deadline = now + lead_in
@@ -174,7 +181,7 @@ class VadRecorder:
                     if sum(window) >= self.onset_frames:
                         started = True
                         speech_started_at = now
-                        silence_frames = 0
+                        tail.clear()
                         collected.extend(lead_in_ring)
                         lead_in_ring.clear()
                         log.info("Speech detected, recording...")
@@ -183,9 +190,12 @@ class VadRecorder:
 
                 collected.append(frame)
                 await self._emit(on_audio, frame)
-                silence_frames = 0 if speech else silence_frames + 1
-                if silence_frames >= silence_limit:
-                    log.debug("%d ms of silence - end of the utterance", silence_frames * self.frame_ms)
+                tail.append(speech)
+                if len(tail) == silence_limit and sum(tail) <= tail_allowed_speech:
+                    log.debug(
+                        "~%d ms of (near-)silence - end of the utterance",
+                        silence_limit * self.frame_ms,
+                    )
                     finished = True
                     break
                 if (now - speech_started_at) >= self.max_utterance_s:

@@ -271,7 +271,8 @@ required keys → clear startup error naming the key.
   detection = any configured phrase appears in a final or partial result; after
   detection reset recognizer. `phrases` defaults to `[word]` if empty.
 - `client/vad.py` — `webrtcvad.Vad(cfg.aggressiveness)` on 30 ms frames; utterance
-  ends after `silence_ms` of consecutive non-speech or at `max_utterance_s`; returns
+  ends once the trailing `silence_ms` window is ≥90% non-speech frames (sporadic
+  false positives from a noisy mic must not reset the tail) or at `max_utterance_s`; returns
   the recorded bytes (or None if no speech at all within a lead-in timeout of 5 s).
 - `client/ws_client.py` — `websockets` library wrapper: connect, send json/binary,
   async iterate messages, reconnect loop.

@@ -50,8 +50,8 @@ client:
     sample_rate: 16000       # do not change: Whisper/VAD/Vosk run at 16 kHz
 
   vad:
-    aggressiveness: 2        # 0..3, higher = cuts silence/noise harder
-    silence_ms: 800          # pause that ends an utterance
+    aggressiveness: 3        # 0..3, higher = cuts silence/noise harder (3 recommended for webcam mics)
+    silence_ms: 700          # pause that ends an utterance
     max_utterance_s: 15
     pre_roll_ms: 300         # audio from BEFORE the trigger included in the recording
 
