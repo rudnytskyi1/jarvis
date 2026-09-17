@@ -33,8 +33,10 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from common import protocol as proto
 from common.config import load_config
+from server import speaker as speaker_mod
 from server.llm import LlmClient
 from server.session import Session
+from server.speaker import VoiceRegistry
 from server.storage import DialogLog, Memory
 from server.stt import SttEngine
 from server.tools import (
@@ -145,6 +147,7 @@ _tts: TtsEngine | None = None
 _vision: VisionClient | None = None
 _memory: Memory | None = None
 _dialogs: DialogLog | None = None
+_voices: VoiceRegistry | None = None
 
 
 def configure(cfg: Any) -> None:
@@ -166,12 +169,18 @@ def get_config() -> Any:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Load STT/LLM/TTS/vision and the storage once at startup (SPEC §3)."""
-    global _stt, _llm, _tts, _vision, _memory, _dialogs
+    global _stt, _llm, _tts, _vision, _memory, _dialogs, _voices
     cfg = get_config()
     log.info("Starting the Jarvis brain: %s:%s", cfg.server.host, cfg.server.port)
 
     _memory = Memory()
     _dialogs = DialogLog()
+    speaker_cfg = getattr(cfg.server, "speaker", None)
+    _voices = VoiceRegistry(
+        threshold=getattr(speaker_cfg, "threshold", 0.72),
+        min_speech_s=getattr(speaker_cfg, "min_speech_s", 0.8),
+        enabled=getattr(speaker_cfg, "enabled", True),
+    )
     _stt = await asyncio.to_thread(SttEngine, cfg.server.stt)
     _llm = LlmClient(cfg.server.llm)
     _vision = VisionClient(cfg.server.llm)
@@ -192,6 +201,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _vision = None
         _memory = None
         _dialogs = None
+        _voices = None
 
 
 app = FastAPI(title="Jarvis brain server", version="1.2", lifespan=lifespan)
@@ -239,6 +249,14 @@ class Connection:
         self._memory_seq = 1
         self._utterance_actions: list[dict[str, Any]] = []
         self._task: asyncio.Task | None = None
+
+        # --- speaker recognition (SPEC v1.3) ---
+        self._speaker_name = speaker_mod.ROLE_UNKNOWN
+        self._speaker_role = speaker_mod.ROLE_UNKNOWN
+        self._speaker_score = 0.0
+        self._current_pcm: bytes = b""
+        #: Set by ``enroll_voice``: the next utterances add samples for ``name``.
+        self._enroll_pending: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ sending
 
@@ -453,6 +471,12 @@ class Connection:
 
     async def _execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """ToolExecutor for :meth:`server.llm.LlmClient.generate` (SPEC §5 matrix)."""
+        denial = speaker_mod.check_permission(self._speaker_role, name, args)
+        if denial is not None:
+            log.info(
+                "Denied %s for %s (%s)", name, self._speaker_name, self._speaker_role
+            )
+            return {"ok": False, "error": denial}
         if name in CLIENT_TOOLS:
             return await self._run_client_action(name, args)
         if name == "look_at_screen":
@@ -461,8 +485,59 @@ class Connection:
             return await self._run_click_screen(args)
         if name == "remember":
             return await self._run_remember(args)
+        if name == "enroll_voice":
+            return await self._run_enroll_voice(args)
+        if name == "set_role":
+            return await self._run_set_role(args)
         log.warning("Tool %r has no server-side handler", name)
         return {"ok": False, "error": f"unknown tool: {name}"}
+
+    async def _run_enroll_voice(self, args: dict[str, Any]) -> dict[str, Any]:
+        """SPEC v1.3: store the current utterance as a voice sample."""
+        if _voices is None or not _voices.enabled:
+            return {"ok": False, "error": "speaker recognition is disabled"}
+        if not self._current_pcm:
+            return {"ok": False, "error": "no utterance audio to sample"}
+        name = str(args.get("name") or "").strip()
+        try:
+            role, status = await asyncio.to_thread(
+                _voices.enroll, name, self._current_pcm, self.sample_rate
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        self._enroll_pending = {
+            "name": name,
+            "remaining": speaker_mod.ENROLL_EXTRA_SAMPLES,
+        }
+        record = {
+            "id": f"v{self._memory_seq}",
+            "tool": "enroll_voice",
+            "args": {"name": name},
+            "result": {"ok": True, "role": role, "status": status},
+        }
+        self._memory_seq += 1
+        self._utterance_actions.append(record)
+        return {
+            "ok": True,
+            "role": role,
+            "status": status,
+            "next": (
+                f"ask {name} to say {speaker_mod.ENROLL_EXTRA_SAMPLES} more full "
+                "sentences - they are collected automatically"
+            ),
+        }
+
+    async def _run_set_role(self, args: dict[str, Any]) -> dict[str, Any]:
+        """SPEC v1.3: admin-only role change (permission already checked)."""
+        if _voices is None or not _voices.enabled:
+            return {"ok": False, "error": "speaker recognition is disabled"}
+        try:
+            applied = await asyncio.to_thread(
+                _voices.set_role, args.get("name"), args.get("role")
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "role": applied}
 
     async def _run_client_action(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Send one action to the client and wait for its ``action_result``."""
@@ -700,6 +775,7 @@ class Connection:
         )
         if not text.strip():
             await self.send_error(ERROR_EMPTY_TRANSCRIPT)
+            self._speaker_score = 0.0
             await self._log_dialog(
                 started_at,
                 session,
@@ -711,10 +787,46 @@ class Connection:
             )
             return
 
+        # 1b. Speaker identification + enrollment continuation (SPEC v1.3)
+        self._current_pcm = pcm
+        enroll_note = ""
+        if _voices is not None and _voices.enabled:
+            name, role, score = await asyncio.to_thread(
+                _voices.identify, pcm, self.sample_rate
+            )
+            self._speaker_name, self._speaker_role, self._speaker_score = name, role, score
+            pending = self._enroll_pending
+            if pending:
+                try:
+                    await asyncio.to_thread(
+                        _voices.enroll, pending["name"], pcm, self.sample_rate
+                    )
+                    pending["remaining"] -= 1
+                except ValueError as exc:
+                    enroll_note = f" [enrollment: sample skipped - {exc}]"
+                else:
+                    if pending["remaining"] <= 0:
+                        self._enroll_pending = None
+                        enroll_note = (
+                            f" [enrollment: done - {pending['name']}'s voice profile "
+                            "is complete, tell them so]"
+                        )
+                    else:
+                        enroll_note = (
+                            f" [enrollment: {pending['remaining']} sample(s) left for "
+                            f"{pending['name']} - ask them to say one more sentence]"
+                        )
+
+        # The LLM sees who is talking; permissions are enforced server-side.
+        prefixed = (
+            f"[speaker: {self._speaker_name} | role: {self._speaker_role}]"
+            f"{enroll_note} {text}"
+        )
+
         # 2. LLM with the tool loop — tools are executed for real (SPEC §3, §5)
         t_llm = time.perf_counter()
         try:
-            result = await brain.generate(session.messages(text), self._execute_tool)
+            result = await brain.generate(session.messages(prefixed), self._execute_tool)
         except (WebSocketDisconnect, RuntimeError):
             raise
         except Exception:
@@ -726,7 +838,7 @@ class Connection:
         say_text = result.text.strip()
         if not say_text:
             say_text = SAY_AFTER_ACTIONS if self._utterance_actions else SAY_NOT_UNDERSTOOD
-        session.remember(text, say_text)
+        session.remember(prefixed, say_text)
 
         # 3. say -> tts stream (order fixed by SPEC §4)
         await self.send_json({"type": proto.MSG_SAY, "text": say_text})
@@ -766,6 +878,8 @@ class Connection:
             "client_id": session.client_id,
             "transcript": transcript,
             "language": language or "",
+            "speaker": self._speaker_name,
+            "speaker_score": round(self._speaker_score, 3),
             "reply": reply,
             "actions": list(self._utterance_actions),
             "durations_ms": durations_ms,

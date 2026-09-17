@@ -279,6 +279,50 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "enroll_voice",
+            "description": (
+                "Store the CURRENT speaker's voice so you can recognize them later. "
+                "Call it when someone asks you to remember their voice or introduces "
+                "themselves for enrollment. The utterance they just spoke becomes the "
+                "first sample; afterwards ask them to say two more full sentences — "
+                "those are collected automatically. The first person ever enrolled "
+                "becomes admin; everyone after starts as user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The speaker's name, e.g. 'Anton'.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_role",
+            "description": (
+                "Change an enrolled person's role. Only an admin speaker may do this "
+                "(enforced by the system). Roles: admin (everything incl. running "
+                "commands), trusted (computer use, screen, memory), user (volume, "
+                "media, lights, chat)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Enrolled person's name."},
+                    "role": {"type": "string", "enum": ["admin", "trusted", "user"]},
+                },
+                "required": ["name", "role"],
+            },
+        },
+    },
 ]
 
 #: Names of the tools the model may call.
@@ -290,7 +334,9 @@ CLIENT_TOOLS: frozenset[str] = frozenset(
 )
 
 #: Tools executed on the server; never sent to the client as they are called.
-SERVER_TOOLS: frozenset[str] = frozenset({"look_at_screen", "click_screen", "remember"})
+SERVER_TOOLS: frozenset[str] = frozenset(
+    {"look_at_screen", "click_screen", "remember", "enroll_voice", "set_role"}
+)
 
 #: Client action produced by the server-side ``click_screen`` pipeline (SPEC §5,
 #: §8): ``{"x_norm": float, "y_norm": float, "button": "left"|"right"|"double"}``.

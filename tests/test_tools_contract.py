@@ -15,7 +15,7 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
-def test_seven_tools_exposed():
+def test_nine_tools_exposed():
     assert tool_names() == {
         "set_light",
         "set_switch",
@@ -24,6 +24,8 @@ def test_seven_tools_exposed():
         "look_at_screen",
         "click_screen",
         "remember",
+        "enroll_voice",
+        "set_role",
     }
 
 
@@ -33,7 +35,13 @@ def test_mouse_click_is_internal_only():
 
 
 def test_matrix_split():
-    assert SERVER_TOOLS == {"look_at_screen", "click_screen", "remember"}
+    assert SERVER_TOOLS == {
+        "look_at_screen",
+        "click_screen",
+        "remember",
+        "enroll_voice",
+        "set_role",
+    }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")
 

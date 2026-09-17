@@ -20,6 +20,9 @@ torchaudio
 omegaconf
 num2words  # spells numbers/times out in words - Silero cannot pronounce digits
 
+# Speaker recognition (SPEC v1.3): voice embeddings for who-is-talking
+resemblyzer
+
 # Shared
 numpy
 pyyaml

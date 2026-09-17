@@ -26,6 +26,11 @@ server:
     keep_alive: 4h           # keep the chat model in VRAM (Ollama unloads after 5 m otherwise)
     num_ctx: 8192            # requested context window; the 32k model default wastes VRAM
 
+  speaker:                   # who is talking (resemblyzer voice profiles, data/voices.json)
+    enabled: true
+    threshold: 0.72          # cosine similarity for a voice to match a profile
+    min_speech_s: 0.8        # shorter utterances are left unidentified
+
   tts:
     engine: silero
     language: en

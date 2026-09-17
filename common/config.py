@@ -130,6 +130,16 @@ class LLMConfig(_Strict):
         return provider
 
 
+class SpeakerConfig(_Strict):
+    """Speaker recognition (``server.speaker``, SPEC v1.3)."""
+
+    enabled: bool = True
+    #: Cosine-similarity threshold for a voice to match an enrolled profile.
+    threshold: float = Field(default=0.72, gt=0.0, le=1.0)
+    #: Utterances shorter than this are not identified (too little voice).
+    min_speech_s: float = Field(default=0.8, ge=0.0)
+
+
 class TTSConfig(_Strict):
     """Silero TTS settings (``server.tts``)."""
 
@@ -148,6 +158,7 @@ class ServerConfig(_Strict):
     stt: STTConfig = Field(default_factory=STTConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
+    speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
 
 
 # ---------------------------------------------------------------------------

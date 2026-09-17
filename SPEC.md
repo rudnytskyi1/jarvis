@@ -42,6 +42,27 @@ v1.1 capabilities on top of the voice→action loop:
   currently no devices configured (`client.devices: []`) — the persona must not
   advertise them when the device list is empty.
 
+v1.3 — **speaker recognition and roles**:
+- Every utterance is voice-identified on the server (`server/speaker.py`,
+  resemblyzer 256-d embeddings, cosine vs enrolled profiles in
+  `data/voices.json`). The LLM sees the speaker as a transcript prefix:
+  `[speaker: Anton | role: admin] <text>` (or `[speaker: unknown]`).
+- Roles: `admin` > `trusted` > `user`; unmatched voices are `unknown`.
+  Permissions are enforced SERVER-side in the tool executor, not by the prompt:
+  `run_command` and `set_role` — admin only; `click_screen`, `look_at_screen`,
+  `remember` and the power `pc_control` commands (open/close/minimize/maximize/
+  focus_app, type_text, hotkey, sleep) — admin or trusted; volume/media/display
+  `pc_control` commands, `set_light`, `set_switch`, `enroll_voice` and plain
+  chat — everyone including unknown. A denied call returns
+  `{"ok": false, "error": "permission denied: …"}` to the LLM.
+- Enrollment: the server tool `enroll_voice {"name": str}` stores the CURRENT
+  utterance's embedding; the first person ever enrolled becomes `admin`, later
+  ones start as `user`. The connection then collects the next 2 non-empty
+  utterances as extra samples (state on the connection; the transcript prefix
+  carries `[enrollment: N sample(s) left for X]` so the model can guide the
+  speaker). `set_role {"name": str, "role": "admin"|"trusted"|"user"}` (admin
+  only) changes a role. Dialog-log entries gain `speaker` and `speaker_score`.
+
 Both machines check out the same repo. One `config.yaml` (copied from
 `config.example.yaml`) with `server:` and `client:` sections; each process reads its
 own section. Python 3.11+ (conda env `jarvis` exists on the brain PC:
@@ -258,6 +279,7 @@ cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns
 cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # v1.1: "ollama_native"|"openai", bool, str, int
 cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 8192 (requested context)
 cfg.server.tts.{engine, language, model_id, speaker, sample_rate}   # English default: language "en", model_id "v3_en", speaker "en_0"
+cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.72 cosine, 0.8 s minimum audio
 cfg.client.server_url        # "ws://192.168.x.x:8765/ws"
 cfg.client.client_id
 cfg.client.wakeword.{word, phrases, vosk_model}                 # phrases: list[str]
