@@ -437,7 +437,6 @@ class CameraService:
             conf=CONF_THRESHOLD,
             verbose=False,
             device=0,
-            half=True,
             imgsz=640,
         )
         counts: Dict[str, int] = {}
