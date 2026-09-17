@@ -111,6 +111,9 @@ BEEP_ECHO_GUARD_MS = 250
 RESULT_OK = "ok"
 RESULT_NO_SPEECH = "no_speech"
 RESULT_ERROR = "error"
+#: The user said the wake word while the reply was playing: playback was cut
+#: and the client goes straight back to listening.
+RESULT_BARGE_IN = "barge_in"
 
 
 class _Stopping(Exception):
@@ -220,6 +223,8 @@ class JarvisClient:
         raw_thinking = _attr(self.ccfg, "thinking_sounds")
         self.thinking_sounds = True if raw_thinking is None else bool(raw_thinking)
         self._thinking_task: Optional[asyncio.Task] = None
+        self._barge_task: Optional[asyncio.Task] = None
+        self._barged = False
 
         self.registry = build_registry(self.ccfg)
         self.dispatcher = Dispatcher(self.ccfg, self.registry)
@@ -327,6 +332,13 @@ class JarvisClient:
         lead_in: Optional[float] = None
         while not self._stopping:
             result = await self._handle_utterance(pre_roll, lead_in)
+            if result == RESULT_BARGE_IN:
+                # The wake word cut the reply short: acknowledge and listen for
+                # the new command right away, no wake word needed.
+                await self._beep(BEEP_FREQ_HZ, BEEP_MS)
+                pre_roll = self._drain_beep_window()
+                lead_in = None
+                continue
             if result != RESULT_OK or self.followup_window_s <= 0:
                 return
             pre_roll = b""
@@ -450,6 +462,7 @@ class JarvisClient:
         """
         self._tts_active = False
         self._tts_bytes = 0
+        self._barged = False
         result = RESULT_OK
         self._start_thinking()
         try:
@@ -475,10 +488,14 @@ class JarvisClient:
                 elif mtype == MSG_TTS_START:
                     await self._stop_thinking()
                     await self._on_tts_start(msg)
+                    self._start_barge_watch()
                 elif mtype == MSG_TTS_END:
                     self._tts_active = False
+                    await self._stop_barge_watch()
                     await self.audio_out.drain()
-                    if self._tts_bytes == 0:
+                    if self._barged:
+                        result = RESULT_BARGE_IN
+                    elif self._tts_bytes == 0:
                         log.info("The TTS stream was empty - nothing to play")
                     else:
                         log.debug("Played %d bytes of TTS", self._tts_bytes)
@@ -496,8 +513,47 @@ class JarvisClient:
                     log.warning("Unknown message type from the server: %r", mtype)
         finally:
             await self._stop_thinking()
+            await self._stop_barge_watch()
             await self._await_actions()
         return result
+
+    # -- barge-in: the wake word interrupts playback -------------------------
+
+    async def _barge_loop(self) -> None:
+        """Listen for the wake word while the reply is playing."""
+        if self.wake is None:
+            return
+        self.audio_in.clear()  # drop stale audio buffered while the server thought
+        self.wake.reset()
+        while True:
+            frame = await self.audio_in.read_frame(timeout=0.5)
+            if not frame:
+                continue
+            if self.wake.accept_frame(frame):
+                log.info("Wake word during playback - interrupting the reply")
+                self._barged = True
+                dropped = self.audio_out.cancel_pending()
+                log.debug("Dropped %d queued playback chunk(s)", dropped)
+                self.wake.reset()
+                return
+
+    def _start_barge_watch(self) -> None:
+        if self._barge_task is None:
+            self._barge_task = asyncio.get_running_loop().create_task(
+                self._barge_loop(), name="jarvis-barge-in"
+            )
+
+    async def _stop_barge_watch(self) -> None:
+        task, self._barge_task = self._barge_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - the watcher must never break the loop
+            log.debug("Barge-in watcher ended with: %s", exc)
 
     # -- thinking sounds (the "I'm working on it" blips) ---------------------
 
@@ -550,6 +606,8 @@ class JarvisClient:
         if not self._tts_active:
             log.debug("Binary frame outside of a TTS stream (%d bytes) - skipping", len(data))
             return
+        if self._barged:
+            return  # interrupted: swallow the rest of the stream silently
         self._tts_bytes += len(data)
         await self.audio_out.write(data)
 

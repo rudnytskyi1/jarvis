@@ -137,6 +137,7 @@ TOOLS: list[dict[str, Any]] = [
                             "open_app",
                             "close_app",
                             "minimize_app",
+                            "maximize_app",
                             "focus_app",
                             "type_text",
                             "hotkey",

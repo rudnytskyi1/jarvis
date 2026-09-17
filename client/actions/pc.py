@@ -58,6 +58,7 @@ CMD_SLEEP = "sleep"
 CMD_OPEN_APP = "open_app"
 CMD_CLOSE_APP = "close_app"
 CMD_MINIMIZE_APP = "minimize_app"
+CMD_MAXIMIZE_APP = "maximize_app"
 CMD_FOCUS_APP = "focus_app"
 CMD_TYPE_TEXT = "type_text"
 CMD_HOTKEY = "hotkey"
@@ -78,6 +79,7 @@ PC_COMMANDS = frozenset(
         CMD_OPEN_APP,
         CMD_CLOSE_APP,
         CMD_MINIMIZE_APP,
+        CMD_MAXIMIZE_APP,
         CMD_FOCUS_APP,
         CMD_TYPE_TEXT,
         CMD_HOTKEY,
@@ -167,6 +169,7 @@ _SM_CYSCREEN = 1
 #: ShowWindow command and the window styles/attributes used by minimize_app
 _SW_MINIMIZE = 6
 _SW_RESTORE = 9
+_SW_MAXIMIZE = 3
 #: Hotkeys that close the focused window/tab. Refused when the focused window
 #: is our own console — that is how Jarvis once closed itself instead of a tab.
 _CLOSING_HOTKEYS = frozenset({"ctrl+w", "ctrl+f4", "ctrl+shift+w", "alt+f4", "ctrl+shift+q"})
@@ -990,7 +993,12 @@ def _sync_focus_window(hwnd: int) -> None:
     user32.keybd_event.argtypes = (
         ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.c_void_p,
     )
-    user32.ShowWindow(hwnd, _SW_RESTORE)
+    user32.IsIconic.argtypes = (wintypes.HWND,)
+    user32.IsIconic.restype = wintypes.BOOL
+    # SW_RESTORE would also un-maximize a maximized window (it shrank the
+    # browser once) - only restore when the window is actually minimized.
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, _SW_RESTORE)
     user32.keybd_event(0x12, 0, 0, None)       # VK_MENU down
     user32.keybd_event(0x12, 0, 0x0002, None)  # VK_MENU up
     user32.SetForegroundWindow(hwnd)
@@ -1007,6 +1015,23 @@ def _sync_focus_app(image_name: str | None, display_name: str) -> str | None:
         targets = [window for window in windows if _title_matches(window.title, query)]
     if not targets:
         return None
+    _sync_focus_window(targets[0].hwnd)
+    return targets[0].title
+
+
+def _sync_maximize_app(image_name: str | None, display_name: str) -> str | None:
+    """Maximize the app's main window and bring it to the foreground."""
+    _require_windows()
+    pids = _sync_process_ids(image_name) if image_name else set()
+    windows = _list_windows()
+    targets = [window for window in windows if window.pid in pids] if pids else []
+    if not targets:
+        query = normalize_app_name(display_name)
+        targets = [window for window in windows if _title_matches(window.title, query)]
+    if not targets:
+        return None
+    user32 = _user32()
+    user32.ShowWindow(targets[0].hwnd, _SW_MAXIMIZE)
     _sync_focus_window(targets[0].hwnd)
     return targets[0].title
 
@@ -1225,6 +1250,9 @@ class PCController:
         if name == CMD_FOCUS_APP:
             return await self.focus_app(value)
 
+        if name == CMD_MAXIMIZE_APP:
+            return await self.maximize_app(value)
+
         # CMD_CLOSE_APP
         return await self._close_app(value)
 
@@ -1301,6 +1329,22 @@ class PCController:
             )
         log.info("pc_control: focused '%s' (%s)", entry.name, title)
         return PCResult(f"focused {entry.name}: {title}")
+
+    async def maximize_app(self, value: Any) -> PCResult:
+        """Maximize an app's window (``pc_control`` ``maximize_app``)."""
+
+        if _is_console_alias(value):
+            raise PCActionError("refusing to maximize the console hosting the client")
+        entry = await self._resolve_app(value)
+        title = await asyncio.to_thread(
+            _sync_maximize_app, entry.process_name(), entry.name
+        )
+        if title is None:
+            raise PCActionError(
+                f"no open window found for '{entry.name}' - open it first with open_app"
+            )
+        log.info("pc_control: maximized '%s' (%s)", entry.name, title)
+        return PCResult(f"maximized {entry.name}: {title}")
 
     async def mouse_click(
         self, x_norm: Any, y_norm: Any, button: Any = None

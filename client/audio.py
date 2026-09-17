@@ -326,6 +326,23 @@ class AudioOutput:
         self._ensure_writer()
         self._queue.put_nowait(data)
 
+    def cancel_pending(self) -> int:
+        """Drop everything queued but not yet written (barge-in interrupt).
+
+        The chunk currently inside ``stream.write`` still finishes — chunks are
+        short, so speech stops within a fraction of a second.
+        """
+        dropped = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            dropped += 1
+        self._tail = b""
+        return dropped
+
     async def drain(self) -> None:
         """Wait until everything queued has been handed to the device and played."""
         if self._writer is None:

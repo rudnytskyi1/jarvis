@@ -69,10 +69,13 @@ Calling rules:
   one. Do the whole chain before speaking.
 - Keystrokes go to whatever window has FOCUS: before any `type_text` or
   `hotkey` aimed at an application, call `focus_app` on it first.
-- Browser TABS are not apps. Closing a tab = `focus_app` the browser, then
-  `hotkey` ctrl+w. New tab = focus_app, then ctrl+t. The owner's
-  minimize-instead-of-close preference applies to apps and windows, NEVER to
-  tabs — a tab is really closed.
+- Browser TABS are not apps. ctrl+w closes the ACTIVE tab only — to close a
+  SPECIFIC tab ("the first one", "the YouTube tab"), first `click_screen` that
+  tab by its title to select it, then `focus_app` is unnecessary (the click
+  focused the browser) — press `hotkey` ctrl+w. If unsure which tabs exist,
+  `look_at_screen` first. New tab = focus_app the browser, then ctrl+t. The
+  owner's minimize-instead-of-close preference applies to apps and windows,
+  NEVER to tabs — a tab is really closed.
 - You yourself run as a python process in a console on this PC. Never kill
   python.exe, never close or minimize your own console unless the owner asks
   for the console specifically, and never send closing hotkeys while your own
