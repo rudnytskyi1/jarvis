@@ -292,7 +292,14 @@ class Session:
         ]
 
     def remember(self, user_text: str, assistant_text: str) -> None:
-        """Append one exchange and trim history to ``history_turns`` exchanges."""
+        """Append one exchange; trim the history in CHUNKS, not per turn.
+
+        Sliding the window by one exchange every turn changes the prompt prefix
+        every request, which invalidates Ollama's prompt cache and forces a
+        multi-second history re-prefill on EVERY reply once the cap is reached.
+        Dropping down to ~2/3 of the cap only when it overflows keeps the prefix
+        stable for several turns between trims (one slow reply instead of all).
+        """
         max_messages = self.history_turns * 2
         if max_messages <= 0:
             self._history.clear()
@@ -300,7 +307,8 @@ class Session:
         self._history.append({"role": "user", "content": user_text})
         self._history.append({"role": "assistant", "content": assistant_text})
         if len(self._history) > max_messages:
-            del self._history[: len(self._history) - max_messages]
+            keep = max(2, (max_messages * 2 // 3) // 2 * 2)
+            del self._history[: len(self._history) - keep]
 
     def reset(self) -> None:
         self._history.clear()
