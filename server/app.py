@@ -558,6 +558,11 @@ class Connection:
         self._last_frames: dict[str, Any] = {}
         #: Last annotated detections photo (jpeg, w, h, title) from find_object.
         self._last_annotated: tuple[bytes, int, int, str] | None = None
+        #: When each cached picture was produced, so "show me the photo" picks
+        #: the freshest one - and prefers the ANNOTATED frame over the plain
+        #: capture it was drawn from (the boxes are the point of showing it).
+        self._last_frame_ts: dict[str, float] = {}
+        self._last_annotated_ts: float = 0.0
         self._utterance_actions: list[dict[str, Any]] = []
         self._task: asyncio.Task | None = None
 
@@ -1213,6 +1218,7 @@ class Connection:
         """
         if isinstance(frame, ImageFrame):
             self._last_frames[kind] = frame
+            self._last_frame_ts[kind] = time.monotonic()
         return frame
 
     async def _request_screenshot(self, shot_id: str) -> ImageFrame | str:
@@ -1837,11 +1843,20 @@ class Connection:
 
         # Prefer the annotated detections photo when it is the freshest thing
         # or explicitly asked for; otherwise the last plain frame.
+        camera_ts = self._last_frame_ts.get(SOURCE_CAMERA, 0.0)
+        # Default ("show me the photo"): the annotated one wins whenever it is
+        # at least as fresh as the plain capture - its boxes and labels are the
+        # whole reason the owner wants to see it.
+        prefer_annotated = bool(
+            self._last_annotated and self._last_annotated_ts >= camera_ts - 1.0
+        )
         if which in ("detections", "objects") and self._last_annotated:
             jpeg, w, h, title = self._last_annotated
         elif which == "screen" and SOURCE_SCREEN in self._last_frames:
             frame = self._last_frames[SOURCE_SCREEN]
             jpeg, w, h, title = frame.jpeg, frame.w, frame.h, "the screen"
+        elif which in ("camera", "room", "") and prefer_annotated:
+            jpeg, w, h, title = self._last_annotated  # type: ignore[misc]
         elif which in ("camera", "room", "") and SOURCE_CAMERA in self._last_frames:
             frame = self._last_frames[SOURCE_CAMERA]
             jpeg, w, h, title = frame.jpeg, frame.w, frame.h, "the room"
@@ -1893,6 +1908,7 @@ class Connection:
             )
             title = f"{target} - {count} found"
             self._last_annotated = (annotated, frame.w, frame.h, title)
+            self._last_annotated_ts = time.monotonic()
             await self._send_image_show(annotated, frame.w, frame.h, title, IMAGE_SHOW_TTL_S)
             # BUG 4: worded as a direct instruction (not just a fact) so the
             # model reliably says it out loud instead of only saying "Done".
