@@ -55,6 +55,7 @@ __all__ = [
     "AudioConfig",
     "VADConfig",
     "CameraConfig",
+    "OverlayConfig",
     "DeviceConfig",
     "load_config",
     "DEFAULT_CONFIG_FILENAME",
@@ -303,6 +304,20 @@ class CameraConfig(_Strict):
     face_check_interval_s: float = Field(default=5.0, gt=0.0)
 
 
+class OverlayConfig(_Strict):
+    """Sci-fi HUD overlay on the TV (``client.overlay``).
+
+    A transparent, always-on-top, click-through Tkinter window showing an
+    animated orb that reacts to the assistant's state. Entirely optional: a
+    missing display or Tk simply disables it, never touching the voice client.
+    """
+
+    enabled: bool = True
+    position: str = "bottom_right"
+    idle_hidden: bool = False
+    scale: float = Field(default=1.0, gt=0.0, le=4.0)
+
+
 class DeviceConfig(BaseModel):
     """One controllable device from ``client.devices``.
 
@@ -349,6 +364,8 @@ class ClientConfig(_Strict):
     vad: VADConfig = Field(default_factory=VADConfig)
     #: Room camera: YOLO presence state + face frames for the server (v1.4).
     camera: CameraConfig = Field(default_factory=CameraConfig)
+    #: Sci-fi HUD overlay on the TV.
+    overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     #: Seconds to keep listening after a reply without the wake word (0 = off).
     followup_window_s: float = Field(default=6.0, ge=0.0)
     #: Soft repeating blips while the server is still working on a reply

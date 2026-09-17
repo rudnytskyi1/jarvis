@@ -55,6 +55,15 @@ CPU_PROVIDERS = ("CPUExecutionProvider",)
 #: Default cosine threshold; ``server.face.threshold`` overrides it.
 DEFAULT_THRESHOLD = 0.45
 
+#: Minimum detector confidence for a detection to count as a real face. The
+#: buffalo_l detector emits weak boxes on posters, reflections and textures
+#: (they showed up as a phantom "unknown person" next to the seated owner);
+#: 0.60 keeps genuine faces and drops those.
+MIN_FACE_DET_SCORE = 0.60
+#: A real face is also not tiny: a box smaller than this fraction of the frame
+#: side is almost always a false positive far in the background.
+MIN_FACE_SIDE_FRAC = 0.06
+
 _spec_cache: dict[str, bool] = {}
 
 
@@ -343,8 +352,19 @@ class FaceEngine:
             log.exception("insightface failed on a %d byte frame", len(jpeg_bytes))
             return []
 
+        frame_side = float(min(image.shape[0], image.shape[1])) if image.ndim >= 2 else 0.0
+        min_area = (MIN_FACE_SIDE_FRAC * frame_side) ** 2 if frame_side else 0.0
         found: list[tuple[float, float, np.ndarray]] = []
         for face in faces or []:
+            score = _det_score(face)
+            area = _bbox_area(getattr(face, "bbox", None))
+            # Drop weak/tiny detections: phantom faces on posters/reflections.
+            if score < MIN_FACE_DET_SCORE:
+                log.debug("Dropping a low-confidence face (det_score %.2f)", score)
+                continue
+            if min_area and area < min_area:
+                log.debug("Dropping a tiny background face (area %.0f < %.0f)", area, min_area)
+                continue
             raw = getattr(face, "normed_embedding", None)
             if raw is None:
                 raw = getattr(face, "embedding", None)
@@ -357,9 +377,7 @@ class FaceEngine:
                 continue
             if vector.size == 0 or not np.isfinite(vector).all():
                 continue
-            found.append(
-                (_det_score(face), _bbox_area(getattr(face, "bbox", None)), vector)
-            )
+            found.append((score, area, vector))
         return found
 
     def detect_and_embed(self, jpeg_bytes: bytes) -> list[tuple[float, np.ndarray]]:

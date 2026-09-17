@@ -87,6 +87,12 @@ client:
     model: yolo11x.pt        # ultralytics model (auto-downloaded on first run)
     face_check_interval_s: 5 # push one frame this often while someone is visible
 
+  overlay:                 # sci-fi HUD on the TV (Tkinter, transparent, click-through)
+    enabled: true
+    position: bottom_right # orb corner: bottom_right | bottom_left | top_right | top_left | center
+    idle_hidden: false     # true = hide the orb entirely when idle
+    scale: 1.0             # orb size multiplier
+
   apps: {}                   # optional overrides: spoken name -> exe path.
                              # Any installed app is found automatically (Start Menu + Store apps);
                              # add entries only when the automatic match picks the wrong thing, e.g.:

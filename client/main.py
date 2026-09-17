@@ -123,6 +123,15 @@ except Exception as _viewer_exc:  # noqa: BLE001 - pragma: no cover
     _VIEWER_IMPORT_ERROR = f"{type(_viewer_exc).__name__}: {_viewer_exc}"
     ImageViewer = None  # type: ignore[assignment]
 
+#: The sci-fi HUD overlay (Tkinter). Optional and self-disabling; a missing
+#: display or tk never touches the voice client.
+_OVERLAY_IMPORT_ERROR: Optional[str] = None
+try:
+    from client.overlay import OverlayHUD
+except Exception as _overlay_exc:  # noqa: BLE001 - pragma: no cover
+    _OVERLAY_IMPORT_ERROR = f"{type(_overlay_exc).__name__}: {_overlay_exc}"
+    OverlayHUD = None  # type: ignore[assignment]
+
 #: Audio format announced in ``utterance_start`` (SPEC §4).
 PCM_FORMAT = getattr(_protocol, "AUDIO_FORMAT", "pcm_s16le")
 CHANNELS = int(getattr(_protocol, "AUDIO_CHANNELS", 1))
@@ -185,6 +194,17 @@ class _LinkDown:
 
 #: Singleton sentinel: waking a waiting conversation when the socket dies.
 LINK_DOWN = _LinkDown()
+
+
+class _NoOverlay:
+    """Stand-in when the overlay module cannot be imported: every call is a no-op."""
+
+    enabled = False
+
+    def __getattr__(self, _name: str):  # pragma: no cover - trivial
+        def _noop(*_a, **_k):
+            return None
+        return _noop
 
 
 class _Stopping(Exception):
@@ -354,6 +374,13 @@ class JarvisClient:
         self.viewer: Optional[Any] = ImageViewer() if ImageViewer is not None else None
         if self.viewer is None:
             log.debug("The detections viewer is not importable: %s", _VIEWER_IMPORT_ERROR)
+
+        # -- sci-fi HUD overlay --------------------------------------------
+        if OverlayHUD is not None:
+            self.overlay: Any = OverlayHUD(_attr(self.ccfg, "overlay"))
+        else:
+            log.debug("The overlay HUD is not importable: %s", _OVERLAY_IMPORT_ERROR)
+            self.overlay = _NoOverlay()
         #: The image_show header awaiting its single binary JPEG frame.
         self._pending_image_show: Optional[Dict[str, Any]] = None
 
@@ -400,6 +427,10 @@ class JarvisClient:
                 await asyncio.to_thread(viewer.close)
             except Exception as exc:  # pragma: no cover - teardown
                 log.debug("Error while stopping the detections viewer: %s", exc)
+        try:
+            self.overlay.stop()
+        except Exception as exc:  # pragma: no cover - teardown
+            log.debug("Error while stopping the overlay: %s", exc)
         task, self._action_task = self._action_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -466,6 +497,10 @@ class JarvisClient:
             await self._setup_wakeword()
             self.audio_in.start()
             self._start_camera()
+            try:
+                self.overlay.start()
+            except Exception as exc:  # noqa: BLE001 - the HUD is never worth a crash
+                log.debug("Could not start the overlay HUD: %s", exc)
             self._started = True
             log.info(
                 "Jarvis client started: client_id=%s, server=%s",
@@ -651,6 +686,7 @@ class JarvisClient:
             return
         self._idle_tts_active = True
         self._idle_playing = True
+        self.overlay.set_state("speaking")
         log.info("Playing an unprompted message (%d Hz)", sample_rate)
 
     async def _on_idle_tts_chunk(self, data: bytes) -> None:
@@ -662,6 +698,7 @@ class JarvisClient:
     async def _on_idle_tts_end(self) -> None:
         self._idle_stream_active = False
         self._idle_tts_active = False
+        self.overlay.set_state("idle")
         if self._idle_interrupted:
             log.debug("The unprompted message was cut after %d bytes", self._idle_tts_bytes)
         elif self._idle_tts_bytes:
@@ -789,11 +826,13 @@ class JarvisClient:
             self._listen_hint_s = 0.0
             window = max(self.followup_window_s, hint)
             if result != RESULT_OK or window <= 0:
+                self.overlay.set_state("idle")
                 return
             pre_roll = b""
             lead_in = window
             await asyncio.sleep(FOLLOWUP_ECHO_GUARD_S)
             self.audio_in.clear()
+            self.overlay.set_state("listening")
             log.info(
                 "Listening for a follow-up for %.1f s (no wake word needed)...",
                 window,
@@ -839,6 +878,7 @@ class JarvisClient:
                 log.info("Waiting for the wake word '%s'...", word)
             if self._proactive_listen_s > 0:
                 log.info("Answer window after a proactive message - no wake word needed")
+                self.overlay.set_state("listening")
                 self.wake.reset()
                 return True
             frame = await self.audio_in.read_frame(timeout=0.5)
@@ -856,6 +896,8 @@ class JarvisClient:
                     self.wake.reset()
                     continue
                 log.info("Wake word detected")
+                self.overlay.flash("wake")
+                self.overlay.set_state("listening")
                 # While idle this loop is also the barge-in watcher: an
                 # unprompted greeting is cut off here and the client goes
                 # straight on to record what the user wants (SPEC v1.4).
@@ -994,6 +1036,7 @@ class JarvisClient:
                     log.info("Reply: %s", self._last_say or "(empty)")
                 elif mtype == MSG_TTS_START:
                     await self._stop_thinking()
+                    self.overlay.set_state("speaking")
                     await self._on_tts_start(msg)
                     if self._says_wake_word(self._last_say):
                         # Rowan is about to SAY its own name: the mic would hear
@@ -1005,6 +1048,10 @@ class JarvisClient:
                     self._tts_active = False
                     await self._stop_barge_watch()
                     await self.audio_out.drain()
+                    self.overlay.set_state(
+                        "listening" if self._listen_hint_s else "idle"
+                    )
+                    self.overlay.set_status("")
                     if self._barged:
                         result = RESULT_BARGE_IN
                     elif self._tts_bytes == 0:
@@ -1083,6 +1130,7 @@ class JarvisClient:
             await asyncio.sleep(THINKING_INTERVAL_S)
 
     def _start_thinking(self) -> None:
+        self.overlay.set_state("thinking")
         if self.thinking_sounds and self._thinking_task is None:
             self._thinking_task = asyncio.get_running_loop().create_task(
                 self._thinking_loop(), name="jarvis-thinking-sounds"
@@ -1153,11 +1201,17 @@ class JarvisClient:
         """
         request_id = str(msg.get("id") or "")
         log.info("Screenshot requested (id=%s) - capturing the screen", request_id or "?")
+        self.overlay.set_status("looking at the screen")
+        self.overlay.scan_screen(True)
         try:
             capture: Capture = await asyncio.to_thread(capture_jpeg)
         except asyncio.CancelledError:
+            self.overlay.scan_screen(False)
+            self.overlay.set_status("")
             raise
         except Exception as exc:
+            self.overlay.scan_screen(False)
+            self.overlay.set_status("")
             error = str(exc).strip() or exc.__class__.__name__
             log.error("Screen capture failed: %s", error)
             await self.ws.send_json(
@@ -1188,6 +1242,8 @@ class JarvisClient:
             capture.screen_h,
             len(capture.jpeg),
         )
+        self.overlay.scan_screen(False)
+        self.overlay.set_status("")
 
     # ------------------------------------------------------------------
     # room camera (SPEC v1.4, S->C camera_request)
@@ -1280,7 +1336,15 @@ class JarvisClient:
                 continue
             action_id = str(item.get("id") or "")
             tool = str(item.get("tool") or "")
-            log.info("Executing %s (%s): %s", action_id or "?", tool, item.get("args") or {})
+            args = item.get("args") or {}
+            log.info("Executing %s (%s): %s", action_id or "?", tool, args)
+            # HUD: animate the mouse targeting for a click and the typing pulse.
+            command = str(args.get("command") or "").strip().lower()
+            typing = tool == "pc_control" and command == "type_text"
+            if tool == "mouse_click":
+                self.overlay.click_at(args.get("x_norm"), args.get("y_norm"))
+            if typing:
+                self.overlay.typing(True)
             try:
                 ok, error, output = await self.dispatcher.execute(item)
             except asyncio.CancelledError:
@@ -1288,6 +1352,8 @@ class JarvisClient:
             except Exception as exc:
                 ok, error, output = False, f"{type(exc).__name__}: {exc}", None
                 log.warning("Action %s crashed: %s", action_id or "?", exc)
+            if typing:
+                self.overlay.typing(False)
             ok = bool(ok)
             output_text = clip_output(output)
             if ok:
