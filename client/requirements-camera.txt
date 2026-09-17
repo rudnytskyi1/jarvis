@@ -16,3 +16,12 @@
 
 ultralytics          # YOLO11 person/object detection (cfg.client.camera.model)
 opencv-python        # VideoCapture for the room camera + JPEG encoding
+
+# --- overlay HUD (client/overlay.py) - NOT camera-related ---
+# The room-TV overlay is a transparent, click-through QWebEngineView showing
+# client/overlay_web/hud.html (real CSS alpha/blur, not a Tk chroma key).
+# Only needed for the HUD: without these, client.overlay just logs one
+# warning, OverlayHUD.enabled stays False, and every method is a no-op - the
+# wake word / VAD / actions / TTS never depend on it.
+PySide6-Essentials   # QtCore/QtGui/QtWidgets - the QApplication + window
+PySide6-Addons       # QtWebEngineWidgets - the transparent WebView itself

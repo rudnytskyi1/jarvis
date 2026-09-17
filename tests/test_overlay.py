@@ -1,21 +1,27 @@
-"""Pure-logic tests for client.overlay - none of these open a window.
+"""Pure-logic tests for client.overlay - none of these create a QApplication.
 
-The HUD's public API (start/stop/set_state/...) is exercised through a
-monkeypatched "window creation always fails" path, which is exactly what a
-real no-display/headless CI box hits too (tkinter.Tk() raising TclError):
-:meth:`OverlayHUD.start` catches it, flips ``enabled`` to False and every
-other method becomes a no-op - this file asserts that contract, plus the
-small pure helper functions (state validation, status truncation, the
-normalized->pixel reticle math) directly, with no tkinter/ctypes involved at
-all.
+The HUD's public API (start/stop/set_state/...) is exercised two ways, both
+without ever touching PySide6/Qt:
+
+* the "window creation always fails" path, monkeypatching the one seam that
+  imports PySide6 (:meth:`OverlayHUD._create_qt_objects`) - exactly what a
+  real machine without PySide6/QtWebEngine installed hits too (this test
+  env's own machine has no PySide6 installed, so :meth:`OverlayHUD.start`
+  fails there for real, the same way, even without monkeypatching);
+* a fake bridge standing in for the real (Qt-signal-based) one, to check
+  that the public methods validate/normalize their argument and hand the
+  bridge exactly the value the page should receive.
+
+Plus the small pure helper functions (state validation, status truncation,
+the normalized-coordinate clamp, the hidden-at-idle decision) directly.
 """
 
 import pytest
 
 from client.overlay import (
-    CLICK_CONVERGE_S,
     CLICK_TOTAL_S,
     FLASH_ERROR,
+    FLASH_SHOT,
     FLASH_WAKE,
     STATE_IDLE,
     STATE_LISTENING,
@@ -23,14 +29,8 @@ from client.overlay import (
     STATE_THINKING,
     VALID_STATES,
     OverlayHUD,
-    _anchor_point,
-    _build_bloom_ramp,
     _clamp01,
-    _ease_in_out,
-    _fade_alpha,
     _is_active,
-    _lerp_color,
-    _reticle_trail,
     _truncate_status,
     _validate_state,
     norm_to_px,
@@ -94,7 +94,8 @@ class TestTruncateStatus:
 
 
 # ------------------------------------------------------------------
-# norm_to_px / _clamp01 - reticle path math
+# norm_to_px / _clamp01 - normalized-coordinate math (API stability; the
+# click ring itself is now placed by the page directly from xNorm/yNorm).
 # ------------------------------------------------------------------
 class TestNormToPx:
     def test_top_left_corner(self):
@@ -113,117 +114,6 @@ class TestNormToPx:
         assert _clamp01(-0.2) == 0.0
         assert _clamp01(1.7) == 1.0
         assert _clamp01(0.33) == pytest.approx(0.33)
-
-
-# ------------------------------------------------------------------
-# _reticle_trail - cursor-trail interpolation between two click points
-# ------------------------------------------------------------------
-class TestReticleTrail:
-    def test_starts_and_ends_at_the_given_points(self):
-        trail = _reticle_trail((0.0, 0.0), (10.0, 20.0), steps=5)
-        assert trail[0] == (0.0, 0.0)
-        assert trail[-1] == (10.0, 20.0)
-
-    def test_has_steps_plus_one_points(self):
-        trail = _reticle_trail((0, 0), (100, 0), steps=8)
-        assert len(trail) == 9
-
-    def test_monotonic_along_a_straight_line(self):
-        trail = _reticle_trail((0, 0), (100, 0), steps=4)
-        xs = [p[0] for p in trail]
-        assert xs == sorted(xs)
-
-    def test_zero_length_trail_is_a_single_point_repeated(self):
-        trail = _reticle_trail((5, 5), (5, 5), steps=3)
-        assert all(p == (5, 5) for p in trail)
-
-    def test_steps_is_clamped_to_at_least_one(self):
-        trail = _reticle_trail((0, 0), (2, 0), steps=0)
-        assert len(trail) == 2
-
-
-# ------------------------------------------------------------------
-# _anchor_point - where the orb sits for a given position config
-# ------------------------------------------------------------------
-class TestAnchorPoint:
-    def test_bottom_right_default(self):
-        x, y = _anchor_point("bottom_right", 1000, 500, 100)
-        assert (x, y) == (900, 400)
-
-    def test_top_left(self):
-        x, y = _anchor_point("top_left", 1000, 500, 100)
-        assert (x, y) == (100, 100)
-
-    def test_center(self):
-        x, y = _anchor_point("center", 1000, 500, 100)
-        assert (x, y) == (500, 250)
-
-    def test_unknown_position_falls_back_to_bottom_right(self):
-        assert _anchor_point("nonsense", 1000, 500, 100) == _anchor_point(
-            "bottom_right", 1000, 500, 100
-        )
-
-
-# ------------------------------------------------------------------
-# _lerp_color / _build_bloom_ramp - the soft-bloom colour ramp
-# ------------------------------------------------------------------
-class TestColorRamp:
-    def test_lerp_color_endpoints(self):
-        assert _lerp_color("#000000", "#ffffff", 0.0) == "#000000"
-        assert _lerp_color("#000000", "#ffffff", 1.0) == "#ffffff"
-
-    def test_lerp_color_midpoint(self):
-        assert _lerp_color("#000000", "#ffffff", 0.5) == "#808080"
-
-    def test_lerp_color_clamps_t(self):
-        assert _lerp_color("#000000", "#ffffff", -1.0) == "#000000"
-        assert _lerp_color("#000000", "#ffffff", 5.0) == "#ffffff"
-
-    def test_ramp_starts_at_core_and_ends_at_edge(self):
-        ramp = _build_bloom_ramp("#f4f1ff", "#8b7dff", "#010101", steps=48)
-        assert ramp[0] == "#f4f1ff"
-        assert ramp[-1] == "#010101"
-
-    def test_ramp_length_matches_steps(self):
-        assert len(_build_bloom_ramp("#000000", "#808080", "#ffffff", steps=12)) == 12
-
-    def test_ramp_passes_through_the_mid_colour(self):
-        ramp = _build_bloom_ramp("#000000", "#808080", "#ffffff", steps=5)
-        # index 2 of 5 sits exactly at t=0.5 -> the mid colour
-        assert ramp[2] == "#808080"
-
-    def test_ramp_step_count_is_clamped_to_at_least_two(self):
-        assert len(_build_bloom_ramp("#000000", "#808080", "#ffffff", steps=0)) == 2
-
-
-# ------------------------------------------------------------------
-# _ease_in_out / _fade_alpha - the smooth fade-in/fade-out curve
-# ------------------------------------------------------------------
-class TestFadeAlpha:
-    def test_ease_endpoints(self):
-        assert _ease_in_out(0.0) == 0.0
-        assert _ease_in_out(1.0) == 1.0
-
-    def test_ease_midpoint_is_half(self):
-        assert _ease_in_out(0.5) == pytest.approx(0.5)
-
-    def test_ease_clamps_out_of_range_input(self):
-        assert _ease_in_out(-1.0) == 0.0
-        assert _ease_in_out(2.0) == 1.0
-
-    def test_fade_alpha_starts_at_the_start_value(self):
-        assert _fade_alpha(0.0, 0.18, 0.0, 1.0) == pytest.approx(0.0)
-
-    def test_fade_alpha_reaches_the_end_value(self):
-        assert _fade_alpha(0.18, 0.18, 0.0, 1.0) == pytest.approx(1.0)
-        assert _fade_alpha(999.0, 0.18, 0.0, 1.0) == pytest.approx(1.0)
-
-    def test_fade_alpha_fades_out_too(self):
-        assert _fade_alpha(0.0, 0.26, 1.0, 0.0) == pytest.approx(1.0)
-        assert _fade_alpha(0.26, 0.26, 1.0, 0.0) == pytest.approx(0.0)
-
-    def test_fade_alpha_zero_duration_jumps_to_end(self):
-        assert _fade_alpha(0.0, 0.0, 0.0, 1.0) == 1.0
 
 
 # ------------------------------------------------------------------
@@ -293,23 +183,31 @@ class TestConfig:
         assert hud.scale == 1.5
         assert hud.chroma == "#020202"
 
+    def test_construction_never_touches_qt(self):
+        # __init__ must never import/touch PySide6 - only start() does.
+        hud = OverlayHUD({"enabled": True})
+        assert hud._app is None
+        assert hud._view is None
+        assert hud._bridge is None
+
 
 # ------------------------------------------------------------------
 # Headless mode: window creation fails -> enabled=False, every method a no-op.
 #
-# This monkeypatches _make_tk_root (the one seam that actually touches
-# tkinter/ctypes) to fail exactly like a real no-display box would (Tk()
-# raising) - it never opens a real window, and on a genuinely headless CI
-# runner this same failure happens for real, hitting the identical code path.
+# This monkeypatches _create_qt_objects (the one seam that actually imports
+# PySide6) to fail exactly like a machine without PySide6/QtWebEngine
+# installed would - it never imports PySide6 or opens a real window, and on
+# a genuinely PySide6-less box (like this repo's own test env) this same
+# failure happens for real, hitting the identical code path.
 # ------------------------------------------------------------------
 class TestHeadlessNoOp:
     def _make_failing_overlay(self, monkeypatch):
         hud = OverlayHUD({"enabled": True})
 
         def _boom():
-            raise RuntimeError("no display available")
+            raise RuntimeError("PySide6/QtWebEngine not available")
 
-        monkeypatch.setattr(hud, "_make_tk_root", _boom)
+        monkeypatch.setattr(hud, "_create_qt_objects", _boom)
         return hud
 
     def test_start_disables_when_window_cannot_be_created(self, monkeypatch):
@@ -338,6 +236,8 @@ class TestHeadlessNoOp:
         hud.typing(False)
         hud.flash("wake")
         hud.flash("error")
+        hud.flash("shot")
+        hud.hide_now()
         hud.stop()  # also a no-op; must not hang joining a thread that never ran
 
     def test_disabled_construction_never_starts_a_thread(self):
@@ -352,131 +252,128 @@ class TestHeadlessNoOp:
 
     def test_invalid_state_never_raises_even_while_enabled_but_not_started(self):
         # enabled=True but start() was never called: still must not raise,
-        # and the invalid state must not even be queued (validation happens
-        # before posting).
+        # and validation happens before ever touching the (nonexistent) bridge.
         hud = OverlayHUD({"enabled": True})
         hud.set_state("not-a-real-state")
-        assert hud._queue.empty()
+        assert hud.enabled is True
 
     def test_non_numeric_click_at_never_raises(self):
         hud = OverlayHUD({"enabled": True})
         hud.click_at("not-a-number", None)
-        assert hud._queue.empty()
+        assert hud.enabled is True
 
     def test_unknown_flash_kind_never_raises_and_is_dropped(self):
         hud = OverlayHUD({"enabled": True})
         hud.flash("sparkle")
-        assert hud._queue.empty()
+        assert hud.enabled is True
 
 
 # ------------------------------------------------------------------
-# Event-queue plumbing: posted events carry the right, validated payload.
+# _FakeBridge - a duck-typed stand-in for the real (PySide6 QObject) bridge,
+# recording what each public method hands it. This exercises the REAL
+# validation/marshaling code in OverlayHUD's public methods (set_state,
+# click_at, ...) without ever creating a QApplication.
 # ------------------------------------------------------------------
-class TestEventQueueing:
-    def test_set_state_posts_normalized_state(self):
-        hud = OverlayHUD({"enabled": True})
-        hud.set_state("  SPEAKING ")
-        event = hud._queue.get_nowait()
-        assert event == ("state", STATE_SPEAKING)
+class _FakeSignal:
+    def __init__(self):
+        self.calls = []
 
-    def test_set_status_posts_truncated_text(self):
-        hud = OverlayHUD({"enabled": True})
-        hud.set_status("x" * 200)
-        tag, text = hud._queue.get_nowait()
-        assert tag == "status"
-        assert len(text) <= 60
-
-    def test_click_at_posts_clamped_floats(self):
-        hud = OverlayHUD({"enabled": True})
-        hud.click_at(-1, 2)
-        tag, x, y = hud._queue.get_nowait()
-        assert tag == "click"
-        assert (x, y) == (0.0, 1.0)
-
-    def test_scan_and_typing_post_bools(self):
-        hud = OverlayHUD({"enabled": True})
-        hud.scan_screen(1)
-        hud.typing(0)
-        assert hud._queue.get_nowait() == ("scan", True)
-        assert hud._queue.get_nowait() == ("typing", False)
-
-    def test_flash_posts_known_kind(self):
-        hud = OverlayHUD({"enabled": True})
-        hud.flash("WAKE")
-        assert hud._queue.get_nowait() == ("flash", FLASH_WAKE)
-        hud.flash("Error")
-        assert hud._queue.get_nowait() == ("flash", FLASH_ERROR)
+    def emit(self, *args):
+        self.calls.append(args)
 
 
-# ------------------------------------------------------------------
-# _apply_event - the UI-thread-side state machine, exercised directly
-# without ever creating a Tk root (it only touches plain attributes).
-# ------------------------------------------------------------------
-class TestApplyEvent:
-    def _hud(self):
+class _FakeBridge:
+    def __init__(self):
+        self.state_changed = _FakeSignal()
+        self.status_changed = _FakeSignal()
+        self.scan_changed = _FakeSignal()
+        self.typing_changed = _FakeSignal()
+        self.click_requested = _FakeSignal()
+        self.flash_requested = _FakeSignal()
+        self.hide_now_requested = _FakeSignal()
+        self.stop_requested = _FakeSignal()
+
+
+class TestPublicApiMarshalsValidatedPayloads:
+    def _hud_with_fake_bridge(self):
         hud = OverlayHUD({"enabled": True})
-        hud._canvas_w, hud._canvas_h = 1920, 1080
+        hud._bridge = _FakeBridge()
         return hud
 
-    def test_state_event_updates_internal_state(self):
-        hud = self._hud()
-        hud._apply_event(("state", STATE_THINKING))
-        assert hud._state == STATE_THINKING
+    def test_set_state_emits_normalized_state(self):
+        hud = self._hud_with_fake_bridge()
+        hud.set_state("  SPEAKING ")
+        assert hud._bridge.state_changed.calls == [(STATE_SPEAKING,)]
 
-    def test_status_event_updates_caption(self):
-        hud = self._hud()
-        hud._apply_event(("status", "hello"))
-        assert hud._status == "hello"
+    def test_set_status_emits_truncated_text(self):
+        hud = self._hud_with_fake_bridge()
+        hud.set_status("x" * 200)
+        (call,) = hud._bridge.status_changed.calls
+        assert len(call[0]) <= 60
 
-    def test_click_event_maps_normalized_to_pixels_and_remembers_last(self):
-        hud = self._hud()
-        hud._apply_event(("click", 0.5, 0.5))
-        assert hud._click_anim["end"] == norm_to_px(0.5, 0.5, 1920, 1080)
-        # first click ever: no prior point, so the trail starts at the target
-        assert hud._click_anim["start"] == hud._click_anim["end"]
-        assert hud._last_click_px == hud._click_anim["end"]
+    def test_click_at_emits_clamped_floats(self):
+        hud = self._hud_with_fake_bridge()
+        hud.click_at(-1, 2)
+        assert hud._bridge.click_requested.calls == [(0.0, 1.0)]
 
-    def test_second_click_trails_from_the_first(self):
-        hud = self._hud()
-        hud._apply_event(("click", 0.0, 0.0))
-        first_end = hud._click_anim["end"]
-        hud._apply_event(("click", 1.0, 1.0))
-        assert hud._click_anim["start"] == first_end
-        assert hud._click_anim["end"] == norm_to_px(1.0, 1.0, 1920, 1080)
+    def test_scan_and_typing_emit_bools(self):
+        hud = self._hud_with_fake_bridge()
+        hud.scan_screen(1)
+        hud.typing(0)
+        assert hud._bridge.scan_changed.calls == [(True,)]
+        assert hud._bridge.typing_changed.calls == [(False,)]
 
-    def test_click_active_expires_after_its_total_duration(self):
-        hud = self._hud()
-        hud._apply_event(("click", 0.5, 0.5))
-        hud._click_anim["t0"] -= CLICK_TOTAL_S + 1.0  # pretend it happened a while ago
-        assert hud._click_active(__import__("time").monotonic()) is False
-        assert hud._click_anim is None
+    def test_flash_emits_known_kind(self):
+        hud = self._hud_with_fake_bridge()
+        hud.flash("WAKE")
+        hud.flash("Error")
+        hud.flash(" Shot ")
+        assert hud._bridge.flash_requested.calls == [
+            (FLASH_WAKE,),
+            (FLASH_ERROR,),
+            (FLASH_SHOT,),
+        ]
 
-    def test_click_active_true_mid_animation(self):
-        hud = self._hud()
-        hud._apply_event(("click", 0.5, 0.5))
-        hud._click_anim["t0"] -= CLICK_CONVERGE_S / 2.0
-        assert hud._click_active(__import__("time").monotonic()) is True
+    def test_hide_now_reaches_the_bridge(self):
+        hud = self._hud_with_fake_bridge()
+        hud.hide_now()
+        assert hud._bridge.hide_now_requested.calls == [()]
 
-    def test_flash_active_expires(self):
-        hud = self._hud()
-        hud._apply_event(("flash", FLASH_WAKE))
-        assert hud._flash_active(__import__("time").monotonic()) is True
-        kind, t0 = hud._flash
-        hud._flash = (kind, t0 - 10.0)
-        assert hud._flash_active(__import__("time").monotonic()) is False
-        assert hud._flash is None
+    def test_invalid_state_never_reaches_the_bridge(self):
+        hud = self._hud_with_fake_bridge()
+        hud.set_state("bogus")
+        assert hud._bridge.state_changed.calls == []
 
-    def test_stop_sentinel_is_reported_by_drain_queue(self):
-        from client.overlay import _STOP
+    def test_unknown_flash_kind_never_reaches_the_bridge(self):
+        hud = self._hud_with_fake_bridge()
+        hud.flash("sparkle")
+        assert hud._bridge.flash_requested.calls == []
 
-        hud = self._hud()
-        hud._queue.put_nowait(("state", STATE_LISTENING))
-        hud._queue.put_nowait(_STOP)
-        assert hud._drain_queue() is True
-        assert hud._state == STATE_LISTENING  # events before _STOP still applied
+    def test_non_numeric_click_never_reaches_the_bridge(self):
+        hud = self._hud_with_fake_bridge()
+        hud.click_at("nope", None)
+        assert hud._bridge.click_requested.calls == []
 
-    def test_drain_queue_without_stop_returns_false(self):
-        hud = self._hud()
-        hud._queue.put_nowait(("typing", True))
-        assert hud._drain_queue() is False
-        assert hud._typing_on is True
+    def test_methods_are_noop_when_disabled_even_with_a_bridge_present(self):
+        hud = self._hud_with_fake_bridge()
+        hud.enabled = False
+        hud.set_state("listening")
+        hud.set_status("hi")
+        hud.scan_screen(True)
+        hud.click_at(0.5, 0.5)
+        hud.typing(True)
+        hud.flash("wake")
+        bridge = hud._bridge
+        assert bridge.state_changed.calls == []
+        assert bridge.status_changed.calls == []
+        assert bridge.scan_changed.calls == []
+        assert bridge.click_requested.calls == []
+        assert bridge.typing_changed.calls == []
+        assert bridge.flash_requested.calls == []
+
+
+# ------------------------------------------------------------------
+# Module-level constants a caller might reasonably rely on staying put.
+# ------------------------------------------------------------------
+def test_click_total_s_is_a_positive_short_duration():
+    assert 0 < CLICK_TOTAL_S < 2.0

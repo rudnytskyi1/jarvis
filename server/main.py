@@ -21,6 +21,13 @@ log = logging.getLogger("jarvis.server.main")
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 LOG_DATE_FORMAT = "%H:%M:%S"
+#: The server runs in its own console window opened by start-jarvis-server.bat,
+#: so its scrollback is gone the moment that window is closed - and it is the
+#: only record of why a greeting did or did not fire, why a reply was slow, and
+#: what the model actually called. Mirror everything to a file (same crude
+#: rotation as the client's data/client.log) so it can be read afterwards.
+LOG_FILE_PATH = REPO_ROOT / "data" / "server.log"
+LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,6 +60,19 @@ def _force_utf8_console() -> None:
                 pass
 
 
+def _add_file_logging() -> None:
+    """Mirror the console log to :data:`LOG_FILE_PATH` (best-effort, never fatal)."""
+    try:
+        LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE_PATH.exists() and LOG_FILE_PATH.stat().st_size > LOG_FILE_MAX_BYTES:
+            LOG_FILE_PATH.unlink()  # crude rotation: start over past 5 MB
+        handler = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(handler)
+    except Exception as exc:  # noqa: BLE001 - file logging is a convenience, not a dependency
+        log.warning("File logging unavailable (%s) - console only", exc)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     _force_utf8_console()
@@ -61,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         format=LOG_FORMAT,
         datefmt=LOG_DATE_FORMAT,
     )
+    _add_file_logging()
 
     config_path = Path(args.config)
     if not config_path.is_absolute():

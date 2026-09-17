@@ -166,6 +166,12 @@ BEEP_ECHO_GUARD_MS = 250
 #: listens this long WITHOUT the wake word, so the person can just answer.
 PROACTIVE_LISTEN_S = 8.0
 
+#: How long to wait after hiding the HUD before grabbing the screen. The window
+#: is gone the moment Qt processes the hide, but the desktop compositor still
+#: has to repaint what was underneath it; without this pause the screenshot can
+#: catch the overlay mid-fade and the assistant ends up describing its own glow.
+OVERLAY_SETTLE_S = 0.12
+
 RESULT_OK = "ok"
 RESULT_NO_SPEECH = "no_speech"
 RESULT_ERROR = "error"
@@ -1210,16 +1216,21 @@ class JarvisClient:
         """
         request_id = str(msg.get("id") or "")
         log.info("Screenshot requested (id=%s) - capturing the screen", request_id or "?")
-        self.overlay.set_status("looking at the screen")
-        self.overlay.scan_screen(True)
+        # The HUD must never be baked into the picture the assistant is about
+        # to study, so it goes off screen first and only comes back - shutter,
+        # then the working glow in the corner - once the frame is already in
+        # hand. OVERLAY_SETTLE_S gives the compositor time to actually drop the
+        # window before the screen is grabbed.
+        self.overlay.scan_screen(False)
+        self.overlay.set_status("")
+        self.overlay.hide_now()
+        await asyncio.sleep(OVERLAY_SETTLE_S)
         try:
             capture: Capture = await asyncio.to_thread(capture_jpeg)
         except asyncio.CancelledError:
-            self.overlay.scan_screen(False)
             self.overlay.set_status("")
             raise
         except Exception as exc:
-            self.overlay.scan_screen(False)
             self.overlay.set_status("")
             error = str(exc).strip() or exc.__class__.__name__
             log.error("Screen capture failed: %s", error)
@@ -1227,6 +1238,13 @@ class JarvisClient:
                 {"type": MSG_SCREENSHOT_ERROR, "id": request_id, "error": error}
             )
             return
+
+        # Captured: shutter, then the glow returns in the bottom-right corner
+        # and sweeps while the server's vision model reads the frame.
+        self.overlay.flash("shot")
+        self.overlay.set_state("thinking")
+        self.overlay.set_status("looking at the screen")
+        self.overlay.scan_screen(True)
 
         # The header and its single binary frame must stay adjacent on the wire.
         async with self._wire_lock:

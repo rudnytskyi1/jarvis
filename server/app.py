@@ -123,6 +123,9 @@ GREETING_QUIET_S = 5.0
 #: this window - a recent real conversation makes an unknown face on camera
 #: almost certainly that same person seen from a bad angle, not a stranger.
 KNOWN_VOICE_HOLDOFF_S = 180.0
+#: The greeting gate is polled every second; repeat the same "no greeting
+#: because X" line at most this often so the log stays readable.
+GREET_BLOCK_LOG_S = 20.0
 #: v1.6: how long an annotated detections photo stays on the room screen.
 IMAGE_SHOW_TTL_S = 60.0
 
@@ -611,6 +614,10 @@ class Connection:
         self._last_audio_at = 0.0
         #: Monotonic clock of the last proactive greeting (0 = never greeted).
         self._last_greeting_at = 0.0
+        #: Last reason the greeting gate said no, and when it was logged - the
+        #: throttle behind :meth:`_greet_blocked`.
+        self._greet_block_reason = ""
+        self._greet_block_logged_at = 0.0
         #: v1.6: monotonic clock of the last utterance a KNOWN voice spoke on
         #: this connection (0 = never) - holds the greeting off (see _may_greet).
         self._last_known_voice_at = 0.0
@@ -1424,6 +1431,22 @@ class Connection:
             cooldown = 300.0
         return after, cooldown
 
+    def _extra_person_present(self) -> bool:
+        """True when the room holds MORE people than the ones Rowan can name.
+
+        This is the whole signal for "somebody I do not know is really here".
+        A known person caught at a bad angle produces one face and one known
+        label; a friend standing next to them produces two faces (or two YOLO
+        persons) against that same one known label. Both suppressions below —
+        a known voice heard a moment ago, a known face alone in frame — exist
+        only to kill the first case, and neither may ever kill the second.
+        """
+        present = self.presence.present()
+        known = sum(1 for label in present if label != LABEL_UNKNOWN)
+        faces = int(getattr(self.presence, "last_face_count", 0) or 0)
+        persons = int((self.camera_state or {}).get("persons") or 0)
+        return faces > known or persons > max(known, 1)
+
     def _known_face_alone(self) -> bool:
         """True when a known face is present together with exactly one YOLO person (v1.6).
 
@@ -1438,11 +1461,7 @@ class Connection:
         present = self.presence.present()
         if not any(label != LABEL_UNKNOWN for label in present):
             return False
-        # ... unless the last burst actually saw MORE faces than there are
-        # known people: then one of them is a genuine stranger (a friend
-        # leaning in, a face held up to the camera) and must be greeted.
-        known = sum(1 for label in present if label != LABEL_UNKNOWN)
-        return int(getattr(self.presence, "last_face_count", 0) or 0) <= known
+        return not self._extra_person_present()
 
     def _may_greet(self, greet_after_s: float, cooldown_s: float) -> bool:
         """True when an unknown face has waited long enough and the room is idle.
@@ -1459,31 +1478,72 @@ class Connection:
         """
         engine = _face
         if not self.face_enabled or engine is None or not engine.available:
-            return False
+            return self._greet_blocked("the face engine is off or unavailable")
         if self.session is None or _llm is None or _tts is None:
-            return False
+            return self._greet_blocked("no session/model/voice yet")
         if self.receiving:  # somebody is speaking to us right now
-            return False
+            return self._greet_blocked("somebody is speaking to us right now")
         if self._task is not None and not self._task.done():
-            return False
+            return self._greet_blocked("a reply is still being produced")
         now = time.monotonic()
         if self._last_audio_at and now - self._last_audio_at < GREETING_QUIET_S:
-            return False
+            return self._greet_blocked("audio was flowing seconds ago")
         if self._last_greeting_at and now - self._last_greeting_at < cooldown_s:
-            return False
+            return self._greet_blocked(
+                f"already greeted {now - self._last_greeting_at:.0f}s ago "
+                f"(cooldown {cooldown_s:.0f}s)"
+            )
         # v1.6: a KNOWN voice on THIS connection recently, or a known face
         # alone with exactly one YOLO person, means the "unknown" face is
         # almost certainly that same not-yet-enrolled/badly-angled person.
+        # Neither applies once there are visibly MORE people than Rowan can
+        # name - that extra person is a real stranger and gets greeted.
         if (
             self._last_known_voice_at
             and now - self._last_known_voice_at < KNOWN_VOICE_HOLDOFF_S
+            and not self._extra_person_present()
         ):
-            return False
+            return self._greet_blocked(
+                f"a known voice spoke {now - self._last_known_voice_at:.0f}s ago "
+                f"and nobody extra is in frame (holdoff {KNOWN_VOICE_HOLDOFF_S:.0f}s)"
+            )
         if self._known_face_alone():
-            return False
+            return self._greet_blocked("a known face is alone in frame")
         if not self.presence.has_fresh_unknown_face():
-            return False
-        return self.presence.unknown_present_for() >= greet_after_s
+            return self._greet_blocked("no unmatched face was detected recently")
+        if self.presence.unknown_present_for() < greet_after_s:
+            return self._greet_blocked(
+                f"the unknown face has only been there "
+                f"{self.presence.unknown_present_for():.0f}s of {greet_after_s:.0f}s"
+            )
+        return True
+
+    def _greet_blocked(self, reason: str) -> bool:
+        """Log WHY no greeting happened (throttled) and return ``False``.
+
+        The greeting gate is polled once a second, so this would otherwise
+        drown the log. Only a CHANGED reason, or the same one after
+        :data:`GREET_BLOCK_LOG_S`, is written - enough to answer "he just saw
+        two people, why did he say nothing?" from the log alone.
+        """
+        now = time.monotonic()
+        if (
+            reason != self._greet_block_reason
+            or now - self._greet_block_logged_at >= GREET_BLOCK_LOG_S
+        ):
+            self._greet_block_reason = reason
+            self._greet_block_logged_at = now
+            log.info(
+                "No greeting: %s [faces=%d known_here=%s persons=%s]",
+                reason,
+                int(getattr(self.presence, "last_face_count", 0) or 0),
+                sorted(
+                    label for label in self.presence.present() if label != LABEL_UNKNOWN
+                )
+                or "none",
+                (self.camera_state or {}).get("persons"),
+            )
+        return False
 
     async def _greeting_loop(self) -> None:
         """Poll the presence tracker and greet an unknown face once (SPEC v1.4)."""

@@ -1,0 +1,424 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jarvis HUD</title>
+<style>
+  /* ------------------------------------------------------------------
+   * Jarvis room-TV overlay - a small, soft, centred "presence", not an
+   * object. Real alpha compositing (radial-gradient + blur + low opacity)
+   * rendered by a transparent QWebEngineView, NOT a Tk chroma-key disc.
+   * Nothing is visible at rest: every layer below starts at opacity 0 and
+   * only the JS calls at the bottom (driven by client/overlay.py) turn
+   * anything on. Palette: white/lavender core -> indigo, heavy blur,
+   * everything semi-transparent - no borders, no boxes, no grid lines.
+   * ------------------------------------------------------------------ */
+  :root {
+    --hud-core: #EEEAFF;
+    --hud-core-mid: #C9BFFF;
+    --hud-indigo: #7C6CFF;
+    --hud-error-core: #FFF3F0;
+    --hud-error-mid: #FFB3AC;
+    --hud-error: #FF6B6B;
+    --hud-text: rgba(230, 228, 245, .75);
+    --hud-scale: 1;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+  }
+
+  body {
+    position: relative;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Everything is purely decorative - the real click-through is done at
+     the OS/Qt level (WindowTransparentForInput); this is defense in depth
+     so nothing here can ever intercept a click even if that ever changes. */
+  body, .presence, .glow-wrap, .glow-core, .status, .typing, .scan, .click-layer,
+  .shot, .shot-frame {
+    pointer-events: none;
+  }
+
+  /* -- the presence: glow + status + typing dots, centred as one group,
+     uniformly resized by --hud-scale (client.overlay's `scale` config) -- */
+  .presence {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    width: 0;
+    height: 0;
+    transition: top 420ms cubic-bezier(.4,0,.2,1), left 420ms cubic-bezier(.4,0,.2,1),
+                transform 420ms cubic-bezier(.4,0,.2,1);
+    transform: translate(-50%, -50%) scale(var(--hud-scale));
+  }
+
+  /* -- the glow: two layers - an outer wrapper that fades the whole thing
+     in/out on state changes (a plain CSS transition), and an inner core
+     that runs the per-state animation (breathe/think/speak/flash). This
+     split is what lets a state change fade in smoothly even though the
+     inner animation's own keyframes do not start at opacity 0. -- */
+  .glow-wrap {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 190px;
+    height: 190px;
+    transform: translate(-50%, -50%);
+    opacity: 0;
+    transition: opacity 480ms ease;
+  }
+
+  .glow-core {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: radial-gradient(circle at 50% 50%,
+        var(--hud-core) 0%,
+        var(--hud-core-mid) 28%,
+        var(--hud-indigo) 62%,
+        rgba(124, 108, 255, 0) 76%);
+    filter: blur(26px);
+  }
+
+  /* the "thinking" sheen: a couple of large, low-contrast arcs drifting
+     under the glow - deliberately not a thin spinner, so it reads as
+     something slowly moving under frosted glass. */
+  .glow-core::after {
+    content: "";
+    position: absolute;
+    inset: -25%;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg,
+        rgba(255, 255, 255, 0) 0deg,
+        rgba(255, 255, 255, .4) 70deg,
+        rgba(255, 255, 255, 0) 150deg,
+        rgba(255, 255, 255, 0) 360deg);
+    opacity: 0;
+    mix-blend-mode: soft-light;
+  }
+
+  /* -- where the presence sits: CENTRE only while being spoken to; working
+     states tuck themselves into the bottom-right corner so they never sit on
+     top of what the owner is watching. Percentages on both ends (never
+     `auto`), so the move is a real animated glide rather than a jump. -- */
+  body.state-thinking .presence,
+  body.state-speaking .presence {
+    top: 86%;
+    left: 92%;
+    transform: translate(-50%, -50%) scale(calc(var(--hud-scale) * .62));
+  }
+
+  /* -- the shutter: a full-screen wash that snaps bright and falls away,
+     the way a camera flash reads on video. Fired only AFTER the screen has
+     already been captured, so it never ends up inside the screenshot. -- */
+  .shot {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(circle at 50% 50%,
+        rgba(255, 255, 255, .95) 0%,
+        rgba(226, 222, 255, .72) 45%,
+        rgba(160, 148, 255, .30) 100%);
+    opacity: 0;
+  }
+  .shot.firing { animation: hud-shot 420ms ease-out 1; }
+  @keyframes hud-shot {
+    0%   { opacity: 0; }
+    10%  { opacity: .42; }
+    100% { opacity: 0; }
+  }
+
+  /* A thin frame closing inwards under the wash - the "viewfinder" beat that
+     tells the owner WHAT was captured (the whole screen), not just that
+     something flickered. */
+  .shot-frame {
+    position: fixed;
+    inset: 0;
+    border: 0 solid rgba(238, 234, 255, .9);
+    opacity: 0;
+  }
+  .shot-frame.firing { animation: hud-shot-frame 520ms ease-out 1; }
+  @keyframes hud-shot-frame {
+    0%   { opacity: 0;   border-width: 0;    inset: 0; }
+    25%  { opacity: .85; border-width: 3px;  inset: 0; }
+    100% { opacity: 0;   border-width: 3px;  inset: 3vh 3vw; }
+  }
+
+  /* -- state -> glow-wrap visibility -- */
+  body.state-idle .glow-wrap { opacity: 0; }
+  body.state-listening .glow-wrap,
+  body.state-thinking .glow-wrap,
+  body.state-speaking .glow-wrap { opacity: 1; }
+
+  /* listening: brightest, gentle breathing, peak opacity ~0.55 */
+  body.state-listening .glow-core {
+    animation: hud-breathe 2.5s ease-in-out infinite;
+  }
+  @keyframes hud-breathe {
+    0%, 100% { opacity: .78; transform: scale(.94); }
+    50%      { opacity: .95; transform: scale(1.06); }
+  }
+
+  /* thinking: low contrast, static base + a slow rotating sheen */
+  body.state-thinking .glow-core {
+    opacity: .62;
+  }
+  body.state-thinking .glow-core::after {
+    opacity: 1;
+    animation: hud-think-spin 4.5s linear infinite;
+  }
+  @keyframes hud-think-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+
+  /* speaking: calm pulse, slightly faster than listening's breathing */
+  body.state-speaking .glow-core {
+    animation: hud-speak-pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes hud-speak-pulse {
+    0%, 100% { opacity: .70; transform: scale(.97); }
+    50%      { opacity: .88; transform: scale(1.08); }
+  }
+
+  /* -- flash: a single quick bloom-and-fade, overrides whatever state is
+     currently showing (a CSS animation always wins the animated property
+     for its own duration, regardless of the state rules above). -- */
+  body.flash-wake .glow-wrap,
+  body.flash-error .glow-wrap {
+    animation: hud-flash-bloom 480ms ease-out 1;
+  }
+  body.flash-error .glow-core {
+    background: radial-gradient(circle at 50% 50%,
+        var(--hud-error-core) 0%,
+        var(--hud-error-mid) 28%,
+        var(--hud-error) 62%,
+        rgba(255, 107, 107, 0) 76%);
+  }
+  @keyframes hud-flash-bloom {
+    0%   { opacity: 0;   transform: translate(-50%, -50%) scale(.9); }
+    30%  { opacity: .85; transform: translate(-50%, -50%) scale(1.3); }
+    100% { opacity: 0;   transform: translate(-50%, -50%) scale(1); }
+  }
+
+  /* -- status caption: small, letter-spaced, fades in/out, empty hides -- */
+  .status {
+    position: absolute;
+    top: 108px;
+    left: 0;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 14px;
+    letter-spacing: .14em;
+    text-transform: lowercase;
+    color: rgba(238,236,252,.95);
+    opacity: 0;
+    transition: opacity 380ms ease;
+  }
+  .status.visible { opacity: 1; }
+
+  /* -- typing: three small dots fading in sequence -- */
+  .typing {
+    position: absolute;
+    top: 140px;
+    left: 0;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 8px;
+    opacity: 0;
+    transition: opacity 300ms ease;
+  }
+  .typing.visible { opacity: 1; }
+  .typing span {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--hud-text);
+    opacity: .2;
+    animation: hud-dot-pulse 1.2s ease-in-out infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: .28s; }
+  .typing span:nth-child(3) { animation-delay: .56s; }
+  @keyframes hud-dot-pulse {
+    0%, 100% { opacity: .2; }
+    50%      { opacity: 1; }
+  }
+
+  /* -- scan: a very soft, wide horizontal band sweeping top to bottom,
+     looping while on. Not scaled with --hud-scale on purpose - it always
+     spans the full viewport. -- */
+  .scan {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: -220px;
+    height: 220px;
+    background: linear-gradient(to bottom,
+        rgba(124, 108, 255, 0) 0%,
+        rgba(124, 108, 255, .12) 50%,
+        rgba(124, 108, 255, 0) 100%);
+    opacity: 0;
+  }
+  body.scan-on .scan {
+    opacity: 1;
+    animation: hud-scan-sweep 2.4s linear infinite;
+  }
+  @keyframes hud-scan-sweep {
+    from { transform: translateY(0); }
+    to   { transform: translateY(calc(100vh + 220px)); }
+  }
+
+  /* -- click: one thin ring, contracts onto the point and fades out.
+     No crosshair, no trail. Fixed pixel sizes (not --hud-scale) since
+     this marks an exact screen point, not the ambient presence. -- */
+  .click-layer {
+    position: fixed;
+    inset: 0;
+  }
+  .click-ring {
+    position: absolute;
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 1.5px solid rgba(238, 234, 255, .85);
+    transform: translate(-50%, -50%);
+    opacity: .5;
+    animation: hud-click-contract 450ms ease-out forwards;
+  }
+  @keyframes hud-click-contract {
+    0%   { width: 90px; height: 90px; opacity: .5; }
+    100% { width: 10px; height: 10px; opacity: 0; }
+  }
+</style>
+</head>
+<body>
+  <div class="presence">
+    <div class="glow-wrap">
+      <div class="glow-core"></div>
+    </div>
+    <div id="status" class="status"></div>
+    <div id="typing" class="typing"><span></span><span></span><span></span></div>
+  </div>
+  <div id="scan" class="scan"></div>
+  <div id="shot" class="shot"></div>
+  <div id="shot-frame" class="shot-frame"></div>
+  <div id="click-layer" class="click-layer"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var body = document.body;
+  var statusEl = document.getElementById("status");
+  var typingEl = document.getElementById("typing");
+  var clickLayer = document.getElementById("click-layer");
+  var shotEl = document.getElementById("shot");
+  var shotFrameEl = document.getElementById("shot-frame");
+  var STATES = ["idle", "listening", "thinking", "speaking"];
+
+  // client.overlay's `scale` config (room-TV sizing) travels in as a URL
+  // query param so it is known before any JS call ever runs.
+  (function applyScale() {
+    var scale = 1;
+    try {
+      var params = new URLSearchParams(window.location.search);
+      var parsed = parseFloat(params.get("scale"));
+      if (isFinite(parsed) && parsed > 0) {
+        scale = parsed;
+      }
+    } catch (err) {
+      // malformed/missing query string - default scale stands
+    }
+    document.documentElement.style.setProperty("--hud-scale", String(scale));
+  })();
+
+  // -- window.hudState({state, status, typing, scan}) - always the FULL
+  // current snapshot (client.overlay resends everything together on every
+  // change), so there is never a partial update to merge here.
+  window.hudState = function (opts) {
+    opts = opts || {};
+    var state = STATES.indexOf(opts.state) >= 0 ? opts.state : "idle";
+    for (var i = 0; i < STATES.length; i++) {
+      body.classList.toggle("state-" + STATES[i], STATES[i] === state);
+    }
+
+    var status = typeof opts.status === "string" ? opts.status : "";
+    statusEl.textContent = status;
+    statusEl.classList.toggle("visible", status.length > 0);
+
+    typingEl.classList.toggle("visible", !!opts.typing);
+
+    body.classList.toggle("scan-on", !!opts.scan);
+  };
+
+  // -- window.hudClick(xNorm, yNorm) - one thin ring at that exact point.
+  window.hudClick = function (xNorm, yNorm) {
+    var x = Number(xNorm);
+    var y = Number(yNorm);
+    if (!isFinite(x)) x = 0;
+    if (!isFinite(y)) y = 0;
+    x = Math.max(0, Math.min(1, x));
+    y = Math.max(0, Math.min(1, y));
+
+    var ring = document.createElement("div");
+    ring.className = "click-ring";
+    ring.style.left = (x * 100) + "vw";
+    ring.style.top = (y * 100) + "vh";
+    clickLayer.appendChild(ring);
+
+    var cleanup = function () {
+      if (ring.parentNode) {
+        ring.parentNode.removeChild(ring);
+      }
+    };
+    ring.addEventListener("animationend", cleanup);
+    setTimeout(cleanup, 700); // safety net if animationend never fires
+  };
+
+  // -- window.hudFlash(kind) - "wake" (bright bloom), "error" (soft red) or
+  // "shot" (the camera shutter: a full-screen wash, not the glow at all).
+  window.hudFlash = function (kind) {
+    if (kind === "shot") {
+      fireShutter();
+      return;
+    }
+    var cls = kind === "error" ? "flash-error" : "flash-wake";
+    body.classList.remove("flash-wake", "flash-error");
+    void body.offsetWidth; // force reflow so a repeat flash restarts cleanly
+    body.classList.add(cls);
+    setTimeout(function () {
+      body.classList.remove(cls);
+    }, 520);
+  };
+
+  function fireShutter() {
+    var layers = [shotEl, shotFrameEl];
+    for (var i = 0; i < layers.length; i++) {
+      layers[i].classList.remove("firing");
+    }
+    void shotEl.offsetWidth; // restart both animations even back-to-back
+    for (var j = 0; j < layers.length; j++) {
+      layers[j].classList.add("firing");
+    }
+    setTimeout(function () {
+      shotEl.classList.remove("firing");
+      shotFrameEl.classList.remove("firing");
+    }, 560);
+  }
+
+  // Resting state: fully hidden until client.overlay sends the first
+  // real event.
+  window.hudState({ state: "idle", status: "", typing: false, scan: false });
+})();
+</script>
+</body>
+</html>
+
