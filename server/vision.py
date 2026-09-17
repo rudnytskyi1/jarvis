@@ -36,8 +36,11 @@ log = logging.getLogger("jarvis.server.vision")
 #: Vision models are slow; SPEC §4 allows up to 120 s for the whole step.
 REQUEST_TIMEOUT_S = 120.0
 
-#: Room left for a screen description — it is read aloud, so it must stay short.
-MAX_ANSWER_TOKENS = 512
+#: Room left for a screen description. The answer only feeds the chat model,
+#: which re-phrases it for speech, so it must be specific but not an essay:
+#: generation time scales with this, and it was the main cost of a screen
+#: question (295 tokens ~= 4 s). ~180 tokens keeps every concrete detail.
+MAX_ANSWER_TOKENS = 200
 
 #: A click point is a handful of tokens; a tight budget keeps grounding fast.
 MAX_POINT_TOKENS = 64
@@ -63,8 +66,10 @@ DESCRIBE_PROMPT_TEMPLATE = (
     "you can read. When several items are listed and the question is about them, "
     "list the first few by title, in order. If the screen genuinely does not "
     "contain the answer, say so and describe what is on it instead.\n"
-    "Answer in English, in at most four short sentences of plain text: no "
-    "markdown, no bullet points, no code.\n\n"
+    "Be concise: answer in at most TWO or THREE short sentences of plain "
+    "English, packed with the concrete names and text, with no preamble, no "
+    "markdown, no bullet points, no code. Do not describe the whole screen when "
+    "the question is about one thing — answer the question.\n\n"
     "Question: {query}"
 )
 

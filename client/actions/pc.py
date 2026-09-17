@@ -927,6 +927,50 @@ def _title_matches(title: str, query: str) -> bool:
     return bool(_name_words(normalized) & _name_words(query))
 
 
+#: Spoken names for "the console/terminal", and the exes that host one. The
+#: Jarvis client itself runs in one of these, so "hide the console" must reach
+#: it even though no such Start-menu app exists.
+_CONSOLE_ALIASES = frozenset(
+    {
+        "console",
+        "the console",
+        "terminal",
+        "the terminal",
+        "command prompt",
+        "the command prompt",
+        "cmd",
+        "cmd prompt",
+        "powershell",
+        "power shell",
+        "windows terminal",
+        "shell",
+    }
+)
+_CONSOLE_EXES = ("cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "conhost.exe")
+
+
+def _is_console_alias(value: Any) -> bool:
+    return normalize_app_name(str(value or "")) in _CONSOLE_ALIASES
+
+
+def _sync_minimize_console() -> list[str]:
+    """Minimize every visible console/terminal window (SPEC §8, minimize_app)."""
+
+    _require_windows()
+    pids: set[int] = set()
+    for exe in _CONSOLE_EXES:
+        pids |= _sync_process_ids(exe)
+    if not pids:
+        return []
+    user32 = _user32()
+    minimized: list[str] = []
+    for window in _list_windows():
+        if window.pid in pids:
+            user32.ShowWindow(window.hwnd, _SW_MINIMIZE)
+            minimized.append(window.title)
+    return minimized
+
+
 def _sync_minimize_app(image_name: str | None, display_name: str) -> list[str]:
     """Minimize every visible window of an app. Returns the titles minimized.
 
@@ -1158,6 +1202,17 @@ class PCController:
 
     async def minimize_app(self, value: Any) -> PCResult:
         """Minimize every window of an app (``pc_control`` ``minimize_app``)."""
+
+        # A console/terminal is not a Start-menu app: "hide the console" must
+        # reach whatever shell hosts the Jarvis logs (cmd, PowerShell, Windows
+        # Terminal), which the app index cannot resolve.
+        if _is_console_alias(value):
+            titles = await asyncio.to_thread(_sync_minimize_console)
+            if not titles:
+                raise PCActionError("no open console or terminal window found")
+            log.info("pc_control: minimized %d console/terminal window(s)", len(titles))
+            named = ", ".join(titles[:MAX_REPORTED_WINDOWS])
+            return PCResult(f"minimized {len(titles)} console window(s): {named}")
 
         entry = await self._resolve_app(value)
         titles = await asyncio.to_thread(
