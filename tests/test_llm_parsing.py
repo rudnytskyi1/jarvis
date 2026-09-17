@@ -1,0 +1,42 @@
+"""server/llm.py helpers: URL derivation, argument parsing, reply cleanup."""
+from server.llm import (
+    _arguments_to_dict,
+    clean_reply,
+    native_base_url,
+    normalize_tool_calls,
+)
+
+
+def test_native_base_url_strips_v1():
+    assert native_base_url("http://127.0.0.1:11434/v1") == "http://127.0.0.1:11434"
+    assert native_base_url("http://127.0.0.1:11434/v1/") == "http://127.0.0.1:11434"
+    assert native_base_url("http://127.0.0.1:11434") == "http://127.0.0.1:11434"
+
+
+def test_arguments_accept_dict_and_json_string():
+    parsed, _ = _arguments_to_dict({"a": 1})
+    assert parsed == {"a": 1}
+    parsed, _ = _arguments_to_dict('{"a": 1}')
+    assert parsed == {"a": 1}
+
+
+def test_arguments_reject_garbage():
+    parsed, _ = _arguments_to_dict("{broken json")
+    assert parsed is None
+    parsed, _ = _arguments_to_dict(42)
+    assert parsed is None
+
+
+def test_broken_tool_call_is_skipped():
+    calls = normalize_tool_calls(
+        [
+            {"function": {"name": "pc_control", "arguments": "{broken"}},
+            {"function": {"name": "remember", "arguments": {"fact": "x"}}},
+        ]
+    )
+    assert [c.name for c in calls] == ["remember"]
+
+
+def test_clean_reply_strips_markdown():
+    assert clean_reply("**Done**, `volume` set.") == "Done, volume set."
+    assert clean_reply(None) == ""

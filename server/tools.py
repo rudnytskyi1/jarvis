@@ -301,14 +301,39 @@ MOUSE_CLICK_TOOL = "mouse_click"
 CLICK_BUTTONS: tuple[str, ...] = ("left", "right", "double")
 DEFAULT_CLICK_BUTTON = "left"
 
+#: Spellings the model actually produces, mapped onto the canonical buttons —
+#: kept in sync with the client's own variant table.
+_CLICK_BUTTON_VARIANTS: dict[str, str] = {
+    "left": "left",
+    "l": "left",
+    "primary": "left",
+    "click": "left",
+    "single": "left",
+    "right": "right",
+    "r": "right",
+    "secondary": "right",
+    "context": "right",
+    "right click": "right",
+    "right_click": "right",
+    "double": "double",
+    "double click": "double",
+    "double_click": "double",
+    "doubleclick": "double",
+    "dblclick": "double",
+    "left double": "double",
+    "left_double": "double",
+}
+
 
 def normalize_click_button(value: Any) -> str:
     """Map the model's ``button`` argument onto a value the client accepts."""
     button = str(value or "").strip().lower()
-    if button in CLICK_BUTTONS:
-        return button
-    if button:
-        log.warning("Unknown click button %r — using %s", value, DEFAULT_CLICK_BUTTON)
+    if not button:
+        return DEFAULT_CLICK_BUTTON
+    canonical = _CLICK_BUTTON_VARIANTS.get(button)
+    if canonical is not None:
+        return canonical
+    log.warning("Unknown click button %r — using %s", value, DEFAULT_CLICK_BUTTON)
     return DEFAULT_CLICK_BUTTON
 
 
