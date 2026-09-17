@@ -188,6 +188,10 @@ class FaceConfig(_Strict):
     threshold: float = Field(default=0.45, gt=0.0, le=1.0)
     #: Somebody is forgotten this long after the camera last saw them.
     presence_ttl_s: float = Field(default=30.0, gt=0.0)
+    #: v1.7: greet with a fixed script instead of a model round. Going through
+    #: the model cost 3-5 s (once 61 s) before a word was spoken, which is far
+    #: too late for somebody standing in front of the camera. True restores it.
+    greeting_llm: bool = False
     #: An unknown face present for this long triggers the proactive greeting.
     greet_after_s: float = Field(default=10.0, ge=0.0)
     #: v1.7: at most one greeting of the SAME STRANGER per this window
