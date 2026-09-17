@@ -301,6 +301,13 @@ class JarvisClient:
         self._listen_hint_s = 0.0
         #: Set when a proactive message finished playing: answer without wake word.
         self._proactive_listen_s = 0.0
+        #: Wake word spellings, lowercased - to spot our own name in reply text.
+        wake_cfg = self.ccfg.wakeword
+        self._wake_phrases = [
+            str(p).strip().lower()
+            for p in ([_attr(wake_cfg, "word")] + list(_attr(wake_cfg, "phrases") or []))
+            if str(p or "").strip()
+        ]
 
         # -- v1.4: one reader task owns the socket -----------------------
         #: Messages belonging to the utterance in flight (text and binary).
@@ -788,6 +795,15 @@ class JarvisClient:
                 continue
             self.preroll.push(frame)
             if self.wake.accept_frame(frame):
+                if (
+                    self._idle_playing
+                    and self._says_wake_word(self._last_say)
+                ):
+                    # That was Rowan pronouncing its own name through the
+                    # speakers (greetings do) - not the user. Ignore it.
+                    log.debug("Ignoring the wake word heard in our own speech")
+                    self.wake.reset()
+                    continue
                 log.info("Wake word detected")
                 # While idle this loop is also the barge-in watcher: an
                 # unprompted greeting is cut off here and the client goes
@@ -919,7 +935,13 @@ class JarvisClient:
                 elif mtype == MSG_TTS_START:
                     await self._stop_thinking()
                     await self._on_tts_start(msg)
-                    self._start_barge_watch()
+                    if self._says_wake_word(self._last_say):
+                        # Rowan is about to SAY its own name: the mic would hear
+                        # it from the speakers and barge in on itself. Skip the
+                        # watcher for this one reply.
+                        log.info("Reply contains the wake word - barge-in off for it")
+                    else:
+                        self._start_barge_watch()
                 elif mtype == MSG_TTS_END:
                     self._tts_active = False
                     await self._stop_barge_watch()
@@ -947,6 +969,11 @@ class JarvisClient:
             await self._stop_barge_watch()
             await self._await_actions()
         return result
+
+    def _says_wake_word(self, text: Any) -> bool:
+        """True when the given reply text contains one of the wake spellings."""
+        lowered = str(text or "").lower()
+        return any(phrase in lowered for phrase in self._wake_phrases)
 
     # -- barge-in: the wake word interrupts playback -------------------------
 
