@@ -57,6 +57,7 @@ _SWP_NOMOVE = 0x0002
 _SWP_NOSIZE = 0x0001
 _SWP_FRAMECHANGED = 0x0020
 _SWP_SHOWWINDOW = 0x0040
+_SWP_NOACTIVATE = 0x0010
 
 __all__ = [
     "DEFAULT_TTL_S",
@@ -142,6 +143,36 @@ def _make_borderless_topmost(window_name: str) -> None:
         )
     except Exception:  # noqa: BLE001 - cosmetic only
         log.debug("Could not make the detections window borderless/topmost", exc_info=True)
+
+
+def _keep_on_top(window_name: str) -> None:
+    """Re-assert the topmost flag without stealing focus.
+
+    Setting it once at show time is not enough: anything that activates
+    afterwards - a browser going full screen, the HUD overlay, a dialog - can
+    push the photo behind it, and the owner is left looking at the window he
+    asked to see hidden under everything else. This is cheap enough to call on
+    every message-loop pump, and ``SWP_NOACTIVATE`` means it never yanks the
+    keyboard away from whatever he is actually typing into.
+    """
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        hwnd = user32.FindWindowW(None, window_name)
+        if not hwnd:
+            return
+        user32.SetWindowPos(
+            hwnd,
+            _HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE,
+        )
+    except Exception:  # noqa: BLE001 - cosmetic only
+        log.debug("Could not keep the detections window on top", exc_info=True)
 
 
 class ImageViewer:
@@ -312,6 +343,10 @@ class ImageViewer:
                         cv2.waitKey(1)  # pump the window's message loop
                     except Exception:
                         pass
+                    # Re-pin every pump: another window activating steals the
+                    # top of the Z-order, and the photo the owner asked to see
+                    # ends up buried behind whatever he was looking at.
+                    _keep_on_top(WINDOW_NAME)
                     if time.monotonic() >= shown_deadline:
                         try:
                             cv2.destroyWindow(WINDOW_NAME)

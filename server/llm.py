@@ -213,7 +213,9 @@ _REQUEST_PREFIX: str = (
     r"(?:\b(?:ok(?:ay)?|hey|hi|yo|so|now|well|please|rowan|jarvis|"
     r"can\s+you|could\s+you|would\s+you|will\s+you|i\s+want\s+you\s+to|"
     r"i\s+need\s+you\s+to|you\s+can|let'?s|lets|just|go\s+ahead\s+and|"
-    r"пожалуйста|слушай|эй|ну|давай|а)\b[\s,]*)*"
+    # Corrections start here: "no, go to home", "actually, close it".
+    r"no|nope|actually|instead|then|first|next|also|and|"
+    r"пожалуйста|слушай|эй|ну|давай|а|нет|не|потом|сначала|теперь)\b[\s,]*)*"
 )
 _IMPERATIVE_EN_RE = re.compile(
     r"^[\s,.!?\-]*" + _REQUEST_PREFIX + r"(?:" + COMMAND_VERBS + r")\b",
@@ -227,7 +229,10 @@ _IMPERATIVE_RU_RE = re.compile(
     r"ь|ьте|ите|йте|айте)\b",
     re.IGNORECASE,
 )
-_CLAUSE_SPLIT_RE = re.compile(r"[.!?;]+|\band\s+|\bthen\s+|\bи\s+", re.IGNORECASE)
+#: Commas split too. A spoken correction arrives as one breath - "no, go in
+#: settings, go to home, click home" - and only the later clauses carry the
+#: order. Splitting generously costs at most one extra self-check round.
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;,]+|\band\s+|\bthen\s+|\bи\s+", re.IGNORECASE)
 
 
 def is_imperative_request(text: str | None) -> bool:
