@@ -76,12 +76,21 @@ class SttEngine:
         self.device = str(cfg_stt.device)
         self.compute_type = str(cfg_stt.compute_type)
         self.default_language = _clean_language(getattr(cfg_stt, "language", None))
+        raw_allowed = getattr(cfg_stt, "allowed_languages", None) or []
+        #: Auto-detection whitelist: Whisper knows 99 languages and happily
+        #: mistakes a mumbled phrase for Portuguese; restricting the choice to
+        #: the languages actually spoken in the room removes those misfires.
+        #: Empty list = no restriction. Ignored when a language is forced.
+        self.allowed_languages = [
+            lang for lang in (_clean_language(item) for item in raw_allowed) if lang
+        ]
         log.info(
-            "Loading faster-whisper %s (device=%s, compute_type=%s, language=%s)",
+            "Loading faster-whisper %s (device=%s, compute_type=%s, language=%s%s)",
             self.model_name,
             self.device,
             self.compute_type,
             self.default_language or "auto",
+            f", allowed={self.allowed_languages}" if self.allowed_languages else "",
         )
         _register_cuda_dlls()
         self._model = WhisperModel(
@@ -116,14 +125,36 @@ class SttEngine:
             return "", requested or ""
 
         duration_s = audio.size / float(WHISPER_SAMPLE_RATE)
-        segments, info = self._model.transcribe(
-            audio,
-            language=requested,
+        kwargs = dict(
             task="transcribe",
             beam_size=5,
             vad_filter=True,
             condition_on_previous_text=False,
         )
+        segments, info = self._model.transcribe(audio, language=requested, **kwargs)
+
+        # Language detection ran on the encoder pass; segments are still a lazy
+        # generator, so re-running with a forced language is cheap here.
+        detected_raw = _clean_language(getattr(info, "language", None))
+        if (
+            requested is None
+            and self.allowed_languages
+            and detected_raw not in self.allowed_languages
+        ):
+            probs = getattr(info, "all_language_probs", None) or []
+            best = max(
+                (item for item in probs if item[0] in self.allowed_languages),
+                key=lambda item: item[1],
+                default=None,
+            )
+            forced = best[0] if best else self.allowed_languages[0]
+            log.info(
+                "Whisper detected '%s' which is not in allowed_languages - forcing '%s'",
+                detected_raw,
+                forced,
+            )
+            segments, info = self._model.transcribe(audio, language=forced, **kwargs)
+
         parts = [segment.text.strip() for segment in segments if segment.text]
         text = " ".join(part for part in parts if part).strip()
         detected = _clean_language(getattr(info, "language", None)) or requested or ""

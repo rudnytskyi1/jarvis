@@ -9,7 +9,8 @@ server:
     model: large-v3          # faster-whisper
     device: cuda
     compute_type: float16
-    language: null           # null = auto-detect (en/ru); "en" pins English
+    language: null           # null = auto-detect within allowed_languages; "en" pins English
+    allowed_languages: [en, ru, es]   # auto-detect whitelist; [] = any language
 
   llm:
     provider: ollama_native  # ollama_native (recommended: can disable thinking) | openai

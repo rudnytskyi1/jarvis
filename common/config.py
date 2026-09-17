@@ -8,6 +8,7 @@ Public API (SPEC section 6)::
     cfg.server.host                 # "0.0.0.0"
     cfg.server.port                 # 8765
     cfg.server.stt.model            # "large-v3"
+    cfg.server.stt.allowed_languages  # ["en", "ru", "es"] (auto-detect whitelist)
     cfg.server.llm.base_url         # "http://127.0.0.1:11434/v1"
     cfg.server.llm.provider         # "ollama_native" | "openai"
     cfg.server.llm.think            # False (Qwen3 reasoning off for fast replies)
@@ -74,6 +75,9 @@ class STTConfig(_Strict):
     compute_type: str = "float16"
     #: ``None``/empty -> language auto-detection.
     language: Optional[str] = None
+    #: Whitelist for auto-detection (the languages actually spoken in the room);
+    #: empty list = any of Whisper's 99 languages. Ignored when ``language`` is set.
+    allowed_languages: list[str] = Field(default_factory=lambda: ["en", "ru", "es"])
 
     @field_validator("language", mode="after")
     @classmethod

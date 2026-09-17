@@ -227,6 +227,7 @@ cfg = load_config(path)      # path to yaml; returns Config
 cfg.server.host              # "0.0.0.0"
 cfg.server.port              # 8765
 cfg.server.stt.{model, device, compute_type, language}          # language: str | None
+cfg.server.stt.allowed_languages                                # ["en","ru","es"]: auto-detect whitelist, [] = all
 cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns}
 cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # v1.1: "ollama_native"|"openai", bool, str, int
 cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 8192 (requested context)
