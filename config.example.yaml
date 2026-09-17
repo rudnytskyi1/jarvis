@@ -18,7 +18,7 @@ server:
     model: millard-qwen4:latest           # Qwen3.6-35B-A3B multimodal; tool calling + vision verified
     api_key: ollama
     think: false             # disable Qwen3 reasoning for fast voice replies
-    vision_model: millard-qwen4:latest    # same model as chat = zero VRAM swapping on screen questions
+    vision_model: qwen2.5vl:7b        # fast NON-thinking vision model (coexists with the chat model)
     temperature: 0.3         # low keeps tool use disciplined (no claimed-but-not-done actions)
     max_tokens: 1024
     max_tool_rounds: 6       # how many tool-call rounds per utterance (computer-use chains need headroom)
@@ -111,6 +111,7 @@ client:
     #   description: main room light (button pusher on the wall switch)
     #   mac: "AA:BB:CC:DD:EE:FF"
     #   mode: press          # press | lever
+
 
 
 
