@@ -35,3 +35,4 @@ desktop.ini
 
 # --- third-party checkouts (SAM3 copy from Downloads) ---
 third_party/
+config.yaml.bak-*
