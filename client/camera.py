@@ -471,9 +471,13 @@ class CameraService:
         A PERSON-count change is reported at once; an object-only change must
         stay identical for two consecutive checks before it is sent.
         """
-        key = (int(persons), tuple(sorted(objects.items())))
+        # Change detection uses the person count and the SET of labels only:
+        # YOLO endlessly flickers object counts (a bottle drifting between 1
+        # and 2), and re-announcing every count change spammed the server every
+        # debounce window. Counts still ride along in the payload when a real
+        # change (new/removed label, person count) is announced.
+        key = (int(persons), tuple(sorted(objects.keys())))
         if key == self._sent_state:
-            self._candidate_state = None
             return
         now = time.monotonic()
         if now - self._sent_state_at < STATE_DEBOUNCE_S:
@@ -481,12 +485,6 @@ class CameraService:
             # so the change is simply announced by one of the next ones. Short
             # flickers (a misdetected chair) never reach the server at all.
             return
-        persons_changed = self._sent_state is None or key[0] != self._sent_state[0]
-        if not persons_changed:
-            if key != getattr(self, "_candidate_state", None):
-                self._candidate_state = key
-                return
-        self._candidate_state = None
         self._sent_state = key
         self._sent_state_at = now
         payload = {
