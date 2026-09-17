@@ -1884,7 +1884,12 @@ class Connection:
         try:
             count = int(result.get("count") or 0)
             annotated = await asyncio.to_thread(
-                draw_boxes, frame.jpeg, result.get("boxes") or [], result.get("scores") or []
+                draw_boxes,
+                frame.jpeg,
+                result.get("boxes") or [],
+                result.get("scores") or [],
+                85,
+                target,
             )
             title = f"{target} - {count} found"
             self._last_annotated = (annotated, frame.w, frame.h, title)

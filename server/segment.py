@@ -44,11 +44,32 @@ BOX_COLOR = (0xFF, 0x33, 0x55)
 BOX_WIDTH_PX = 3
 
 
+def _label_font(image_height: int) -> Any:
+    """A readable TrueType font scaled to the image, or PIL's default.
+
+    The default bitmap font is ~11 px: on a 1080p camera frame the score label
+    was there but invisible, which read as "no labels at all".
+    """
+    from PIL import ImageFont  # noqa: PLC0415 - lazy, like the rest of the module
+
+    size = max(18, int(image_height / 28))
+    for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:  # noqa: BLE001 - try the next font
+            continue
+    try:
+        return ImageFont.load_default(size=size)  # Pillow >= 10.1 can scale it
+    except Exception:  # noqa: BLE001 - ancient Pillow
+        return ImageFont.load_default()
+
+
 def draw_boxes(
     jpeg_bytes: bytes,
     boxes: list[Any] | None,
     scores: list[Any] | None = None,
     quality: int = 85,
+    label: str = "",
 ) -> bytes:
     """Draw ``find_object``'s boxes on ``jpeg_bytes`` (v1.6, PIL, pure-python).
 
@@ -73,6 +94,10 @@ def draw_boxes(
         width, height = image.size
         draw = ImageDraw.Draw(image)
         scores = scores or []
+        font = _label_font(height)
+        # Thicker boxes on a big frame: 3 px is a hairline on 1080p.
+        stroke = max(BOX_WIDTH_PX, int(height / 250))
+        name = " ".join(str(label or "").split())
         for index, box in enumerate(boxes):
             try:
                 x1, y1, x2, y2 = (float(v) for v in box)
@@ -80,15 +105,33 @@ def draw_boxes(
                 log.warning("Skipping a malformed detection box: %r", box)
                 continue
             rect = (x1 * width, y1 * height, x2 * width, y2 * height)
-            draw.rectangle(rect, outline=BOX_COLOR, width=BOX_WIDTH_PX)
+            draw.rectangle(rect, outline=BOX_COLOR, width=stroke)
+
+            caption = name
             if index < len(scores):
                 try:
-                    label = f"{float(scores[index]):.2f}"
+                    caption = f"{name} {float(scores[index]):.0%}".strip()
                 except (TypeError, ValueError):
-                    label = ""
-                if label:
-                    label_y = max(0.0, rect[1] - 14)
-                    draw.text((rect[0] + 2, label_y), label, fill=BOX_COLOR)
+                    caption = name
+            if not caption:
+                continue
+            # A filled chip behind the text so it stays readable on any photo.
+            try:
+                left, top, right, bottom = draw.textbbox((0, 0), caption, font=font)
+                text_w, text_h = right - left, bottom - top
+            except Exception:  # noqa: BLE001 - very old Pillow
+                text_w, text_h = len(caption) * 10, 20
+            pad = max(4, text_h // 4)
+            chip_h = text_h + pad * 2
+            chip_x = rect[0]
+            chip_y = rect[1] - chip_h
+            if chip_y < 0:  # no room above the box: put the chip inside it
+                chip_y = rect[1]
+            draw.rectangle(
+                (chip_x, chip_y, chip_x + text_w + pad * 2, chip_y + chip_h),
+                fill=BOX_COLOR,
+            )
+            draw.text((chip_x + pad, chip_y + pad), caption, fill=(255, 255, 255), font=font)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=max(1, min(95, int(quality))))
         return buffer.getvalue()
