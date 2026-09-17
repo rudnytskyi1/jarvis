@@ -117,13 +117,37 @@ def test_below_threshold_is_unknown(tmp_path):
 
 # -- enrollment hygiene -------------------------------------------------------
 
-def test_a_sample_from_somebody_else_is_refused_and_not_stored(tmp_path):
+def test_a_clearly_different_voice_is_refused_and_not_stored(tmp_path):
+    # A second, orthogonal voice added to Drew's profile: far below the
+    # self-similarity floor, so it is rejected however the message is worded.
     reg = registry(tmp_path, [(1, 0, 0), (0, 1, 0)])
+    reg.enroll("Drew", PCM, 16000)
+    with pytest.raises(VoiceMismatch):
+        reg.enroll("Drew", PCM, 16000)
+    assert len(reg._people["Drew"][VOICE_KEY]) == 1
+
+
+def test_a_sample_matching_another_person_better_is_refused(tmp_path):
+    # Anton is enrolled; a voice much closer to Anton than to Drew is offered
+    # as a Drew sample - the relative test catches it by name.
+    reg = registry(tmp_path, [(1, 0, 0), (0, 1, 0), (0.98, 0.1, 0)])
+    reg.enroll("Anton", PCM, 16000)
     reg.enroll("Drew", PCM, 16000)
     with pytest.raises(VoiceMismatch) as caught:
         reg.enroll("Drew", PCM, 16000)
-    assert "did not sound like Drew" in str(caught.value)
+    assert "Anton" in str(caught.value)
     assert len(reg._people["Drew"][VOICE_KEY]) == 1
+
+
+def test_the_enrollees_own_natural_variation_is_not_rejected(tmp_path):
+    # The deadlock case: a second same-speaker sample that is only moderately
+    # similar (0.3) to the first must still be accepted - it used to be
+    # rejected as "somebody else" against a 0.35 floor.
+    reg = registry(tmp_path, [(1, 0, 0), (0.30, 0.954, 0)])
+    reg.enroll("Anton", PCM, 16000)
+    _, status = reg.enroll("Anton", PCM, 16000)
+    assert status.startswith("sample 2 stored")
+    assert len(reg._people["Anton"][VOICE_KEY]) == 2
 
 
 def test_a_mismatch_is_still_a_value_error_for_older_callers(tmp_path):

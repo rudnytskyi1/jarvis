@@ -419,8 +419,8 @@ cfg.server.llm.vision_keep_alive   # v1.7: "10m" - the VISION model's own keep_a
 cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 16384 (requested context; v1.7 - the
                                                                 #   system prompt + tool schemas alone are ~7.6k tokens)
 cfg.server.tts.{engine, language, model_id, speaker, sample_rate}   # English default: language "en", model_id "v3_en", speaker "en_0"
-cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.40 cosine (v1.7 ECAPA scale), 0.8 s minimum audio
-cfg.server.speaker.{margin, admin_threshold}                    # v1.7: 0.08 lead over the runner-up, 0.55 for run_command/set_role
+cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.28 cosine (v1.7.1 ECAPA on the real mic), 0.8 s minimum audio
+cfg.server.speaker.{margin, admin_threshold}                    # v1.7.1: 0.10 lead over the runner-up, 0.42 for run_command/set_role
 cfg.server.face.greeting_llm                                     # v1.7: false - greet from a script, not a model round
 cfg.client.server_url        # "ws://192.168.x.x:8765/ws"
 cfg.client.client_id

@@ -29,9 +29,9 @@ server:
 
   speaker:                   # who is talking (ECAPA voice profiles, data/people.json)
     enabled: true
-    threshold: 0.40          # ECAPA cosine similarity for a voice to match a profile
-    margin: 0.08             # with 2+ voices, the best must beat the runner-up by this much
-    admin_threshold: 0.55    # higher bar for run_command / set_role (a lookalike voice can't run commands)
+    threshold: 0.28          # ECAPA on the REAL mic: same-speaker sits ~0.2-0.45 (0.40 rejected the owner)
+    margin: 0.10             # with 2+ voices the winner must lead the runner-up by this
+    admin_threshold: 0.42    # run_command / set_role need this much confidence
     min_speech_s: 0.8        # shorter utterances are left unidentified
 
   face:                      # face recognition + presence (v1.4, insightface)

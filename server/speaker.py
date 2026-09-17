@@ -86,14 +86,29 @@ VOICE_MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "spkrec-ecapa
 #: v1.7: defaults calibrated for ECAPA on noisy room speech (equal error rate
 #: point measured at 0.44). The old resemblyzer defaults (0.72 / 0.70) mean
 #: nothing on this model's scale.
-DEFAULT_THRESHOLD = 0.40
-DEFAULT_MARGIN = 0.08
-#: A new sample for somebody being enrolled must sound like the samples they
-#: already gave, within this much slack under the identification threshold.
-#: Without it the NEXT utterance in the room was filed under their name no
-#: matter who said it, and one stray sentence from somebody else was enough to
-#: make that other person match the profile from then on.
-ENROLL_CONSISTENCY_SLACK = 0.05
+#: v1.7.1: calibrated on the room's REAL webcam mic, not clean synthetic TTS.
+#: The synthetic benchmark put same-speaker at 0.67, but measured on Anton's
+#: own recording two 1-second windows of the SAME utterance scored 0.19 - real
+#: mic speech of one person, cross-utterance, sits around 0.2-0.45. A 0.40 bar
+#: therefore rejected the owner's own voice every time; 0.28 clears real
+#: same-speaker while a different person (0.0-0.2) still falls short. Re-tune
+#: from the per-utterance scores now printed in the log once profiles are built.
+DEFAULT_THRESHOLD = 0.28
+#: With two or more voices enrolled the winner must also lead the runner-up by
+#: this much - the RELATIVE gap is far more reliable than the absolute score.
+DEFAULT_MARGIN = 0.10
+#: An enrollment sample is refused only when it sounds clearly MORE like an
+#: already-enrolled OTHER person than like the enrollee - a relative test, not
+#: an absolute floor. The old absolute floor (0.35) sat above real same-speaker
+#: similarity and deadlocked enrollment: the owner's own voice was rejected as
+#: "somebody else" against his single short sample, so he could never add more.
+ENROLL_REJECT_MARGIN = 0.10
+#: A sample scoring below this against the enrollee's own samples is treated as
+#: a DIFFERENT voice (or non-speech): the last absolute bar, set below real
+#: same-speaker full-utterance similarity but above typical different-speaker,
+#: so it catches somebody else speaking during enrollment without deadlocking
+#: on the enrollee's own natural variation.
+ENROLL_MIN_SELF = 0.12
 #: v1.7: enrollment audio is kept so a future, better model can be calibrated
 #: on the room's real voices instead of on guesses.
 VOICE_AUDIO_DIRNAME = "voices"
@@ -643,34 +658,53 @@ class VoiceRegistry:
         with self._lock:
             existing = self._people.get(cleaned)
             own = self._centroid((existing or {}).get(VOICE_KEY) or [])
-            if own is not None and own.shape == embedding.shape:
-                similarity = float(np.dot(own, embedding))
-                floor = self.threshold - ENROLL_CONSISTENCY_SLACK
-                if similarity < floor:
-                    log.info(
-                        "Rejected a voice sample for %s: it scored %.2f against "
-                        "their own samples (needs %.2f) - probably somebody else",
-                        cleaned, similarity, floor,
-                    )
-                    raise VoiceMismatch(
-                        f"that did not sound like {cleaned} (similarity "
-                        f"{similarity:.2f}, needs {floor:.2f}) - it was probably "
-                        f"somebody else speaking. Ask {cleaned} to say the next "
-                        "sentence themselves while nobody else talks"
-                    )
-            else:
-                # First sample: say so if this voice is already somebody else's.
-                others = [
-                    (score, who)
-                    for score, who in self._scores_locked(embedding)
-                    if who != cleaned
-                ]
-                if others and others[0][0] >= self.threshold + self.margin:
-                    note = (
-                        f"this voice already sounds a lot like {others[0][1]} "
-                        f"({others[0][0]:.2f}) - make sure it really is "
-                        f"{cleaned} speaking"
-                    )
+            best_other, best_other_name = -1.0, None
+            for score, who in self._scores_locked(embedding):
+                if who != cleaned:
+                    best_other, best_other_name = score, who
+                    break
+            self_sim = float(np.dot(own, embedding)) if own is not None else None
+
+            # Reject only when the sample sounds clearly MORE like an ALREADY
+            # ENROLLED other person than like the enrollee. This catches a
+            # second person speaking during enrollment, but - unlike an
+            # absolute floor - can never reject the enrollee's own natural
+            # variation, which is what deadlocked the owner.
+            if (
+                self_sim is not None
+                and best_other_name is not None
+                and best_other - self_sim > ENROLL_REJECT_MARGIN
+            ):
+                log.info(
+                    "Rejected a voice sample for %s: it sounds more like %s "
+                    "(%.2f) than like %s (%.2f)",
+                    cleaned, best_other_name, best_other, cleaned, self_sim,
+                )
+                raise VoiceMismatch(
+                    f"that sounded more like {best_other_name} than {cleaned} "
+                    f"- it was probably somebody else speaking. Ask {cleaned} to "
+                    "say the next sentence themselves while nobody else talks"
+                )
+            if self_sim is not None and self_sim < ENROLL_MIN_SELF:
+                log.info(
+                    "Rejected a voice sample for %s: %.2f against their own "
+                    "samples is too low to be the same speech", cleaned, self_sim,
+                )
+                raise VoiceMismatch(
+                    f"that did not sound like usable speech for {cleaned} - ask "
+                    "them to say a full sentence clearly"
+                )
+            if (
+                own is None
+                and best_other_name is not None
+                and best_other >= self.threshold + self.margin
+            ):
+                # Brand-new person whose first sample already matches somebody.
+                note = (
+                    f"this voice already sounds a lot like {best_other_name} "
+                    f"({best_other:.2f}) - make sure it really is "
+                    f"{cleaned} speaking"
+                )
             person = self._person_locked(cleaned)
             vectors = person[VOICE_KEY]
             vectors.append([round(float(v), 6) for v in embedding.tolist()])
@@ -828,7 +862,8 @@ __all__ = [
     "VOICE_MODEL_ID",
     "DEFAULT_THRESHOLD",
     "DEFAULT_MARGIN",
-    "ENROLL_CONSISTENCY_SLACK",
+    "ENROLL_REJECT_MARGIN",
+    "ENROLL_MIN_SELF",
     "VoiceMismatch",
     "SAFE_PC_COMMANDS",
     "check_permission",

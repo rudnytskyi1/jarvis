@@ -14,7 +14,7 @@ Public API (SPEC section 6)::
     cfg.server.llm.think            # False (Qwen3 reasoning off for fast replies)
     cfg.server.llm.vision_model     # "qwen3-vl:8b" (look_at_screen)
     cfg.server.llm.max_tool_rounds  # 4
-    cfg.server.speaker.threshold    # 0.40 (ECAPA voice matching, v1.7)
+    cfg.server.speaker.threshold    # 0.28 (ECAPA voice matching, v1.7.1)
     cfg.server.face.threshold       # 0.45 (face matching + presence, v1.4)
     cfg.server.face.{burst_size, enroll_bursts}  # v1.4 burst: 3, 3 (multi-frame camera pulls)
     cfg.server.segment.{enabled, checkpoint, confidence}  # v1.5: SAM3 find_object
@@ -162,15 +162,15 @@ class SpeakerConfig(_Strict):
     #: Cosine-similarity threshold for a voice to match an enrolled profile.
     #: v1.7: on the ECAPA scale (equal error rate measured near 0.44); the old
     #: resemblyzer values do not transfer.
-    threshold: float = Field(default=0.40, gt=0.0, le=1.0)
+    threshold: float = Field(default=0.28, gt=0.0, le=1.0)
     #: v1.7: with two or more voices enrolled, the best match must lead the
     #: runner-up by this much, or the speaker is reported as unknown.
-    margin: float = Field(default=0.08, ge=0.0, le=1.0)
+    margin: float = Field(default=0.10, ge=0.0, le=1.0)
     #: Higher bar for the most dangerous tools (run_command, set_role): the
     #: speaker must match this closely, not just the normal threshold, before
     #: those are allowed even to an admin profile. Guards against a lookalike
     #: voice slipping past the (lower) identification threshold.
-    admin_threshold: float = Field(default=0.55, gt=0.0, le=1.0)
+    admin_threshold: float = Field(default=0.42, gt=0.0, le=1.0)
     #: Utterances shorter than this are not identified (too little voice).
     min_speech_s: float = Field(default=0.8, ge=0.0)
 
