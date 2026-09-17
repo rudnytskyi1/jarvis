@@ -1858,17 +1858,75 @@ class Connection:
             return record["result"]
 
         log.info("look_at_camera (%s): %r", frame_id, query)
-        captured = await self._request_camera_frame(frame_id)
+        captured = await self._request_camera_frame_full(frame_id)
         if isinstance(captured, str):
             result: dict[str, Any] = {"ok": False, "error": captured}
         else:
             answer = await _vision.describe_screenshot(
                 captured.jpeg, f"{CAMERA_QUERY_PREFIX} Question: {query}".strip()
             )
-            result = {"ok": True, "answer": answer}
+            result = {"ok": True, "answer": answer, **self._room_ground_truth()}
+            log.info(
+                "look_at_camera (%s): detector %s, recognised %s",
+                frame_id,
+                result.get("objects_detected") or "none",
+                result.get("people_recognised") or "nobody",
+            )
 
         record["result"] = result
         return result
+
+    def _room_ground_truth(self) -> dict[str, Any]:
+        """The measured facts to hand the model alongside the description.
+
+        The vision model writes fluent prose and invents things inside it: it
+        has reported a bowl, scattered papers and two different wall colours in
+        a room that has none of them, and it cannot name anybody. So its answer
+        never travels alone. Two measurements ride with it:
+
+        * the room camera's own object detector, running continuously on every
+          frame - authoritative for WHICH objects are in the room and how many,
+          within the classes it knows;
+        * the face engine's presence tracker - the only thing here that can put
+          a NAME to a person.
+
+        The note spells out how to weigh them, because the model otherwise
+        treats the most fluent text as the most true.
+        """
+        state = self.camera_state or {}
+        objects = state.get("objects")
+        objects_text = (
+            ", ".join(f"{label} x{count}" for label, count in sorted(objects.items()))
+            if isinstance(objects, dict) and objects
+            else ""
+        )
+        recognised = sorted(
+            label for label in self.presence.present() if label != LABEL_UNKNOWN
+        )
+        unknown_faces = self.presence.unknown_count
+        people: list[str] = list(recognised)
+        if unknown_faces:
+            people.append(
+                f"{unknown_faces} person(s) whose face you do not recognise"
+            )
+        return {
+            "objects_detected": objects_text or "(the detector sees no known objects)",
+            "people_recognised": ", ".join(people) or "(nobody recognised)",
+            "persons_detected": state.get("persons"),
+            "note": (
+                "The 'answer' is from a vision model: good at describing a scene, "
+                "but it guesses and regularly invents objects that are not there, "
+                "and it can never tell you who somebody is. 'objects_detected' "
+                "comes from the room camera's own detector and is what is really "
+                "there. 'people_recognised' comes from face matching and is the "
+                "ONLY source of names. Never state an object as present if the "
+                "detector does not list it, never name a person the face matcher "
+                "did not recognise, and if the two sources disagree say what you "
+                "are sure of instead of picking the more detailed one. The "
+                "detector's person count can flicker on reflections, so trust the "
+                "recognised faces over it when they disagree."
+            ),
+        }
 
     async def _run_enroll_face(self, args: dict[str, Any]) -> dict[str, Any]:
         """Stage a face profile like voice enrollment (SPEC v1.4 burst).

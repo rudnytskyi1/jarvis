@@ -372,6 +372,12 @@ TOOLS: list[dict[str, Any]] = [
                 "room looks like right now. Use look_at_screen instead when the "
                 "question is about what is on the computer screen. Never guess what "
                 "the camera would show: if you have not looked, you do not know. "
+                "The result carries THREE things, and they are not equally reliable: "
+                "'answer' is a vision model describing the scene, which reads well but "
+                "invents objects and can never identify anybody; 'objects_detected' is "
+                "the camera's own object detector and is what is really in the room; "
+                "'people_recognised' is face matching and is your only source of names. "
+                "Say what the measurements support, not what the description says. "
                 + _COMMON_HINT
             ),
             "parameters": {
