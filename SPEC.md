@@ -44,7 +44,7 @@ v1.1 capabilities on top of the voice→action loop:
 
 v1.3 — **speaker recognition and roles**:
 - Every utterance is voice-identified on the server (`server/speaker.py`,
-  resemblyzer 256-d embeddings, cosine vs enrolled profiles in
+  resemblyzer 256-d embeddings - ECAPA 192-d since v1.7 - cosine vs enrolled profiles in
   `data/voices.json`). The LLM sees the speaker as a transcript prefix:
   `[speaker: Anton | role: admin] <text>` (or `[speaker: unknown]`).
 - Roles: `admin` > `trusted` > `user`; unmatched voices are `unknown`.
@@ -90,6 +90,18 @@ v1.4 — **camera, faces, presence** (the C920 on the room PC):
   LLM (offering voice enrollment once, per persona rules) and pushes it as an
   unsolicited `say` + `tts_start…tts_end` block. The client therefore reads the
   socket BETWEEN utterances too and plays such proactive audio only when idle.
+- **Voice recognition model (v1.7)**: voices are embedded with SpeechBrain's
+  ECAPA-TDNN (`speechbrain/spkrec-ecapa-voxceleb`, 192-d, on the CPU) instead of
+  resemblyzer, which could not separate two people on the room's webcam mic
+  (same person 0.666, different people 0.659). `people.json` gains a top-level
+  `voice_model`; voice vectors made by any other model are dropped on load (faces
+  and roles are kept) and those people re-enroll their voice. A person is scored
+  against the CENTRE of their samples, not their single closest sample; with two
+  or more profiles the winner must lead the runner-up by `margin`, else the
+  speaker is `unknown`. During enrollment a follow-up sample that does not match
+  the person's own samples (below `threshold - 0.05`) is rejected as somebody
+  else's voice instead of being filed under their name. Enrollment clips are kept
+  as WAV files under `data/voices/<name>/` for future recalibration.
 - **Per-person memory (v1.7)**: `data/memory.jsonl` records carry a `person`
   field. `remember {"fact": str, "about": str}` files a fact against one person
   (`about` is their name, or `"me"` for the current speaker) or against the room
@@ -390,9 +402,11 @@ cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns
 cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # v1.1: "ollama_native"|"openai", bool, str, int
 cfg.server.llm.vision_keep_alive   # v1.7: "10m" - the VISION model's own keep_alive; it holds
                                    # ~8.4 GB resident and SAM3 needs that memory
-cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 8192 (requested context)
+cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 16384 (requested context; v1.7 - the
+                                                                #   system prompt + tool schemas alone are ~7.6k tokens)
 cfg.server.tts.{engine, language, model_id, speaker, sample_rate}   # English default: language "en", model_id "v3_en", speaker "en_0"
-cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.72 cosine, 0.8 s minimum audio
+cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.40 cosine (v1.7 ECAPA scale), 0.8 s minimum audio
+cfg.server.speaker.{margin, admin_threshold}                    # v1.7: 0.08 lead over the runner-up, 0.55 for run_command/set_role
 cfg.client.server_url        # "ws://192.168.x.x:8765/ws"
 cfg.client.client_id
 cfg.client.wakeword.{word, phrases, vosk_model}                 # phrases: list[str]

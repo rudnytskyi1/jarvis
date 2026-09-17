@@ -14,7 +14,7 @@ Public API (SPEC section 6)::
     cfg.server.llm.think            # False (Qwen3 reasoning off for fast replies)
     cfg.server.llm.vision_model     # "qwen3-vl:8b" (look_at_screen)
     cfg.server.llm.max_tool_rounds  # 4
-    cfg.server.speaker.threshold    # 0.72 (voice matching, v1.3)
+    cfg.server.speaker.threshold    # 0.40 (ECAPA voice matching, v1.7)
     cfg.server.face.threshold       # 0.45 (face matching + presence, v1.4)
     cfg.server.face.{burst_size, enroll_bursts}  # v1.4 burst: 3, 3 (multi-frame camera pulls)
     cfg.server.segment.{enabled, checkpoint, confidence}  # v1.5: SAM3 find_object
@@ -138,7 +138,9 @@ class LLMConfig(_Strict):
     #: Context window requested from Ollama (ollama_native only). The model's
     #: own default (32k for qwen3:30b) wastes several GB of VRAM on KV cache
     #: that a voice assistant with a short history never uses.
-    num_ctx: int = Field(default=8192, ge=1024)
+    #: v1.7: 16384 - the system prompt plus the tool schemas alone are ~7.6k
+    #: tokens, so 8192 overflowed after a single exchange.
+    num_ctx: int = Field(default=16384, ge=1024)
     #: After an action turn, re-prompt the model as a verifier that checks it
     #: actually did everything requested/promised and finishes anything missing.
     #: Runs only when a state-changing tool ran, so plain chat stays fast.
@@ -158,12 +160,17 @@ class SpeakerConfig(_Strict):
 
     enabled: bool = True
     #: Cosine-similarity threshold for a voice to match an enrolled profile.
-    threshold: float = Field(default=0.72, gt=0.0, le=1.0)
+    #: v1.7: on the ECAPA scale (equal error rate measured near 0.44); the old
+    #: resemblyzer values do not transfer.
+    threshold: float = Field(default=0.40, gt=0.0, le=1.0)
+    #: v1.7: with two or more voices enrolled, the best match must lead the
+    #: runner-up by this much, or the speaker is reported as unknown.
+    margin: float = Field(default=0.08, ge=0.0, le=1.0)
     #: Higher bar for the most dangerous tools (run_command, set_role): the
     #: speaker must match this closely, not just the normal threshold, before
     #: those are allowed even to an admin profile. Guards against a lookalike
     #: voice slipping past the (lower) identification threshold.
-    admin_threshold: float = Field(default=0.70, gt=0.0, le=1.0)
+    admin_threshold: float = Field(default=0.55, gt=0.0, le=1.0)
     #: Utterances shorter than this are not identified (too little voice).
     min_speech_s: float = Field(default=0.8, ge=0.0)
 

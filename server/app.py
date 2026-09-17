@@ -115,6 +115,8 @@ REASON_REQUEST = proto.CAMERA_REASON_REQUEST
 
 #: Presence label for a detected face that matches no enrolled profile.
 LABEL_UNKNOWN = speaker_mod.ROLE_UNKNOWN
+#: Fire-and-forget startup work, kept referenced until it finishes.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 #: How often the greeting task re-checks whether it may speak.
 GREETING_POLL_S = 1.0
@@ -529,10 +531,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _dialogs = DialogLog()
     speaker_cfg = getattr(cfg.server, "speaker", None)
     _voices = VoiceRegistry(
-        threshold=getattr(speaker_cfg, "threshold", 0.72),
+        threshold=getattr(speaker_cfg, "threshold", speaker_mod.DEFAULT_THRESHOLD),
         min_speech_s=getattr(speaker_cfg, "min_speech_s", 0.8),
         enabled=getattr(speaker_cfg, "enabled", True),
+        margin=getattr(speaker_cfg, "margin", speaker_mod.DEFAULT_MARGIN),
     )
+    # The ECAPA encoder takes a few seconds to load; do it now, off the loop,
+    # instead of making the first person to speak wait for it.
+    # Held in a module-level set: a task nobody references can be garbage
+    # collected before it finishes.
+    _warm_task = asyncio.create_task(asyncio.to_thread(_voices.warm_up))
+    _BACKGROUND_TASKS.add(_warm_task)
+    _warm_task.add_done_callback(_BACKGROUND_TASKS.discard)
     # The face model itself is loaded lazily on the first camera frame, so a
     # server without insightface still starts and serves the voice pipeline.
     _face = FaceEngine(getattr(cfg.server, "face", None))
@@ -1102,6 +1112,26 @@ class Connection:
             "status": status,
             "next": self._enroll_progress_note(self._enroll_pending),
         }
+
+    @staticmethod
+    def _enroll_status_text(pending: dict[str, Any], note: str = "") -> str:
+        """The HUD caption for an enrollment in progress (v1.7)."""
+        name = pending.get("name") or "you"
+        samples = int(pending.get("samples") or 0)
+        remaining_s = max(
+            0.0, speaker_mod.MIN_ENROLL_SPEECH_S - float(pending.get("total_speech_s") or 0.0)
+        )
+        if "NOT used" in (note or ""):
+            return f"That was not {name}'s voice - {name}, please say the next sentence"
+        if remaining_s > 0:
+            return (
+                f"Learning {name}'s voice - {samples} of {speaker_mod.ENROLL_MIN_SAMPLES}, "
+                f"about {remaining_s:.0f} s more - keep talking"
+            )
+        return (
+            f"Learning {name}'s voice - {samples} of {speaker_mod.ENROLL_MIN_SAMPLES}, "
+            "one more sentence"
+        )
 
     @staticmethod
     def _enroll_progress_note(pending: dict[str, Any]) -> str:
@@ -2037,11 +2067,19 @@ class Connection:
         (:meth:`Connection.close`).
         """
         added = 0
+        await self._send_status(
+            f"Taking photos of {name} - look at the camera, turn your head slowly",
+            ttl_s=ENROLL_FACE_INTERVAL_S * (enroll_bursts + 1),
+        )
         for i in range(enroll_bursts):
             try:
                 await asyncio.sleep(ENROLL_FACE_INTERVAL_S)
             except asyncio.CancelledError:
                 raise
+            await self._send_status(
+                f"Face photo {i + 2} of {enroll_bursts + 1} for {name} - keep turning slowly",
+                ttl_s=ENROLL_FACE_INTERVAL_S * 2,
+            )
             engine, registry = _face, _voices
             if engine is None or registry is None or not self.face_enabled:
                 continue
@@ -2082,6 +2120,11 @@ class Connection:
             "Face enrollment for %s finished: %d extra sample(s) added (%s total)",
             name, added, total,
         )
+        await self._send_status(
+            f"{name}'s face saved ({total} photos)" if added else
+            f"Could not take more photos of {name} - one photo kept",
+            ttl_s=5.0,
+        )
         # The spoken instruction promised "I will tell you when I am done", so
         # say it: an unsolicited one-liner, exactly like a greeting.
         if added:
@@ -2101,6 +2144,19 @@ class Connection:
             return
         except Exception:
             log.debug("Could not announce the end of face enrollment", exc_info=True)
+
+    async def _send_status(self, text: str, ttl_s: float = proto.DEFAULT_STATUS_TTL_S) -> None:
+        """Put a short caption on the room screen (v1.7); never raises.
+
+        For things that take a while and happen in the background, where the
+        person otherwise has no idea whether Rowan is still doing anything.
+        """
+        try:
+            await self.send_json(
+                {"type": proto.MSG_STATUS, "text": str(text or ""), "ttl_s": float(ttl_s)}
+            )
+        except Exception:  # noqa: BLE001 - a caption is never worth an error
+            log.debug("Could not send a status caption", exc_info=True)
 
     async def _say_unprompted(self, text: str) -> None:
         """Speak one line outside a conversation (enrollment done, greetings)."""
@@ -2599,6 +2655,14 @@ class Connection:
                     await asyncio.to_thread(
                         _voices.enroll, pending["name"], pcm, self.sample_rate
                     )
+                except speaker_mod.VoiceMismatch as exc:
+                    # Somebody else spoke: their seconds must not count toward
+                    # this person's profile, and the model has to say so.
+                    pending["rejected"] = pending.get("rejected", 0) + 1
+                    enroll_note = (
+                        f" [enrollment: sample NOT used - {exc}; "
+                        f"{self._enroll_progress_note(pending)}]"
+                    )
                 except ValueError as exc:
                     pending["total_speech_s"] = pending.get("total_speech_s", 0.0) + sample_s
                     enroll_note = (
@@ -2696,6 +2760,14 @@ class Connection:
                 # Voice enrollment expects the speaker to keep talking: tell the
                 # client to hold the follow-up window open longer than usual.
                 say_payload["listen_s"] = ENROLL_LISTEN_S
+                # ...and SHOW what it is waiting for (v1.7). Heard once in the
+                # middle of a reply, "keep talking" was easy to miss, and the
+                # room had no idea whether enrollment was still going.
+                say_payload[proto.SAY_STATUS_FIELD] = self._enroll_status_text(
+                    self._enroll_pending, enroll_note
+                )
+            elif enroll_note and "done" in enroll_note:
+                say_payload[proto.SAY_STATUS_FIELD] = "Voice saved"
             await self.send_json(say_payload)
             t_tts = time.perf_counter()
             await self._stream_tts(voice, say_text)

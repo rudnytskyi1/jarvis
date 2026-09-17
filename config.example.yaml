@@ -8,7 +8,7 @@ server:
   stt:
     model: large-v3          # faster-whisper
     device: cuda
-    compute_type: float16
+    compute_type: float16    # int8_float16: same accuracy, ~1.9 GB less VRAM (use it on a shared GPU)
     language: null           # null = auto-detect within allowed_languages; "en" pins English
     allowed_languages: [en, ru, es]   # auto-detect whitelist; [] = any language
 
@@ -25,12 +25,13 @@ server:
     history_turns: 12        # how many recent exchanges to keep
     keep_alive: 4h           # keep the CHAT model in VRAM (Ollama unloads after 5 m otherwise)
     vision_keep_alive: 10m   # the vision model holds ~8.4 GB; give it back when idle
-    num_ctx: 8192            # requested context window; the 32k model default wastes VRAM
+    num_ctx: 16384           # system prompt + tool schemas alone are ~7.6k tokens; 8192 overflows
 
-  speaker:                   # who is talking (resemblyzer voice profiles, data/people.json)
+  speaker:                   # who is talking (ECAPA voice profiles, data/people.json)
     enabled: true
-    threshold: 0.62          # cosine similarity for a voice to match a profile
-    admin_threshold: 0.70    # higher bar for run_command / set_role (a lookalike voice can't run commands)
+    threshold: 0.40          # ECAPA cosine similarity for a voice to match a profile
+    margin: 0.08             # with 2+ voices, the best must beat the runner-up by this much
+    admin_threshold: 0.55    # higher bar for run_command / set_role (a lookalike voice can't run commands)
     min_speech_s: 0.8        # shorter utterances are left unidentified
 
   face:                      # face recognition + presence (v1.4, insightface)

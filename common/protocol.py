@@ -44,7 +44,10 @@ Server -> Client
   (see the seq/of note above). ``full`` (v1.6, optional, default false) skips
   the usual downscale for THIS pull only -- used by ``find_object`` so the
   object detector sees the frame at native camera resolution.
-* ``{"type": MSG_SAY, "text": str}``
+* ``{"type": MSG_SAY, "text": str, "listen_s": float, "status": str}`` --
+  ``listen_s`` and ``status`` are optional. v1.7: ``status`` is a caption the
+  client shows on the HUD for the follow-up window this reply opens (voice
+  enrollment progress).
 * ``{"type": MSG_TTS_START, "sr": int, "format": "pcm_s16le", "channels": 1}``
   followed by binary PCM frames and ``{"type": MSG_TTS_END}``
 * ``{"type": MSG_IMAGE_SHOW, "id": str, "w": int, "h": int, "title": str,
@@ -52,6 +55,9 @@ Server -> Client
   show a photo on the room screen (``find_object`` pushes its annotated
   detections here). ``ttl_s`` is how long the client keeps it up (default 60 on
   the client side if omitted); a newer image replaces whatever is showing.
+* ``{"type": MSG_STATUS, "text": str, "ttl_s": float}`` -- v1.7: a HUD caption
+  for something slow happening in the background (face enrollment photos);
+  empty ``text`` clears it. May arrive at any time, nothing is spoken.
 * ``{"type": MSG_ERROR, "message": str}``
 
 Order per utterance: transcript -> zero or more rounds of actions and/or
@@ -106,7 +112,18 @@ MSG_TTS_START = "tts_start"
 MSG_TTS_END = "tts_end"
 #: v1.6: show a photo on the room screen (header, then one binary JPEG frame).
 MSG_IMAGE_SHOW = "image_show"
+#: v1.7: a short caption for the room screen, ``{"text": str, "ttl_s": float}``,
+#: shown on the HUD while something slow happens in the background (face
+#: enrollment photos). Empty text clears it. Nothing is spoken.
+MSG_STATUS = "status"
 MSG_ERROR = "error"
+
+#: v1.7: optional ``say`` field - a caption the client shows on the HUD for the
+#: follow-up window that reply opens (voice enrollment progress), so the person
+#: can SEE what Rowan is waiting for instead of guessing from the speech alone.
+SAY_STATUS_FIELD = "status"
+#: How long a status caption stays up when the server gives no ttl.
+DEFAULT_STATUS_TTL_S = 8.0
 
 # --- shared literals used inside the frames ---------------------------------
 #: WebSocket endpoint path served by the brain server.
@@ -175,6 +192,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_TTS_START,
         MSG_TTS_END,
         MSG_IMAGE_SHOW,
+        MSG_STATUS,
         MSG_ERROR,
     }
 )
@@ -198,6 +216,9 @@ __all__ = [
     "MSG_TTS_START",
     "MSG_TTS_END",
     "MSG_IMAGE_SHOW",
+    "MSG_STATUS",
+    "SAY_STATUS_FIELD",
+    "DEFAULT_STATUS_TTL_S",
     "MSG_ERROR",
     "WS_PATH",
     "AUDIO_FORMAT",

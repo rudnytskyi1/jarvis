@@ -20,8 +20,17 @@ torchaudio
 omegaconf
 num2words  # spells numbers/times out in words - Silero cannot pronounce digits
 
-# Speaker recognition (SPEC v1.3): voice embeddings for who-is-talking
-resemblyzer
+# Speaker recognition (SPEC v1.7): ECAPA-TDNN voice embeddings for who-is-talking.
+# Install these three with --no-deps: a plain install lets pip "resolve" torch
+# and replace the CUDA build with a CPU one, which has already killed Whisper
+# twice on this machine.
+#   pip install --no-deps speechbrain hyperpyyaml sentencepiece "ruamel.yaml==0.18.10"
+# ruamel.yaml 0.19 breaks hyperpyyaml 1.2.3 ("'Loader' object has no attribute
+# 'max_depth'"), hence the pin.
+speechbrain
+hyperpyyaml
+sentencepiece
+ruamel.yaml==0.18.10
 
 # Face recognition and presence (SPEC v1.4): insightface buffalo_l (512-d
 # ArcFace embeddings) running on onnxruntime. The model pack downloads itself

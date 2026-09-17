@@ -75,6 +75,7 @@ from common.protocol import (
     MSG_SCREENSHOT,
     MSG_SCREENSHOT_ERROR,
     MSG_SCREENSHOT_REQUEST,
+    MSG_STATUS,
     MSG_TRANSCRIPT,
     MSG_TTS_END,
     MSG_TTS_START,
@@ -351,6 +352,14 @@ class JarvisClient:
         self._last_say = ""
         #: Server's follow-up window request from the last reply (say.listen_s).
         self._listen_hint_s = 0.0
+        #: v1.7: HUD caption the last reply asked for (say.status), shown for
+        #: the follow-up window it opens - voice enrollment progress.
+        self._say_status = ""
+        #: v1.7: bumped on every caption, so an old caption's timer cannot
+        #: clear a newer one.
+        self._status_seq = 0
+        #: True while a background caption (MSG_STATUS) owns the HUD state.
+        self._status_owns_hud = False
         #: Set when a proactive message finished playing: answer without wake word.
         self._proactive_listen_s = 0.0
         #: Wake word spellings, lowercased - to spot our own name in reply text.
@@ -686,8 +695,52 @@ class JarvisClient:
             log.error("Server error between utterances: %s", msg.get("message"))
         elif mtype == MSG_READY:
             log.debug("The server sent ready")
+        elif mtype == MSG_STATUS:
+            self._on_status_message(msg, in_conversation=False)
         else:
             log.warning("Unknown message type from the server: %r", mtype)
+
+    # -- HUD captions (v1.7) --------------------------------------------------
+
+    def _show_status(self, text: str, ttl_s: float) -> None:
+        """Put ``text`` on the HUD for ``ttl_s`` seconds (empty clears it)."""
+        self._status_seq += 1
+        seq = self._status_seq
+        self.overlay.set_status(text or "")
+        if text and ttl_s > 0:
+            asyncio.get_running_loop().call_later(ttl_s, self._expire_status, seq)
+
+    def _expire_status(self, seq: int) -> None:
+        if seq != self._status_seq:
+            return  # a newer caption replaced this one
+        self.overlay.set_status("")
+        if self._status_owns_hud:
+            self._status_owns_hud = False
+            if self._mode == MODE_IDLE:
+                self.overlay.set_state("idle")
+
+    def _on_status_message(self, msg: Dict[str, Any], in_conversation: bool) -> None:
+        """MSG_STATUS: a caption for background work, e.g. face enrollment photos.
+
+        Between turns the HUD is normally dark, so a caption alone would float
+        over an invisible orb; the working state is lit behind it until the
+        caption expires. During a conversation the turn owns the HUD state and
+        only the caption changes.
+        """
+        text = str(msg.get("text") or "").strip()
+        try:
+            ttl_s = float(msg.get("ttl_s") or _protocol.DEFAULT_STATUS_TTL_S)
+        except (TypeError, ValueError):
+            ttl_s = _protocol.DEFAULT_STATUS_TTL_S
+        log.info("Status: %s", text or "(cleared)")
+        if not in_conversation and self._mode == MODE_IDLE:
+            if text:
+                self._status_owns_hud = True
+                self.overlay.set_state("thinking")
+            elif self._status_owns_hud:
+                self._status_owns_hud = False
+                self.overlay.set_state("idle")
+        self._show_status(text, ttl_s)
 
     # -- proactive playback (greetings): only ever while idle ----------------
 
@@ -1065,6 +1118,9 @@ class JarvisClient:
                         self._listen_hint_s = float(msg.get("listen_s") or 0.0)
                     except (TypeError, ValueError):
                         self._listen_hint_s = 0.0
+                    self._say_status = str(
+                        msg.get(_protocol.SAY_STATUS_FIELD) or ""
+                    ).strip()
                     log.info("Reply: %s", self._last_say or "(empty)")
                 elif mtype == MSG_TTS_START:
                     await self._stop_thinking()
@@ -1083,7 +1139,15 @@ class JarvisClient:
                     self.overlay.set_state(
                         "listening" if self._listen_hint_s else "idle"
                     )
-                    self.overlay.set_status("")
+                    # A caption the reply asked for stays up while the person
+                    # answers; otherwise the working caption is cleared.
+                    self._show_status(
+                        self._say_status,
+                        max(self._listen_hint_s, _protocol.DEFAULT_STATUS_TTL_S)
+                        if self._say_status
+                        else 0.0,
+                    )
+                    self._say_status = ""
                     if self._barged:
                         result = RESULT_BARGE_IN
                     elif self._tts_bytes == 0:
@@ -1100,6 +1164,8 @@ class JarvisClient:
                     break
                 elif mtype == MSG_READY:
                     log.debug("The server sent ready")
+                elif mtype == MSG_STATUS:
+                    self._on_status_message(msg, in_conversation=True)
                 else:
                     log.warning("Unknown message type from the server: %r", mtype)
         except _BargedIn:

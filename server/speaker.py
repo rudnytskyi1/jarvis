@@ -1,9 +1,19 @@
 """The people registry: voices, faces and role-based permissions (SPEC v1.3/v1.4).
 
-Every utterance is embedded with resemblyzer (256-d d-vector) and compared by
-cosine similarity against the profiles enrolled in ``data/people.json``. Roles:
-``admin`` > ``trusted`` > ``user``; a voice that matches nobody is ``unknown``.
-Permissions are enforced here, server-side — the prompt only explains refusals.
+Every utterance is embedded with SpeechBrain's ECAPA-TDNN (192-d, v1.7) and
+compared by cosine similarity against the profiles enrolled in
+``data/people.json``. Roles: ``admin`` > ``trusted`` > ``user``; a voice that
+matches nobody is ``unknown``. Permissions are enforced here, server-side — the
+prompt only explains refusals.
+
+v1.7 — why not resemblyzer any more: measured on the room's own webcam mic, two
+different people (Anton against Drew) scored 0.659 on average and the same
+person against himself 0.666. The distributions sat on top of each other, so no
+threshold could ever tell them apart, and the configured 0.62 accepted almost
+anybody. On the same degraded speech ECAPA separates voices twice as widely
+(same 0.67 / different 0.17, equal error rate 2.0% against 4.1%). Embeddings
+from the two models are not comparable, so the file records which model made
+its voice vectors and stale ones are dropped on load.
 
 v1.4: one file holds both modalities —
 ``{"people": {name: {"role": str, "voice_embeddings": [[…]],
@@ -64,6 +74,33 @@ ENROLL_MIN_SAMPLES = 1 + ENROLL_EXTRA_SAMPLES
 MIN_ENROLL_SPEECH_S = 10.0
 #: Cap per person so the profile file cannot grow without bound.
 MAX_SAMPLES_PER_PERSON = 10
+
+#: v1.7: identifies the model that produced the stored voice vectors. Written
+#: at the top of people.json; vectors from any other model are meaningless to
+#: this one and are dropped on load (faces and roles are kept).
+VOICE_MODEL_ID = "speechbrain/spkrec-ecapa-voxceleb"
+#: What a file written before v1.7 (no voice_model key) was embedded with.
+LEGACY_VOICE_MODEL_ID = "resemblyzer"
+#: Where the ECAPA checkpoint is cached, relative to the repo root.
+VOICE_MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "spkrec-ecapa-voxceleb"
+#: v1.7: defaults calibrated for ECAPA on noisy room speech (equal error rate
+#: point measured at 0.44). The old resemblyzer defaults (0.72 / 0.70) mean
+#: nothing on this model's scale.
+DEFAULT_THRESHOLD = 0.40
+DEFAULT_MARGIN = 0.08
+#: A new sample for somebody being enrolled must sound like the samples they
+#: already gave, within this much slack under the identification threshold.
+#: Without it the NEXT utterance in the room was filed under their name no
+#: matter who said it, and one stray sentence from somebody else was enough to
+#: make that other person match the profile from then on.
+ENROLL_CONSISTENCY_SLACK = 0.05
+#: v1.7: enrollment audio is kept so a future, better model can be calibrated
+#: on the room's real voices instead of on guesses.
+VOICE_AUDIO_DIRNAME = "voices"
+
+
+class VoiceMismatch(ValueError):
+    """An enrollment sample that does not sound like the person being enrolled."""
 
 #: v1.6: names nobody should actually be enrolled under - the model must ask
 #: for the real name instead (enroll_voice and rename_person both reject them).
@@ -285,26 +322,36 @@ class VoiceRegistry:
     def __init__(
         self,
         data_dir: Path | str | None = None,
-        threshold: float = 0.72,
+        threshold: float = DEFAULT_THRESHOLD,
         min_speech_s: float = 0.8,
         enabled: bool = True,
+        margin: float = DEFAULT_MARGIN,
+        save_audio: bool = True,
     ) -> None:
         base = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
         self.path = base / PEOPLE_FILENAME
         #: Pre-v1.4 file; migrated into :attr:`path` when that one is absent.
         self.legacy_path = base / LEGACY_VOICES_FILENAME
+        self.audio_dir = base / VOICE_AUDIO_DIRNAME
         self.threshold = float(threshold)
+        #: v1.7: with two or more people enrolled, the best match must beat the
+        #: runner-up by at least this much - otherwise the voice is ambiguous and
+        #: nobody is named, rather than a coin toss deciding who holds admin.
+        self.margin = max(0.0, float(margin))
         self.min_speech_s = float(min_speech_s)
         self.enabled = bool(enabled)
+        self.save_audio = bool(save_audio)
         self._lock = threading.Lock()
         self._encoder: Any = None
         self._people: dict[str, dict[str, Any]] = {}
         self._load()
         log.info(
-            "People registry: %s (%d profile(s), voice threshold %.2f)",
+            "People registry: %s (%d profile(s), voice model %s, threshold %.2f, margin %.2f)",
             self.path,
             len(self._people),
+            VOICE_MODEL_ID,
             self.threshold,
+            self.margin,
         )
 
     # -- storage ---------------------------------------------------------
@@ -316,16 +363,30 @@ class VoiceRegistry:
         if not self.path.is_file() and self.legacy_path.is_file():
             source = self.legacy_path
             migrating = True
+        stale_voices = False
         try:
             if source.is_file():
                 data = json.loads(source.read_text(encoding="utf-8"))
                 people = data.get("people") if isinstance(data, dict) else None
                 if isinstance(people, dict):
                     self._people = normalize_people(people)
+                model = (
+                    str(data.get("voice_model") or LEGACY_VOICE_MODEL_ID)
+                    if isinstance(data, dict)
+                    else LEGACY_VOICE_MODEL_ID
+                )
+                if model != VOICE_MODEL_ID:
+                    stale_voices = self._drop_voice_vectors(model)
         except Exception:
             log.exception("Could not read %s - starting empty", source)
             self._people = {}
             return
+        if stale_voices and not migrating:
+            try:
+                with self._lock:
+                    self._save_locked()
+            except Exception:
+                log.exception("Could not rewrite %s without the stale voices", self.path)
         if not migrating:
             return
         try:
@@ -343,10 +404,39 @@ class VoiceRegistry:
             VOICE_KEY,
         )
 
+    def _drop_voice_vectors(self, model: str) -> bool:
+        """Forget voice vectors made by ``model``; faces and roles survive.
+
+        Returns True when anything was actually dropped.
+        """
+        dropped = {
+            name: len(person.get(VOICE_KEY) or [])
+            for name, person in self._people.items()
+            if person.get(VOICE_KEY)
+        }
+        for person in self._people.values():
+            person[VOICE_KEY] = []
+        if dropped:
+            log.warning(
+                "Voice samples in %s were made by %s, which %s cannot compare "
+                "against - dropped them, so these people must enroll their voice "
+                "again (faces and roles are kept): %s",
+                self.path,
+                model,
+                VOICE_MODEL_ID,
+                ", ".join(f"{name} ({count})" for name, count in sorted(dropped.items())),
+            )
+        return bool(dropped)
+
     def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"people": self._people}, ensure_ascii=False)
-        self.path.write_text(payload, encoding="utf-8")
+        payload = json.dumps(
+            {"voice_model": VOICE_MODEL_ID, "people": self._people}, ensure_ascii=False
+        )
+        # Write-then-replace: a crash mid-write must not leave half a registry.
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(self.path)
 
     def _person_locked(self, name: str) -> dict[str, Any]:
         """Return the person's record, creating it on first enrollment.
@@ -366,11 +456,26 @@ class VoiceRegistry:
     # -- encoder ---------------------------------------------------------
 
     def _get_encoder(self) -> Any:
-        if self._encoder is None:
-            from resemblyzer import VoiceEncoder  # heavy import, kept lazy
+        """Load ECAPA once, on the CPU.
 
-            self._encoder = VoiceEncoder("cpu", verbose=False)
-            log.info("resemblyzer voice encoder loaded")
+        CPU on purpose: the 5090 is already full (chat model, Whisper, and
+        other programs of the owner's), and a 20 M-parameter encoder embeds
+        three seconds of speech in well under 100 ms without it.
+        """
+        if self._encoder is None:
+            import torch  # noqa: PLC0415 - heavy, kept lazy
+            from speechbrain.inference.speaker import EncoderClassifier  # noqa: PLC0415
+            from speechbrain.utils.fetching import LocalStrategy  # noqa: PLC0415
+
+            torch.set_grad_enabled(False)
+            self._encoder = EncoderClassifier.from_hparams(
+                source=VOICE_MODEL_ID,
+                savedir=str(VOICE_MODEL_DIR),
+                run_opts={"device": "cpu"},
+                # Windows refuses symlinks without admin rights or developer mode.
+                local_strategy=LocalStrategy.COPY,
+            )
+            log.info("ECAPA voice encoder loaded (%s)", VOICE_MODEL_ID)
         return self._encoder
 
     def _embed(self, pcm_s16le: bytes, sample_rate: int) -> np.ndarray | None:
@@ -381,8 +486,76 @@ class VoiceRegistry:
             wav = np.interp(positions, np.arange(wav.size), wav).astype(np.float32)
         if wav.size / 16000.0 < self.min_speech_s:
             return None
-        embedding = self._get_encoder().embed_utterance(wav)
-        return np.asarray(embedding, dtype=np.float32)
+        import torch  # noqa: PLC0415 - already imported by _get_encoder
+
+        encoder = self._get_encoder()
+        with torch.no_grad():
+            embedding = encoder.encode_batch(torch.from_numpy(wav)[None])
+        vector = embedding.squeeze().cpu().numpy().astype(np.float32)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0 else None
+
+    def warm_up(self) -> None:
+        """Load the encoder now, so the first utterance does not wait ~4 s for it."""
+        if not self.enabled:
+            return
+        try:
+            self._get_encoder()
+        except Exception:  # noqa: BLE001 - identify() retries and logs properly
+            log.exception("Could not pre-load the voice encoder")
+
+    @staticmethod
+    def _centroid(vectors: list[list[float]]) -> np.ndarray | None:
+        """The unit-length mean of a person's voice samples.
+
+        Scoring against the centre of a profile rather than its single closest
+        sample is what keeps one bad sample from deciding everything: under the
+        old max-over-samples rule a single stray sentence filed under the wrong
+        name made its real owner match that profile forever.
+        """
+        if not vectors:
+            return None
+        matrix = np.asarray(vectors, dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        mean = (matrix / norms).mean(axis=0)
+        length = float(np.linalg.norm(mean))
+        return mean / length if length > 0 else None
+
+    def _scores_locked(self, embedding: np.ndarray) -> list[tuple[float, str]]:
+        """``(score, name)`` for every person with a voice profile, best first."""
+        scores: list[tuple[float, str]] = []
+        for name, person in self._people.items():
+            centre = self._centroid(person.get(VOICE_KEY) or [])
+            if centre is None or centre.shape != embedding.shape:
+                continue
+            scores.append((float(np.dot(centre, embedding)), name))
+        scores.sort(reverse=True)
+        return scores
+
+    def _save_audio(self, name: str, pcm_s16le: bytes, sample_rate: int) -> None:
+        """Keep an enrollment clip as a WAV next to the registry (best-effort)."""
+        if not self.save_audio or not pcm_s16le:
+            return
+        try:
+            import wave  # noqa: PLC0415 - stdlib, only needed here
+            from datetime import datetime  # noqa: PLC0415
+
+            folder = self.audio_dir / "".join(
+                ch if ch.isalnum() or ch in "-_ " else "_" for ch in name
+            ).strip()
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"{datetime.now():%Y%m%d-%H%M%S-%f}.wav"
+            with wave.open(str(target), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(int(sample_rate) or 16000)
+                handle.writeframes(pcm_s16le)
+            clips = sorted(folder.glob("*.wav"))
+            for old in clips[:-MAX_SAMPLES_PER_PERSON]:
+                old.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 - keeping audio is a convenience
+            log.debug("Could not keep the enrollment clip for %s", name, exc_info=True)
 
     # -- public API ------------------------------------------------------
 
@@ -408,26 +581,39 @@ class VoiceRegistry:
         if embedding is None:
             return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0
 
-        best_name, best_score = None, -1.0
         with self._lock:
-            for name, person in self._people.items():
-                vectors = person.get(VOICE_KEY) or []
-                for raw in vectors:
-                    vector = np.asarray(raw, dtype=np.float32)
-                    denom = float(np.linalg.norm(vector) * np.linalg.norm(embedding))
-                    if denom <= 0.0:
-                        continue
-                    score = float(np.dot(vector, embedding) / denom)
-                    if score > best_score:
-                        best_name, best_score = name, score
-            matched = best_name if best_score >= self.threshold else None
+            scores = self._scores_locked(embedding)
+            best_score, best_name = scores[0] if scores else (0.0, None)
+            runner_up = scores[1][0] if len(scores) > 1 else None
+            matched = None
+            reason = ""
+            if best_name is None:
+                reason = "no voice profiles"
+            elif best_score < self.threshold:
+                reason = f"below threshold {self.threshold:.2f}"
+            elif runner_up is not None and best_score - runner_up < self.margin:
+                reason = (
+                    f"too close to {scores[1][1]} ({runner_up:.2f}), "
+                    f"needs a {self.margin:.2f} lead"
+                )
+            else:
+                matched = best_name
             role = (
                 str(self._people[matched].get("role") or ROLE_USER)
                 if matched
                 else ROLE_UNKNOWN
             )
         name = matched or ROLE_UNKNOWN
-        log.info("Speaker: %s (score %.2f)", name, max(best_score, 0.0))
+        # Every candidate's score, so a wrong match can be diagnosed - and the
+        # thresholds recalibrated - from the log alone.
+        board = ", ".join(f"{who} {score:.2f}" for score, who in scores[:4]) or "-"
+        log.info(
+            "Speaker: %s (score %.2f)%s [%s]",
+            name,
+            max(best_score, 0.0),
+            f" - unknown: {reason}" if reason else "",
+            board,
+        )
         return name, role, max(best_score, 0.0)
 
     def enroll(self, name: str, pcm_s16le: bytes, sample_rate: int) -> tuple[str, str]:
@@ -450,7 +636,38 @@ class VoiceRegistry:
                 "the utterance was too short to make a voice sample - "
                 "ask the speaker to say a full sentence"
             )
+        note = ""
         with self._lock:
+            existing = self._people.get(cleaned)
+            own = self._centroid((existing or {}).get(VOICE_KEY) or [])
+            if own is not None and own.shape == embedding.shape:
+                similarity = float(np.dot(own, embedding))
+                floor = self.threshold - ENROLL_CONSISTENCY_SLACK
+                if similarity < floor:
+                    log.info(
+                        "Rejected a voice sample for %s: it scored %.2f against "
+                        "their own samples (needs %.2f) - probably somebody else",
+                        cleaned, similarity, floor,
+                    )
+                    raise VoiceMismatch(
+                        f"that did not sound like {cleaned} (similarity "
+                        f"{similarity:.2f}, needs {floor:.2f}) - it was probably "
+                        f"somebody else speaking. Ask {cleaned} to say the next "
+                        "sentence themselves while nobody else talks"
+                    )
+            else:
+                # First sample: say so if this voice is already somebody else's.
+                others = [
+                    (score, who)
+                    for score, who in self._scores_locked(embedding)
+                    if who != cleaned
+                ]
+                if others and others[0][0] >= self.threshold + self.margin:
+                    note = (
+                        f"this voice already sounds a lot like {others[0][1]} "
+                        f"({others[0][0]:.2f}) - make sure it really is "
+                        f"{cleaned} speaking"
+                    )
             person = self._person_locked(cleaned)
             vectors = person[VOICE_KEY]
             vectors.append([round(float(v), 6) for v in embedding.tolist()])
@@ -458,8 +675,10 @@ class VoiceRegistry:
             self._save_locked()
             role = str(person.get("role") or ROLE_USER)
             count = len(vectors)
+        self._save_audio(cleaned, pcm_s16le, sample_rate)
         log.info("Enrolled voice sample %d for %s (%s)", count, cleaned, role)
-        return role, f"sample {count} stored"
+        status = f"sample {count} stored"
+        return role, f"{status} - {note}" if note else status
 
     # -- faces (SPEC v1.4) -----------------------------------------------
 
@@ -594,6 +813,11 @@ __all__ = [
     "MIN_ENROLL_SPEECH_S",
     "MAX_SAMPLES_PER_PERSON",
     "PLACEHOLDER_NAMES",
+    "VOICE_MODEL_ID",
+    "DEFAULT_THRESHOLD",
+    "DEFAULT_MARGIN",
+    "ENROLL_CONSISTENCY_SLACK",
+    "VoiceMismatch",
     "SAFE_PC_COMMANDS",
     "check_permission",
     "normalize_people",

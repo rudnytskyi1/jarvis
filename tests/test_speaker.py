@@ -15,6 +15,7 @@ from server.speaker import (
     ROLE_UNKNOWN,
     ROLE_USER,
     VOICE_KEY,
+    VOICE_MODEL_ID,
     VoiceRegistry,
     check_permission,
     enrollment_complete,
@@ -125,14 +126,17 @@ def test_people_json_migration_from_voices_json(tmp_path):
 
     written = json.loads((tmp_path / PEOPLE_FILENAME).read_text(encoding="utf-8"))
     anton = written["people"]["Anton"]
-    assert anton[VOICE_KEY] == [[1.0, 0.0, 0.0]]  # "embeddings" renamed
+    assert "embeddings" not in anton  # the v1.3 key is gone
     assert anton[FACE_KEY] == []  # faces start empty
-    assert "embeddings" not in anton
+    # v1.7: a v1.3 file can only have been made by resemblyzer, whose vectors
+    # the ECAPA model cannot compare against - the people and their roles
+    # migrate, their voices have to be enrolled again.
+    assert anton[VOICE_KEY] == []
+    assert written["voice_model"] == VOICE_MODEL_ID
 
-    # The migrated voice sample still identifies its owner.
     reg._embed = lambda pcm, sr: np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
-    name, role, score = reg.identify(PCM, 16000)
-    assert name == "Anton" and role == ROLE_ADMIN and score > 0.99
+    name, _, _ = reg.identify(PCM, 16000)
+    assert name == ROLE_UNKNOWN
 
 
 def test_people_json_wins_over_a_stale_voices_json(tmp_path):
