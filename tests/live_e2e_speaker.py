@@ -1,8 +1,8 @@
-"""Live e2e for speaker recognition and roles against localhost:8765.
+﻿"""Live e2e for speaker recognition and roles against localhost:8765.
 
 Two Silero voices play two people: en_0 enrolls as TestOwner (first person =>
 admin), en_29 is a stranger whose run_command must be denied server-side.
-Cleans data/voices.json afterwards (the server must be restarted after this
+Cleans data/people.json afterwards (the server must be restarted after this
 script so its in-memory registry is fresh again).
 """
 import asyncio
@@ -17,7 +17,7 @@ import websockets
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 URL = "ws://127.0.0.1:8765/ws"
-VOICES = REPO / "data" / "voices.json"
+VOICES = REPO / "data" / "people.json"
 
 _model = None
 
@@ -65,7 +65,7 @@ async def utter(ws, pcm: bytes) -> dict:
 
 async def main() -> int:
     if VOICES.exists():
-        print("ABORT: data/voices.json already exists - not touching real profiles")
+        print("ABORT: data/people.json already exists - not touching real profiles")
         return 2
 
     checks = []
@@ -89,8 +89,8 @@ async def main() -> int:
         data = json.loads(VOICES.read_text(encoding="utf-8"))
         person = data.get("people", {}).get("Test Owner", {})
         check("Test Owner is admin", person.get("role") == "admin", str(person.get("role")))
-        check("3 voice samples stored", len(person.get("embeddings", [])) == 3,
-              str(len(person.get("embeddings", []))))
+        check("3 voice samples stored", len(person.get("voice_embeddings", [])) == 3,
+              str(len(person.get("voice_embeddings", []))))
 
         # Stranger asks for a command: must be denied server-side.
         r = await utter(ws, synth(
@@ -114,10 +114,11 @@ async def main() -> int:
               f"<- {entry.get('transcript', '')[:60]!r}")
 
     VOICES.unlink(missing_ok=True)
-    print("cleaned data/voices.json")
+    print("cleaned data/people.json")
     print(("PASSED" if all(checks) else "FAILED") + f" {sum(checks)}/{len(checks)}")
     return 0 if all(checks) else 1
 
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
+

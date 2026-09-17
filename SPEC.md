@@ -63,6 +63,48 @@ v1.3 — **speaker recognition and roles**:
   speaker). `set_role {"name": str, "role": "admin"|"trusted"|"user"}` (admin
   only) changes a role. Dialog-log entries gain `speaker` and `speaker_score`.
 
+v1.4 — **camera, faces, presence** (the C920 on the room PC):
+- **Unified people registry**: `data/voices.json` becomes `data/people.json` —
+  `{"people": {name: {"role": str, "voice_embeddings": [[…]], "face_embeddings":
+  [[…]]}}}`. `server/speaker.py`'s registry class owns the file and the roles
+  (voice matching unchanged, key `embeddings` renamed to `voice_embeddings`);
+  `server/face.py` (insightface buffalo_l via onnxruntime, CUDA when available)
+  adds face detection + 512-d embeddings and cosine matching against
+  `face_embeddings` with its own threshold.
+- **Client camera service** (`client/camera.py`): OpenCV capture of the C920 +
+  Ultralytics YOLO (yolo11n) at ~5–10 fps on the 3060 Ti. It reports STATE, not
+  video: `{"type": "camera_state", "persons": int, "objects": {label: count}}`
+  sent when the picture changes (debounced, ≥2 s apart). While at least one
+  person is visible it also pushes ONE frame every `face_check_interval_s`
+  (default 5 s): `{"type": "camera_frame", "id": "p<N>", "reason": "presence",
+  "w": int, "h": int}` + one binary JPEG (largest side ≤1280). The server may
+  also pull a frame with `{"type": "camera_request", "id": str}` (client answers
+  like a screenshot, `reason: "request"`; `camera_error` mirrors
+  `screenshot_error`). Camera failures must never break the voice pipeline.
+- **Server presence tracker**: face-matches every presence frame and keeps
+  `{name_or_unknown: last_seen}`; entries expire after `presence_ttl_s`. The
+  system prompt gains a `{presence}` placeholder — "Present in the room:
+  Anton (admin), 1 unknown person" or "(camera sees nobody)".
+- **Greeting**: when an unknown face has been present ≥`greet_after_s` and no
+  conversation is active, the server generates ONE short greeting through the
+  LLM (offering voice enrollment once, per persona rules) and pushes it as an
+  unsolicited `say` + `tts_start…tts_end` block. The client therefore reads the
+  socket BETWEEN utterances too and plays such proactive audio only when idle;
+  at most one greeting per `greeting_cooldown_s`.
+- **New server tools**: `look_at_camera {"query": str}` — pull a camera frame,
+  answer through the vision model (same pipeline and permissions as
+  `look_at_screen`). `enroll_face {"name": str}` — pull a frame, embed the
+  LARGEST face, add it to the person (creating them like `enroll_voice`;
+  everyone may enroll themselves). After voice enrollment completes, the model
+  offers `enroll_face` ("look at the camera for a second").
+- Config §6: `server.face.{enabled, threshold, presence_ttl_s, greet_after_s,
+  greeting_cooldown_s}` (true, 0.45, 30.0, 10.0, 300.0) and
+  `client.camera.{enabled, index, fps, model, face_check_interval_s}`
+  (true, 0, 5, "yolo11n.pt", 5.0). Camera deps live in
+  `client/requirements-camera.txt` (ultralytics, opencv-python; torch with CUDA
+  installed separately) so the base client stays light; without them the client
+  logs one clear warning and runs voice-only.
+
 Both machines check out the same repo. One `config.yaml` (copied from
 `config.example.yaml`) with `server:` and `client:` sections; each process reads its
 own section. Python 3.11+ (conda env `jarvis` exists on the brain PC:

@@ -4,6 +4,11 @@ Thin wrapper around the ``websockets`` library: connect with auto-reconnect
 (3 s backoff, ``hello`` re-sent on every (re)connect), send JSON control
 frames and binary payloads (microphone PCM, screenshot JPEG), receive
 messages. Text frames come back as parsed ``dict``, binary frames as ``bytes``.
+
+Since v1.4 exactly one task — the reader in :mod:`client.main` — calls
+:meth:`WSClient.recv` for the lifetime of a connection (the server may talk
+between utterances: proactive greetings, ``camera_request``), so it reads with
+:data:`WAIT_FOREVER` and the per-reply deadline lives in that reader's consumer.
 """
 
 from __future__ import annotations
@@ -33,6 +38,13 @@ READY_TIMEOUT_S = 10.0
 #: worst case between two messages: one vision call (120 s in ``server/vision.py``)
 #: followed by one LLM completion (180 s in ``server/llm.py``), plus margin.
 RECV_TIMEOUT_S = 420.0
+#: ``recv(timeout=WAIT_FOREVER)`` blocks until a frame arrives or the socket
+#: dies. v1.4 reads the socket permanently (proactive greetings, camera
+#: requests), and an idle room is silent for hours: the deadline that guards one
+#: utterance belongs to the caller waiting for that reply, not to the reader.
+#: A dead peer is still noticed — the library's ping keepalive (20 s) closes the
+#: connection, which makes the pending ``recv`` raise.
+WAIT_FOREVER = 0.0
 
 Message = Union[Dict[str, Any], bytes]
 
@@ -73,6 +85,17 @@ class WSClient:
         if state is not None:
             return getattr(state, "name", "") == "OPEN"
         return not getattr(conn, "closed", False)  # pragma: no cover - legacy
+
+    def drop(self) -> None:
+        """Close the current connection so the next call reconnects.
+
+        Used when the caller — not the socket — decides the link is dead, e.g.
+        the reply to an utterance never arrived: closing here makes the reader
+        task end and ``ensure_connected`` build a fresh connection.
+        """
+        if self._conn is not None:
+            log.debug("Dropping the connection on request")
+        self._drop()
 
     def _drop(self) -> None:
         conn, self._conn = self._conn, None
@@ -177,14 +200,21 @@ class WSClient:
             raise WSDisconnected(f"send failed: {exc}") from exc
 
     async def recv(self, timeout: Optional[float] = None) -> Message:
-        """Next server message: parsed dict for text frames, bytes for binary."""
+        """Next server message: parsed dict for text frames, bytes for binary.
+
+        ``timeout`` is seconds, ``None`` means :data:`RECV_TIMEOUT_S` and
+        :data:`WAIT_FOREVER` (0 or less) waits for as long as the socket lives.
+        """
         conn = self._conn
         if conn is None:
             raise WSDisconnected("no connection")
-        wait = self.recv_timeout if timeout is None else timeout
+        wait = self.recv_timeout if timeout is None else float(timeout)
         while True:
             try:
-                raw = await asyncio.wait_for(conn.recv(), timeout=wait)
+                if wait <= 0:
+                    raw = await conn.recv()
+                else:
+                    raw = await asyncio.wait_for(conn.recv(), timeout=wait)
             except (asyncio.TimeoutError, TimeoutError) as exc:
                 self._drop()
                 raise WSDisconnected("the server is not responding") from exc

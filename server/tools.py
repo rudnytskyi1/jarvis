@@ -1,14 +1,16 @@
 """OpenAI-style tool schemas exposed to the LLM, plus protocol helpers (SPEC §5).
 
-Seven tools. Execution matrix:
+Eleven tools. Execution matrix:
 
 * ``set_light``, ``set_switch``, ``pc_control``, ``run_command`` are CLIENT
   actions — forwarded to the room PC as protocol action items with the model's
   arguments verbatim; the tool result is the client's ``action_result``.
-* ``look_at_screen``, ``click_screen`` and ``remember`` run SERVER-side and are
-  never forwarded verbatim. ``click_screen`` runs a screenshot through the
-  vision model in ``server/app.py`` and then sends the client one
-  :data:`MOUSE_CLICK_TOOL` action with normalized coordinates.
+* ``look_at_screen``, ``click_screen``, ``remember``, ``enroll_voice``,
+  ``set_role`` and v1.4's ``look_at_camera`` / ``enroll_face`` run SERVER-side
+  and are never forwarded verbatim. ``click_screen`` runs a screenshot through
+  the vision model in ``server/app.py`` and then sends the client one
+  :data:`MOUSE_CLICK_TOOL` action with normalized coordinates; the two camera
+  tools pull a frame with a ``camera_request`` and answer from it.
 
 The same schema list is used by both LLM providers: Ollama's native ``/api/chat``
 accepts the OpenAI tool format unchanged.
@@ -306,6 +308,64 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "look_at_camera",
+            "description": (
+                "Look through the room camera — the webcam pointed at the room, not "
+                "the PC screen. Use it for every question about the physical room and "
+                "the people in it: who is here, how many people, what someone is "
+                "holding or wearing, whether the door or the window is open, what the "
+                "room looks like right now. Use look_at_screen instead when the "
+                "question is about what is on the computer screen. Never guess what "
+                "the camera would show: if you have not looked, you do not know. "
+                + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "What to look for or answer, as a full question, e.g. "
+                            "'How many people are in the room and what are they doing?' "
+                            "or 'What is the person in front of the camera holding?'"
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "enroll_face",
+            "description": (
+                "Remember what somebody LOOKS like, so the camera recognizes them "
+                "later. Ask them to look at the camera for a second, then call it with "
+                "their name; the largest face in the current camera frame is stored. "
+                "Offer it right after their voice enrollment finished, and only with "
+                "their consent. Anyone may be enrolled, including a guest. If the "
+                "result says no face was visible, ask them to face the camera and try "
+                "once more. " + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "The person's name, spelled exactly as in their voice "
+                            "profile when they already have one, e.g. 'Anton'."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_role",
             "description": (
                 "Change an enrolled person's role. Only an admin speaker may do this "
@@ -334,8 +394,18 @@ CLIENT_TOOLS: frozenset[str] = frozenset(
 )
 
 #: Tools executed on the server; never sent to the client as they are called.
+#: ``look_at_camera`` and ``enroll_face`` (v1.4) pull a camera frame with a
+#: ``camera_request`` and then run the vision model / the face engine here.
 SERVER_TOOLS: frozenset[str] = frozenset(
-    {"look_at_screen", "click_screen", "remember", "enroll_voice", "set_role"}
+    {
+        "look_at_screen",
+        "click_screen",
+        "remember",
+        "enroll_voice",
+        "set_role",
+        "look_at_camera",
+        "enroll_face",
+    }
 )
 
 #: Client action produced by the server-side ``click_screen`` pipeline (SPEC §5,

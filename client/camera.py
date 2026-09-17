@@ -1,0 +1,693 @@
+"""Room camera service: presence, object counts and face frames (SPEC v1.4).
+
+The C920 on the room PC is the assistant's eyes. This module reports STATE, not
+video:
+
+* an OpenCV capture thread keeps the newest frame of ``cfg.client.camera.index``
+  in memory (draining the driver buffer so the frame is always fresh),
+* a second thread runs Ultralytics YOLO (``cfg.client.camera.model``) over that
+  frame ``cfg.client.camera.fps`` times per second and counts the labels it sees
+  with a confidence of at least :data:`CONF_THRESHOLD`,
+* whenever the picture changes it sends ``camera_state`` (debounced, at least
+  :data:`STATE_DEBOUNCE_S` apart),
+* while at least one person is visible it pushes ONE JPEG every
+  ``cfg.client.camera.face_check_interval_s`` as ``camera_frame``
+  (``reason: "presence"``, id ``p<N>``) so the server can match faces,
+* and it answers the server's ``camera_request`` from the latest frame
+  (``reason: "request"``), the way :mod:`client.screen` answers a
+  ``screenshot_request``.
+
+Everything about the camera is optional. ``cv2`` and ``ultralytics`` are
+imported lazily inside the worker threads, and any failure — missing packages,
+a busy or absent device, a model that will not load — logs exactly ONE warning,
+flips :attr:`CameraService.enabled` to ``False`` and leaves the voice pipeline
+completely untouched.
+
+Wiring (see :mod:`client.main`)::
+
+    camera = CameraService(cfg.client.camera)
+    camera.start(loop, ws.send_json, ws.send_bytes, send_lock=wire_lock)
+    ...
+    await camera.serve_request(request_id)   # answers camera_request
+    camera.stop()
+
+``send_lock`` is the client's "one binary sequence at a time" lock: the server
+routes incoming binary frames by the header that announced them, so a camera
+JPEG must never slip between ``utterance_start`` and ``utterance_end`` or into
+the middle of a screenshot. Presence pushes are simply skipped while that lock
+is held (the user is talking — the server is not looking at faces anyway).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+import time
+from collections.abc import Mapping
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+
+from common.protocol import (
+    CAMERA_FORMAT,
+    CAMERA_REASON_PRESENCE,
+    CAMERA_REASON_REQUEST,
+    MSG_CAMERA_ERROR,
+    MSG_CAMERA_FRAME,
+    MSG_CAMERA_REQUEST,
+    MSG_CAMERA_STATE,
+)
+
+log = logging.getLogger(__name__)
+
+# --- tuning ---------------------------------------------------------------
+#: Longest side of a pushed frame (SPEC v1.4: JPEG, largest side <= 1280).
+MAX_SIDE_PX = 1280
+#: JPEG quality of the pushed frames.
+JPEG_QUALITY = 80
+#: A changed picture is announced at most this often (SPEC v1.4: >= 2 s apart).
+STATE_DEBOUNCE_S = 2.0
+#: Detections below this confidence are ignored when counting people/objects.
+CONF_THRESHOLD = 0.5
+#: Clamp for ``cfg.client.camera.fps``.
+MIN_FPS = 0.2
+MAX_FPS = 30.0
+#: A frame older than this is not worth sending to the server any more.
+STALE_FRAME_S = 10.0
+#: How many consecutive failed ``VideoCapture.read()`` calls mean the device is
+#: gone (a C920 briefly stumbles when another app grabs it).
+MAX_READ_FAILURES = 30
+#: How long :meth:`CameraService.stop` waits for its worker threads.
+JOIN_TIMEOUT_S = 3.0
+
+SendJson = Callable[[Dict[str, Any]], Awaitable[None]]
+SendBytes = Callable[[bytes], Awaitable[None]]
+
+__all__ = [
+    "MSG_CAMERA_STATE",
+    "MSG_CAMERA_FRAME",
+    "MSG_CAMERA_REQUEST",
+    "MSG_CAMERA_ERROR",
+    "CAMERA_REASON_PRESENCE",
+    "CAMERA_REASON_REQUEST",
+    "MAX_SIDE_PX",
+    "JPEG_QUALITY",
+    "STATE_DEBOUNCE_S",
+    "CONF_THRESHOLD",
+    "CameraUnavailable",
+    "CameraService",
+]
+
+
+class CameraUnavailable(RuntimeError):
+    """The camera stack cannot be used (missing packages, no device, no model)."""
+
+
+def _attr(obj: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` from a pydantic model / dataclass / mapping."""
+    if obj is None:
+        return default
+    if isinstance(obj, Mapping):
+        value = obj.get(name, default)
+    else:
+        value = getattr(obj, name, default)
+    return default if value is None else value
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class CameraService:
+    """Capture + YOLO worker pair that reports presence over the WebSocket.
+
+    The object is always constructible: passing ``None`` (no ``camera`` section
+    in the config) or a section with ``enabled: false`` yields a service whose
+    :attr:`enabled` is ``False`` and whose :meth:`start` does nothing but keep
+    the send callbacks, so an incoming ``camera_request`` still gets a proper
+    ``camera_error`` instead of silence.
+    """
+
+    def __init__(self, cfg_camera: Any = None) -> None:
+        self._enabled = bool(_attr(cfg_camera, "enabled", False))
+        self.index = _as_int(_attr(cfg_camera, "index", 0), 0)
+        self.fps = min(MAX_FPS, max(MIN_FPS, _as_float(_attr(cfg_camera, "fps", 5), 5.0)))
+        self.model_name = str(_attr(cfg_camera, "model", "yolo11n.pt") or "yolo11n.pt")
+        self.face_check_interval_s = max(
+            0.5, _as_float(_attr(cfg_camera, "face_check_interval_s", 5.0), 5.0)
+        )
+
+        # --- wiring to the event loop ---
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._send_json: Optional[SendJson] = None
+        self._send_bytes: Optional[SendBytes] = None
+        self._send_lock: Optional[asyncio.Lock] = None
+
+        # --- threads ---
+        self._stop_event = threading.Event()
+        self._capture_ready = threading.Event()
+        self._capture_thread: Optional[threading.Thread] = None
+        self._infer_thread: Optional[threading.Thread] = None
+
+        # --- latest frame ---
+        self._frame_lock = threading.Lock()
+        self._frame: Any = None
+        self._frame_ts = 0.0
+        self._cv2: Any = None
+
+        # --- reporting state ---
+        self._warned = False
+        self._detect_errors = 0
+        self._send_errors = 0
+        self._frame_seq = 0
+        self._sent_state: Optional[Tuple[int, Tuple[Tuple[str, int], ...]]] = None
+        self._sent_state_at = 0.0
+        self._last_presence_push = 0.0
+
+    # ------------------------------------------------------------------
+    # state
+    # ------------------------------------------------------------------
+    @property
+    def enabled(self) -> bool:
+        """``False`` when the camera is off in the config or has failed.
+
+        The voice pipeline never looks at anything else: a ``False`` here means
+        "there is no camera on this machine", nothing more.
+        """
+        return self._enabled
+
+    @property
+    def running(self) -> bool:
+        """True while the capture thread is alive and delivering frames."""
+        thread = self._capture_thread
+        return bool(self._enabled and thread is not None and thread.is_alive())
+
+    def _fail(self, message: str) -> None:
+        """Disable the camera permanently, logging exactly one warning."""
+        self._enabled = False
+        self._stop_event.set()
+        if not self._warned:
+            self._warned = True
+            log.warning("Camera disabled: %s. The voice assistant keeps working.", message)
+        else:  # pragma: no cover - a second failure after the first warning
+            log.debug("Camera failure after it was already disabled: %s", message)
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+    def start(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        send_json: SendJson,
+        send_bytes: SendBytes,
+        send_lock: Optional[asyncio.Lock] = None,
+    ) -> bool:
+        """Start the capture and detection threads.
+
+        :param loop: the client's event loop; the worker threads schedule their
+            sends onto it with ``run_coroutine_threadsafe``.
+        :param send_json: coroutine function sending one JSON control frame.
+        :param send_bytes: coroutine function sending one binary frame.
+        :param send_lock: optional lock held around every header+binary pair so
+            camera frames cannot interleave with streamed microphone audio.
+        :returns: ``True`` if the threads were started.
+
+        Returns immediately: importing ``ultralytics`` and opening the device
+        take seconds and happen inside the workers, so the wake word is live
+        while the camera is still warming up.
+        """
+        # Kept even when disabled: camera_request must still get an answer.
+        self._loop = loop
+        self._send_json = send_json
+        self._send_bytes = send_bytes
+        self._send_lock = send_lock
+
+        if not self._enabled:
+            log.info("Camera is disabled in the config - running voice only")
+            return False
+        if self._capture_thread is not None and self._capture_thread.is_alive():
+            return True
+
+        self._stop_event.clear()
+        self._capture_ready.clear()
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, name="jarvis-camera-capture", daemon=True
+        )
+        self._infer_thread = threading.Thread(
+            target=self._infer_loop, name="jarvis-camera-yolo", daemon=True
+        )
+        self._capture_thread.start()
+        self._infer_thread.start()
+        log.info(
+            "Camera service starting: device index %d, %s at %.1f fps, "
+            "one presence frame every %.1f s",
+            self.index,
+            self.model_name,
+            self.fps,
+            self.face_check_interval_s,
+        )
+        return True
+
+    def stop(self) -> None:
+        """Stop both threads and release the device (safe to call twice)."""
+        self._stop_event.set()
+        self._capture_ready.set()
+        for thread in (self._infer_thread, self._capture_thread):
+            if thread is None or not thread.is_alive():
+                continue
+            thread.join(timeout=JOIN_TIMEOUT_S)
+            if thread.is_alive():  # pragma: no cover - a stuck driver call
+                log.debug("Camera thread %s did not stop in time", thread.name)
+        if self._capture_thread is not None or self._infer_thread is not None:
+            log.info("Camera service stopped")
+        self._capture_thread = None
+        self._infer_thread = None
+        with self._frame_lock:
+            self._frame = None
+            self._frame_ts = 0.0
+
+    # ------------------------------------------------------------------
+    # lazy imports
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _import_cv2() -> Any:
+        # Not just ImportError: a half-installed OpenCV raises DLL/numpy errors.
+        try:
+            import cv2  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise CameraUnavailable(
+                "OpenCV is not available (pip install -r client/requirements-camera.txt): "
+                f"{exc}"
+            ) from exc
+        return cv2
+
+    @staticmethod
+    def _import_yolo() -> Any:
+        try:
+            from ultralytics import YOLO  # type: ignore
+        except Exception as exc:  # noqa: BLE001 - torch/ultralytics import errors
+            raise CameraUnavailable(
+                "Ultralytics is not available (pip install -r client/requirements-camera.txt): "
+                f"{exc}"
+            ) from exc
+        return YOLO
+
+    # ------------------------------------------------------------------
+    # capture thread
+    # ------------------------------------------------------------------
+    def _open_capture(self, cv2: Any) -> Any:
+        """Open ``cfg.camera.index``, retrying with DirectShow on Windows."""
+        capture = cv2.VideoCapture(self.index)
+        if capture is not None and capture.isOpened():
+            return capture
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        # MSMF (the Windows default) refuses some UVC webcams that DirectShow
+        # opens without complaint, so the fallback is worth the extra attempt.
+        backend = getattr(cv2, "CAP_DSHOW", None)
+        if backend is not None:
+            capture = cv2.VideoCapture(self.index, backend)
+            if capture is not None and capture.isOpened():
+                log.debug("Camera %d opened through the DirectShow backend", self.index)
+                return capture
+            if capture is not None:
+                try:
+                    capture.release()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        raise CameraUnavailable(
+            f"camera index {self.index} could not be opened (is it unplugged or in use?)"
+        )
+
+    def _capture_loop(self) -> None:
+        capture = None
+        try:
+            try:
+                cv2 = self._import_cv2()
+                capture = self._open_capture(cv2)
+                self._cv2 = cv2
+            except CameraUnavailable as exc:
+                self._fail(str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001 - never let a driver kill the client
+                self._fail(f"could not start the camera: {exc}")
+                return
+            finally:
+                self._capture_ready.set()
+
+            log.info("Camera %d opened", self.index)
+            failures = 0
+            while not self._stop_event.is_set():
+                try:
+                    ok, frame = capture.read()
+                except Exception as exc:  # noqa: BLE001 - driver hiccup
+                    ok, frame = False, None
+                    log.debug("Camera read error: %s", exc)
+                if not ok or frame is None:
+                    failures += 1
+                    if failures >= MAX_READ_FAILURES:
+                        self._fail("the camera stopped delivering frames")
+                        return
+                    self._stop_event.wait(0.2)
+                    continue
+                failures = 0
+                with self._frame_lock:
+                    self._frame = frame
+                    self._frame_ts = time.monotonic()
+                # The driver queue must stay drained (otherwise every frame we
+                # look at is seconds old), so this loop runs at camera speed and
+                # only yields the GIL for a moment.
+                time.sleep(0.005)
+        finally:
+            self._capture_ready.set()
+            if capture is not None:
+                try:
+                    capture.release()
+                except Exception as exc:  # pragma: no cover - teardown
+                    log.debug("Error while releasing the camera: %s", exc)
+
+    def _latest_frame(self) -> Tuple[Any, float]:
+        """The newest captured frame and its age in seconds (``None``, ``inf``)."""
+        with self._frame_lock:
+            frame = self._frame
+            ts = self._frame_ts
+        if frame is None:
+            return None, float("inf")
+        return frame, max(0.0, time.monotonic() - ts)
+
+    # ------------------------------------------------------------------
+    # detection thread
+    # ------------------------------------------------------------------
+    def _infer_loop(self) -> None:
+        self._capture_ready.wait()
+        if self._stop_event.is_set() or not self._enabled:
+            return
+        try:
+            yolo_class = self._import_yolo()
+            model = yolo_class(self.model_name)
+        except CameraUnavailable as exc:
+            self._fail(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - weights download / CUDA errors
+            self._fail(f"the YOLO model {self.model_name!r} could not be loaded: {exc}")
+            return
+        log.info("YOLO model %s loaded - watching the room", self.model_name)
+
+        interval = 1.0 / self.fps
+        while not self._stop_event.is_set():
+            started = time.monotonic()
+            frame, age = self._latest_frame()
+            if frame is not None and age <= STALE_FRAME_S:
+                try:
+                    persons, objects = self._detect(model, frame)
+                except Exception as exc:  # noqa: BLE001 - inference must not kill us
+                    self._detect_errors += 1
+                    if self._detect_errors == 1:
+                        log.warning("YOLO inference failed: %s", exc)
+                    else:
+                        log.debug("YOLO inference failed (%d): %s", self._detect_errors, exc)
+                    if self._detect_errors >= 10:
+                        self._fail("YOLO inference keeps failing")
+                        return
+                else:
+                    self._detect_errors = 0
+                    self._publish_state(persons, objects)
+                    if persons >= 1:
+                        self._maybe_push_presence(frame)
+            remaining = interval - (time.monotonic() - started)
+            if remaining > 0:
+                self._stop_event.wait(remaining)
+
+    def _detect(self, model: Any, frame: Any) -> Tuple[int, Dict[str, int]]:
+        """Count people and objects in one frame by YOLO class name."""
+        results = model.predict(
+            source=frame,
+            conf=CONF_THRESHOLD,
+            verbose=False,
+        )
+        counts: Dict[str, int] = {}
+        for result in results or []:
+            names = getattr(result, "names", None) or {}
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            classes = getattr(boxes, "cls", None)
+            confidences = getattr(boxes, "conf", None)
+            if classes is None or confidences is None:
+                continue
+            class_list = classes.tolist() if hasattr(classes, "tolist") else list(classes)
+            conf_list = (
+                confidences.tolist() if hasattr(confidences, "tolist") else list(confidences)
+            )
+            for class_id, confidence in zip(class_list, conf_list):
+                if float(confidence) < CONF_THRESHOLD:
+                    continue
+                index = int(class_id)
+                label = str(names.get(index, index) if isinstance(names, dict) else index)
+                counts[label] = counts.get(label, 0) + 1
+        persons = counts.pop("person", 0)
+        return int(persons), counts
+
+    # ------------------------------------------------------------------
+    # camera_state (SPEC v1.4)
+    # ------------------------------------------------------------------
+    def _publish_state(self, persons: int, objects: Dict[str, int]) -> None:
+        """Send ``camera_state`` when the picture changed, at most every 2 s.
+
+        YOLO flickers object counts (a bottle drifting between 1 and 2 across
+        frames), which used to re-announce the "change" every debounce window.
+        A PERSON-count change is reported at once; an object-only change must
+        stay identical for two consecutive checks before it is sent.
+        """
+        key = (int(persons), tuple(sorted(objects.items())))
+        if key == self._sent_state:
+            self._candidate_state = None
+            return
+        now = time.monotonic()
+        if now - self._sent_state_at < STATE_DEBOUNCE_S:
+            # Too soon after the last report: the state is recomputed every tick,
+            # so the change is simply announced by one of the next ones. Short
+            # flickers (a misdetected chair) never reach the server at all.
+            return
+        persons_changed = self._sent_state is None or key[0] != self._sent_state[0]
+        if not persons_changed:
+            if key != getattr(self, "_candidate_state", None):
+                self._candidate_state = key
+                return
+        self._candidate_state = None
+        self._sent_state = key
+        self._sent_state_at = now
+        payload = {
+            "type": MSG_CAMERA_STATE,
+            "persons": int(persons),
+            "objects": {label: int(count) for label, count in sorted(objects.items())},
+        }
+        log.info(
+            "Camera: %d person(s), objects: %s",
+            persons,
+            ", ".join(f"{label} x{count}" for label, count in sorted(objects.items())) or "none",
+        )
+        self._submit(self._send_state(payload))
+
+    async def _send_state(self, payload: Dict[str, Any]) -> None:
+        send_json = self._send_json
+        if send_json is None:
+            return
+        try:
+            await send_json(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dead socket is normal here
+            self._note_send_failure("camera_state", exc)
+
+    # ------------------------------------------------------------------
+    # camera_frame (SPEC v1.4)
+    # ------------------------------------------------------------------
+    def _maybe_push_presence(self, frame: Any) -> None:
+        now = time.monotonic()
+        if now - self._last_presence_push < self.face_check_interval_s:
+            return
+        self._last_presence_push = now
+        try:
+            jpeg, width, height = self._encode(frame)
+        except Exception as exc:  # noqa: BLE001 - encoding must not kill the thread
+            log.debug("Could not encode the presence frame: %s", exc)
+            return
+        self._frame_seq += 1
+        frame_id = f"p{self._frame_seq}"
+        self._submit(
+            self._send_frame(frame_id, CAMERA_REASON_PRESENCE, jpeg, width, height, skip_if_busy=True)
+        )
+
+    def _encode(self, frame: Any) -> Tuple[bytes, int, int]:
+        """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80."""
+        cv2 = self._cv2
+        if cv2 is None:  # pragma: no cover - only reachable before the first frame
+            raise CameraUnavailable("OpenCV is not loaded")
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        if width <= 0 or height <= 0:
+            raise CameraUnavailable("the camera returned an empty frame")
+        longest = max(width, height)
+        if longest > MAX_SIDE_PX:
+            scale = MAX_SIDE_PX / float(longest)
+            width = max(1, int(round(width * scale)))
+            height = max(1, int(round(height * scale)))
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        ok, buffer = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        )
+        if not ok:
+            raise CameraUnavailable("JPEG encoding failed")
+        return bytes(buffer.tobytes() if hasattr(buffer, "tobytes") else buffer), width, height
+
+    async def _send_frame(
+        self,
+        frame_id: str,
+        reason: str,
+        jpeg: bytes,
+        width: int,
+        height: int,
+        skip_if_busy: bool = False,
+    ) -> None:
+        """Send the ``camera_frame`` header plus its single binary frame."""
+        send_json, send_bytes = self._send_json, self._send_bytes
+        if send_json is None or send_bytes is None:
+            return
+        lock = self._send_lock
+        if lock is not None and lock.locked() and skip_if_busy:
+            # The microphone is streaming an utterance (or a screenshot is going
+            # out): the server would read our JPEG as audio. Skip this push; the
+            # next one comes in face_check_interval_s.
+            log.debug("Skipping presence frame %s - the socket is busy", frame_id)
+            return
+        header = {
+            "type": MSG_CAMERA_FRAME,
+            "id": frame_id,
+            "reason": reason,
+            "format": CAMERA_FORMAT,
+            "w": int(width),
+            "h": int(height),
+        }
+        log.debug(
+            "Sending camera frame %s (%s): %dx%d, %d bytes",
+            frame_id, reason, width, height, len(jpeg),
+        )
+        try:
+            if lock is None:
+                await send_json(header)
+                await send_bytes(jpeg)
+            else:
+                async with lock:
+                    await send_json(header)
+                    await send_bytes(jpeg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reconnects are routine
+            self._note_send_failure("camera_frame", exc)
+
+    async def _send_error(self, request_id: str, error: str) -> None:
+        """Mirror of ``screenshot_error`` (SPEC v1.4): no binary frame follows."""
+        send_json = self._send_json
+        if send_json is None:
+            return
+        try:
+            await send_json(
+                {"type": MSG_CAMERA_ERROR, "id": str(request_id), "error": str(error)}
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._note_send_failure("camera_error", exc)
+
+    def _note_send_failure(self, kind: str, exc: BaseException) -> None:
+        """A failed send means the socket is down; re-announce state later."""
+        self._sent_state = None  # force a fresh camera_state after the reconnect
+        self._send_errors += 1
+        if self._send_errors == 1:
+            log.info("Could not send %s (%s) - retrying once reconnected", kind, exc)
+        else:
+            log.debug("Could not send %s (%d): %s", kind, self._send_errors, exc)
+
+    # ------------------------------------------------------------------
+    # camera_request (SPEC v1.4)
+    # ------------------------------------------------------------------
+    async def serve_request(self, request_id: str) -> None:
+        """Answer the server's ``camera_request`` from the latest frame.
+
+        Never raises: a missing camera, a stale frame or an encoding error all
+        come back to the server as ``camera_error`` so its tool call fails fast
+        instead of waiting for a timeout.
+        """
+        request_id = str(request_id or "")
+        if not self._enabled:
+            await self._send_error(request_id, "the camera is not available on this client")
+            return
+        frame, age = self._latest_frame()
+        if frame is None:
+            reason = (
+                "the camera has no frame yet (still starting up)"
+                if self.running
+                else "the camera is not running"
+            )
+            await self._send_error(request_id, reason)
+            return
+        if age > STALE_FRAME_S:
+            await self._send_error(
+                request_id, f"the last camera frame is {age:.0f} s old - the camera stalled"
+            )
+            return
+        try:
+            jpeg, width, height = await asyncio.to_thread(self._encode, frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any encoding failure
+            error = str(exc).strip() or exc.__class__.__name__
+            log.warning("Could not encode the requested camera frame: %s", error)
+            await self._send_error(request_id, error)
+            return
+        log.info(
+            "Answering the camera request (id=%s): %dx%d, %d bytes",
+            request_id or "?", width, height, len(jpeg),
+        )
+        await self._send_frame(request_id, CAMERA_REASON_REQUEST, jpeg, width, height)
+
+    # ------------------------------------------------------------------
+    # thread -> event loop
+    # ------------------------------------------------------------------
+    def _submit(self, coro: Awaitable[None]) -> None:
+        """Run a coroutine on the client's loop from a worker thread."""
+        loop = self._loop
+        if loop is None or loop.is_closed() or self._stop_event.is_set():
+            close = getattr(coro, "close", None)
+            if callable(close):  # never leave a coroutine un-awaited
+                close()
+            return
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - the loop may be shutting down
+            log.debug("Could not hand the camera message to the event loop: %s", exc)
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return
+        future.add_done_callback(self._drain_future)
+
+    @staticmethod
+    def _drain_future(future: Any) -> None:
+        """Consume the result so a failed send is never an unretrieved exception."""
+        try:
+            future.result()
+        except Exception as exc:  # noqa: BLE001 - already logged where it happened
+            log.debug("Camera send task ended with: %s", exc)

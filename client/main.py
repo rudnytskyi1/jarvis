@@ -19,6 +19,25 @@ Per utterance the server may send several rounds of ``actions`` and/or
 ``screenshot_request`` (one per LLM tool round) before the spoken reply, so the
 response loop keeps handling messages until ``tts_end`` or ``error``.
 
+v1.4 — the socket is read ALL the time
+--------------------------------------
+The server talks between utterances too: it greets a face it does not know and
+it pulls camera frames for ``look_at_camera``/``enroll_face``. So exactly one
+background task (:meth:`JarvisClient._reader_loop`) owns ``ws.recv()`` for the
+lifetime of a connection and routes what it reads:
+
+* ``camera_request`` — answered at any moment from :mod:`client.camera`;
+* during a conversation — everything (binary frames included) goes into an
+  ``asyncio.Queue`` that :meth:`JarvisClient._receive_response` consumes;
+* while idle — a proactive ``say`` + ``tts_start``…``tts_end`` block is played
+  through the speakers, and the wake word cuts it short and starts listening.
+
+The mode flag is owned by the conversation loop and flips exactly at
+``utterance_start``/end of reply, so no message is ever consumed twice or lost
+in between. The reader dies with the connection and is restarted by
+:meth:`JarvisClient._ensure_link` after every reconnect; the camera keeps
+running across reconnects and resumes its pushes by itself.
+
 Run from the repository root: ``python -m client.main --config config.yaml``.
 """
 
@@ -43,6 +62,8 @@ from common.config import load_config
 from common.protocol import (
     MSG_ACTION_RESULT,
     MSG_ACTIONS,
+    MSG_CAMERA_ERROR,
+    MSG_CAMERA_REQUEST,
     MSG_ERROR,
     MSG_HELLO,
     MSG_READY,
@@ -74,9 +95,19 @@ from client.devices.registry import build_registry
 from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
 from client.vad import VadRecorder
 from client.wakeword import WakeWordDetector
-from client.ws_client import WSClient, WSDisconnected
+from client.ws_client import WAIT_FOREVER, WSClient, WSDisconnected
 
 log = logging.getLogger("client")
+
+#: The camera stack (OpenCV + Ultralytics) is optional and lives behind lazy
+#: imports, but even importing this thin module must not be able to stop the
+#: voice client — a broken checkout simply means "no camera on this machine".
+_CAMERA_IMPORT_ERROR: Optional[str] = None
+try:
+    from client.camera import CameraService
+except Exception as _camera_exc:  # noqa: BLE001 - pragma: no cover
+    _CAMERA_IMPORT_ERROR = f"{type(_camera_exc).__name__}: {_camera_exc}"
+    CameraService = None  # type: ignore[assignment]
 
 #: Audio format announced in ``utterance_start`` (SPEC §4).
 PCM_FORMAT = getattr(_protocol, "AUDIO_FORMAT", "pcm_s16le")
@@ -114,6 +145,28 @@ RESULT_ERROR = "error"
 #: The user said the wake word while the reply was playing: playback was cut
 #: and the client goes straight back to listening.
 RESULT_BARGE_IN = "barge_in"
+
+#: Routing modes of the reader task (v1.4). The conversation loop owns the flag.
+#: ``idle`` — proactive audio is played and camera/screen requests answered;
+#: ``conversation`` — every message belongs to the utterance in flight and is
+#: buffered for :meth:`JarvisClient._receive_response`.
+MODE_IDLE = "idle"
+MODE_CONVERSATION = "conversation"
+#: How often a waiting conversation re-checks that the reader is still alive.
+INBOX_POLL_S = 0.5
+
+
+class _LinkDown:
+    """Sentinel put into the inbox when the reader task ends."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<link down>"
+
+
+#: Singleton sentinel: waking a waiting conversation when the socket dies.
+LINK_DOWN = _LinkDown()
 
 
 class _Stopping(Exception):
@@ -241,6 +294,33 @@ class JarvisClient:
         self._tts_bytes = 0
         self._last_say = ""
 
+        # -- v1.4: one reader task owns the socket -----------------------
+        #: Messages belonging to the utterance in flight (text and binary).
+        self._inbox: "asyncio.Queue[Any]" = asyncio.Queue()
+        self._mode = MODE_IDLE
+        self._reader_task: Optional[asyncio.Task] = None
+        #: Held around every header+binary pair we send, and for the whole
+        #: duration of a streamed utterance: the server routes incoming binary
+        #: frames by the header that announced them, so a camera JPEG must never
+        #: interleave with microphone audio or with a screenshot.
+        self._wire_lock = asyncio.Lock()
+        # -- proactive (unprompted) playback state, owned by the reader ---
+        self._idle_stream_active = False   # between a proactive tts_start/tts_end
+        self._idle_tts_active = False      # ...and the speaker is accepting it
+        self._idle_tts_bytes = 0
+        self._idle_interrupted = False     # the wake word cut the greeting
+        self._idle_playing = False         # audio still queued for the speaker
+        self._idle_drain_task: Optional[asyncio.Task] = None
+
+        camera_cfg = _attr(self.ccfg, "camera")
+        self.camera: Optional[Any] = None
+        if CameraService is None:
+            log.debug("Camera support is not importable: %s", _CAMERA_IMPORT_ERROR)
+        elif camera_cfg is None:
+            log.debug("No client.camera section in the config - running voice only")
+        else:
+            self.camera = CameraService(camera_cfg)
+
     # ------------------------------------------------------------------
     # setup / teardown
     # ------------------------------------------------------------------
@@ -269,6 +349,15 @@ class JarvisClient:
 
     async def _shutdown(self) -> None:
         self._stopping = True
+        await self._stop_reader()
+        await self._cancel_task(self._idle_drain_task, "proactive playback")
+        self._idle_drain_task = None
+        camera = self.camera
+        if camera is not None:
+            try:
+                await asyncio.to_thread(camera.stop)
+            except Exception as exc:  # pragma: no cover - teardown
+                log.debug("Error while stopping the camera: %s", exc)
         task, self._action_task = self._action_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -293,6 +382,39 @@ class JarvisClient:
         if self._started:
             log.info("Client stopped")
 
+    @staticmethod
+    async def _cancel_task(task: Optional[asyncio.Task], what: str) -> None:
+        """Cancel a helper task and swallow whatever it ends with."""
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # pragma: no cover - helpers must not break teardown
+            log.debug("The %s task ended with: %s", what, exc)
+
+    def _start_camera(self) -> None:
+        """Start the optional camera service (SPEC v1.4); never fatal."""
+        camera = self.camera
+        if camera is None:
+            if _CAMERA_IMPORT_ERROR is not None:
+                log.warning(
+                    "Camera support is unavailable (%s) - running voice only",
+                    _CAMERA_IMPORT_ERROR,
+                )
+            return
+        try:
+            camera.start(
+                asyncio.get_running_loop(),
+                self.ws.send_json,
+                self.ws.send_bytes,
+                send_lock=self._wire_lock,
+            )
+        except Exception as exc:  # noqa: BLE001 - the camera is never worth a crash
+            log.warning("Could not start the camera service: %s - running voice only", exc)
+
     # ------------------------------------------------------------------
     # main loop
     # ------------------------------------------------------------------
@@ -301,6 +423,7 @@ class JarvisClient:
         try:
             await self._setup_wakeword()
             self.audio_in.start()
+            self._start_camera()
             self._started = True
             log.info(
                 "Jarvis client started: client_id=%s, server=%s",
@@ -309,7 +432,7 @@ class JarvisClient:
             )
             while not self._stopping:
                 try:
-                    await self.ws.ensure_connected()
+                    await self._ensure_link()
                     await self._conversation()
                 except _Stopping:
                     break
@@ -320,6 +443,250 @@ class JarvisClient:
                     await self._beep(ERROR_BEEP_FREQ_HZ, ERROR_BEEP_MS)
         finally:
             await self._shutdown()
+
+    # ------------------------------------------------------------------
+    # v1.4: the connection and its single reader task
+    # ------------------------------------------------------------------
+    def _reader_alive(self) -> bool:
+        task = self._reader_task
+        return task is not None and not task.done()
+
+    async def _ensure_link(self) -> None:
+        """Guarantee a live connection with exactly ONE task reading it.
+
+        The handshake in ``ws.ensure_connected`` consumes messages itself, so
+        the reader is always stopped first: two consumers on one socket would
+        each swallow half of the reply.
+        """
+        if self.ws.connected and self._reader_alive():
+            return
+        await self._stop_reader()
+        await self.ws.ensure_connected()
+        self._start_reader()
+
+    def _start_reader(self) -> None:
+        if self._reader_alive():
+            return
+        self._drain_inbox("stale message")
+        self._reader_task = asyncio.get_running_loop().create_task(
+            self._reader_loop(), name="jarvis-ws-reader"
+        )
+        log.debug("The socket reader task is running")
+
+    async def _stop_reader(self) -> None:
+        task, self._reader_task = self._reader_task, None
+        await self._cancel_task(task, "socket reader")
+        self._idle_stream_active = False
+        self._idle_tts_active = False
+        self._drain_inbox("message from the previous connection")
+
+    def _drain_inbox(self, what: str) -> int:
+        """Throw away buffered messages that can no longer belong to a reply."""
+        dropped = 0
+        while True:
+            try:
+                item = self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is not LINK_DOWN:
+                dropped += 1
+        if dropped:
+            log.debug("Discarded %d %s(s)", dropped, what)
+        return dropped
+
+    async def _reader_loop(self) -> None:
+        """Own ``ws.recv()`` for the lifetime of this connection (SPEC v1.4)."""
+        try:
+            while not self._stopping:
+                msg = await self.ws.recv(timeout=WAIT_FOREVER)
+                await self._route_message(msg)
+        except asyncio.CancelledError:
+            raise
+        except WSDisconnected as exc:
+            if not self._stopping:
+                log.info("The socket reader stopped: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - one bad message must not deafen us
+            log.error("The socket reader crashed: %s", exc)
+            log.debug("Details:", exc_info=True)
+            self.ws.drop()
+        finally:
+            self._idle_stream_active = False
+            self._idle_tts_active = False
+            try:
+                self._inbox.put_nowait(LINK_DOWN)
+            except Exception:  # pragma: no cover - an unbounded queue cannot fail
+                pass
+
+    async def _route_message(self, msg: Any) -> None:
+        """Send one server message where it belongs (see the module docstring)."""
+        if isinstance(msg, bytes):
+            if self._idle_stream_active:
+                await self._on_idle_tts_chunk(msg)
+            elif self._mode == MODE_CONVERSATION:
+                self._inbox.put_nowait(msg)
+            else:
+                log.debug("Binary frame outside of any stream (%d bytes) - ignored", len(msg))
+            return
+
+        mtype = msg.get("type")
+        if mtype == MSG_CAMERA_REQUEST:
+            # Answered in both modes: the server pulls frames for
+            # look_at_camera / enroll_face whenever it likes.
+            await self._handle_camera_request(msg)
+            return
+        if self._idle_stream_active:
+            # The tail of a proactive block stays with the reader even if a
+            # conversation started meanwhile (the wake word interrupted it):
+            # its binary frames are NOT the reply the conversation waits for.
+            if mtype == MSG_TTS_END:
+                await self._on_idle_tts_end()
+                return
+            if mtype == MSG_TTS_START:  # pragma: no cover - defensive
+                log.debug("A new TTS stream began before the proactive one ended")
+                await self._on_idle_tts_end()
+        if self._mode == MODE_CONVERSATION:
+            self._inbox.put_nowait(msg)
+            return
+        await self._handle_idle_message(mtype, msg)
+
+    async def _handle_idle_message(self, mtype: Any, msg: Dict[str, Any]) -> None:
+        """Handle a message that arrived between utterances (SPEC v1.4)."""
+        if mtype == MSG_SAY:
+            self._last_say = str(msg.get("text") or "").strip()
+            log.info("Unprompted message: %s", self._last_say or "(empty)")
+        elif mtype == MSG_TTS_START:
+            await self._on_idle_tts_start(msg)
+        elif mtype == MSG_TTS_END:
+            log.debug("tts_end without a proactive stream - ignored")
+        elif mtype == MSG_SCREENSHOT_REQUEST:
+            await self._handle_screenshot_request(msg)
+        elif mtype == MSG_ACTIONS:
+            log.info("Actions received between utterances")
+            await self._start_actions(msg.get("items") or [])
+        elif mtype == MSG_TRANSCRIPT:
+            log.debug("Transcript outside of a conversation: %s", msg.get("text"))
+        elif mtype == MSG_ERROR:
+            log.error("Server error between utterances: %s", msg.get("message"))
+        elif mtype == MSG_READY:
+            log.debug("The server sent ready")
+        else:
+            log.warning("Unknown message type from the server: %r", mtype)
+
+    # -- proactive playback (greetings): only ever while idle ----------------
+
+    async def _on_idle_tts_start(self, msg: Dict[str, Any]) -> None:
+        sample_rate = int(msg.get("sr") or self.sample_rate)
+        fmt = str(msg.get("format") or PCM_FORMAT)
+        channels = int(msg.get("channels") or CHANNELS)
+        if fmt != PCM_FORMAT or channels != CHANNELS:
+            log.warning(
+                "The server announced an unexpected TTS format: %s, %d channel(s) - playing it as %s mono",
+                fmt, channels, PCM_FORMAT,
+            )
+        self._idle_tts_bytes = 0
+        self._idle_interrupted = False
+        # Set before opening the device: even if playback fails, the frames of
+        # this block belong to the reader and must not reach the inbox.
+        self._idle_stream_active = True
+        try:
+            await self.audio_out.open(sample_rate)
+        except Exception as exc:  # noqa: BLE001 - audio device issues
+            log.error("Could not open the audio output at %d Hz: %s", sample_rate, exc)
+            self._idle_tts_active = False
+            return
+        self._idle_tts_active = True
+        self._idle_playing = True
+        log.info("Playing an unprompted message (%d Hz)", sample_rate)
+
+    async def _on_idle_tts_chunk(self, data: bytes) -> None:
+        if not self._idle_tts_active or self._idle_interrupted:
+            return  # interrupted or muted: swallow the rest of the block
+        self._idle_tts_bytes += len(data)
+        await self.audio_out.write(data)
+
+    async def _on_idle_tts_end(self) -> None:
+        self._idle_stream_active = False
+        self._idle_tts_active = False
+        if self._idle_interrupted:
+            log.debug("The unprompted message was cut after %d bytes", self._idle_tts_bytes)
+        elif self._idle_tts_bytes:
+            log.debug("Played %d bytes of the unprompted message", self._idle_tts_bytes)
+        else:
+            log.info("The unprompted message carried no audio")
+        # Waiting for the speaker to go quiet must not stop the reader from
+        # reading, so the drain runs in its own task.
+        if self._idle_drain_task is None or self._idle_drain_task.done():
+            self._idle_drain_task = asyncio.get_running_loop().create_task(
+                self._finish_idle_playback(), name="jarvis-proactive-drain"
+            )
+
+    async def _finish_idle_playback(self) -> None:
+        try:
+            await self.audio_out.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("Error while finishing the unprompted playback: %s", exc)
+        finally:
+            if not self._idle_stream_active:
+                self._idle_playing = False
+                self._idle_interrupted = False
+
+    def _interrupt_idle_playback(self) -> bool:
+        """Cut an unprompted message short; ``True`` if there was one.
+
+        Called when the wake word fires and when a new utterance starts. The
+        ``_idle_stream_active`` flag stays on so the rest of the block (binary
+        frames and its ``tts_end``) is still swallowed by the reader.
+        """
+        if not (self._idle_stream_active or self._idle_tts_active or self._idle_playing):
+            return False
+        already = self._idle_interrupted
+        self._idle_interrupted = True
+        self._idle_tts_active = False
+        dropped = self.audio_out.cancel_pending()
+        if not already:
+            log.info("Interrupting the unprompted message")
+        log.debug("Dropped %d queued playback chunk(s)", dropped)
+        return True
+
+    # -- conversation mode flag (owned by the conversation loop) -------------
+
+    def _enter_conversation(self) -> None:
+        """From now on every server message belongs to the utterance in flight."""
+        self._interrupt_idle_playback()
+        self._drain_inbox("stale message")
+        self._mode = MODE_CONVERSATION
+
+    def _leave_conversation(self) -> None:
+        """Back to idle routing; anything left over cannot belong to a reply."""
+        self._mode = MODE_IDLE
+        self._drain_inbox("leftover reply message")
+
+    async def _next_message(self) -> Any:
+        """Next message of the conversation, buffered by the reader task.
+
+        Raises :class:`WSDisconnected` when the link died or the server went
+        quiet for longer than the transport's receive timeout — the same
+        contract ``ws.recv()`` had before the reader existed.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(getattr(self.ws, "recv_timeout", 420.0))
+        while True:
+            try:
+                item = await asyncio.wait_for(self._inbox.get(), timeout=INBOX_POLL_S)
+            except (asyncio.TimeoutError, TimeoutError):
+                if self._stopping:
+                    raise _Stopping()
+                if not self._reader_alive() and self._inbox.empty():
+                    raise WSDisconnected("the connection was lost while waiting for the reply")
+                if loop.time() >= deadline:
+                    self.ws.drop()
+                    raise WSDisconnected("the server is not responding")
+                continue
+            if item is LINK_DOWN:
+                raise WSDisconnected("the connection was lost while waiting for the reply")
+            return item
 
     async def _conversation(self) -> None:
         """One wake-word trigger plus any follow-up turns."""
@@ -381,9 +748,9 @@ class JarvisClient:
         self.audio_in.clear()
         self.wake.reset()
         while not self._stopping:
-            if not self.ws.connected:
+            if not self.ws.connected or not self._reader_alive():
                 log.info("No connection to the server - reconnecting...")
-                await self.ws.ensure_connected()
+                await self._ensure_link()
                 self.audio_in.clear()
                 self.preroll.clear()
                 self.wake.reset()
@@ -394,6 +761,10 @@ class JarvisClient:
             self.preroll.push(frame)
             if self.wake.accept_frame(frame):
                 log.info("Wake word detected")
+                # While idle this loop is also the barge-in watcher: an
+                # unprompted greeting is cut off here and the client goes
+                # straight on to record what the user wants (SPEC v1.4).
+                self._interrupt_idle_playback()
                 self.wake.reset()
                 return True
         return False
@@ -421,10 +792,19 @@ class JarvisClient:
         self, pre_roll: bytes, lead_in_s: Optional[float]
     ) -> str:
         sent_start = False
+        holding_wire = False
 
         async def on_audio(chunk: bytes) -> None:
-            nonlocal sent_start
+            nonlocal sent_start, holding_wire
             if not sent_start:
+                # Everything binary the server receives between utterance_start
+                # and utterance_end is microphone audio (SPEC §4), so the wire is
+                # held for the whole stream: a camera frame would corrupt it.
+                await self._wire_lock.acquire()
+                holding_wire = True
+                # ...and from this exact point on every incoming message belongs
+                # to this utterance, not to an unprompted greeting.
+                self._enter_conversation()
                 await self.ws.send_json(
                     {
                         "type": MSG_UTTERANCE_START,
@@ -438,27 +818,46 @@ class JarvisClient:
             for piece in self._split_frames(chunk):
                 await self.ws.send_bytes(piece)
 
-        audio = await self.vad.record(
-            self._read_frame,
-            pre_roll=pre_roll,
-            lead_in_s=lead_in_s,
-            on_audio=on_audio,
-        )
-        if audio is None:
-            log.info("No speech detected - back to waiting for the wake word")
-            await self._beep(NO_SPEECH_BEEP_FREQ_HZ, NO_SPEECH_BEEP_MS, volume=0.22)
-            return RESULT_NO_SPEECH
+        try:
+            try:
+                audio = await self.vad.record(
+                    self._read_frame,
+                    pre_roll=pre_roll,
+                    lead_in_s=lead_in_s,
+                    on_audio=on_audio,
+                )
+                if audio is None:
+                    # on_audio was never called: nothing was sent, so this was a
+                    # false trigger and the mode flag was never flipped.
+                    log.info("No speech detected - back to waiting for the wake word")
+                    await self._beep(NO_SPEECH_BEEP_FREQ_HZ, NO_SPEECH_BEEP_MS, volume=0.22)
+                    return RESULT_NO_SPEECH
 
-        await self.ws.send_json({"type": MSG_UTTERANCE_END})
-        log.debug("Sent %.2f s of audio", len(audio) / float(self.sample_rate * SAMPLE_WIDTH))
-        return await self._receive_response()
+                await self.ws.send_json({"type": MSG_UTTERANCE_END})
+                log.debug(
+                    "Sent %.2f s of audio",
+                    len(audio) / float(self.sample_rate * SAMPLE_WIDTH),
+                )
+            finally:
+                # Released before waiting for the reply: the reply's rounds may
+                # need the wire themselves (screenshot), and the camera should
+                # get its turn again while the server thinks.
+                if holding_wire:
+                    holding_wire = False
+                    self._wire_lock.release()
+            return await self._receive_response()
+        finally:
+            self._leave_conversation()
 
     async def _receive_response(self) -> str:
         """Handle every server message for one utterance (SPEC §4).
 
         ``actions`` and ``screenshot_request`` may arrive several times and in
         any order before the reply, so both are handled inside this loop; it
-        ends with ``tts_end`` or ``error``.
+        ends with ``tts_end`` or ``error``. Since v1.4 the messages come from
+        the reader task through :meth:`_next_message` instead of the socket —
+        whatever arrived while the microphone was still streaming is already
+        waiting in the inbox.
         """
         self._tts_active = False
         self._tts_bytes = 0
@@ -467,7 +866,7 @@ class JarvisClient:
         self._start_thinking()
         try:
             while True:
-                msg = await self.ws.recv()
+                msg = await self._next_message()
                 if isinstance(msg, bytes):
                     await self._on_tts_chunk(msg)
                     continue
@@ -648,18 +1047,20 @@ class JarvisClient:
             )
             return
 
-        await self.ws.send_json(
-            {
-                "type": MSG_SCREENSHOT,
-                "id": request_id,
-                "format": SCREENSHOT_FORMAT,
-                "w": capture.w,
-                "h": capture.h,
-                "screen_w": capture.screen_w,
-                "screen_h": capture.screen_h,
-            }
-        )
-        await self.ws.send_bytes(capture.jpeg)
+        # The header and its single binary frame must stay adjacent on the wire.
+        async with self._wire_lock:
+            await self.ws.send_json(
+                {
+                    "type": MSG_SCREENSHOT,
+                    "id": request_id,
+                    "format": SCREENSHOT_FORMAT,
+                    "w": capture.w,
+                    "h": capture.h,
+                    "screen_w": capture.screen_w,
+                    "screen_h": capture.screen_h,
+                }
+            )
+            await self.ws.send_bytes(capture.jpeg)
         log.info(
             "Screenshot sent (id=%s): %dx%d image of a %dx%d screen, %d bytes",
             request_id or "?",
@@ -669,6 +1070,36 @@ class JarvisClient:
             capture.screen_h,
             len(capture.jpeg),
         )
+
+    # ------------------------------------------------------------------
+    # room camera (SPEC v1.4, S->C camera_request)
+    # ------------------------------------------------------------------
+    async def _handle_camera_request(self, msg: Dict[str, Any]) -> None:
+        """Answer ``camera_request`` with the newest camera frame, in any mode.
+
+        :mod:`client.camera` owns the reply, including ``camera_error`` when it
+        has no picture to give (the mirror of ``screenshot_error``). A client
+        without a camera answers the error itself so the server's tool call
+        fails immediately instead of waiting for its timeout.
+        """
+        request_id = str(msg.get("id") or "")
+        log.info("Camera frame requested (id=%s)", request_id or "?")
+        camera = self.camera
+        if camera is None:
+            await self.ws.send_json(
+                {
+                    "type": MSG_CAMERA_ERROR,
+                    "id": request_id,
+                    "error": "this client has no camera",
+                }
+            )
+            return
+        try:
+            await camera.serve_request(request_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the camera never breaks the client
+            log.warning("Could not answer the camera request: %s", exc)
 
     # ------------------------------------------------------------------
     # actions (executed by W3's dispatcher)

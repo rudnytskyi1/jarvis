@@ -32,3 +32,6 @@ env/
 Thumbs.db
 desktop.ini
 *.swp
+
+# --- third-party checkouts (SAM3 copy from Downloads) ---
+third_party/

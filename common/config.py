@@ -14,11 +14,14 @@ Public API (SPEC section 6)::
     cfg.server.llm.think            # False (Qwen3 reasoning off for fast replies)
     cfg.server.llm.vision_model     # "qwen3-vl:8b" (look_at_screen)
     cfg.server.llm.max_tool_rounds  # 4
+    cfg.server.speaker.threshold    # 0.72 (voice matching, v1.3)
+    cfg.server.face.threshold       # 0.45 (face matching + presence, v1.4)
     cfg.server.tts.speaker          # "en_0"
     cfg.client.server_url           # "ws://192.168.1.100:8765/ws"
     cfg.client.wakeword.phrases     # ["rowan", "roan", "rowen"]
     cfg.client.audio.input_device   # int | str | None
     cfg.client.vad.silence_ms       # 800
+    cfg.client.camera.fps           # 5 (room camera -> YOLO presence, v1.4)
     cfg.client.followup_window_s    # 6.0
     cfg.client.apps                 # {"browser": "C:\\...\\chrome.exe"} (may be empty)
     cfg.client.devices              # [DeviceConfig, ...] (may be empty)
@@ -41,11 +44,14 @@ __all__ = [
     "ServerConfig",
     "STTConfig",
     "LLMConfig",
+    "SpeakerConfig",
+    "FaceConfig",
     "TTSConfig",
     "ClientConfig",
     "WakewordConfig",
     "AudioConfig",
     "VADConfig",
+    "CameraConfig",
     "DeviceConfig",
     "load_config",
     "DEFAULT_CONFIG_FILENAME",
@@ -140,6 +146,25 @@ class SpeakerConfig(_Strict):
     min_speech_s: float = Field(default=0.8, ge=0.0)
 
 
+class FaceConfig(_Strict):
+    """Face recognition and room presence (``server.face``, SPEC v1.4).
+
+    The server matches every camera frame the client pushes against the
+    ``face_embeddings`` of ``data/people.json`` and keeps a per-connection
+    presence map that feeds the ``{presence}`` block of the system prompt.
+    """
+
+    enabled: bool = True
+    #: Cosine-similarity threshold for a face to match an enrolled profile.
+    threshold: float = Field(default=0.45, gt=0.0, le=1.0)
+    #: Somebody is forgotten this long after the camera last saw them.
+    presence_ttl_s: float = Field(default=30.0, gt=0.0)
+    #: An unknown face present for this long triggers the proactive greeting.
+    greet_after_s: float = Field(default=10.0, ge=0.0)
+    #: At most one proactive greeting per this window (0 = no cooldown).
+    greeting_cooldown_s: float = Field(default=300.0, ge=0.0)
+
+
 class TTSConfig(_Strict):
     """Silero TTS settings (``server.tts``)."""
 
@@ -159,6 +184,7 @@ class ServerConfig(_Strict):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
+    face: FaceConfig = Field(default_factory=FaceConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +233,26 @@ class VADConfig(_Strict):
     min_speech_ms: int = Field(default=250, ge=0)
 
 
+class CameraConfig(_Strict):
+    """Room camera settings (``client.camera``, SPEC v1.4).
+
+    The client runs YOLO on the capture and reports STATE (how many people,
+    which objects), plus one JPEG every ``face_check_interval_s`` while
+    somebody is visible so the server can recognise faces. Missing camera
+    dependencies must never break the voice pipeline.
+    """
+
+    enabled: bool = True
+    #: OpenCV capture device index.
+    index: int = Field(default=0, ge=0)
+    #: How many frames per second are pushed through YOLO.
+    fps: int = Field(default=5, ge=1)
+    #: Ultralytics model file (downloaded automatically on first run).
+    model: str = "yolo11n.pt"
+    #: One frame is sent to the server this often while a person is visible.
+    face_check_interval_s: float = Field(default=5.0, gt=0.0)
+
+
 class DeviceConfig(BaseModel):
     """One controllable device from ``client.devices``.
 
@@ -251,6 +297,8 @@ class ClientConfig(_Strict):
     wakeword: WakewordConfig = Field(default_factory=WakewordConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
+    #: Room camera: YOLO presence state + face frames for the server (v1.4).
+    camera: CameraConfig = Field(default_factory=CameraConfig)
     #: Seconds to keep listening after a reply without the wake word (0 = off).
     followup_window_s: float = Field(default=6.0, ge=0.0)
     #: Soft repeating blips while the server is still working on a reply

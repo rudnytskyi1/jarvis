@@ -1,8 +1,14 @@
 """Per-connection conversation state: system prompt + rolling history (SPEC §3).
 
-The system prompt comes from ``prompts/system.md`` with two placeholders filled
-in: ``{devices}`` from the client's ``hello`` message and ``{memory}`` from the
-facts stored by :class:`server.storage.Memory`.
+The system prompt comes from ``prompts/system.md`` with three placeholders
+filled in: ``{devices}`` from the client's ``hello`` message, ``{memory}`` from
+the facts stored by :class:`server.storage.Memory`, and ``{presence}`` (v1.4)
+from the room camera's presence tracker in ``server/app.py``.
+
+``{devices}`` and ``{memory}`` are rendered once (and again whenever a fact is
+added), but presence changes between one utterance and the next — so the
+``presence`` argument may be a CALLABLE and is resolved every time
+:attr:`Session.system_prompt` is read.
 """
 
 from __future__ import annotations
@@ -20,11 +26,15 @@ DEFAULT_PROMPT_PATH = REPO_ROOT / "prompts" / "system.md"
 DEVICES_PLACEHOLDER = "{devices}"
 #: Placeholder inside prompts/system.md filled with the remembered facts.
 MEMORY_PLACEHOLDER = "{memory}"
+#: v1.4: placeholder filled with what the room camera currently sees.
+PRESENCE_PLACEHOLDER = "{presence}"
 
 #: Shown instead of the device list when the client reported no devices.
 NO_DEVICES_TEXT = "(no devices configured)"
 #: Shown instead of the fact list when nothing has been remembered yet.
 NO_MEMORY_TEXT = "(no saved facts yet)"
+#: Shown when the camera is off, missing or sees nobody (SPEC v1.4).
+NO_PRESENCE_TEXT = "(camera sees nobody)"
 
 #: Used only if prompts/system.md is missing or unreadable.
 FALLBACK_SYSTEM_PROMPT = (
@@ -36,6 +46,7 @@ FALLBACK_SYSTEM_PROMPT = (
     "describing the action in words. Use remember to store lasting facts. Take "
     "device names verbatim from the list below; no other devices exist.\n\n"
     "Facts you have saved earlier:\n" + MEMORY_PLACEHOLDER + "\n\n"
+    "What the room camera sees:\n" + PRESENCE_PLACEHOLDER + "\n\n"
     "Devices in the room:\n" + DEVICES_PLACEHOLDER + "\n"
 )
 
@@ -96,6 +107,26 @@ def format_memory(facts: Sequence[Any] | None) -> str:
     return "\n".join(lines)
 
 
+def resolve_presence(presence: Any) -> str:
+    """Render the ``{presence}`` block (SPEC v1.4).
+
+    ``presence`` is either a ready string or a callable returning one — the
+    presence tracker lives in ``server/app.py`` and changes between utterances,
+    so the session asks it for the current value every time the prompt is read.
+    A callable that fails must never break the reply: it falls back to
+    :data:`NO_PRESENCE_TEXT`.
+    """
+    value: Any = presence
+    if callable(presence):
+        try:
+            value = presence()
+        except Exception:
+            log.exception("The presence callback failed — reporting an empty room")
+            value = None
+    text = " ".join(str(value or "").split())
+    return text or NO_PRESENCE_TEXT
+
+
 def load_prompt_template(prompt_path: Path | str | None = None) -> str:
     """Read prompts/system.md, falling back to a built-in prompt."""
     path = Path(prompt_path) if prompt_path else DEFAULT_PROMPT_PATH
@@ -110,12 +141,17 @@ def load_prompt_template(prompt_path: Path | str | None = None) -> str:
     return text
 
 
-def build_system_prompt(
+def build_prompt_base(
     devices: Sequence[Any] | None,
     memory_facts: Sequence[Any] | None = None,
     prompt_path: Path | str | None = None,
 ) -> str:
-    """Render the system prompt with the device list and the saved facts filled in."""
+    """Render everything that is stable, leaving ``{presence}`` in place.
+
+    The result still contains :data:`PRESENCE_PLACEHOLDER` (appended when the
+    prompt file has none), so the caller can substitute the live presence text
+    per utterance without re-reading and re-rendering the whole prompt.
+    """
     template = load_prompt_template(prompt_path)
     devices_text = format_devices(devices)
     memory_text = format_memory(memory_facts)
@@ -138,7 +174,28 @@ def build_system_prompt(
         )
         template = f"{template.rstrip()}\n\nFacts you have saved earlier:\n{memory_text}\n"
 
+    if PRESENCE_PLACEHOLDER not in template:
+        log.warning(
+            "The system prompt has no %s placeholder — appending the camera view",
+            PRESENCE_PLACEHOLDER,
+        )
+        template = (
+            f"{template.rstrip()}\n\nWhat the room camera sees:\n"
+            f"{PRESENCE_PLACEHOLDER}\n"
+        )
+
     return template
+
+
+def build_system_prompt(
+    devices: Sequence[Any] | None,
+    memory_facts: Sequence[Any] | None = None,
+    prompt_path: Path | str | None = None,
+    presence: Any = None,
+) -> str:
+    """Render the full system prompt: devices, saved facts and camera presence."""
+    base = build_prompt_base(devices, memory_facts, prompt_path)
+    return base.replace(PRESENCE_PLACEHOLDER, resolve_presence(presence))
 
 
 class Session:
@@ -151,6 +208,7 @@ class Session:
         history_turns: int,
         memory_facts: Iterable[Any] | None = None,
         prompt_path: Path | str | None = None,
+        presence: Any = None,
     ) -> None:
         self.client_id = (client_id or "unknown").strip() or "unknown"
         self.devices: list[Any] = list(devices or [])
@@ -163,7 +221,9 @@ class Session:
             log.warning("Invalid history_turns=%r — using 8", history_turns)
             self.history_turns = 8
         self.prompt_path = prompt_path
-        self.system_prompt = build_system_prompt(self.devices, self.memory_facts, prompt_path)
+        #: String or callable rendering the ``{presence}`` block (SPEC v1.4).
+        self.presence: Any = presence
+        self._base_prompt = build_prompt_base(self.devices, self.memory_facts, prompt_path)
         self._history: list[dict[str, str]] = []
         log.info(
             "Session %s: %d device(s), %d remembered fact(s), keeping %d exchange(s)",
@@ -172,6 +232,20 @@ class Session:
             len(self.memory_facts),
             self.history_turns,
         )
+
+    @property
+    def presence_text(self) -> str:
+        """What the room camera currently sees, as it goes into the prompt."""
+        return resolve_presence(self.presence)
+
+    def set_presence(self, presence: Any) -> None:
+        """Point the ``{presence}`` block at a value or a callable (SPEC v1.4)."""
+        self.presence = presence
+
+    @property
+    def system_prompt(self) -> str:
+        """The prompt for the next completion, with live presence filled in."""
+        return self._base_prompt.replace(PRESENCE_PLACEHOLDER, self.presence_text)
 
     @property
     def device_names(self) -> list[str]:
@@ -189,7 +263,7 @@ class Session:
         if not text or text in self.memory_facts:
             return
         self.memory_facts.append(text)
-        self.system_prompt = build_system_prompt(
+        self._base_prompt = build_prompt_base(
             self.devices, self.memory_facts, self.prompt_path
         )
 
@@ -222,12 +296,16 @@ class Session:
 
 __all__ = [
     "Session",
+    "build_prompt_base",
     "build_system_prompt",
     "format_devices",
     "format_memory",
+    "resolve_presence",
     "load_prompt_template",
     "DEVICES_PLACEHOLDER",
     "MEMORY_PLACEHOLDER",
+    "PRESENCE_PLACEHOLDER",
     "NO_DEVICES_TEXT",
     "NO_MEMORY_TEXT",
+    "NO_PRESENCE_TEXT",
 ]

@@ -15,7 +15,7 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
-def test_nine_tools_exposed():
+def test_eleven_tools_exposed():
     assert tool_names() == {
         "set_light",
         "set_switch",
@@ -26,6 +26,8 @@ def test_nine_tools_exposed():
         "remember",
         "enroll_voice",
         "set_role",
+        "look_at_camera",
+        "enroll_face",
     }
 
 
@@ -41,9 +43,22 @@ def test_matrix_split():
         "remember",
         "enroll_voice",
         "set_role",
+        "look_at_camera",
+        "enroll_face",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")
+    # v1.4: the camera tools run on the server, like the screen ones.
+    assert not is_client_tool("look_at_camera") and not is_client_tool("enroll_face")
+    assert SERVER_TOOLS.isdisjoint(CLIENT_TOOLS)
+    assert set(tool_names()) == SERVER_TOOLS | CLIENT_TOOLS
+
+
+def test_camera_tools_take_their_one_argument():
+    camera = next(t for t in TOOLS if t["function"]["name"] == "look_at_camera")
+    assert camera["function"]["parameters"]["required"] == ["query"]
+    enroll = next(t for t in TOOLS if t["function"]["name"] == "enroll_face")
+    assert enroll["function"]["parameters"]["required"] == ["name"]
 
 
 def test_pc_control_command_enum():
@@ -63,9 +78,12 @@ def test_click_args_clamped():
 def test_server_tools_never_forwarded():
     calls = [
         {"function": {"name": "click_screen", "arguments": {"target": "x"}}},
+        {"function": {"name": "look_at_camera", "arguments": {"query": "who is here"}}},
+        {"function": {"name": "enroll_face", "arguments": {"name": "Anton"}}},
         {"function": {"name": "pc_control", "arguments": {"command": "mute"}}},
     ]
     items = actions_from_tool_calls(calls)
     names = [item["tool"] for item in items]
     assert "click_screen" not in names
+    assert "look_at_camera" not in names and "enroll_face" not in names
     assert "pc_control" in names
