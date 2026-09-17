@@ -55,6 +55,12 @@ _GIB = float(1024 ** 3)
 LOAD_FREE_VRAM_BYTES = int(6 * _GIB)
 #: Free VRAM required for one inference once the model is already resident.
 RUN_FREE_VRAM_BYTES = int(2 * _GIB)
+#: Below this much free VRAM, SAM3 is unloaded before an Ollama vision call.
+#: Measured on the 5090: qwen2.5vl:7b at num_ctx 4096 takes 8.4 GB resident,
+#: not the 5.5 GB "ollama ps" reports for the weights alone - the KV cache and
+#: the compute buffers are the rest, and they are what makes it and SAM3
+#: mutually exclusive on a card this size.
+VISION_FREE_VRAM_BYTES = int(9 * _GIB)
 
 
 def free_vram_bytes() -> int | None:
@@ -236,6 +242,32 @@ class Sam3Engine:
         return self.enabled and self._failed_reason is None
 
     # ------------------------------------------------------------------ memory
+
+    def unload(self) -> bool:
+        """Drop SAM3 off the GPU, freeing its checkpoint and workspace.
+
+        SAM3 and the Ollama vision model cannot both be resident on this 32 GB
+        card, and the vision model is asked for on almost every turn while
+        find_object is occasional. So whichever one is needed evicts the other,
+        and this is the SAM3 side of that bargain: the next find_object pays a
+        reload, which is the right place for the cost to land.
+
+        Returns True when something was actually released.
+        """
+        with self._lock:
+            if self._processor is None:
+                return False
+            self._processor = None
+            # A previous hard failure is not a reason to refuse a fresh start.
+            self._failed_reason = None
+            torch = self._torch
+        if torch is not None:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 - freeing memory is best-effort
+                log.debug("Could not empty the CUDA cache after unloading SAM3", exc_info=True)
+        log.info("Unloaded SAM3 from the GPU")
+        return True
 
     @staticmethod
     def _free_vram(torch: Any) -> int | None:

@@ -195,9 +195,20 @@ class VisionClient:
             self.temperature = float(getattr(cfg_llm, "temperature", 0.6))
         except (TypeError, ValueError):
             self.temperature = 0.6
-        #: Keep the vision model resident between screen questions, exactly like
-        #: the chat model — with one model serving both there is nothing to swap.
-        self.keep_alive = str(getattr(cfg_llm, "keep_alive", "4h") or "4h")
+        #: How long the vision model stays resident after a question. It is a
+        #: SEPARATE setting from the chat model's on purpose: measured on the
+        #: 5090 this model holds 8.4 GB (weights plus KV cache and compute
+        #: buffers, not the 5.5 GB "ollama ps" prints), it is asked a handful of
+        #: times per conversation, and that 8.4 GB is the difference between
+        #: SAM3 fitting on the card and not. Pinning it for hours starves
+        #: everything else for memory that is idle almost all the time; a short
+        #: window keeps it warm through a burst of screen questions and gives
+        #: the memory back afterwards.
+        self.keep_alive = str(
+            getattr(cfg_llm, "vision_keep_alive", "")
+            or getattr(cfg_llm, "keep_alive", "10m")
+            or "10m"
+        )
         #: Small context on purpose. The vision model (qwen3-vl:8b) is a SEPARATE
         #: model from the chat model now, so it must fit in VRAM ALONGSIDE millard
         #: (22 GB) with OLLAMA_MAX_LOADED_MODELS>=2. A vision prompt + one image is

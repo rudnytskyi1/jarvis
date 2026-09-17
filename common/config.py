@@ -124,6 +124,10 @@ class LLMConfig(_Strict):
     max_tokens: int = Field(default=1024, ge=1)
     #: How many tool-call rounds one utterance may take before a final answer.
     max_tool_rounds: int = Field(default=4, ge=1)
+    #: v1.7: how long the VISION model stays in VRAM after a question.
+    #: Separate from keep_alive because it is big (8.4 GB resident) and
+    #: rarely used, and that memory is what SAM3 needs.
+    vision_keep_alive: str = "10m"
     #: How many last user/assistant exchanges are kept in the session history.
     history_turns: int = Field(default=12, ge=0)
     #: How long Ollama keeps the chat model loaded after a request

@@ -388,6 +388,8 @@ cfg.server.stt.{model, device, compute_type, language}          # language: str 
 cfg.server.stt.allowed_languages                                # ["en","ru","es"]: auto-detect whitelist, [] = all
 cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns}
 cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # v1.1: "ollama_native"|"openai", bool, str, int
+cfg.server.llm.vision_keep_alive   # v1.7: "10m" - the VISION model's own keep_alive; it holds
+                                   # ~8.4 GB resident and SAM3 needs that memory
 cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 8192 (requested context)
 cfg.server.tts.{engine, language, model_id, speaker, sample_rate}   # English default: language "en", model_id "v3_en", speaker "en_0"
 cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.72 cosine, 0.8 s minimum audio

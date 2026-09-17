@@ -1835,6 +1835,7 @@ class Connection:
         if isinstance(captured, str):
             result: dict[str, Any] = {"ok": False, "error": captured}
         else:
+            await self._make_room_for_vision()
             answer = await _vision.describe_screenshot(captured.jpeg, query)
             result = {"ok": True, "answer": answer}
 
@@ -1862,6 +1863,7 @@ class Connection:
         if isinstance(captured, str):
             result: dict[str, Any] = {"ok": False, "error": captured}
         else:
+            await self._make_room_for_vision()
             answer = await _vision.describe_screenshot(
                 captured.jpeg, f"{CAMERA_QUERY_PREFIX} Question: {query}".strip()
             )
@@ -2109,6 +2111,28 @@ class Connection:
             await self.send_json({"type": proto.MSG_SAY, "text": text})
             await self._stream_tts(voice, text)
         log.info("Said unprompted: %r", text)
+
+    async def _make_room_for_vision(self) -> None:
+        """Free VRAM for the Ollama vision model by dropping SAM3 if it is loaded.
+
+        The mirror of :meth:`_make_room_for_segmentation`. These two cannot both
+        sit on the card, so whichever is needed evicts the other, and the
+        occasional tool pays the reload rather than the constant one.
+
+        This only ever releases Rowan's OWN models - SAM3 inside this process,
+        and Ollama models through Ollama's own API. Nothing here touches any
+        other program using the GPU.
+        """
+        if _segment is None or not _segment.loaded:
+            return
+        free = segment_mod.free_vram_bytes()
+        if free is None or free >= segment_mod.VISION_FREE_VRAM_BYTES:
+            return
+        log.info(
+            "Only %.1f GB free for the vision model - unloading SAM3 to make room",
+            free / (1024 ** 3),
+        )
+        await asyncio.to_thread(_segment.unload)
 
     async def _make_room_for_segmentation(self) -> None:
         """Free enough VRAM for SAM3 by evicting the vision model if need be.
@@ -2371,6 +2395,7 @@ class Connection:
             }
             return record["result"]
 
+        await self._make_room_for_vision()
         point = await _vision.locate_on_screen(captured.jpeg, target, captured.w, captured.h)
         if point is None:
             result: dict[str, Any] = {

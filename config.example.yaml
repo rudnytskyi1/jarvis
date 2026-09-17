@@ -23,7 +23,8 @@ server:
     max_tokens: 1024
     max_tool_rounds: 10      # tool-call rounds per utterance (a computer-use chain needs ~8)
     history_turns: 12        # how many recent exchanges to keep
-    keep_alive: 4h           # keep the chat model in VRAM (Ollama unloads after 5 m otherwise)
+    keep_alive: 4h           # keep the CHAT model in VRAM (Ollama unloads after 5 m otherwise)
+    vision_keep_alive: 10m   # the vision model holds ~8.4 GB; give it back when idle
     num_ctx: 8192            # requested context window; the 32k model default wastes VRAM
 
   speaker:                   # who is talking (resemblyzer voice profiles, data/people.json)
