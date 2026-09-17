@@ -143,6 +143,14 @@ GREETING_REQUEST = (
     "yourself, ASK FOR THEIR NAME, and offer once to remember their voice. Do "
     "not call any tools, just speak."
 )
+#: Appended to the greeting when known people are in the room with the
+#: stranger, so the hello is personal ("you're here with Anton") instead of
+#: addressing an empty room.
+GREETING_COMPANY_HINT = (
+    " The people you DO recognize in the room right now are: {names}. Mention "
+    "naturally that you can see the stranger is here with them (use their "
+    "names), then ask the stranger's name."
+)
 #: Spoken when the LLM is unreachable or answers nothing at all.
 SAY_FALLBACK_GREETING = "Good day. I am Rowan, the assistant of this room."
 #: While voice enrollment is collecting samples the user needs room to speak:
@@ -1530,9 +1538,16 @@ class Connection:
                 bool(engine is not None and engine.available),
                 self._known_face_alone(),
             )
+            # Tell the model who the stranger is standing next to, by name.
+            known_now = [
+                label for label in self.presence.present() if label != LABEL_UNKNOWN
+            ]
+            request = GREETING_REQUEST
+            if known_now:
+                request += GREETING_COMPANY_HINT.format(names=", ".join(sorted(known_now)))
             try:
                 result = await brain.generate(
-                    session.messages(GREETING_REQUEST), self._refuse_tools
+                    session.messages(request), self._refuse_tools
                 )
                 text = result.text.strip()
             except (WebSocketDisconnect, RuntimeError):

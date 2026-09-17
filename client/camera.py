@@ -651,7 +651,11 @@ class CameraService:
             return
         self._last_presence_push = now
         try:
-            pairs = self._capture_burst_sync(FACE_BURST)
+            # full=True: face recognition needs a CRISP face. The old 1280px /
+            # quality-80 presence frame made the owner's own face score around
+            # the match threshold; a native-resolution frame fixes that at the
+            # source instead of lowering the bar.
+            pairs = self._capture_burst_sync(FACE_BURST, full=True)
         except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the thread
             log.debug("Could not capture the presence burst: %s", exc)
             return
