@@ -53,10 +53,20 @@ def test_reconcile_dropping_the_unknown_bucket_also_drops_freshness():
     # A stale/misattributed unknown gets reconciled away by named labels
     # covering YOLO's count (SPEC v1.6) - the greeting must not see it as fresh.
     tracker = PresenceTracker(ttl_s=30.0)
-    tracker.note_faces(["Anton", LABEL_UNKNOWN])
+    tracker.note_faces(["Anton"])
+    tracker.note_faces([LABEL_UNKNOWN])  # the same man, caught badly
     assert tracker.has_fresh_unknown_face()
     tracker.reconcile(1)  # 1 named label already covers YOLO's 1 person
     assert not tracker.has_fresh_unknown_face()
+
+
+def test_a_second_face_beside_a_known_one_stays_fresh_for_the_greeting():
+    # The owner holding a stranger's photo up to the camera: one body, two
+    # faces. The unmatched one must survive reconcile so the greeting can fire.
+    tracker = PresenceTracker(ttl_s=30.0)
+    tracker.note_faces(["Anton", LABEL_UNKNOWN])
+    tracker.reconcile(1)
+    assert tracker.has_fresh_unknown_face()
 
 
 def test_clear_removes_freshness():

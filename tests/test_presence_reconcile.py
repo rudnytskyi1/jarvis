@@ -10,14 +10,29 @@ reported as "you and a stranger" while the owner is alone.
 from server.app import LABEL_UNKNOWN, PresenceTracker
 
 
-def test_reconcile_drops_unknown_when_named_covers_persons():
+def test_reconcile_drops_unknown_seen_in_a_later_worse_angle_burst():
     tracker = PresenceTracker(ttl_s=30.0)
-    tracker.note_faces(["Anton", LABEL_UNKNOWN])
+    tracker.note_faces(["Anton"])  # a good-angle frame matched him
+    tracker.note_faces([LABEL_UNKNOWN])  # the next frame caught him badly
     assert LABEL_UNKNOWN in tracker.present()
 
     tracker.reconcile(1)  # YOLO: only 1 person - Anton alone accounts for it
     present = tracker.present()
     assert LABEL_UNKNOWN not in present
+    assert "Anton" in present
+
+
+def test_reconcile_keeps_an_unknown_face_seen_beside_a_named_one():
+    # One burst, two faces, only one of them named: the face engine really did
+    # see a second face where YOLO counts one body - a photo held up to the
+    # camera, a face on the TV, somebody leaning in. That is a real stranger
+    # and dropping it is what used to keep Rowan silent.
+    tracker = PresenceTracker(ttl_s=30.0)
+    tracker.note_faces(["Anton", LABEL_UNKNOWN])
+
+    tracker.reconcile(1)  # YOLO sees one body, the camera saw two faces
+    present = tracker.present()
+    assert LABEL_UNKNOWN in present
     assert "Anton" in present
 
 
@@ -31,12 +46,23 @@ def test_reconcile_keeps_unknown_when_named_does_not_cover_persons():
 
 def test_reconcile_drops_unknown_when_several_named_labels_cover_persons():
     tracker = PresenceTracker(ttl_s=30.0)
-    tracker.note_faces(["Anton", "Bob", LABEL_UNKNOWN])
+    tracker.note_faces(["Anton", "Bob"])
+    tracker.note_faces(["Anton", LABEL_UNKNOWN])  # Bob caught at a bad angle
 
     tracker.reconcile(2)  # 2 named labels already cover YOLO's 2 people
     present = tracker.present()
     assert LABEL_UNKNOWN not in present
     assert set(present) == {"Anton", "Bob"}
+
+
+def test_reconcile_keeps_a_third_face_two_named_people_cannot_account_for():
+    tracker = PresenceTracker(ttl_s=30.0)
+    tracker.note_faces(["Anton", "Bob", LABEL_UNKNOWN])
+
+    # Three faces in ONE frame but only two names: whoever the third face
+    # belongs to, it is not Anton and not Bob.
+    tracker.reconcile(2)
+    assert LABEL_UNKNOWN in tracker.present()
 
 
 def test_reconcile_ignores_zero_or_negative_persons():

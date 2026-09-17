@@ -316,6 +316,9 @@ class PresenceTracker:
         self._seen: dict[str, _Presence] = {}
         #: How many faces of the last frame matched nobody (for the wording).
         self._unknown_count = 0
+        #: How many faces the last matched burst contained, named or not. More
+        #: faces than names means somebody unrecognised is genuinely there.
+        self.last_face_count = 0
         #: Since when ``camera_state`` has been reporting nobody at all.
         self._empty_since: float | None = None
 
@@ -367,6 +370,13 @@ class PresenceTracker:
         unknown sighting cannot be a second real person, so it is dropped.
         Does nothing when YOLO reports zero (no fresh signal to reconcile
         against) or there is no unknown bucket to begin with.
+
+        The exception is a burst that saw MORE faces than it could name. YOLO
+        counts bodies, and a face can arrive without one: a photo held up to
+        the camera, a face on the TV, somebody leaning in from behind whose
+        body is hidden. Those all give one YOLO person and two faces, and the
+        unmatched one is real - dropping it is what kept Rowan silent when the
+        owner held a stranger's photo up to the camera.
         """
         if persons <= 0:
             return
@@ -374,11 +384,13 @@ class PresenceTracker:
         if LABEL_UNKNOWN not in self._seen:
             return
         named = sum(1 for label in self._seen if label != LABEL_UNKNOWN)
-        if named >= persons:
+        faces = int(getattr(self, "last_face_count", 0) or 0)
+        if named >= persons and faces <= named:
             log.debug(
                 "Presence reconcile: %d named label(s) already cover the %d "
-                "YOLO person(s) - dropping the unknown bucket",
-                named, persons,
+                "YOLO person(s) and the last burst saw only %d face(s) - "
+                "dropping the unknown bucket",
+                named, persons, faces,
             )
             del self._seen[LABEL_UNKNOWN]
             self._unknown_count = 0
@@ -614,9 +626,9 @@ class Connection:
         self._last_audio_at = 0.0
         #: Monotonic clock of the last proactive greeting (0 = never greeted).
         self._last_greeting_at = 0.0
-        #: Last reason the greeting gate said no, and when it was logged - the
-        #: throttle behind :meth:`_greet_blocked`.
-        self._greet_block_reason = ""
+        #: Which gate last said no (a stable key, not the formatted message) and
+        #: when it was logged - the throttle behind :meth:`_greet_blocked`.
+        self._greet_block_key = ""
         self._greet_block_logged_at = 0.0
         #: v1.6: monotonic clock of the last utterance a KNOWN voice spoke on
         #: this connection (0 = never) - holds the greeting off (see _may_greet).
@@ -1478,20 +1490,21 @@ class Connection:
         """
         engine = _face
         if not self.face_enabled or engine is None or not engine.available:
-            return self._greet_blocked("the face engine is off or unavailable")
+            return self._greet_blocked("face_engine", "the face engine is off or unavailable")
         if self.session is None or _llm is None or _tts is None:
-            return self._greet_blocked("no session/model/voice yet")
+            return self._greet_blocked("not_ready", "no session/model/voice yet")
         if self.receiving:  # somebody is speaking to us right now
-            return self._greet_blocked("somebody is speaking to us right now")
+            return self._greet_blocked("receiving", "somebody is speaking to us right now")
         if self._task is not None and not self._task.done():
-            return self._greet_blocked("a reply is still being produced")
+            return self._greet_blocked("replying", "a reply is still being produced")
         now = time.monotonic()
         if self._last_audio_at and now - self._last_audio_at < GREETING_QUIET_S:
-            return self._greet_blocked("audio was flowing seconds ago")
+            return self._greet_blocked("audio", "audio was flowing seconds ago")
         if self._last_greeting_at and now - self._last_greeting_at < cooldown_s:
             return self._greet_blocked(
+                "cooldown",
                 f"already greeted {now - self._last_greeting_at:.0f}s ago "
-                f"(cooldown {cooldown_s:.0f}s)"
+                f"(cooldown {cooldown_s:.0f}s)",
             )
         # v1.6: a KNOWN voice on THIS connection recently, or a known face
         # alone with exactly one YOLO person, means the "unknown" face is
@@ -1504,34 +1517,39 @@ class Connection:
             and not self._extra_person_present()
         ):
             return self._greet_blocked(
+                "known_voice",
                 f"a known voice spoke {now - self._last_known_voice_at:.0f}s ago "
-                f"and nobody extra is in frame (holdoff {KNOWN_VOICE_HOLDOFF_S:.0f}s)"
+                f"and nobody extra is in frame (holdoff {KNOWN_VOICE_HOLDOFF_S:.0f}s)",
             )
         if self._known_face_alone():
-            return self._greet_blocked("a known face is alone in frame")
+            return self._greet_blocked("known_alone", "a known face is alone in frame")
         if not self.presence.has_fresh_unknown_face():
-            return self._greet_blocked("no unmatched face was detected recently")
+            return self._greet_blocked("no_unknown_face", "no unmatched face was detected recently")
         if self.presence.unknown_present_for() < greet_after_s:
             return self._greet_blocked(
+                "waiting",
                 f"the unknown face has only been there "
-                f"{self.presence.unknown_present_for():.0f}s of {greet_after_s:.0f}s"
+                f"{self.presence.unknown_present_for():.0f}s of {greet_after_s:.0f}s",
             )
         return True
 
-    def _greet_blocked(self, reason: str) -> bool:
+    def _greet_blocked(self, key: str, reason: str) -> bool:
         """Log WHY no greeting happened (throttled) and return ``False``.
 
         The greeting gate is polled once a second, so this would otherwise
-        drown the log. Only a CHANGED reason, or the same one after
+        drown the log. Throttling is keyed on ``key`` — a stable identifier for
+        WHICH gate said no — and never on ``reason``, which embeds a
+        seconds-ago counter that changes on every single poll and would defeat
+        the throttle entirely. Only a different gate, or the same gate after
         :data:`GREET_BLOCK_LOG_S`, is written - enough to answer "he just saw
         two people, why did he say nothing?" from the log alone.
         """
         now = time.monotonic()
         if (
-            reason != self._greet_block_reason
+            key != self._greet_block_key
             or now - self._greet_block_logged_at >= GREET_BLOCK_LOG_S
         ):
-            self._greet_block_reason = reason
+            self._greet_block_key = key
             self._greet_block_logged_at = now
             log.info(
                 "No greeting: %s [faces=%d known_here=%s persons=%s]",
