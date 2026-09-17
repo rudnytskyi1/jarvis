@@ -104,7 +104,9 @@ function Resolve-Python {
         $python = Get-CondaEnvPython -CondaExe $conda -Name $EnvName
         if (-not $python) {
             Write-Step "Creating conda env '$EnvName' with Python $PythonVersion"
-            & $conda create -y -n $EnvName "python=$PythonVersion"
+            # conda-forge with --override-channels: the default anaconda channels
+            # require an interactive Terms-of-Service acceptance on fresh installs.
+            & $conda create -y -n $EnvName "python=$PythonVersion" -c conda-forge --override-channels
             if ($LASTEXITCODE -ne 0) { throw "conda create failed with exit code $LASTEXITCODE" }
             $python = Get-CondaEnvPython -CondaExe $conda -Name $EnvName
         }

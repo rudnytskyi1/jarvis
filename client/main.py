@@ -90,6 +90,10 @@ MAX_OUTPUT_CHARS = 4000
 #: Short "nothing heard" chirp after a false wake-word trigger.
 NO_SPEECH_BEEP_FREQ_HZ = 440.0
 NO_SPEECH_BEEP_MS = 90
+#: Pause before the follow-up window opens: the room is still ringing with the
+#: tail of our own reply (speaker-to-mic echo), which VAD would otherwise pick
+#: up as speech and send to the server as a phantom empty utterance.
+FOLLOWUP_ECHO_GUARD_S = 0.5
 #: Mic audio recorded while the ack beep was playing: everything captured in the
 #: last ``BEEP_MS + BEEP_ECHO_GUARD_MS`` is our own beep (tone + output latency)
 #: and is dropped; anything older is the user already speaking and is kept, so a
@@ -315,6 +319,7 @@ class JarvisClient:
                 return
             pre_roll = b""
             lead_in = self.followup_window_s
+            await asyncio.sleep(FOLLOWUP_ECHO_GUARD_S)
             self.audio_in.clear()
             log.info(
                 "Listening for a follow-up for %.1f s (no wake word needed)...",

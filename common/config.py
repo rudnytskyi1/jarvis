@@ -11,7 +11,7 @@ Public API (SPEC section 6)::
     cfg.server.llm.base_url         # "http://127.0.0.1:11434/v1"
     cfg.server.llm.provider         # "ollama_native" | "openai"
     cfg.server.llm.think            # False (Qwen3 reasoning off for fast replies)
-    cfg.server.llm.vision_model     # "qwen3-vl:30b" (look_at_screen)
+    cfg.server.llm.vision_model     # "qwen3-vl:8b" (look_at_screen)
     cfg.server.llm.max_tool_rounds  # 4
     cfg.server.tts.speaker          # "en_0"
     cfg.client.server_url           # "ws://192.168.1.100:8765/ws"
@@ -98,14 +98,24 @@ class LLMConfig(_Strict):
     api_key: str = "ollama"
     #: Qwen3 reasoning; False keeps voice replies fast (ollama_native only).
     think: bool = False
-    #: Vision model used by the look_at_screen tool.
-    vision_model: str = "qwen3-vl:30b"
+    #: Vision model used by the look_at_screen tool (8B fits in VRAM next to
+    #: the 30B chat model, so screen questions do not trigger a model swap).
+    vision_model: str = "qwen3-vl:8b"
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=1)
     #: How many tool-call rounds one utterance may take before a final answer.
     max_tool_rounds: int = Field(default=4, ge=1)
     #: How many last user/assistant exchanges are kept in the session history.
     history_turns: int = Field(default=12, ge=0)
+    #: How long Ollama keeps the chat model loaded after a request
+    #: (a duration string like "4h", or "-1" for forever; ollama_native only).
+    #: Ollama's own default of 5 m makes the first command after a quiet spell
+    #: pay a full model reload from disk.
+    keep_alive: str = "4h"
+    #: Context window requested from Ollama (ollama_native only). The model's
+    #: own default (32k for qwen3:30b) wastes several GB of VRAM on KV cache
+    #: that a voice assistant with a short history never uses.
+    num_ctx: int = Field(default=8192, ge=1024)
 
     @field_validator("provider", mode="after")
     @classmethod

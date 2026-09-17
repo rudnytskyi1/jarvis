@@ -17,11 +17,13 @@ server:
     model: qwen3:30b                      # Qwen3-30B-A3B; tool calling verified
     api_key: ollama
     think: false             # disable Qwen3 reasoning for fast voice replies
-    vision_model: qwen3-vl:30b            # used by look_at_screen
+    vision_model: qwen3-vl:8b             # used by look_at_screen; 8B fits next to the chat model (no VRAM swap)
     temperature: 0.6
     max_tokens: 1024
     max_tool_rounds: 4       # how many tool-call rounds per utterance
     history_turns: 12        # how many recent exchanges to keep
+    keep_alive: 4h           # keep the chat model in VRAM (Ollama unloads after 5 m otherwise)
+    num_ctx: 8192            # requested context window; the 32k model default wastes VRAM
 
   tts:
     engine: silero

@@ -229,6 +229,7 @@ cfg.server.port              # 8765
 cfg.server.stt.{model, device, compute_type, language}          # language: str | None
 cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns}
 cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # v1.1: "ollama_native"|"openai", bool, str, int
+cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 8192 (requested context)
 cfg.server.tts.{engine, language, model_id, speaker, sample_rate}   # English default: language "en", model_id "v3_en", speaker "en_0"
 cfg.client.server_url        # "ws://192.168.x.x:8765/ws"
 cfg.client.client_id

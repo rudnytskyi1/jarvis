@@ -77,6 +77,9 @@ class VisionClient:
         payload = {
             "model": self.model,
             "stream": False,
+            # Keep the (small) vision model resident next to the chat model so
+            # repeated screen questions do not reload it from disk.
+            "keep_alive": "4h",
             "messages": [
                 {
                     "role": "user",

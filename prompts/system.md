@@ -43,6 +43,12 @@ Calling rules:
 - For `open_app` and `close_app`, pass the app name the user said — the PC
   resolves it against everything installed. If it fails, the error lists close
   matches: pick the right one and retry once.
+- "Open" often means a website, not a program. For sites and online services —
+  YouTube, Netflix, Twitch, Gmail, any URL — do not use `open_app`; call
+  `run_command` with Start-Process and the address, for example
+  Start-Process "https://www.youtube.com". The default browser will open it.
+  If `open_app` cannot find a matching program and the name sounds like a
+  website, fall back to opening it as a URL the same way.
 - Volume for `volume_set` is a number from 0 to 100.
 - For `run_command`, prefer one short PowerShell command; you will get back its
   output and can chain another call if needed.

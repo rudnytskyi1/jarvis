@@ -233,6 +233,14 @@ class LlmClient:
         except (TypeError, ValueError):
             self.max_tool_rounds = 4
         self.api_key = str(getattr(cfg_llm, "api_key", "") or "ollama")
+        #: How long Ollama keeps the chat model loaded after a request. The
+        #: default 5 m would make the first command after a quiet spell pay a
+        #: full ~15 s model reload (native provider only).
+        self.keep_alive = str(getattr(cfg_llm, "keep_alive", "4h") or "4h")
+        try:
+            self.num_ctx = max(1024, int(getattr(cfg_llm, "num_ctx", 8192)))
+        except (TypeError, ValueError):
+            self.num_ctx = 8192
 
         #: Cleared when the server rejects the "think" field (older Ollama builds).
         self._send_think = True
@@ -280,7 +288,9 @@ class LlmClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
+            "keep_alive": self.keep_alive,
             "options": {
+                "num_ctx": self.num_ctx,
                 "num_predict": self.max_tokens,
                 "temperature": self.temperature,
             },
