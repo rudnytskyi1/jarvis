@@ -38,7 +38,7 @@ NO_PRESENCE_TEXT = "(camera sees nobody)"
 
 #: Used only if prompts/system.md is missing or unreadable.
 FALLBACK_SYSTEM_PROMPT = (
-    "You are Jarvis, the voice assistant of a dorm room. Your reply is read aloud, "
+    "You are Rowan, the voice assistant of a dorm room. Your reply is read aloud, "
     "so answer in English in one or two short sentences, with no markdown, lists "
     "or emoji.\n"
     "Fulfil every request about the room PC or the room devices by calling a tool "

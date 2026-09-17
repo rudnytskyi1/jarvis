@@ -118,7 +118,10 @@ GREETING_REQUEST = (
     "tools, just speak."
 )
 #: Spoken when the LLM is unreachable or answers nothing at all.
-SAY_FALLBACK_GREETING = "Good day. I am Jarvis, the assistant of this room."
+SAY_FALLBACK_GREETING = "Good day. I am Rowan, the assistant of this room."
+#: While voice enrollment is collecting samples the user needs room to speak:
+#: the follow-up window the client holds open after our reply (SPEC §4 say.listen_s).
+ENROLL_LISTEN_S = 12.0
 
 #: SPEC §4: the error sent when STT produced nothing (shared with the client).
 ERROR_EMPTY_TRANSCRIPT = proto.ERR_EMPTY_TRANSCRIPT
@@ -1419,7 +1422,12 @@ class Connection:
             session.remember(prefixed, say_text)
 
             # 3. say -> tts stream (order fixed by SPEC §4)
-            await self.send_json({"type": proto.MSG_SAY, "text": say_text})
+            say_payload: dict[str, Any] = {"type": proto.MSG_SAY, "text": say_text}
+            if self._enroll_pending:
+                # Voice enrollment expects the speaker to keep talking: tell the
+                # client to hold the follow-up window open longer than usual.
+                say_payload["listen_s"] = ENROLL_LISTEN_S
+            await self.send_json(say_payload)
             t_tts = time.perf_counter()
             await self._stream_tts(voice, say_text)
             tts_ms = int((time.perf_counter() - t_tts) * 1000)

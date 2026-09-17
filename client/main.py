@@ -293,6 +293,8 @@ class JarvisClient:
         self._tts_active = False
         self._tts_bytes = 0
         self._last_say = ""
+        #: Server's follow-up window request from the last reply (say.listen_s).
+        self._listen_hint_s = 0.0
 
         # -- v1.4: one reader task owns the socket -----------------------
         #: Messages belonging to the utterance in flight (text and binary).
@@ -706,15 +708,20 @@ class JarvisClient:
                 pre_roll = self._drain_beep_window()
                 lead_in = None
                 continue
-            if result != RESULT_OK or self.followup_window_s <= 0:
+            # SPEC §4: the server may ask for a longer follow-up window via
+            # say.listen_s (voice enrollment needs room to keep talking).
+            hint = self._listen_hint_s
+            self._listen_hint_s = 0.0
+            window = max(self.followup_window_s, hint)
+            if result != RESULT_OK or window <= 0:
                 return
             pre_roll = b""
-            lead_in = self.followup_window_s
+            lead_in = window
             await asyncio.sleep(FOLLOWUP_ECHO_GUARD_S)
             self.audio_in.clear()
             log.info(
                 "Listening for a follow-up for %.1f s (no wake word needed)...",
-                self.followup_window_s,
+                window,
             )
 
     def _drain_beep_window(self) -> bytes:
@@ -883,6 +890,10 @@ class JarvisClient:
                 elif mtype == MSG_SAY:
                     await self._stop_thinking()
                     self._last_say = str(msg.get("text") or "").strip()
+                    try:
+                        self._listen_hint_s = float(msg.get("listen_s") or 0.0)
+                    except (TypeError, ValueError):
+                        self._listen_hint_s = 0.0
                     log.info("Reply: %s", self._last_say or "(empty)")
                 elif mtype == MSG_TTS_START:
                     await self._stop_thinking()
