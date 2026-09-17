@@ -242,6 +242,9 @@ class ClientConfig(_Strict):
     vad: VADConfig = Field(default_factory=VADConfig)
     #: Seconds to keep listening after a reply without the wake word (0 = off).
     followup_window_s: float = Field(default=6.0, ge=0.0)
+    #: Soft repeating blips while the server is still working on a reply
+    #: (vision, tool rounds) so silence never looks like a hang.
+    thinking_sounds: bool = True
     #: Friendly app name -> executable path / command; OVERRIDES on top of the
     #: client's installed-app index. Empty by default.
     apps: Dict[str, str] = Field(default_factory=dict)

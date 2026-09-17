@@ -202,9 +202,14 @@ items, args verbatim; result = the client's `action_result`). `look_at_screen`,
    `{"device": str, "action": "on"|"off"|"press"|"toggle"}`
    (Bots in press mode treat "toggle"/"on"/"off" as a single press.)
 3. **`pc_control`** — control the room PC (the client machine itself).
-   `{"command": "volume_set"|"volume_up"|"volume_down"|"mute"|"unmute"|"media_play_pause"|"media_next"|"media_prev"|"display_off"|"display_on"|"sleep"|"open_app"|"close_app"|"minimize_app"|"type_text"|"hotkey", "value": str|int|null}`
+   `{"command": "volume_set"|"volume_up"|"volume_down"|"mute"|"unmute"|"media_play_pause"|"media_next"|"media_prev"|"display_off"|"display_on"|"sleep"|"open_app"|"close_app"|"minimize_app"|"focus_app"|"type_text"|"hotkey", "value": str|int|null}`
    `minimize_app` minimizes all top-level windows of the named app (resolved
-   like `close_app`; works for UWP apps too via window enumeration by process).
+   like `close_app`; works for UWP apps too via window enumeration by process;
+   console/terminal aliases minimize the shell windows hosting the client).
+   `focus_app` (v1.2.1) restores + foregrounds the app's main window so
+   subsequent `type_text`/`hotkey` reach it; refuses the console aliases.
+   Safety: closing hotkeys (ctrl+w, alt+f4, …) are refused while the focused
+   window is the client's own console (it once closed itself that way).
    `value`: `volume_set` int 0–100; `open_app`/`close_app` an app name — resolved
    by the client's installed-app index (§8 apps.py): `cfg.client.apps` overrides
    first, then fuzzy match over ALL installed apps; unknown → error result naming
@@ -259,6 +264,7 @@ cfg.client.wakeword.{word, phrases, vosk_model}                 # phrases: list[
 cfg.client.audio.{input_device, output_device, sample_rate}     # devices: int|str|None
 cfg.client.vad.{aggressiveness, silence_ms, max_utterance_s, pre_roll_ms, min_speech_ms}
 cfg.client.followup_window_s # float, 0 = off
+cfg.client.thinking_sounds   # bool, true: soft blips while a reply takes > ~1.5 s
 cfg.client.apps              # dict[str, str] friendly name -> exe path/command (OVERRIDES on top of the app index; may be empty)
 cfg.client.devices           # list[DeviceConfig]; [] is the current default (no physical devices yet)
 ```

@@ -58,6 +58,7 @@ client:
     min_speech_ms: 250       # shorter voiced bursts are noise blips - dropped, listening continues
 
   followup_window_s: 6       # after a reply, listen N more seconds without wake word (0 = off)
+  thinking_sounds: true      # soft blips when a reply takes longer than ~1.5 s (vision, tool chains)
 
   apps: {}                   # optional overrides: spoken name -> exe path.
                              # Any installed app is found automatically (Start Menu + Store apps);

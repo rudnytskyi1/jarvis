@@ -94,6 +94,14 @@ NO_SPEECH_BEEP_MS = 90
 #: tail of our own reply (speaker-to-mic echo), which VAD would otherwise pick
 #: up as speech and send to the server as a phantom empty utterance.
 FOLLOWUP_ECHO_GUARD_S = 0.5
+#: "Thinking" sounds: when the server takes longer than this to start replying
+#: (vision, tool rounds), a soft two-tone blip repeats so the user knows Jarvis
+#: is working rather than stuck. Silenced the moment the reply begins.
+THINKING_DELAY_S = 1.5
+THINKING_INTERVAL_S = 2.2
+THINKING_BLIP_FREQS_HZ = (520.0, 660.0)
+THINKING_BLIP_MS = 60
+THINKING_VOLUME = 0.14
 #: Mic audio recorded while the ack beep was playing: everything captured in the
 #: last ``BEEP_MS + BEEP_ECHO_GUARD_MS`` is our own beep (tone + output latency)
 #: and is dropped; anything older is the user already speaking and is kept, so a
@@ -209,6 +217,9 @@ class JarvisClient:
         self.preroll = RingBuffer(int(math.ceil(pre_roll_ms / float(self.frame_ms))))
 
         self.followup_window_s = float(_attr(self.ccfg, "followup_window_s") or 0.0)
+        raw_thinking = _attr(self.ccfg, "thinking_sounds")
+        self.thinking_sounds = True if raw_thinking is None else bool(raw_thinking)
+        self._thinking_task: Optional[asyncio.Task] = None
 
         self.registry = build_registry(self.ccfg)
         self.dispatcher = Dispatcher(self.ccfg, self.registry)
@@ -440,6 +451,7 @@ class JarvisClient:
         self._tts_active = False
         self._tts_bytes = 0
         result = RESULT_OK
+        self._start_thinking()
         try:
             while True:
                 msg = await self.ws.recv()
@@ -457,9 +469,11 @@ class JarvisClient:
                 elif mtype == MSG_SCREENSHOT_REQUEST:
                     await self._handle_screenshot_request(msg)
                 elif mtype == MSG_SAY:
+                    await self._stop_thinking()
                     self._last_say = str(msg.get("text") or "").strip()
                     log.info("Reply: %s", self._last_say or "(empty)")
                 elif mtype == MSG_TTS_START:
+                    await self._stop_thinking()
                     await self._on_tts_start(msg)
                 elif mtype == MSG_TTS_END:
                     self._tts_active = False
@@ -470,6 +484,7 @@ class JarvisClient:
                         log.debug("Played %d bytes of TTS", self._tts_bytes)
                     break
                 elif mtype == MSG_ERROR:
+                    await self._stop_thinking()
                     log.error("Server error: %s", msg.get("message"))
                     self._tts_active = False
                     await self._beep(ERROR_BEEP_FREQ_HZ, ERROR_BEEP_MS)
@@ -480,8 +495,37 @@ class JarvisClient:
                 else:
                     log.warning("Unknown message type from the server: %r", mtype)
         finally:
+            await self._stop_thinking()
             await self._await_actions()
         return result
+
+    # -- thinking sounds (the "I'm working on it" blips) ---------------------
+
+    async def _thinking_loop(self) -> None:
+        """Soft repeating blips while the server is still working on a reply."""
+        await asyncio.sleep(THINKING_DELAY_S)
+        while True:
+            for freq in THINKING_BLIP_FREQS_HZ:
+                await self._beep(freq, THINKING_BLIP_MS, volume=THINKING_VOLUME)
+            await asyncio.sleep(THINKING_INTERVAL_S)
+
+    def _start_thinking(self) -> None:
+        if self.thinking_sounds and self._thinking_task is None:
+            self._thinking_task = asyncio.get_running_loop().create_task(
+                self._thinking_loop(), name="jarvis-thinking-sounds"
+            )
+
+    async def _stop_thinking(self) -> None:
+        task, self._thinking_task = self._thinking_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - a sound must never break the loop
+            log.debug("Thinking-sound task ended with: %s", exc)
 
     async def _on_tts_start(self, msg: Dict[str, Any]) -> None:
         sample_rate = int(msg.get("sr") or self.sample_rate)
@@ -679,11 +723,23 @@ def setup_logging(level: str) -> None:
             reconfigure(encoding="utf-8", errors="replace")
         except Exception:  # pragma: no cover - redirected/exotic streams
             pass
-    logging.basicConfig(
-        level=getattr(logging, str(level).upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    resolved = getattr(logging, str(level).upper(), logging.INFO)
+    fmt = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+    logging.basicConfig(level=resolved, format=fmt, datefmt="%H:%M:%S")
+    # The client normally runs with a hidden console, so the log also goes to a
+    # file — that is the only way to debug it after the window went away.
+    try:
+        log_path = REPO_ROOT / "data" / "client.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+            log_path.unlink()  # crude rotation: start over past 5 MB
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(
+            logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        logging.getLogger().addHandler(file_handler)
+    except Exception as exc:  # noqa: BLE001 - file logging is best-effort
+        logging.getLogger(__name__).warning("File logging unavailable: %s", exc)
     for noisy in ("websockets", "websockets.client", "comtypes", "bleak", "asyncio", "PIL"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

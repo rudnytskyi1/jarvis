@@ -108,9 +108,13 @@ TOOLS: list[dict[str, Any]] = [
                 "display on/off, sleep, opening, closing and minimising applications, "
                 "typing text and pressing hotkeys. Use it for every request about sound, "
                 "music, video, the display, or starting, closing and hiding programs. For "
-                "open_app, close_app and minimize_app pass the name the user said — the PC "
-                "matches it against everything installed, and a failed match comes back "
-                "with the closest names so you can retry once. "
+                "open_app, close_app, minimize_app and focus_app pass the name the user "
+                "said — the PC matches it against everything installed, and a failed "
+                "match comes back with the closest names so you can retry once. "
+                "Keystrokes (type_text, hotkey) go to whatever window has FOCUS: always "
+                "focus_app the target application first. Browser tabs are closed with "
+                "focus_app on the browser followed by hotkey ctrl+w — never by closing "
+                "or minimising the whole app. "
                 + _COMMON_HINT
             ),
             "parameters": {
@@ -133,6 +137,7 @@ TOOLS: list[dict[str, Any]] = [
                             "open_app",
                             "close_app",
                             "minimize_app",
+                            "focus_app",
                             "type_text",
                             "hotkey",
                         ],

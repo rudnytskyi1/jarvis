@@ -58,6 +58,7 @@ CMD_SLEEP = "sleep"
 CMD_OPEN_APP = "open_app"
 CMD_CLOSE_APP = "close_app"
 CMD_MINIMIZE_APP = "minimize_app"
+CMD_FOCUS_APP = "focus_app"
 CMD_TYPE_TEXT = "type_text"
 CMD_HOTKEY = "hotkey"
 
@@ -77,6 +78,7 @@ PC_COMMANDS = frozenset(
         CMD_OPEN_APP,
         CMD_CLOSE_APP,
         CMD_MINIMIZE_APP,
+        CMD_FOCUS_APP,
         CMD_TYPE_TEXT,
         CMD_HOTKEY,
     }
@@ -164,6 +166,10 @@ _SM_CYSCREEN = 1
 
 #: ShowWindow command and the window styles/attributes used by minimize_app
 _SW_MINIMIZE = 6
+_SW_RESTORE = 9
+#: Hotkeys that close the focused window/tab. Refused when the focused window
+#: is our own console — that is how Jarvis once closed itself instead of a tab.
+_CLOSING_HOTKEYS = frozenset({"ctrl+w", "ctrl+f4", "ctrl+shift+w", "alt+f4", "ctrl+shift+q"})
 _GWL_EXSTYLE = -20
 _WS_EX_TOOLWINDOW = 0x00000080
 #: DwmGetWindowAttribute index telling whether a window is cloaked — UWP apps
@@ -971,6 +977,54 @@ def _sync_minimize_console() -> list[str]:
     return minimized
 
 
+def _sync_focus_window(hwnd: int) -> None:
+    """Restore a window and bring it to the foreground.
+
+    Windows refuses ``SetForegroundWindow`` from a background process unless an
+    Alt key event "unlocks" it first — the long-standing ``keybd_event``
+    workaround, needed because the client runs headless.
+    """
+    user32 = _user32()
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.keybd_event.argtypes = (
+        ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.c_void_p,
+    )
+    user32.ShowWindow(hwnd, _SW_RESTORE)
+    user32.keybd_event(0x12, 0, 0, None)       # VK_MENU down
+    user32.keybd_event(0x12, 0, 0x0002, None)  # VK_MENU up
+    user32.SetForegroundWindow(hwnd)
+
+
+def _sync_focus_app(image_name: str | None, display_name: str) -> str | None:
+    """Bring the app's main window to the foreground; returns its title."""
+    _require_windows()
+    pids = _sync_process_ids(image_name) if image_name else set()
+    windows = _list_windows()
+    targets = [window for window in windows if window.pid in pids] if pids else []
+    if not targets:
+        query = normalize_app_name(display_name)
+        targets = [window for window in windows if _title_matches(window.title, query)]
+    if not targets:
+        return None
+    _sync_focus_window(targets[0].hwnd)
+    return targets[0].title
+
+
+def _own_console_focused() -> bool:
+    """True when the foreground window is the console hosting this client."""
+    try:
+        user32 = _user32()
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetConsoleWindow.restype = wintypes.HWND
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        own = kernel32.GetConsoleWindow()
+        return bool(own) and user32.GetForegroundWindow() == own
+    except Exception as exc:  # noqa: BLE001 - a guard must never break the action
+        log.debug("could not compare console windows: %s", exc)
+        return False
+
+
 def _sync_minimize_app(image_name: str | None, display_name: str) -> list[str]:
     """Minimize every visible window of an app. Returns the titles minimized.
 
@@ -1168,6 +1222,9 @@ class PCController:
         if name == CMD_MINIMIZE_APP:
             return await self.minimize_app(value)
 
+        if name == CMD_FOCUS_APP:
+            return await self.focus_app(value)
+
         # CMD_CLOSE_APP
         return await self._close_app(value)
 
@@ -1226,6 +1283,24 @@ class PCController:
         named = ", ".join(titles[:MAX_REPORTED_WINDOWS])
         detail = f"minimized {len(titles)} window(s) of {entry.name}"
         return PCResult(f"{detail}: {named}" if named else detail)
+
+    async def focus_app(self, value: Any) -> PCResult:
+        """Bring an app's window to the foreground (``pc_control`` ``focus_app``)."""
+
+        if _is_console_alias(value):
+            raise PCActionError(
+                "refusing to focus the console - it hosts the Jarvis client itself"
+            )
+        entry = await self._resolve_app(value)
+        title = await asyncio.to_thread(
+            _sync_focus_app, entry.process_name(), entry.name
+        )
+        if title is None:
+            raise PCActionError(
+                f"no open window found for '{entry.name}' - open it first with open_app"
+            )
+        log.info("pc_control: focused '%s' (%s)", entry.name, title)
+        return PCResult(f"focused {entry.name}: {title}")
 
     async def mouse_click(
         self, x_norm: Any, y_norm: Any, button: Any = None
@@ -1291,6 +1366,13 @@ class PCController:
 
     async def _hotkey(self, value: Any) -> PCResult:
         modifiers, keys, label = parse_hotkey(value)
+        combo = "+".join(part.strip().lower() for part in str(value or "").split("+"))
+        if combo in _CLOSING_HOTKEYS and await asyncio.to_thread(_own_console_focused):
+            raise PCActionError(
+                f"refusing to press {label}: the focused window is my own console "
+                "and that key combination would close me - focus_app the target "
+                "application first, then retry"
+            )
         await asyncio.to_thread(_sync_hotkey, modifiers, keys)
         log.info("pc_control: pressed %s", label)
         return PCResult(f"pressed {label}")
