@@ -177,6 +177,8 @@ class ImageFrame:
     reason: str = REASON_REQUEST
     seq: int = 1
     of: int = 1
+    #: The id from the announcing header (presence bursts group by it).
+    id: str = ""
 
 
 #: v1.1 name of the same record; screenshots are just the ``screen`` source.
@@ -766,6 +768,7 @@ class Connection:
             reason=str(header.get("reason") or REASON_REQUEST),
             seq=seq,
             of=max(of, seq),
+            id=str(header.get("id") or ""),
         )
 
     def _deliver_image(self, data: bytes) -> None:
