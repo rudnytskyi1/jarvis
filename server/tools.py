@@ -274,7 +274,12 @@ TOOLS: list[dict[str, Any]] = [
                 "Save a lasting fact to your permanent memory. Use it when someone shares "
                 "something worth keeping — names, preferences, schedules, where things are, "
                 "promises — or explicitly asks you to remember something. Do not use it for "
-                "one-off commands or small talk. " + _COMMON_HINT
+                "one-off commands or small talk. "
+                "Always set 'about': a fact belongs either to ONE person (their "
+                "preference, their habit, how they want you to behave with them) or "
+                "to the room as a whole. A personal fact is only ever read back "
+                "while that person is the one speaking, so filing it against the "
+                "room tells everybody else about them too. " + _COMMON_HINT
             ),
             "parameters": {
                 "type": "object",
@@ -284,6 +289,15 @@ TOOLS: list[dict[str, Any]] = [
                         "description": (
                             "One self-contained English sentence, e.g. "
                             "'Anton's lectures start at 9am on Tuesdays.'"
+                        ),
+                    },
+                    "about": {
+                        "type": "string",
+                        "description": (
+                            "Whose fact this is: the person's name exactly as you know "
+                            "it, or 'me' for whoever is speaking right now. Use 'room' "
+                            "for something true of the room itself and everybody in it, "
+                            "such as where the light switch is."
                         ),
                     },
                 },

@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -256,6 +257,23 @@ def _should_show_detections(count: int, show_requested: bool) -> bool:
     without a whole fake connection.
     """
     return count > 0 or bool(show_requested)
+
+
+#: First-person wording that makes a remembered fact belong to the speaker
+#: rather than to the room: "I prefer tea", "call me Tony", "my desk lamp".
+_SPEAKER_FACT_RE = re.compile(
+    r"\b(?:i|i'?m|i'?ve|me|my|mine|myself|call\s+me)\b", re.IGNORECASE
+)
+
+
+def _mentions_the_speaker(fact: str) -> bool:
+    """True when ``fact`` is phrased about the person saying it.
+
+    The model is told to pass ``about``, but it forgets, and a preference
+    filed against the room would then be read back to everybody. Pure string
+    matching so it can be unit-tested on its own.
+    """
+    return bool(_SPEAKER_FACT_RE.search(str(fact or "")))
 
 
 def _positive_int(value: Any) -> int | None:
@@ -650,6 +668,9 @@ class Connection:
         #: Monotonic clock of the last proactive greeting of ANYBODY (0 = never).
         #: Only spaces two greetings apart; who is due is per person, below.
         self._last_greeting_at = 0.0
+        #: v1.7: name -> everything remembered about that person, read from
+        #: data/memory.jsonl the first time they speak on this connection.
+        self._personal_facts: dict[str, list[str]] = {}
         #: v1.7: label -> monotonic clock of the last time the camera SAW that
         #: person. The greeting rule is about absence, not about how long ago
         #: Rowan last spoke: somebody who has been sitting in front of the
@@ -969,6 +990,21 @@ class Connection:
             frame.screen_w, frame.screen_h,
         )
         future.set_result(frame)
+
+    def _known_speaker_name(self) -> str:
+        """The identified speaker's name, or ``""`` when nobody is identified."""
+        name = str(self._speaker_name or "").strip()
+        return "" if name == speaker_mod.ROLE_UNKNOWN else name
+
+    def _personal_facts_for(self, name: str) -> list[str]:
+        """Everything remembered about ``name``, cached for this connection."""
+        if not name:
+            return []
+        cached = self._personal_facts.get(name)
+        if cached is None:
+            cached = _memory.facts(name) if _memory is not None else []
+            self._personal_facts[name] = cached
+        return cached
 
     def _turn_changed_state(self) -> bool:
         """True when this utterance ran a tool that changed something (§ judge)."""
@@ -2303,17 +2339,35 @@ class Connection:
         if _memory is None:
             record["result"] = {"ok": False, "error": "memory storage is not available"}
             return record["result"]
+        # Whose fact is it? "about" lets the model say so explicitly; otherwise
+        # anything phrased about the speaker themselves ("I prefer...", "call me
+        # ...") belongs to the identified speaker, and everything else is about
+        # the room and applies to everybody.
+        about = str(args.get("about") or "").strip()
+        if about.lower() in ("", "room", "everyone", "everybody", "all", "general"):
+            owner = ""
+        elif about.lower() in ("me", "myself", "speaker", "user"):
+            owner = self._known_speaker_name()
+        else:
+            owner = about
+        if not owner and _mentions_the_speaker(fact):
+            owner = self._known_speaker_name()
+
         try:
-            stored = await asyncio.to_thread(_memory.add, fact)
+            stored = await asyncio.to_thread(_memory.add, fact, owner)
         except ValueError as exc:
             result = {"ok": False, "error": str(exc)}
         except Exception as exc:
             log.exception("Could not store a fact")
             result = {"ok": False, "error": f"could not store the fact: {exc}"}
         else:
-            if self.session is not None:
+            if not owner and self.session is not None:
+                # Only a room-wide fact belongs in the system prompt; a personal
+                # one rides in that person's turn prefix instead.
                 self.session.add_fact(stored)
-            result = {"ok": True}
+            if owner:
+                self._personal_facts.setdefault(owner, []).append(stored)
+            result = {"ok": True, "remembered_about": owner or "the room"}
 
         record["result"] = result
         return result
@@ -2491,9 +2545,18 @@ class Connection:
         except Exception:  # noqa: BLE001 - presence must never break a reply
             room_text = ""
         room_part = f" [room: {room_text}]" if room_text else ""
+        # What Rowan knows about THIS person specifically - their preferences
+        # and habits. It rides here rather than in the system prompt for the
+        # same reason presence does: the prompt must stay byte-identical
+        # between turns or Ollama re-prefills everything, and this block
+        # changes the moment somebody else speaks.
+        known = self._personal_facts_for(self._known_speaker_name())
+        about_part = (
+            f" [about {self._speaker_name}: {'; '.join(known)}]" if known else ""
+        )
         prefixed = (
             f"[speaker: {self._speaker_name} | role: {self._speaker_role}]"
-            f"{room_part}{enroll_note} {text}"
+            f"{room_part}{about_part}{enroll_note} {text}"
         )
 
         # 2. LLM with the tool loop — tools are executed for real (SPEC §3, §5)

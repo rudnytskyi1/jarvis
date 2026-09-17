@@ -90,6 +90,16 @@ v1.4 — **camera, faces, presence** (the C920 on the room PC):
   LLM (offering voice enrollment once, per persona rules) and pushes it as an
   unsolicited `say` + `tts_start…tts_end` block. The client therefore reads the
   socket BETWEEN utterances too and plays such proactive audio only when idle.
+- **Per-person memory (v1.7)**: `data/memory.jsonl` records carry a `person`
+  field. `remember {"fact": str, "about": str}` files a fact against one person
+  (`about` is their name, or `"me"` for the current speaker) or against the room
+  (`"room"`, or omitted); a fact phrased in the first person is attributed to the
+  identified speaker even when the model forgets `about`. `Memory.facts()`
+  returns ONLY room facts and those go in the system prompt; `Memory.facts(name)`
+  returns only that person's, and they ride in the per-turn message prefix as
+  `[about <name>: …]` next to `[speaker: …]` and `[room: …]` — so the system
+  prompt stays byte-identical between turns and Ollama's prompt cache survives.
+  A personal fact is never shown while somebody else is speaking.
 - **Per-person greeting cooldowns (v1.7)**: cooldowns are tracked per person,
   not per room. The same stranger is greeted again after `greeting_cooldown_s`;
   somebody the server recognises by name is greeted again after

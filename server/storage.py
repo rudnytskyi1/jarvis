@@ -77,9 +77,9 @@ class Memory:
         self._lock = threading.Lock()
         log.info("Memory file: %s", self.path)
 
-    def facts(self) -> list[str]:
-        """Return every stored fact, oldest first. Never raises."""
-        result: list[str] = []
+    def _records(self) -> list[dict[str, Any]]:
+        """Every stored record, oldest first, as ``{"fact": str, "person": str}``."""
+        result: list[dict[str, Any]] = []
         try:
             with self._lock:
                 if not self.path.is_file():
@@ -100,14 +100,44 @@ class Memory:
                 continue
             if isinstance(record, dict):
                 fact = str(record.get("fact") or "").strip()
+                person = str(record.get("person") or "").strip()
             else:
-                fact = str(record).strip()
+                fact, person = str(record).strip(), ""
             if fact:
-                result.append(fact)
+                result.append({"fact": fact, "person": person})
         return result
 
-    def add(self, fact: str) -> str:
+    def facts(self, person: str | None = None) -> list[str]:
+        """Facts that apply right now, oldest first. Never raises.
+
+        Without ``person``, only the facts that belong to nobody in particular
+        - the ones true of the room itself, which go in the system prompt and
+        must stay byte-identical between turns for the model's prompt cache to
+        survive. With a name, ONLY that person's own facts, which ride in the
+        per-turn message prefix instead.
+        """
+        wanted = " ".join(str(person or "").split())
+        return [
+            record["fact"]
+            for record in self._records()
+            if record["person"] == wanted
+        ]
+
+    def people(self) -> list[str]:
+        """Names that have at least one remembered fact of their own."""
+        seen: list[str] = []
+        for record in self._records():
+            name = record["person"]
+            if name and name not in seen:
+                seen.append(name)
+        return seen
+
+    def add(self, fact: str, person: str | None = None) -> str:
         """Store one self-contained fact and return it as stored.
+
+        ``person`` attributes the fact to somebody - their preference, their
+        habit, how they like things done. Facts about the room itself are
+        stored with no person and apply to everyone.
 
         :raises ValueError: the fact is empty after trimming.
         :raises OSError: the file could not be written.
@@ -117,9 +147,14 @@ class Memory:
             raise ValueError("fact is empty")
         if len(cleaned) > MAX_FACT_CHARS:
             cleaned = cleaned[:MAX_FACT_CHARS].rstrip()
+        owner = " ".join(str(person or "").split())
         with self._lock:
-            _write_line(self.path, {"ts": _now_iso(), "fact": cleaned})
-        log.info("Remembered a fact: %r", cleaned)
+            _write_line(
+                self.path, {"ts": _now_iso(), "person": owner, "fact": cleaned}
+            )
+        log.info(
+            "Remembered a fact%s: %r", f" about {owner}" if owner else "", cleaned
+        )
         return cleaned
 
 
