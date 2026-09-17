@@ -193,6 +193,14 @@ class VisionClient:
         #: Keep the vision model resident between screen questions, exactly like
         #: the chat model — with one model serving both there is nothing to swap.
         self.keep_alive = str(getattr(cfg_llm, "keep_alive", "4h") or "4h")
+        #: MUST match the chat model's num_ctx. Ollama reloads a model from disk
+        #: whenever a request changes runner options like num_ctx — with chat and
+        #: vision on the same model but different num_ctx, every screen question
+        #: paid two ~15 s reloads (chat->vision->chat). Same value = zero reloads.
+        try:
+            self.num_ctx = max(1024, int(getattr(cfg_llm, "num_ctx", 8192)))
+        except (TypeError, ValueError):
+            self.num_ctx = 8192
         #: Cleared when the server rejects the "think" field (older Ollama builds).
         self._send_think = True
         self._client = httpx.Client(timeout=REQUEST_TIMEOUT_S)
@@ -222,6 +230,7 @@ class VisionClient:
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
+                "num_ctx": self.num_ctx,
             },
         }
         if self._send_think:

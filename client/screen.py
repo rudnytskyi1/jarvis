@@ -33,7 +33,11 @@ from typing import Any, Tuple
 log = logging.getLogger(__name__)
 
 #: Longest edge of the sent image along X; taller screens keep their aspect ratio.
-MAX_WIDTH_PX = 1600
+# 1024 px keeps the whole UI legible to the vision model while cutting its image
+# prefill from ~1400 to ~600 tokens (measured 8.7 s -> 1.0 s at millard-qwen4).
+# Grounding stays accurate: click coordinates come back on a 0-1000 grid and are
+# normalized, so they do not depend on the pixel size of the screenshot.
+MAX_WIDTH_PX = 1024
 #: JPEG quality used for the encoded screenshot.
 JPEG_QUALITY = 80
 #: Value of the ``format`` field in the ``screenshot`` header (SPEC §4, C->S #6).
