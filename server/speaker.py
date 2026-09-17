@@ -145,6 +145,9 @@ _TRUSTED_TOOLS = frozenset(
         "remember",
         "find_object",
         "show_photo",
+        # Who holds admin is security-relevant: a stranger must not be able to
+        # enumerate the room's people and find out whom to imitate.
+        "list_people",
     }
 )
 #: Tools that need admin.
@@ -708,6 +711,15 @@ class VoiceRegistry:
             count = len(vectors)
         log.info("Stored face sample %d for %s (%s)", count, cleaned, role)
         return role, f"face sample {count} stored"
+
+    def voice_profiles(self) -> dict[str, int]:
+        """name -> how many voice samples they have (people with none are left out)."""
+        with self._lock:
+            return {
+                name: len(person.get(VOICE_KEY) or [])
+                for name, person in self._people.items()
+                if person.get(VOICE_KEY)
+            }
 
     def face_profiles(self) -> dict[str, list[list[float]]]:
         """name -> face embeddings, for :meth:`server.face.FaceEngine.match`.

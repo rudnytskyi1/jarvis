@@ -1,13 +1,13 @@
 """OpenAI-style tool schemas exposed to the LLM, plus protocol helpers (SPEC §5).
 
-Thirteen tools. Execution matrix:
+Fifteen tools. Execution matrix:
 
 * ``set_light``, ``set_switch``, ``pc_control``, ``run_command`` are CLIENT
   actions — forwarded to the room PC as protocol action items with the model's
   arguments verbatim; the tool result is the client's ``action_result``.
 * ``look_at_screen``, ``click_screen``, ``remember``, ``enroll_voice``,
   ``set_role``, v1.4's ``look_at_camera`` / ``enroll_face``, v1.5's
-  ``find_object`` and v1.6's ``rename_person`` run SERVER-side and are never
+  ``find_object``, v1.6's ``rename_person`` and v1.7's ``list_people`` run SERVER-side and are never
   forwarded verbatim. ``click_screen`` runs a screenshot through the vision
   model in ``server/app.py`` and then sends the client one
   :data:`MOUSE_CLICK_TOOL` action with normalized coordinates; the
@@ -483,6 +483,23 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_people",
+            "description": (
+                "List everyone you know: their name, their role (admin, trusted "
+                "or user) and whether you can recognise them by voice, by face, "
+                "or not yet at all. Call it whenever someone asks who you know, "
+                "who the admins are, who is enrolled, what somebody's role is, "
+                "or whether you would recognise a particular person. You do NOT "
+                "know this from memory and must never guess it - the roles "
+                "change, and the answer is only ever what this tool returns. "
+                + _COMMON_HINT
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "rename_person",
             "description": (
                 "Correct or change an enrolled person's name — voice, face, or "
@@ -560,6 +577,7 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "find_object",
         "rename_person",
         "show_photo",
+        "list_people",
     }
 )
 

@@ -15,7 +15,7 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
-def test_fourteen_tools_exposed():
+def test_fifteen_tools_exposed():
     assert tool_names() == {
         "set_light",
         "set_switch",
@@ -31,6 +31,7 @@ def test_fourteen_tools_exposed():
         "find_object",
         "rename_person",
         "show_photo",
+        "list_people",
     }
 
 
@@ -51,6 +52,7 @@ def test_matrix_split():
         "find_object",
         "rename_person",
         "show_photo",
+        "list_people",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")

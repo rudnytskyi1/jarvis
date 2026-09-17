@@ -61,7 +61,7 @@ from server.face import FaceEngine
 from server.llm import LlmClient, is_imperative_request
 from server.segment import Sam3Engine, draw_boxes
 from server.session import NO_PRESENCE_TEXT, Session
-from server.speaker import VoiceRegistry
+from server.speaker import ROLE_ADMIN, VoiceRegistry
 from server.storage import DialogLog, Memory
 from server.stt import SttEngine
 from server.tools import (
@@ -1081,6 +1081,8 @@ class Connection:
             return await self._run_enroll_voice(args)
         if name == "set_role":
             return await self._run_set_role(args)
+        if name == "list_people":
+            return await self._run_list_people(args)
         if name == "rename_person":
             return await self._run_rename_person(args)
         if name == "look_at_camera":
@@ -1186,6 +1188,44 @@ class Connection:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "role": applied}
+
+    async def _run_list_people(self, args: dict[str, Any]) -> dict[str, Any]:
+        """SPEC v1.7: who Rowan knows, with roles - the answer to "who is admin?".
+
+        The model has no way to know this: roles change at runtime and the
+        registry is never in the prompt. Asked who the admins were, it used to
+        answer from whatever it had seen in the conversation, which was wrong
+        as often as not.
+        """
+        if _voices is None or not _voices.enabled:
+            return {"ok": False, "error": "speaker recognition is disabled"}
+        try:
+            roles = await asyncio.to_thread(_voices.people)
+            faces = await asyncio.to_thread(_voices.face_profiles)
+            voices = await asyncio.to_thread(_voices.voice_profiles)
+        except Exception as exc:  # noqa: BLE001 - never break the tool loop
+            log.exception("Could not read the people registry")
+            return {"ok": False, "error": f"could not read the people registry: {exc}"}
+
+        people = [
+            {
+                "name": name,
+                "role": role,
+                "known_by_voice": bool(voices.get(name)),
+                "known_by_face": bool(faces.get(name)),
+            }
+            for name, role in sorted(roles.items())
+        ]
+        admins = [person["name"] for person in people if person["role"] == ROLE_ADMIN]
+        return {
+            "ok": True,
+            "people": people,
+            "admins": admins or "nobody",
+            "note": (
+                "This is the whole list - anybody not named here is somebody you "
+                "do not know. Report it as it is; do not add people from memory."
+            ),
+        }
 
     async def _run_rename_person(self, args: dict[str, Any]) -> dict[str, Any]:
         """SPEC v1.6: rename (or merge) an enrolled person.
