@@ -110,19 +110,44 @@ _ADMIN_TOOLS = frozenset({"run_command", "set_role"})
 #: tool, it depends on WHO is speaking, not just their role.
 
 
+#: Tools dangerous enough to demand a higher voice-match confidence, not just
+#: an admin role — a lookalike voice must not run a command or change roles.
+HIGH_CONFIDENCE_TOOLS = frozenset({"run_command", "set_role"})
+
+
 def check_permission(
     role: str,
     tool: str,
     args: dict[str, Any] | None,
     speaker_name: str | None = None,
+    speaker_score: float | None = None,
+    admin_threshold: float | None = None,
 ) -> str | None:
     """Return None when allowed, or the denial message for the LLM.
 
     ``speaker_name`` (v1.6) is only used by ``rename_person``: unlike every
     other tool, its permission depends on WHO is talking, not just their role
     - the speaker may always rename their own profile, whatever their role.
+
+    ``speaker_score``/``admin_threshold`` (v1.6): the most dangerous tools
+    (:data:`HIGH_CONFIDENCE_TOOLS`) additionally require the voice match to be
+    at least ``admin_threshold`` confident, so a lookalike voice that merely
+    cleared the (lower) identification bar cannot run commands.
     """
     role = role if role in ROLES else ROLE_UNKNOWN
+
+    if (
+        tool in HIGH_CONFIDENCE_TOOLS
+        and admin_threshold is not None
+        and speaker_score is not None
+        and speaker_score < float(admin_threshold)
+    ):
+        return (
+            f"permission denied: {tool} needs a confident voice match "
+            f"(at least {float(admin_threshold):.2f}), but this voice matched "
+            f"only {float(speaker_score):.2f} - ask the person to say it again "
+            "clearly, or from closer to the microphone"
+        )
 
     def deny(needed: str) -> str:
         return (

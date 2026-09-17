@@ -28,7 +28,8 @@ server:
 
   speaker:                   # who is talking (resemblyzer voice profiles, data/people.json)
     enabled: true
-    threshold: 0.72          # cosine similarity for a voice to match a profile
+    threshold: 0.62          # cosine similarity for a voice to match a profile
+    admin_threshold: 0.70    # higher bar for run_command / set_role (a lookalike voice can't run commands)
     min_speech_s: 0.8        # shorter utterances are left unidentified
 
   face:                      # face recognition + presence (v1.4, insightface)

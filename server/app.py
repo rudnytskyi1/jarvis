@@ -148,6 +148,25 @@ SAY_FALLBACK_GREETING = "Good day. I am Rowan, the assistant of this room."
 #: While voice enrollment is collecting samples the user needs room to speak:
 #: the follow-up window the client holds open after our reply (SPEC §4 say.listen_s).
 ENROLL_LISTEN_S = 12.0
+
+#: Cap for the self-check pass so it can never hang a reply.
+VERIFY_TIMEOUT_S = 60.0
+#: Tools that CHANGE something (vs. only looking): a turn using one of these is
+#: worth a self-check. Pure chat or a lone look_at_* never triggers the judge.
+STATE_CHANGING_TOOLS = frozenset(
+    {
+        "pc_control",
+        "run_command",
+        "click_screen",
+        "set_light",
+        "set_switch",
+        "enroll_voice",
+        "enroll_face",
+        "set_role",
+        "rename_person",
+        "remember",
+    }
+)
 #: v1.4 burst: gap between the background bursts of a staged face enrollment
 #: ("2-3 s apart" per SPEC); at the default 3 background bursts this totals
 #: the ~9 s SPEC describes.
@@ -875,12 +894,23 @@ class Connection:
         )
         future.set_result(frame)
 
+    def _turn_changed_state(self) -> bool:
+        """True when this utterance ran a tool that changed something (§ judge)."""
+        return any(
+            rec.get("tool") in STATE_CHANGING_TOOLS for rec in self._utterance_actions
+        )
+
     # ------------------------------------------------------------------ tool executor
 
     async def _execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """ToolExecutor for :meth:`server.llm.LlmClient.generate` (SPEC §5 matrix)."""
         denial = speaker_mod.check_permission(
-            self._speaker_role, name, args, self._speaker_name
+            self._speaker_role,
+            name,
+            args,
+            self._speaker_name,
+            speaker_score=self._speaker_score,
+            admin_threshold=getattr(self.cfg.server.speaker, "admin_threshold", 0.70),
         )
         if denial is not None:
             log.info(
@@ -2041,6 +2071,26 @@ class Connection:
                 log.exception("LLM request failed")
                 await self.send_error("llm failed")
                 return
+            # Self-check ("judge"): only after a turn that actually CHANGED
+            # something (not plain chat, not a pure look) - re-prompt the model
+            # to confirm it did everything asked/promised and finish any gap.
+            if getattr(self.cfg.server.llm, "verify_actions", True) and self._turn_changed_state():
+                try:
+                    verified = await asyncio.wait_for(
+                        brain.verify(result.history, result.text, self._execute_tool),
+                        timeout=VERIFY_TIMEOUT_S,
+                    )
+                    if verified.text.strip():
+                        log.info("Self-check produced the final reply (%d extra action(s))",
+                                 len(verified.tool_calls))
+                        result = verified
+                except asyncio.TimeoutError:
+                    log.warning("Self-check timed out - keeping the original reply")
+                except (WebSocketDisconnect, RuntimeError):
+                    raise
+                except Exception:
+                    log.exception("Self-check failed - keeping the original reply")
+
             llm_ms = int((time.perf_counter() - t_llm) * 1000)
 
             say_text = result.text.strip()

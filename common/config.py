@@ -134,6 +134,10 @@ class LLMConfig(_Strict):
     #: own default (32k for qwen3:30b) wastes several GB of VRAM on KV cache
     #: that a voice assistant with a short history never uses.
     num_ctx: int = Field(default=8192, ge=1024)
+    #: After an action turn, re-prompt the model as a verifier that checks it
+    #: actually did everything requested/promised and finishes anything missing.
+    #: Runs only when a state-changing tool ran, so plain chat stays fast.
+    verify_actions: bool = True
 
     @field_validator("provider", mode="after")
     @classmethod
@@ -150,6 +154,11 @@ class SpeakerConfig(_Strict):
     enabled: bool = True
     #: Cosine-similarity threshold for a voice to match an enrolled profile.
     threshold: float = Field(default=0.72, gt=0.0, le=1.0)
+    #: Higher bar for the most dangerous tools (run_command, set_role): the
+    #: speaker must match this closely, not just the normal threshold, before
+    #: those are allowed even to an admin profile. Guards against a lookalike
+    #: voice slipping past the (lower) identification threshold.
+    admin_threshold: float = Field(default=0.70, gt=0.0, le=1.0)
     #: Utterances shorter than this are not identified (too little voice).
     min_speech_s: float = Field(default=0.8, ge=0.0)
 

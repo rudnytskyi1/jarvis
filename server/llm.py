@@ -121,6 +121,18 @@ FORCE_ACT_MESSAGE = (
     "say so plainly instead of promising.]"
 )
 
+#: The self-check ("judge") turn, appended after an action reply. The model
+#: re-examines whether it actually completed the request and its own promises,
+#: finishes anything missing with tools, then gives the final spoken reply.
+VERIFY_MESSAGE = (
+    "[system self-check: before this is spoken to the user, verify you ACTUALLY "
+    "did everything they asked and everything you said you would. Look at the "
+    "real tool results above, not your intentions. If anything the user "
+    "requested or you promised did NOT happen, do it NOW by calling the right "
+    "tools. When everything is truly done, reply with the final one or two "
+    "spoken sentences for the user - do not mention this self-check.]"
+)
+
 
 def announces_undone_action(text: str) -> bool:
     """True when ``text`` promises a future action (see FUTURE_INTENT_PHRASES)."""
@@ -166,6 +178,10 @@ class LlmResult:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     rounds: int = 0
+    #: The full message history the loop ended with (system + turns + every
+    #: tool call and result). Fed to :meth:`LlmClient.verify` so the self-check
+    #: continues from the real state instead of redoing work.
+    history: list[dict[str, Any]] = field(default_factory=list)
 
 
 def native_base_url(base_url: str) -> str:
@@ -523,6 +539,25 @@ class LlmClient:
             return result
         return {"ok": True, "result": result}
 
+    async def verify(
+        self,
+        history: list[dict[str, Any]],
+        reply: str,
+        executor: ToolExecutor | None = None,
+    ) -> LlmResult:
+        """Self-check pass: did the model do everything asked/promised?
+
+        Continues from the finished conversation ``history`` (which already
+        holds every tool call and result of the turn), appends the reply and a
+        verifier instruction, and runs the tool loop once more. If work was
+        missing, the model finishes it here; otherwise it just confirms. The
+        returned text replaces the spoken reply.
+        """
+        continued = list(history)
+        continued.append({"role": "assistant", "content": reply})
+        continued.append({"role": "user", "content": VERIFY_MESSAGE})
+        return await self.generate(continued, executor)
+
     async def generate(
         self,
         messages: list[dict[str, Any]],
@@ -601,7 +636,10 @@ class LlmClient:
                     history.append({"role": "assistant", "content": text})
                     history.append({"role": "user", "content": FORCE_ACT_MESSAGE})
                     continue
-                return LlmResult(text=text, tool_calls=executed, rounds=round_index)
+                history.append({"role": "assistant", "content": text})
+                return LlmResult(
+                    text=text, tool_calls=executed, rounds=round_index, history=history
+                )
 
             history.append(self._assistant_message(text, calls))
             for call in calls:
@@ -614,7 +652,10 @@ class LlmClient:
         log.info("Tool round cap (%d) reached — asking for a final reply", self.max_tool_rounds)
         text, _ = await self._chat(history, with_tools=False)
         log.info("LLM final reply: %r", text)
-        return LlmResult(text=text, tool_calls=executed, rounds=self.max_tool_rounds)
+        history.append({"role": "assistant", "content": text})
+        return LlmResult(
+            text=text, tool_calls=executed, rounds=self.max_tool_rounds, history=history
+        )
 
     def close(self) -> None:
         """Release the HTTP resources of whichever provider is in use."""
