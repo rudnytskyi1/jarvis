@@ -645,11 +645,17 @@ class Connection:
         #: Monotonic clock of the last proactive greeting of ANYBODY (0 = never).
         #: Only spaces two greetings apart; who is due is per person, below.
         self._last_greeting_at = 0.0
-        #: v1.7: label -> monotonic clock of the last contact with that person,
-        #: either a greeting Rowan spoke or an utterance they spoke to him.
-        #: Talking to somebody IS saying hello to them, so a conversation
-        #: restarts their cooldown and Rowan never greets mid-exchange.
-        self._greeted_at: dict[str, float] = {}
+        #: v1.7: label -> monotonic clock of the last time the camera SAW that
+        #: person. The greeting rule is about absence, not about how long ago
+        #: Rowan last spoke: somebody who has been sitting in front of the
+        #: camera all evening is not greeted again, somebody who walked out and
+        #: came back is.
+        self._last_seen_at: dict[str, float] = {}
+        #: Labels that reappeared after being away long enough to deserve a
+        #: hello. Latched on the sighting that ends the absence and cleared when
+        #: the greeting is actually spoken, so it cannot evaporate between the
+        #: frame that noticed the return and the moment the room goes quiet.
+        self._due_greeting: set[str] = set()
         #: Which gate last said no (a stable key, not the formatted message) and
         #: when it was logged - the throttle behind :meth:`_greet_blocked`.
         self._greet_block_key = ""
@@ -1396,6 +1402,9 @@ class Connection:
                 # Nobody recognisable in this burst; the ttl handles the rest.
                 return
             labels = list(best_named.keys()) + [LABEL_UNKNOWN] * max_unknown
+            # Before note_faces: the absence has to be measured against the
+            # PREVIOUS sighting, which this call is about to overwrite.
+            self.note_sightings(labels)
             self.presence.note_faces(labels)
             parts = [f"{name} ({score:.2f})" for name, score in best_named.items()]
             if max_unknown:
@@ -1471,32 +1480,50 @@ class Connection:
             _read("greeting_cooldown_known_s", 900.0),
         )
 
-    def _greeted_recently(self, label: str, cooldown_s: float, now: float) -> bool:
-        """True when ``label`` was greeted (or spoke to us) inside ``cooldown_s``."""
-        last = self._greeted_at.get(label)
-        if last is None:
-            return False
-        if cooldown_s <= 0.0:
-            return False
-        return now - last < cooldown_s
+    def note_sightings(self, labels: Sequence[str]) -> None:
+        """Record who the camera just saw, latching anybody who came BACK.
+
+        The greeting rule the owner asked for is about absence: a familiar face
+        gone for ``greeting_cooldown_known_s`` and a stranger gone for
+        ``greeting_cooldown_s`` are worth a hello when they turn up again. The
+        gap has to be measured here, on the sighting that ends it, because one
+        frame later the gap is five seconds and the fact that they were ever
+        away is lost. Somebody never seen before is always due.
+        """
+        now = time.monotonic()
+        _, unknown_gap_s, known_gap_s = self._greet_config()
+        for label in set(labels):
+            gap_s = unknown_gap_s if label == LABEL_UNKNOWN else known_gap_s
+            previous = self._last_seen_at.get(label)
+            if previous is None or gap_s <= 0.0 or now - previous >= gap_s:
+                if label not in self._due_greeting:
+                    log.info(
+                        "%s is due a hello (%s)",
+                        label,
+                        "first sighting"
+                        if previous is None
+                        else f"away for {now - previous:.0f}s, threshold {gap_s:.0f}s",
+                    )
+                self._due_greeting.add(label)
+            self._last_seen_at[label] = now
 
     def _greet_target(
         self, greet_after_s: float, unknown_cooldown_s: float, known_cooldown_s: float
     ) -> str | None:
         """Who is due a hello right now: a name, :data:`LABEL_UNKNOWN`, or ``None``.
 
-        A stranger outranks a familiar face — introducing yourself matters more
-        than saying hello again. Among familiar faces the one Rowan has gone
-        longest without greeting goes first, so two people who walked in
-        together both get their turn instead of one of them being greeted twice.
+        Reads the latch :meth:`note_sightings` set. A stranger outranks a
+        familiar face — introducing yourself matters more than welcoming
+        somebody back — and among familiar faces the one away longest goes
+        first, so two people who walked in together both get their turn.
         """
         now = time.monotonic()
 
         if (
-            self.presence.has_fresh_unknown_face()
+            LABEL_UNKNOWN in self._due_greeting
+            and self.presence.has_fresh_unknown_face()
             and self.presence.unknown_present_for() >= greet_after_s
             and not self._known_face_alone()
-            and not self._greeted_recently(LABEL_UNKNOWN, unknown_cooldown_s, now)
             # An unknown face moments after a known voice spoke is almost
             # certainly that same person at a bad angle - unless the camera can
             # see somebody the names present do not account for.
@@ -1511,11 +1538,10 @@ class Connection:
         due = [
             label
             for label in self.presence.present()
-            if label != LABEL_UNKNOWN
-            and not self._greeted_recently(label, known_cooldown_s, now)
+            if label != LABEL_UNKNOWN and label in self._due_greeting
         ]
         if due:
-            return min(due, key=lambda label: self._greeted_at.get(label, float("-inf")))
+            return min(due, key=lambda label: self._last_seen_at.get(label, 0.0))
         return None
 
     def _extra_person_present(self) -> bool:
@@ -1593,13 +1619,18 @@ class Connection:
         if target is None:
             return self._greet_blocked(
                 "nobody_due",
-                f"nobody is due a hello (strangers every {unknown_cooldown_s:.0f}s, "
-                f"familiar faces every {known_cooldown_s:.0f}s)",
+                f"nobody has been away long enough to welcome back "
+                f"(a stranger {unknown_cooldown_s:.0f}s, a familiar face {known_cooldown_s:.0f}s)",
             )
         return target
 
     def _greet_blocked(self, key: str, reason: str) -> None:
-        """Log WHY no greeting happened (throttled) and return ``False``.
+        """Log WHY no greeting happened (throttled) and return ``None``.
+
+        ``None`` is the contract, not ``False``: the caller reads the return
+        value as the NAME of the person to greet, and anything that is not
+        ``None`` is spoken. Returning ``False`` here once made Rowan greet a
+        person called "False" out loud.
 
         The greeting gate is polled once a second, so this would otherwise
         drown the log. Throttling is keyed on ``key`` — a stable identifier for
@@ -1626,7 +1657,7 @@ class Connection:
                 or "none",
                 (self.camera_state or {}).get("persons"),
             )
-        return False
+        return None
 
     async def _greeting_loop(self) -> None:
         """Poll the presence tracker and greet whoever is due (SPEC v1.4, v1.7)."""
@@ -1635,8 +1666,9 @@ class Connection:
             log.info("Proactive greetings are off (server.face.greet_after_s = 0)")
             return
         log.info(
-            "Greeting task armed: a stranger after %.0f s and again every %.0f s, "
-            "a familiar face again every %.0f s",
+            "Greeting task armed: a stranger is greeted after %.0f s in frame and "
+            "again once last seen over %.0f s ago, a familiar face once last seen "
+            "over %.0f s ago",
             greet_after_s, unknown_cooldown_s, known_cooldown_s,
         )
         while True:
@@ -1645,7 +1677,9 @@ class Connection:
                 if self._reply_lock.locked():
                     continue
                 target = self._may_greet(greet_after_s, unknown_cooldown_s, known_cooldown_s)
-                if target is None:
+                if not isinstance(target, str) or not target:
+                    # Anything but a real name means "nobody" - and a name is
+                    # about to be SPOKEN, so never take that on trust.
                     continue
                 await self._greet_person(
                     target, greet_after_s, unknown_cooldown_s, known_cooldown_s
@@ -1686,19 +1720,18 @@ class Connection:
             # The room may have changed while we waited for the lock, and the
             # person due a hello may now be somebody else.
             target = self._may_greet(greet_after_s, unknown_cooldown_s, known_cooldown_s)
-            if target is None:
+            if not isinstance(target, str) or not target:
                 return
-            # Start both cooldowns before speaking: a greeting that fails to
-            # generate must not be retried every second either.
-            now = time.monotonic()
-            self._last_greeting_at = now
-            self._greeted_at[target] = now
+            # Clear the latch and start the spacing gap BEFORE speaking: a
+            # greeting that fails to generate must not be retried every second.
+            self._last_greeting_at = time.monotonic()
+            self._due_greeting.discard(target)
             engine = _face
             # BUG 2: log every input the gate decided on, so a wrong greeting
             # (or a missing one) can be diagnosed from the log alone.
             log.info(
                 "Greeting decision: target=%s fresh_unknown_face=%s present_for=%.0fs "
-                "greet_after_s=%.0f cooldowns=(stranger %.0fs, familiar %.0fs) "
+                "greet_after_s=%.0f absence thresholds=(stranger %.0fs, familiar %.0fs) "
                 "face_enabled=%s face_available=%s known_face_alone=%s",
                 target,
                 self.presence.has_fresh_unknown_face(),
@@ -2354,13 +2387,14 @@ class Connection:
             if name != speaker_mod.ROLE_UNKNOWN:
                 # v1.6: holds the greeting off while a known voice was just
                 # heard on this connection (see _may_greet).
-                # v1.7: talking to somebody counts as having said hello to
-                # them, so their per-person cooldown restarts here. Without
-                # this Rowan would interrupt a conversation to greet the very
-                # person he is mid-conversation with.
+                # v1.7: hearing somebody also means they are here, so it
+                # counts as a sighting - and it cancels any pending hello
+                # for them, because greeting the person you are already in
+                # conversation with is absurd.
                 heard_at = time.monotonic()
                 self._last_known_voice_at = heard_at
-                self._greeted_at[name] = heard_at
+                self._last_seen_at[name] = heard_at
+                self._due_greeting.discard(name)
             pending = self._enroll_pending
             if pending:
                 # v1.6: every attempt counts its seconds, even a failed one —

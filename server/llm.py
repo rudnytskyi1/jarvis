@@ -144,12 +144,28 @@ def announces_undone_action(text: str) -> bool:
 #: A reply that REPORTS an action in the past ("the photo has been hidden",
 #: "I've closed it", "volume is now at thirty") while no tool ran at all is a
 #: lie of the same family as the broken promise - the thing never happened.
+#: The state words a reply uses to assert the world already changed. Kept as
+#: one list so the frames below all cover the same family at once.
+_STATE_WORDS = (
+    r"closed|hidden|open|opened|gone|removed|deleted|off|on|up|down|gray|grey|"
+    r"gone\s+from\s+the\s+screen|gone\s+now|gone\s+off|"
+    r"muted|unmuted|paused|playing|stopped|started|running|"
+    r"minimi[sz]ed|maximi[sz]ed|full\s*screen|visible|displayed|showing|gone\s+away"
+)
 DONE_CLAIM_PHRASES: tuple[str, ...] = (
     r"\b(?:has|have)\s+been\s+\w+(?:ed|en|ut|one)\b",
     r"\bi(?:'ve| have)\s+(?:closed|hidden|opened|set|muted|unmuted|started|stopped|"
     r"typed|clicked|removed|deleted|saved|changed|paused|played)\b",
-    r"\bis\s+now\s+(?:closed|hidden|open|gone|off|on|muted|unmuted|paused|playing|"
-    r"minimi[sz]ed|maximi[sz]ed|full\s*screen)\b",
+    # The COPULA FRAME: "is/are" + an optional polarity adverb + a state word.
+    # Matching the frame instead of one spelling of the verb is deliberate. A
+    # phrase list is an arms race the model keeps winning: after "the photo has
+    # been hidden" was caught it answered "the photo is no longer displayed on
+    # the screen", which meant exactly the same thing and slipped straight
+    # through. "no longer displayed", "is now closed" and "is gone" are one
+    # frame, and this catches all of them.
+    r"\b(?:is|are|it'?s|they'?re)\s+"
+    r"(?:now|already|no\s+longer|not|n't|currently|back|all)?\s*"
+    r"(?:" + _STATE_WORDS + r")\b",
     r"\b(?:closed|hidden|removed|opened|minimi[sz]ed|maximi[sz]ed)\s+(?:it|that|the)\b",
     r"\bi\s+(?:just\s+)?(?:closed|hid|opened|set|muted|clicked|typed|removed)\b",
     r"^\s*(?:done|okay,? done|all set)\b",
@@ -169,6 +185,62 @@ def claims_completed_action(text: str) -> bool:
     if not text:
         return False
     return _DONE_CLAIM_RE.search(text) is not None
+
+
+#: Verbs that ask for a CHANGE, in imperative position. Every other guard in
+#: this module reads the ASSISTANT's wording, and that side of the conversation
+#: re-words itself the moment a phrase list catches it - which is how "the photo
+#: has been hidden" became "the photo is no longer displayed" and slipped
+#: through. The USER's side is the stationary one: he says "close the photo"
+#: however Rowan answers. Matching there turns an arms race into a fixed target.
+#: Perception verbs (look, find, see) are left out deliberately - a turn that
+#: was only asked to LOOK is already fulfilled by the vision tools.
+COMMAND_VERBS: str = (
+    r"open|close|shut|hide|show|display|dismiss|put|take|remove|delete|clear|"
+    r"turn|switch|set|make|move|scroll|go|play|pause|resume|stop|start|launch|"
+    r"run|execute|restart|reboot|lock|unlock|enable|disable|"
+    r"mute|unmute|click|press|push|type|write|send|skip|next|previous|"
+    r"rewind|minimi[sz]e|maximi[sz]e|dim|brighten|raise|lower|increase|decrease|"
+    r"remember|forget|rename|bring|drop|kill|quit|exit"
+)
+#: Wake word, politeness and "can you" wrappers that sit in front of the verb.
+_REQUEST_PREFIX: str = (
+    r"(?:\b(?:ok(?:ay)?|hey|hi|yo|so|now|well|please|rowan|jarvis|"
+    r"can\s+you|could\s+you|would\s+you|will\s+you|i\s+want\s+you\s+to|"
+    r"i\s+need\s+you\s+to|you\s+can|let'?s|lets|just|go\s+ahead\s+and|"
+    r"пожалуйста|слушай|эй|ну|давай|а)\b[\s,]*)*"
+)
+_IMPERATIVE_EN_RE = re.compile(
+    r"^[\s,.!?\-]*" + _REQUEST_PREFIX + r"(?:" + COMMAND_VERBS + r")\b",
+    re.IGNORECASE,
+)
+#: Russian needs no verb list: the imperative is morphological (закрой, выключи,
+#: покажи, убери, поставь, нажми) - a suffix rule rather than a lexicon.
+_IMPERATIVE_RU_RE = re.compile(
+    r"^[\s,.!?\-]*" + _REQUEST_PREFIX + r"[а-яё]{2,}"
+    r"(?:ай|яй|ей|ой|уй|ди|ни|ти|чи|жи|ши|ри|ли|ми|си|зи|би|ви|пи|ки|ги|хи|"
+    r"ь|ьте|ите|йте|айте)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;]+|\band\s+|\bthen\s+|\bи\s+", re.IGNORECASE)
+
+
+def is_imperative_request(text: str | None) -> bool:
+    """True when the user ORDERED a state change, in any clause of ``text``.
+
+    Deliberately generous: a false positive costs one extra self-check round,
+    a false negative costs a silent lie to the owner's face. Pure string
+    matching - never raises, safe on ``None``.
+    """
+    if not text:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(str(text)):
+        clause = clause.strip()
+        if clause and (
+            _IMPERATIVE_EN_RE.match(clause) or _IMPERATIVE_RU_RE.match(clause)
+        ):
+            return True
+    return False
 
 
 def contains_sight_claim(text: str) -> bool:
