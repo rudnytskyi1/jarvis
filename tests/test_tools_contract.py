@@ -15,7 +15,7 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
-def test_eleven_tools_exposed():
+def test_twelve_tools_exposed():
     assert tool_names() == {
         "set_light",
         "set_switch",
@@ -28,6 +28,7 @@ def test_eleven_tools_exposed():
         "set_role",
         "look_at_camera",
         "enroll_face",
+        "find_object",
     }
 
 
@@ -45,11 +46,14 @@ def test_matrix_split():
         "set_role",
         "look_at_camera",
         "enroll_face",
+        "find_object",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")
     # v1.4: the camera tools run on the server, like the screen ones.
     assert not is_client_tool("look_at_camera") and not is_client_tool("enroll_face")
+    # v1.5: find_object (SAM3) is server-side too, same as the other camera tools.
+    assert not is_client_tool("find_object")
     assert SERVER_TOOLS.isdisjoint(CLIENT_TOOLS)
     assert set(tool_names()) == SERVER_TOOLS | CLIENT_TOOLS
 
@@ -59,6 +63,13 @@ def test_camera_tools_take_their_one_argument():
     assert camera["function"]["parameters"]["required"] == ["query"]
     enroll = next(t for t in TOOLS if t["function"]["name"] == "enroll_face")
     assert enroll["function"]["parameters"]["required"] == ["name"]
+
+
+def test_find_object_args():
+    tool = next(t for t in TOOLS if t["function"]["name"] == "find_object")
+    params = tool["function"]["parameters"]
+    assert params["required"] == ["target"]
+    assert set(params["properties"]["source"]["enum"]) == {"camera", "screen"}
 
 
 def test_pc_control_command_enum():
@@ -80,10 +91,12 @@ def test_server_tools_never_forwarded():
         {"function": {"name": "click_screen", "arguments": {"target": "x"}}},
         {"function": {"name": "look_at_camera", "arguments": {"query": "who is here"}}},
         {"function": {"name": "enroll_face", "arguments": {"name": "Anton"}}},
+        {"function": {"name": "find_object", "arguments": {"target": "cola can"}}},
         {"function": {"name": "pc_control", "arguments": {"command": "mute"}}},
     ]
     items = actions_from_tool_calls(calls)
     names = [item["tool"] for item in items]
     assert "click_screen" not in names
     assert "look_at_camera" not in names and "enroll_face" not in names
+    assert "find_object" not in names
     assert "pc_control" in names

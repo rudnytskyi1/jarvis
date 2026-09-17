@@ -1,16 +1,18 @@
 """OpenAI-style tool schemas exposed to the LLM, plus protocol helpers (SPEC §5).
 
-Eleven tools. Execution matrix:
+Twelve tools. Execution matrix:
 
 * ``set_light``, ``set_switch``, ``pc_control``, ``run_command`` are CLIENT
   actions — forwarded to the room PC as protocol action items with the model's
   arguments verbatim; the tool result is the client's ``action_result``.
 * ``look_at_screen``, ``click_screen``, ``remember``, ``enroll_voice``,
-  ``set_role`` and v1.4's ``look_at_camera`` / ``enroll_face`` run SERVER-side
-  and are never forwarded verbatim. ``click_screen`` runs a screenshot through
-  the vision model in ``server/app.py`` and then sends the client one
-  :data:`MOUSE_CLICK_TOOL` action with normalized coordinates; the two camera
-  tools pull a frame with a ``camera_request`` and answer from it.
+  ``set_role``, v1.4's ``look_at_camera`` / ``enroll_face`` and v1.5's
+  ``find_object`` run SERVER-side and are never forwarded verbatim.
+  ``click_screen`` runs a screenshot through the vision model in
+  ``server/app.py`` and then sends the client one :data:`MOUSE_CLICK_TOOL`
+  action with normalized coordinates; the camera/screen tools (including
+  ``find_object``) pull a frame with a ``camera_request``/``screenshot_request``
+  and answer from it.
 
 The same schema list is used by both LLM providers: Ollama's native ``/api/chat``
 accepts the OpenAI tool format unchanged.
@@ -366,6 +368,44 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_object",
+            "description": (
+                "Count and locate specific physical objects with a real object "
+                "detector, instead of guessing from a general look-around. Use it "
+                "for questions like 'how many chairs are there', 'where is my "
+                "backpack', 'is there a water bottle here' — about the physical "
+                "room (source camera, the default) or about something visible on "
+                "the room PC's screen (source screen). It is slower than "
+                "look_at_camera or look_at_screen, so reach for it only when an "
+                "exact count or an exact location is actually needed. "
+                + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "A short noun phrase for what to find, e.g. 'cola can' "
+                            "or 'backpack'."
+                        ),
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["camera", "screen"],
+                        "description": (
+                            "camera looks at the physical room (default); screen "
+                            "looks at the room PC's screen."
+                        ),
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_role",
             "description": (
                 "Change an enrolled person's role. Only an admin speaker may do this "
@@ -396,6 +436,8 @@ CLIENT_TOOLS: frozenset[str] = frozenset(
 #: Tools executed on the server; never sent to the client as they are called.
 #: ``look_at_camera`` and ``enroll_face`` (v1.4) pull a camera frame with a
 #: ``camera_request`` and then run the vision model / the face engine here.
+#: ``find_object`` (v1.5) pulls a camera or screen frame the same way and runs
+#: it through SAM3 (``server/segment.py``).
 SERVER_TOOLS: frozenset[str] = frozenset(
     {
         "look_at_screen",
@@ -405,6 +447,7 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "set_role",
         "look_at_camera",
         "enroll_face",
+        "find_object",
     }
 )
 

@@ -49,6 +49,11 @@ PCM = b"\x00\x01" * 16000  # 1 s of fake s16le
         (ROLE_UNKNOWN, "look_at_camera", {}, False),
         (ROLE_UNKNOWN, "enroll_face", {}, True),
         (ROLE_USER, "enroll_face", {}, True),
+        # v1.5: find_object joins the trusted tier, same as look_at_camera.
+        (ROLE_TRUSTED, "find_object", {}, True),
+        (ROLE_ADMIN, "find_object", {}, True),
+        (ROLE_USER, "find_object", {}, False),
+        (ROLE_UNKNOWN, "find_object", {}, False),
     ],
 )
 def test_permission_matrix(role, tool, args, allowed):

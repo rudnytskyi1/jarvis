@@ -16,6 +16,7 @@ Public API (SPEC section 6)::
     cfg.server.llm.max_tool_rounds  # 4
     cfg.server.speaker.threshold    # 0.72 (voice matching, v1.3)
     cfg.server.face.threshold       # 0.45 (face matching + presence, v1.4)
+    cfg.server.segment.{enabled, checkpoint, confidence}  # v1.5: SAM3 find_object
     cfg.server.tts.speaker          # "en_0"
     cfg.client.server_url           # "ws://192.168.1.100:8765/ws"
     cfg.client.wakeword.phrases     # ["rowan", "roan", "rowen"]
@@ -46,6 +47,7 @@ __all__ = [
     "LLMConfig",
     "SpeakerConfig",
     "FaceConfig",
+    "SegmentConfig",
     "TTSConfig",
     "ClientConfig",
     "WakewordConfig",
@@ -60,6 +62,11 @@ __all__ = [
 
 DEFAULT_CONFIG_FILENAME = "config.yaml"
 EXAMPLE_CONFIG_FILENAME = "config.example.yaml"
+
+#: Repo root (this file lives at <root>/common/config.py) — used to resolve a
+#: relative ``server.segment.checkpoint`` (SAM3) regardless of the process's
+#: current working directory.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _Strict(BaseModel):
@@ -165,6 +172,31 @@ class FaceConfig(_Strict):
     greeting_cooldown_s: float = Field(default=300.0, ge=0.0)
 
 
+class SegmentConfig(_Strict):
+    """SAM3 open-vocabulary object detection (``server.segment``, v1.5).
+
+    Backs the ``find_object`` tool: counts and locates objects described in
+    free text in a camera or screen frame. Everything about SAM3 itself (the
+    ``sys.path`` insertion, the imports, the checkpoint load) stays lazy in
+    ``server/segment.py`` — this section only carries the settings.
+    """
+
+    enabled: bool = True
+    #: Local checkpoint file; resolved below relative to the repo root when
+    #: given as a relative path, regardless of the process's cwd.
+    checkpoint: str = "third_party/sam3/server/model/sam3.pt"
+    #: SAM3's own confidence threshold for keeping a match.
+    confidence: float = Field(default=0.5, gt=0.0, le=1.0)
+
+    @field_validator("checkpoint", mode="after")
+    @classmethod
+    def _resolve_checkpoint(cls, value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        return str(path)
+
+
 class TTSConfig(_Strict):
     """Silero TTS settings (``server.tts``)."""
 
@@ -185,6 +217,7 @@ class ServerConfig(_Strict):
     tts: TTSConfig = Field(default_factory=TTSConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     face: FaceConfig = Field(default_factory=FaceConfig)
+    segment: SegmentConfig = Field(default_factory=SegmentConfig)
 
 
 # ---------------------------------------------------------------------------

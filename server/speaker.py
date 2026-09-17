@@ -77,8 +77,10 @@ SAFE_PC_COMMANDS = frozenset(
 _EVERYONE_TOOLS = frozenset({"set_light", "set_switch", "enroll_voice", "enroll_face"})
 #: Tools that need admin or trusted. Looking through the room camera is as
 #: sensitive as looking at the screen, so it sits in the same tier.
+#: ``find_object`` (v1.5) pulls the same kind of frame as ``look_at_camera``/
+#: ``look_at_screen``, so it joins them here.
 _TRUSTED_TOOLS = frozenset(
-    {"click_screen", "look_at_screen", "look_at_camera", "remember"}
+    {"click_screen", "look_at_screen", "look_at_camera", "remember", "find_object"}
 )
 #: Tools that need admin.
 _ADMIN_TOOLS = frozenset({"run_command", "set_role"})

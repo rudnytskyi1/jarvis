@@ -12,8 +12,10 @@ model inference (Whisper, LLM, Silero) runs in worker threads via
 Server-side tools (SPEC §5): ``look_at_screen`` describes a screenshot,
 ``click_screen`` locates the described element in that screenshot and sends the
 client a single ``mouse_click`` action, ``remember`` writes to the memory file,
-and v1.4's ``look_at_camera`` / ``enroll_face`` pull one frame of the room
-camera. Everything else is forwarded to the client verbatim.
+v1.4's ``look_at_camera`` / ``enroll_face`` pull one frame of the room camera,
+and v1.5's ``find_object`` pulls a camera or screen frame and runs it through
+SAM3 (``server/segment.py``) to count and locate objects. Everything else is
+forwarded to the client verbatim.
 
 v1.4 camera (SPEC "camera, faces, presence"): screenshots and camera frames
 share one request/binary-frame machinery, tagged by SOURCE. Unsolicited
@@ -45,6 +47,7 @@ from common.config import load_config
 from server import speaker as speaker_mod
 from server.face import FaceEngine
 from server.llm import LlmClient
+from server.segment import Sam3Engine
 from server.session import NO_PRESENCE_TEXT, Session
 from server.speaker import VoiceRegistry
 from server.storage import DialogLog, Memory
@@ -317,6 +320,7 @@ _memory: Memory | None = None
 _dialogs: DialogLog | None = None
 _voices: VoiceRegistry | None = None
 _face: FaceEngine | None = None
+_segment: Sam3Engine | None = None
 
 
 def configure(cfg: Any) -> None:
@@ -338,7 +342,7 @@ def get_config() -> Any:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Load STT/LLM/TTS/vision and the storage once at startup (SPEC §3)."""
-    global _stt, _llm, _tts, _vision, _memory, _dialogs, _voices, _face
+    global _stt, _llm, _tts, _vision, _memory, _dialogs, _voices, _face, _segment
     cfg = get_config()
     log.info("Starting the Jarvis brain: %s:%s", cfg.server.host, cfg.server.port)
 
@@ -353,6 +357,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # The face model itself is loaded lazily on the first camera frame, so a
     # server without insightface still starts and serves the voice pipeline.
     _face = FaceEngine(getattr(cfg.server, "face", None))
+    # SAM3 (v1.5, find_object) is just as lazy: nothing is imported or put on
+    # the GPU until the first find_object call actually needs it.
+    _segment = Sam3Engine(getattr(cfg.server, "segment", None))
     _stt = await asyncio.to_thread(SttEngine, cfg.server.stt)
     _llm = LlmClient(cfg.server.llm)
     _vision = VisionClient(cfg.server.llm)
@@ -375,6 +382,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _dialogs = None
         _voices = None
         _face = None
+        _segment = None
 
 
 app = FastAPI(title="Jarvis brain server", version="1.4", lifespan=lifespan)
@@ -390,6 +398,8 @@ async def health() -> dict[str, Any]:
         "tts": bool(_tts is not None and _tts.available),
         # v1.4: face recognition is enabled and insightface can be imported.
         "face": bool(_face is not None and _face.available),
+        # v1.5: SAM3 (find_object) is loaded, or enabled and not yet known broken.
+        "sam": bool(_segment is not None and _segment.available),
     }
 
 
@@ -769,6 +779,8 @@ class Connection:
             return await self._run_look_at_camera(args)
         if name == "enroll_face":
             return await self._run_enroll_face(args)
+        if name == "find_object":
+            return await self._run_find_object(args)
         log.warning("Tool %r has no server-side handler", name)
         return {"ok": False, "error": f"unknown tool: {name}"}
 
@@ -1194,6 +1206,57 @@ class Connection:
             return fail(f"could not store the face sample: {exc}")
 
         result = {"ok": True, "role": role, "status": status, "faces_seen": len(faces)}
+        record["result"] = result
+        return result
+
+    async def _run_find_object(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Count and locate objects described by ``target`` with SAM3 (v1.5).
+
+        Pulls one frame exactly like ``look_at_camera``/``look_at_screen``
+        (same request/binary-frame machinery, chosen by ``source``), then runs
+        it through :class:`server.segment.Sam3Engine` in a worker thread — SAM3
+        inference is blocking CUDA work and must never touch the event loop.
+        """
+        target = " ".join(str(args.get("target") or "").split())
+        source = str(args.get("source") or SOURCE_CAMERA).strip().lower()
+        if source not in (SOURCE_CAMERA, SOURCE_SCREEN):
+            source = SOURCE_CAMERA
+
+        if source == SOURCE_SCREEN:
+            frame_id = f"s{self._screenshot_seq}"
+            self._screenshot_seq += 1
+        else:
+            frame_id = f"c{self._camera_seq}"
+            self._camera_seq += 1
+        record: dict[str, Any] = {"id": frame_id, "tool": "find_object", "args": dict(args)}
+        self._utterance_actions.append(record)
+
+        def fail(error: str) -> dict[str, Any]:
+            record["result"] = {"ok": False, "error": error}
+            return record["result"]
+
+        if not target:
+            return fail("find_object needs a target: describe what to look for")
+        if _segment is None or not _segment.enabled:
+            return fail("the object finder is not available")
+
+        log.info("find_object (%s, %s): %r", frame_id, source, target)
+        if source == SOURCE_SCREEN:
+            captured = await self._request_screenshot(frame_id)
+        else:
+            captured = await self._request_camera_frame(frame_id)
+        if isinstance(captured, str):
+            return fail(captured)
+
+        result = await asyncio.to_thread(_segment.segment, captured.jpeg, target)
+        if result.get("ok"):
+            count = int(result.get("count") or 0)
+            if count <= 0:
+                result["summary"] = "nothing matching found"
+            elif count == 1:
+                result["summary"] = "found 1 match"
+            else:
+                result["summary"] = f"found {count} matches"
         record["result"] = result
         return result
 

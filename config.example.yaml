@@ -1,4 +1,4 @@
-# Jarvis config template. Copy to config.yaml and adjust.
+﻿# Jarvis config template. Copy to config.yaml and adjust.
 # Both PCs use the same file: the server reads the server section, the client reads client.
 
 server:
@@ -38,6 +38,11 @@ server:
     greet_after_s: 10        # greet an unknown face after this many seconds
     greeting_cooldown_s: 300 # at most one proactive greeting per this window
 
+  segment:                   # SAM3 open-vocabulary object finder (v1.5, find_object tool)
+    enabled: true
+    checkpoint: third_party/sam3/server/model/sam3.pt   # resolved relative to the repo root
+    confidence: 0.5           # SAM3's own confidence threshold for keeping a match
+
   tts:
     engine: silero
     language: en
@@ -75,8 +80,8 @@ client:
   camera:                    # room camera -> YOLO presence + face frames (v1.4)
     enabled: true
     index: 0                 # OpenCV device index
-    fps: 5                   # YOLO processing rate
-    model: yolo11n.pt        # ultralytics model (auto-downloaded on first run)
+    fps: 8                   # YOLO processing rate
+    model: yolo11x.pt        # ultralytics model (auto-downloaded on first run)
     face_check_interval_s: 5 # push one frame this often while someone is visible
 
   apps: {}                   # optional overrides: spoken name -> exe path.
@@ -104,3 +109,4 @@ client:
     #   description: main room light (button pusher on the wall switch)
     #   mac: "AA:BB:CC:DD:EE:FF"
     #   mode: press          # press | lever
+
