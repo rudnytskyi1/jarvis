@@ -1692,10 +1692,15 @@ class Connection:
             "score": round(float(score), 3),
         }
         if enroll_bursts > 0:
+            # Spoken instructions are the whole point here: without them the
+            # person just sits there while the shots are taken and the profile
+            # ends up with one angle. Worded as a direct order to speak NOW.
             result["next"] = (
-                "tell them to keep looking at the camera and slowly turn their "
-                "head left and right for the next several seconds - more "
-                "samples are collected automatically, no need to call this again"
+                "SAY THIS OUT LOUD TO THEM NOW, in your own words but keeping "
+                "every instruction: look straight at the camera, and slowly turn "
+                "your head left, then right, for about ten seconds while I take "
+                "the pictures - I will tell you when I am done. Do not call this "
+                "tool again; the extra shots are taken automatically."
             )
             self._start_enroll_face_task(name, enroll_bursts, burst_size)
         record["result"] = result
@@ -1773,6 +1778,35 @@ class Connection:
             "Face enrollment for %s finished: %d extra sample(s) added (%s total)",
             name, added, total,
         )
+        # The spoken instruction promised "I will tell you when I am done", so
+        # say it: an unsolicited one-liner, exactly like a greeting.
+        if added:
+            spoken = (
+                f"All done, {name}. I have your face now."
+                if added >= max(1, enroll_bursts - 1)
+                else f"Thank you, {name}. I got a few good shots of your face."
+            )
+        else:
+            spoken = (
+                f"I could not get a clear look at your face, {name}. "
+                "We can try again when you are facing the camera."
+            )
+        try:
+            await self._say_unprompted(spoken)
+        except (WebSocketDisconnect, RuntimeError):
+            return
+        except Exception:
+            log.debug("Could not announce the end of face enrollment", exc_info=True)
+
+    async def _say_unprompted(self, text: str) -> None:
+        """Speak one line outside a conversation (enrollment done, greetings)."""
+        voice = _tts
+        if voice is None or not text:
+            return
+        async with self._reply_lock:
+            await self.send_json({"type": proto.MSG_SAY, "text": text})
+            await self._stream_tts(voice, text)
+        log.info("Said unprompted: %r", text)
 
     async def _run_find_object(self, args: dict[str, Any]) -> dict[str, Any]:
         """Count and locate objects described by ``target`` with SAM3 (v1.5).
