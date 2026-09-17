@@ -617,6 +617,15 @@ class JarvisClient:
         if mtype == MSG_IMAGE_SHOW:
             # v1.6: handled directly here, in both idle and conversation mode -
             # the header just announces the ONE binary frame that follows it.
+            if msg.get("hide"):
+                # No frame follows: the owner asked to dismiss the photo.
+                viewer = self.viewer
+                if viewer is not None:
+                    try:
+                        viewer.hide()
+                    except Exception as exc:  # noqa: BLE001 - never fatal
+                        log.debug("Could not hide the photo: %s", exc)
+                return
             self._pending_image_show = dict(msg)
             return
         if mtype == MSG_CAMERA_REQUEST:

@@ -553,6 +553,11 @@ class Connection:
         self._memory_seq = 1
         #: v1.6: id counter for image_show pushes (find_object's annotated photo).
         self._image_seq = 1
+        #: Last frame pulled per source, so ``show_photo`` can display exactly
+        #: the picture that was just described instead of taking a new one.
+        self._last_frames: dict[str, Any] = {}
+        #: Last annotated detections photo (jpeg, w, h, title) from find_object.
+        self._last_annotated: tuple[bytes, int, int, str] | None = None
         self._utterance_actions: list[dict[str, Any]] = []
         self._task: asyncio.Task | None = None
 
@@ -925,6 +930,8 @@ class Connection:
             return await self._run_click_screen(args)
         if name == "remember":
             return await self._run_remember(args)
+        if name == "show_photo":
+            return await self._run_show_photo(args)
         if name == "enroll_voice":
             return await self._run_enroll_voice(args)
         if name == "set_role":
@@ -1197,19 +1204,32 @@ class Connection:
             return collected
         return error or f"{source} capture failed"
 
+    def _remember_frame(self, frame: Any, kind: str) -> Any:
+        """Cache the last pulled frame so ``show_photo`` can re-show it.
+
+        The owner asked to SEE the photo that was just described, and every
+        tool used to take a brand new one; the last frame per source is kept
+        here so showing it costs nothing and shows exactly what was described.
+        """
+        if isinstance(frame, ImageFrame):
+            self._last_frames[kind] = frame
+        return frame
+
     async def _request_screenshot(self, shot_id: str) -> ImageFrame | str:
         """Ask the client for a screenshot of the room PC (SPEC §4)."""
         result = await self._request_image(
             SOURCE_SCREEN, shot_id, proto.MSG_SCREENSHOT_REQUEST, SCREENSHOT_TIMEOUT_S
         )
-        return result[0] if isinstance(result, list) else result
+        first = result[0] if isinstance(result, list) else result
+        return self._remember_frame(first, SOURCE_SCREEN)
 
     async def _request_camera_frame(self, frame_id: str) -> ImageFrame | str:
         """Ask the client for one frame of the room camera (SPEC v1.4)."""
         result = await self._request_image(
             SOURCE_CAMERA, frame_id, proto.MSG_CAMERA_REQUEST, CAMERA_TIMEOUT_S
         )
-        return result[0] if isinstance(result, list) else result
+        first = result[0] if isinstance(result, list) else result
+        return self._remember_frame(first, SOURCE_CAMERA)
 
     async def _request_camera_frame_full(self, frame_id: str) -> ImageFrame | str:
         """Ask the client for one FULL-resolution camera frame (SPEC v1.6).
@@ -1783,6 +1803,76 @@ class Connection:
         record["result"] = result
         return result
 
+    async def _run_show_photo(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Show the picture already taken, WITHOUT taking a new one (v1.6).
+
+        "Show me the photo you just described" must display that exact frame:
+        the last camera/screen frame and the last annotated detections photo
+        are cached, so this costs no capture and no vision pass.
+        """
+        which = str(args.get("which") or "").strip().lower()
+        record: dict[str, Any] = {
+            "id": f"img{self._image_seq}",
+            "tool": "show_photo",
+            "args": dict(args),
+        }
+        self._utterance_actions.append(record)
+
+        def done(result: dict[str, Any]) -> dict[str, Any]:
+            record["result"] = result
+            return result
+
+        if which in ("hide", "close", "off"):
+            # Dismiss whatever is on the screen; no frame follows the header.
+            try:
+                await self.send_json(
+                    {"type": proto.MSG_IMAGE_SHOW, "id": f"img{self._image_seq}", "hide": True}
+                )
+                self._image_seq += 1
+            except (WebSocketDisconnect, RuntimeError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return done({"ok": False, "error": f"could not close the photo: {exc}"})
+            return done({"ok": True, "note": "the photo was closed"})
+
+        # Prefer the annotated detections photo when it is the freshest thing
+        # or explicitly asked for; otherwise the last plain frame.
+        if which in ("detections", "objects") and self._last_annotated:
+            jpeg, w, h, title = self._last_annotated
+        elif which == "screen" and SOURCE_SCREEN in self._last_frames:
+            frame = self._last_frames[SOURCE_SCREEN]
+            jpeg, w, h, title = frame.jpeg, frame.w, frame.h, "the screen"
+        elif which in ("camera", "room", "") and SOURCE_CAMERA in self._last_frames:
+            frame = self._last_frames[SOURCE_CAMERA]
+            jpeg, w, h, title = frame.jpeg, frame.w, frame.h, "the room"
+        elif self._last_annotated:
+            jpeg, w, h, title = self._last_annotated
+        elif self._last_frames:
+            frame = next(iter(self._last_frames.values()))
+            jpeg, w, h, title = frame.jpeg, frame.w, frame.h, "the last photo"
+        else:
+            return done(
+                {
+                    "ok": False,
+                    "error": "there is no photo yet - look at the camera or the "
+                    "screen first, then show it",
+                }
+            )
+
+        try:
+            await self._send_image_show(jpeg, w, h, title, IMAGE_SHOW_TTL_S)
+        except (WebSocketDisconnect, RuntimeError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - showing is best effort
+            log.exception("Could not show the cached photo")
+            return done({"ok": False, "error": f"could not show the photo: {exc}"})
+        return done(
+            {
+                "ok": True,
+                "note": "the photo is now on the room screen - tell the user it is up",
+            }
+        )
+
     async def _push_detections_photo(
         self, frame: ImageFrame, target: str, result: dict[str, Any]
     ) -> None:
@@ -1797,6 +1887,7 @@ class Connection:
                 draw_boxes, frame.jpeg, result.get("boxes") or [], result.get("scores") or []
             )
             title = f"{target} - {count} found"
+            self._last_annotated = (annotated, frame.w, frame.h, title)
             await self._send_image_show(annotated, frame.w, frame.h, title, IMAGE_SHOW_TTL_S)
             # BUG 4: worded as a direct instruction (not just a fact) so the
             # model reliably says it out loud instead of only saying "Done".

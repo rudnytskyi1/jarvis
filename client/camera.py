@@ -73,6 +73,15 @@ log = logging.getLogger(__name__)
 MAX_SIDE_PX = 1280
 #: JPEG quality of the pushed frames.
 JPEG_QUALITY = 80
+#: Quality for a ``full: true`` pull (find_object / SAM3): those frames skip the
+#: downscale, so they also deserve far less compression noise.
+FULL_JPEG_QUALITY = 95
+#: Capture resolution requested from the device. OpenCV otherwise negotiates
+#: the driver default, which on the C920 is 640x480 - SAM3 and the vision model
+#: were being fed a blurry thumbnail of the room. The camera downgrades by
+#: itself if it cannot do this, so asking is free.
+CAPTURE_WIDTH = 1920
+CAPTURE_HEIGHT = 1080
 #: A changed picture is announced at most this often (SPEC v1.4: >= 2 s apart).
 STATE_DEBOUNCE_S = 2.0
 #: Detections below this confidence are ignored when counting people/objects.
@@ -324,10 +333,26 @@ class CameraService:
     # ------------------------------------------------------------------
     # capture thread
     # ------------------------------------------------------------------
+    def _request_resolution(self, cv2: Any, capture: Any) -> None:
+        """Ask the device for :data:`CAPTURE_WIDTH` x :data:`CAPTURE_HEIGHT`.
+
+        Never fatal: a camera that cannot do it simply keeps its own mode, and
+        the negotiated size is logged so a blurry frame is obvious in the log.
+        """
+        try:
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            log.info("Camera %d capturing at %dx%d", self.index, width, height)
+        except Exception as exc:  # noqa: BLE001 - resolution is best-effort
+            log.debug("Could not set the capture resolution: %s", exc)
+
     def _open_capture(self, cv2: Any) -> Any:
         """Open ``cfg.camera.index``, retrying with DirectShow on Windows."""
         capture = cv2.VideoCapture(self.index)
         if capture is not None and capture.isOpened():
+            self._request_resolution(cv2, capture)
             return capture
         if capture is not None:
             try:
@@ -341,6 +366,7 @@ class CameraService:
             capture = cv2.VideoCapture(self.index, backend)
             if capture is not None and capture.isOpened():
                 log.debug("Camera %d opened through the DirectShow backend", self.index)
+                self._request_resolution(cv2, capture)
                 return capture
             if capture is not None:
                 try:
@@ -655,8 +681,9 @@ class CameraService:
             width = max(1, int(round(width * scale)))
             height = max(1, int(round(height * scale)))
             frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+        quality = FULL_JPEG_QUALITY if full else JPEG_QUALITY
         ok, buffer = cv2.imencode(
-            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         )
         if not ok:
             raise CameraUnavailable("JPEG encoding failed")

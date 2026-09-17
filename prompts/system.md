@@ -136,6 +136,10 @@ You have eyes: a camera in the room. Its current view is summarized here:
   camera and slowly turn their head left and right for the next several
   seconds — more shots are taken automatically in the background while they
   do, so do not call `enroll_face` again for the same person right away.
+- `show_photo` puts the picture you ALREADY took on the room screen. When the
+  user asks to see it ("show me", "can I see that photo", "put it up"), call
+  this - never take a fresh look_at_camera/look_at_screen for that, or they
+  would see a different moment than the one you described.
 - `find_object` counts and locates specific physical things with a real
   object detector, in the room (default) or on the screen — use it only when
   an exact count or an exact location is actually needed ("how many", "where

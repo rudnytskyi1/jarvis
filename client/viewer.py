@@ -79,6 +79,37 @@ class _ShowRequest:
 
 #: Sentinel telling the viewer thread to stop.
 _STOP = object()
+#: Sentinel telling the viewer thread to close the window but keep running,
+#: so the owner can dismiss a photo by voice ("close the photo").
+_HIDE = object()
+
+
+def _screen_size() -> tuple[int, int]:
+    """Desktop resolution (falls back to 1920x1080 when ctypes is unavailable)."""
+    try:
+        import ctypes  # noqa: PLC0415 - Windows-only, imported where used
+
+        user32 = ctypes.windll.user32
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+    except Exception:  # noqa: BLE001 - any failure just means "assume 1080p"
+        return 1920, 1080
+
+
+def _fit_to_screen(cv2: Any, frame: Any) -> Any:
+    """Scale ``frame`` down so the whole picture fits on the screen."""
+    try:
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        screen_w, screen_h = _screen_size()
+        if width <= 0 or height <= 0 or screen_w <= 0 or screen_h <= 0:
+            return frame
+        scale = min(screen_w / float(width), screen_h / float(height))
+        if scale >= 1.0:
+            return frame
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+    except Exception:  # noqa: BLE001 - showing the original beats showing nothing
+        log.debug("Could not fit the photo to the screen", exc_info=True)
+        return frame
 
 
 def _make_borderless_topmost(window_name: str) -> None:
@@ -174,6 +205,13 @@ class ImageViewer:
         except Exception:  # noqa: BLE001 - never break the caller
             log.exception("Could not queue the detections photo for display")
 
+    def hide(self) -> None:
+        """Close the photo window but keep the viewer alive (voice dismissal)."""
+        try:
+            self._queue.put_nowait(_HIDE)
+        except Exception:  # pragma: no cover - unbounded queue cannot fail
+            pass
+
     def close(self) -> None:
         """Stop the viewer thread and close its window (safe to call twice)."""
         try:
@@ -237,15 +275,27 @@ class ImageViewer:
 
                 if item is _STOP:
                     break
+                if item is _HIDE:
+                    try:
+                        cv2.destroyWindow(WINDOW_NAME)
+                        cv2.waitKey(1)
+                    except Exception:  # pragma: no cover - no window open
+                        pass
+                    shown_deadline = None
+                    continue
                 if isinstance(item, _ShowRequest):
                     frame = self._decode(cv2, item.jpeg)
                     if frame is not None:
                         try:
-                            height, width = frame.shape[0], frame.shape[1]
+                            # Full screen, image fitted inside it: a 1920x1080
+                            # camera frame in a native-size window used to spill
+                            # off the TV and could not be seen or closed.
                             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-                            cv2.imshow(WINDOW_NAME, frame)
+                            cv2.setWindowProperty(
+                                WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
+                            )
+                            cv2.imshow(WINDOW_NAME, _fit_to_screen(cv2, frame))
                             cv2.waitKey(1)
-                            cv2.resizeWindow(WINDOW_NAME, max(1, int(width)), max(1, int(height)))
                             _make_borderless_topmost(WINDOW_NAME)
                             cv2.waitKey(1)
                         except Exception:

@@ -1,4 +1,4 @@
-"""server/tools.py: the tool schemas and the client/server execution matrix."""
+﻿"""server/tools.py: the tool schemas and the client/server execution matrix."""
 from server.tools import (
     CLIENT_TOOLS,
     MOUSE_CLICK_TOOL,
@@ -15,7 +15,7 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
-def test_thirteen_tools_exposed():
+def test_fourteen_tools_exposed():
     assert tool_names() == {
         "set_light",
         "set_switch",
@@ -30,6 +30,7 @@ def test_thirteen_tools_exposed():
         "enroll_face",
         "find_object",
         "rename_person",
+        "show_photo",
     }
 
 
@@ -49,6 +50,7 @@ def test_matrix_split():
         "enroll_face",
         "find_object",
         "rename_person",
+        "show_photo",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")
@@ -110,3 +112,4 @@ def test_server_tools_never_forwarded():
     assert "look_at_camera" not in names and "enroll_face" not in names
     assert "find_object" not in names
     assert "pc_control" in names
+

@@ -286,6 +286,37 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "show_photo",
+            "description": (
+                "Put the picture you ALREADY took up on the room screen, without "
+                "taking a new one. Use it whenever the user asks to see, show or "
+                "display the photo you just looked at or described ('show me', "
+                "'can I see it', 'put it on the screen'). Never take a fresh "
+                "look_at_camera/look_at_screen for that - they would capture a "
+                "different moment than the one you described. " + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "which": {
+                        "type": "string",
+                        "enum": ["camera", "screen", "detections", "hide"],
+                        "description": (
+                            "camera = the last room photo (default), screen = the "
+                            "last screenshot, detections = the last annotated "
+                            "find_object result, hide = CLOSE the photo currently "
+                            "on the screen (use it when the user says close it, "
+                            "hide it, take it away, I am done looking)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "enroll_voice",
             "description": (
                 "Store the CURRENT speaker's voice so you can recognize them later. "
@@ -386,11 +417,15 @@ TOOLS: list[dict[str, Any]] = [
                     "target": {
                         "type": "string",
                         "description": (
-                            "A short SIMPLE noun for what to find - prefer 'bottle' "
-                            "over 'water bottle', 'can' over 'cola can': the detector "
-                            "matches broad concepts better. If a search returns zero "
-                            "but the thing is probably there, retry ONCE with a "
-                            "simpler or more generic word before answering."
+                            "A short CONCRETE noun for one kind of thing - 'bottle', "
+                            "'cup', 'keyboard', 'backpack'. Prefer the simple word "
+                            "('bottle' over 'water bottle'). NEVER pass an abstract "
+                            "word like 'object', 'thing', 'item' or 'anything': the "
+                            "detector matches concepts, so those always find nothing "
+                            "- for an open question about what is around, use "
+                            "look_at_camera instead. If a search returns zero but "
+                            "the thing is probably there, retry ONCE with a simpler "
+                            "word."
                         ),
                     },
                     "source": {
@@ -496,6 +531,7 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "enroll_face",
         "find_object",
         "rename_person",
+        "show_photo",
     }
 )
 

@@ -101,7 +101,14 @@ _EVERYONE_TOOLS = frozenset({"set_light", "set_switch", "enroll_voice", "enroll_
 #: ``find_object`` (v1.5) pulls the same kind of frame as ``look_at_camera``/
 #: ``look_at_screen``, so it joins them here.
 _TRUSTED_TOOLS = frozenset(
-    {"click_screen", "look_at_screen", "look_at_camera", "remember", "find_object"}
+    {
+        "click_screen",
+        "look_at_screen",
+        "look_at_camera",
+        "remember",
+        "find_object",
+        "show_photo",
+    }
 )
 #: Tools that need admin.
 _ADMIN_TOOLS = frozenset({"run_command", "set_role"})
