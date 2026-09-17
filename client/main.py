@@ -75,6 +75,7 @@ from common.protocol import (
     MSG_SCREENSHOT,
     MSG_SCREENSHOT_ERROR,
     MSG_SCREENSHOT_REQUEST,
+    MSG_SPEAKER,
     MSG_STATUS,
     MSG_TRANSCRIPT,
     MSG_TTS_END,
@@ -697,6 +698,8 @@ class JarvisClient:
             log.debug("The server sent ready")
         elif mtype == MSG_STATUS:
             self._on_status_message(msg, in_conversation=False)
+        elif mtype == MSG_SPEAKER:
+            self._on_speaker_message(msg)
         else:
             log.warning("Unknown message type from the server: %r", mtype)
 
@@ -718,6 +721,20 @@ class JarvisClient:
             self._status_owns_hud = False
             if self._mode == MODE_IDLE:
                 self.overlay.set_state("idle")
+
+    def _on_speaker_message(self, msg: Dict[str, Any]) -> None:
+        """MSG_SPEAKER: put the recognised person's name in the middle of the TV.
+
+        Cleared when the turn ends, so a name is only ever on screen while it
+        is actually about the person talking right now.
+        """
+        name = str(msg.get("name") or "").strip()
+        try:
+            score = float(msg.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        log.info("Recognised speaker: %s (%.2f)", name or "(nobody)", score)
+        self.overlay.speaker(name)
 
     def _on_status_message(self, msg: Dict[str, Any], in_conversation: bool) -> None:
         """MSG_STATUS: a caption for background work, e.g. face enrollment photos.
@@ -1166,6 +1183,8 @@ class JarvisClient:
                     log.debug("The server sent ready")
                 elif mtype == MSG_STATUS:
                     self._on_status_message(msg, in_conversation=True)
+                elif mtype == MSG_SPEAKER:
+                    self._on_speaker_message(msg)
                 else:
                     log.warning("Unknown message type from the server: %r", mtype)
         except _BargedIn:
@@ -1180,6 +1199,8 @@ class JarvisClient:
             await self._stop_thinking()
             await self._stop_barge_watch()
             await self._await_actions()
+            # The name belongs to the turn that is now over.
+            self.overlay.speaker("")
         return result
 
     def _says_wake_word(self, text: Any) -> bool:

@@ -2249,6 +2249,20 @@ class Connection:
         except Exception:
             log.debug("Could not announce the end of face enrollment", exc_info=True)
 
+    async def _announce_speaker(self, name: str, score: float) -> None:
+        """Tell the client whose voice this is (v1.7); never raises.
+
+        Only for a voice that actually matched somebody - an unidentified
+        speaker is not announced at all, because a name on screen is a claim
+        and a wrong one is worse than none.
+        """
+        try:
+            await self.send_json(
+                {"type": proto.MSG_SPEAKER, "name": str(name), "score": float(score)}
+            )
+        except Exception:  # noqa: BLE001 - a caption is never worth an error
+            log.debug("Could not announce the speaker", exc_info=True)
+
     async def _send_status(self, text: str, ttl_s: float = proto.DEFAULT_STATUS_TTL_S) -> None:
         """Put a short caption on the room screen (v1.7); never raises.
 
@@ -2749,6 +2763,10 @@ class Connection:
                 self._last_known_voice_at = heard_at
                 self._last_seen_at[name] = heard_at
                 self._due_greeting.discard(name)
+                # v1.7: tell the room WHO it heard, right away. This goes out
+                # before the reply is produced, so the name is on the TV while
+                # the person is still looking at it.
+                await self._announce_speaker(name, score)
             pending = self._enroll_pending
             if pending:
                 # v1.6: every attempt counts its seconds, even a failed one —

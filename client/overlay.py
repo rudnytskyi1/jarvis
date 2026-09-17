@@ -301,6 +301,8 @@ class OverlayHUD:
         # window; the actual look/animation lives entirely in hud.html/css).
         self._state = STATE_IDLE
         self._status = ""
+        #: Name currently shown centred on screen (v1.7), "" when none.
+        self._speaker_name = ""
         self._scanning = False
         self._typing_on = False
         self._flash_until = 0.0
@@ -415,6 +417,19 @@ class OverlayHUD:
             return
         self._post(lambda bridge: bridge.typing_changed.emit(bool(on)))
 
+    def speaker(self, name: Any) -> None:
+        """Show the recognised person's NAME centred on screen; ``""`` clears it.
+
+        Deliberately separate from :meth:`set_status`: the status caption rides
+        with the glow, which tucks into the corner while Rowan works, and the
+        owner asked for the name in the middle of the screen where he is
+        actually looking.
+        """
+        if not self.enabled:
+            return
+        text = _truncate_status(name)
+        self._post(lambda bridge: bridge.speaker_changed.emit(text))
+
     def flash(self, kind: str) -> None:
         """A quick accent flash: :data:`FLASH_WAKE`, :data:`FLASH_ERROR` or :data:`FLASH_SHOT`."""
         if not self.enabled:
@@ -509,6 +524,7 @@ class OverlayHUD:
             typing_changed = Signal(bool)
             click_requested = Signal(float, float)
             flash_requested = Signal(str)
+            speaker_changed = Signal(str)
             hide_now_requested = Signal()
             stop_requested = Signal()
 
@@ -520,6 +536,7 @@ class OverlayHUD:
                 self.typing_changed.connect(self._on_typing)
                 self.click_requested.connect(self._on_click)
                 self.flash_requested.connect(self._on_flash)
+                self.speaker_changed.connect(self._on_speaker)
                 self.hide_now_requested.connect(self._on_hide_now)
                 self.stop_requested.connect(self._on_stop)
 
@@ -548,7 +565,7 @@ class OverlayHUD:
                 now = time.monotonic()
                 return _is_active(
                     owner._state,
-                    owner._status,
+                    owner._status or owner._speaker_name,
                     owner._scanning,
                     owner._typing_on,
                     now < owner._flash_until,
@@ -611,6 +628,15 @@ class OverlayHUD:
                 self._run_js(f"window.hudClick && window.hudClick({x}, {y});")
                 self._reconsider_visibility()
                 QTimer.singleShot(int(CLICK_TOTAL_S * 1000) + 50, self._maybe_hide)
+
+            def _on_speaker(self, name: str) -> None:
+                owner._speaker_name = name
+                self._run_js(
+                    f"window.hudSpeaker && window.hudSpeaker({json.dumps(name)});"
+                )
+                self._reconsider_visibility()
+                if not name:
+                    QTimer.singleShot(int(HIDE_DELAY_S * 1000), self._maybe_hide)
 
             def _on_flash(self, kind: str) -> None:
                 hold = SHOT_DURATION_S if kind == FLASH_SHOT else FLASH_DURATION_S

@@ -43,7 +43,7 @@
      the OS/Qt level (WindowTransparentForInput); this is defense in depth
      so nothing here can ever intercept a click even if that ever changes. */
   body, .presence, .glow-wrap, .glow-core, .status, .typing, .scan, .click-layer,
-  .shot, .shot-frame {
+  .shot, .shot-frame, .speaker {
     pointer-events: none;
   }
 
@@ -114,6 +114,31 @@
     top: 86%;
     left: 92%;
     transform: translate(-50%, -50%) scale(calc(var(--hud-scale) * .62));
+  }
+
+  /* -- who is speaking: the recognised name, always centred under the orb's
+     home position. It lives OUTSIDE .presence on purpose - the presence moves
+     to the corner while Rowan works, and the name belongs in the middle where
+     the person is looking. -- */
+  .speaker {
+    position: fixed;
+    top: calc(50% + 150px);
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 30px;
+    letter-spacing: .10em;
+    color: rgba(238, 236, 252, .96);
+    text-shadow: 0 0 22px rgba(124, 108, 255, .85), 0 0 44px rgba(124, 108, 255, .45);
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 420ms ease, transform 420ms cubic-bezier(.4, 0, .2, 1);
+  }
+  .speaker.visible {
+    opacity: 1;
+    transform: translateY(0);
   }
 
   /* -- the shutter: a full-screen wash that snaps bright and falls away,
@@ -307,6 +332,7 @@
     <div id="status" class="status"></div>
     <div id="typing" class="typing"><span></span><span></span><span></span></div>
   </div>
+  <div id="speaker" class="speaker"></div>
   <div id="scan" class="scan"></div>
   <div id="shot" class="shot"></div>
   <div id="shot-frame" class="shot-frame"></div>
@@ -320,6 +346,7 @@
   var statusEl = document.getElementById("status");
   var typingEl = document.getElementById("typing");
   var clickLayer = document.getElementById("click-layer");
+  var speakerEl = document.getElementById("speaker");
   var shotEl = document.getElementById("shot");
   var shotFrameEl = document.getElementById("shot-frame");
   var STATES = ["idle", "listening", "thinking", "speaking"];
@@ -383,6 +410,16 @@
     setTimeout(cleanup, 700); // safety net if animationend never fires
   };
 
+  // -- window.hudSpeaker(name) - the recognised person's name, centred.
+  // An empty name fades it away.
+  window.hudSpeaker = function (name) {
+    var text = typeof name === "string" ? name.trim() : "";
+    if (text) {
+      speakerEl.textContent = text;
+    }
+    speakerEl.classList.toggle("visible", text.length > 0);
+  };
+
   // -- window.hudFlash(kind) - "wake" (bright bloom), "error" (soft red) or
   // "shot" (the camera shutter: a full-screen wash, not the glow at all).
   window.hudFlash = function (kind) {
@@ -417,6 +454,7 @@
   // Resting state: fully hidden until client.overlay sends the first
   // real event.
   window.hudState({ state: "idle", status: "", typing: false, scan: false });
+  window.hudSpeaker("");
 })();
 </script>
 </body>

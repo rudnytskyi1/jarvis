@@ -55,6 +55,8 @@ Server -> Client
   show a photo on the room screen (``find_object`` pushes its annotated
   detections here). ``ttl_s`` is how long the client keeps it up (default 60 on
   the client side if omitted); a newer image replaces whatever is showing.
+* ``{"type": MSG_SPEAKER, "name": str, "score": float}`` -- v1.7: the voice was
+  recognised; the client shows the name centred on the HUD until the turn ends.
 * ``{"type": MSG_STATUS, "text": str, "ttl_s": float}`` -- v1.7: a HUD caption
   for something slow happening in the background (face enrollment photos);
   empty ``text`` clears it. May arrive at any time, nothing is spoken.
@@ -116,6 +118,11 @@ MSG_IMAGE_SHOW = "image_show"
 #: shown on the HUD while something slow happens in the background (face
 #: enrollment photos). Empty text clears it. Nothing is spoken.
 MSG_STATUS = "status"
+#: v1.7: who the server just recognised by voice, ``{"name": str, "score":
+#: float}``. Sent right after identification, before the reply is produced, so
+#: the HUD can show the name while the person is still looking at it. An empty
+#: name clears it; a voice that matched nobody is simply not announced.
+MSG_SPEAKER = "speaker"
 MSG_ERROR = "error"
 
 #: v1.7: optional ``say`` field - a caption the client shows on the HUD for the
@@ -193,6 +200,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_TTS_END,
         MSG_IMAGE_SHOW,
         MSG_STATUS,
+        MSG_SPEAKER,
         MSG_ERROR,
     }
 )
@@ -217,6 +225,7 @@ __all__ = [
     "MSG_TTS_END",
     "MSG_IMAGE_SHOW",
     "MSG_STATUS",
+    "MSG_SPEAKER",
     "SAY_STATUS_FIELD",
     "DEFAULT_STATUS_TTL_S",
     "MSG_ERROR",
