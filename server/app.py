@@ -321,6 +321,9 @@ class PresenceTracker:
         """Record the labels matched in one presence frame."""
         now = time.monotonic()
         unknown = 0
+        #: How many faces the last burst actually saw: a stranger leaning in
+        #: next to a known person means more faces than known labels.
+        self.last_face_count = len(labels)
         for label in labels:
             entry = self._seen.get(label)
             if entry is None or now - entry.last_seen >= self.ttl_s:
@@ -339,6 +342,7 @@ class PresenceTracker:
         self._seen.clear()
         self._unknown_count = 0
         self._empty_since = None
+        self.last_face_count = 0
 
     def reconcile(self, persons: int) -> None:
         """Drop the unknown bucket when named labels already cover YOLO (v1.6).
@@ -1424,7 +1428,13 @@ class Connection:
         if persons != 1:
             return False
         present = self.presence.present()
-        return any(label != LABEL_UNKNOWN for label in present)
+        if not any(label != LABEL_UNKNOWN for label in present):
+            return False
+        # ... unless the last burst actually saw MORE faces than there are
+        # known people: then one of them is a genuine stranger (a friend
+        # leaning in, a face held up to the camera) and must be greeted.
+        known = sum(1 for label in present if label != LABEL_UNKNOWN)
+        return int(getattr(self.presence, "last_face_count", 0) or 0) <= known
 
     def _may_greet(self, greet_after_s: float, cooldown_s: float) -> bool:
         """True when an unknown face has waited long enough and the room is idle.
