@@ -24,7 +24,12 @@ from client.overlay import (
     VALID_STATES,
     OverlayHUD,
     _anchor_point,
+    _build_bloom_ramp,
     _clamp01,
+    _ease_in_out,
+    _fade_alpha,
+    _is_active,
+    _lerp_color,
     _reticle_trail,
     _truncate_status,
     _validate_state,
@@ -157,6 +162,95 @@ class TestAnchorPoint:
         assert _anchor_point("nonsense", 1000, 500, 100) == _anchor_point(
             "bottom_right", 1000, 500, 100
         )
+
+
+# ------------------------------------------------------------------
+# _lerp_color / _build_bloom_ramp - the soft-bloom colour ramp
+# ------------------------------------------------------------------
+class TestColorRamp:
+    def test_lerp_color_endpoints(self):
+        assert _lerp_color("#000000", "#ffffff", 0.0) == "#000000"
+        assert _lerp_color("#000000", "#ffffff", 1.0) == "#ffffff"
+
+    def test_lerp_color_midpoint(self):
+        assert _lerp_color("#000000", "#ffffff", 0.5) == "#808080"
+
+    def test_lerp_color_clamps_t(self):
+        assert _lerp_color("#000000", "#ffffff", -1.0) == "#000000"
+        assert _lerp_color("#000000", "#ffffff", 5.0) == "#ffffff"
+
+    def test_ramp_starts_at_core_and_ends_at_edge(self):
+        ramp = _build_bloom_ramp("#f4f1ff", "#8b7dff", "#010101", steps=48)
+        assert ramp[0] == "#f4f1ff"
+        assert ramp[-1] == "#010101"
+
+    def test_ramp_length_matches_steps(self):
+        assert len(_build_bloom_ramp("#000000", "#808080", "#ffffff", steps=12)) == 12
+
+    def test_ramp_passes_through_the_mid_colour(self):
+        ramp = _build_bloom_ramp("#000000", "#808080", "#ffffff", steps=5)
+        # index 2 of 5 sits exactly at t=0.5 -> the mid colour
+        assert ramp[2] == "#808080"
+
+    def test_ramp_step_count_is_clamped_to_at_least_two(self):
+        assert len(_build_bloom_ramp("#000000", "#808080", "#ffffff", steps=0)) == 2
+
+
+# ------------------------------------------------------------------
+# _ease_in_out / _fade_alpha - the smooth fade-in/fade-out curve
+# ------------------------------------------------------------------
+class TestFadeAlpha:
+    def test_ease_endpoints(self):
+        assert _ease_in_out(0.0) == 0.0
+        assert _ease_in_out(1.0) == 1.0
+
+    def test_ease_midpoint_is_half(self):
+        assert _ease_in_out(0.5) == pytest.approx(0.5)
+
+    def test_ease_clamps_out_of_range_input(self):
+        assert _ease_in_out(-1.0) == 0.0
+        assert _ease_in_out(2.0) == 1.0
+
+    def test_fade_alpha_starts_at_the_start_value(self):
+        assert _fade_alpha(0.0, 0.18, 0.0, 1.0) == pytest.approx(0.0)
+
+    def test_fade_alpha_reaches_the_end_value(self):
+        assert _fade_alpha(0.18, 0.18, 0.0, 1.0) == pytest.approx(1.0)
+        assert _fade_alpha(999.0, 0.18, 0.0, 1.0) == pytest.approx(1.0)
+
+    def test_fade_alpha_fades_out_too(self):
+        assert _fade_alpha(0.0, 0.26, 1.0, 0.0) == pytest.approx(1.0)
+        assert _fade_alpha(0.26, 0.26, 1.0, 0.0) == pytest.approx(0.0)
+
+    def test_fade_alpha_zero_duration_jumps_to_end(self):
+        assert _fade_alpha(0.0, 0.0, 0.0, 1.0) == 1.0
+
+
+# ------------------------------------------------------------------
+# _is_active - the hidden-at-idle decision
+# ------------------------------------------------------------------
+class TestIsActive:
+    def test_idle_and_quiet_is_hidden(self):
+        assert _is_active(STATE_IDLE, "", False, False, False, False) is False
+
+    def test_non_idle_state_is_always_active(self):
+        for state in (STATE_LISTENING, STATE_THINKING, STATE_SPEAKING):
+            assert _is_active(state, "", False, False, False, False) is True
+
+    def test_idle_with_status_text_is_active(self):
+        assert _is_active(STATE_IDLE, "listening", False, False, False, False) is True
+
+    def test_idle_with_scan_is_active(self):
+        assert _is_active(STATE_IDLE, "", True, False, False, False) is True
+
+    def test_idle_with_typing_is_active(self):
+        assert _is_active(STATE_IDLE, "", False, True, False, False) is True
+
+    def test_idle_with_flash_is_active(self):
+        assert _is_active(STATE_IDLE, "", False, False, True, False) is True
+
+    def test_idle_with_click_is_active(self):
+        assert _is_active(STATE_IDLE, "", False, False, False, True) is True
 
 
 # ------------------------------------------------------------------

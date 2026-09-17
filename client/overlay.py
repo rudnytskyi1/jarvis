@@ -1,10 +1,12 @@
-"""Sci-fi HUD overlay for the room TV (self-contained, OPTIONAL).
+"""Modern HUD overlay for the room TV (self-contained, OPTIONAL).
 
 A transparent, borderless, always-on-top, click-through full-screen window
-that gives the room TV a visible "presence" for the assistant: a glowing orb
-that breathes at rest, reacts while listening/thinking/speaking, sweeps a
-scan-line while the screen is being looked at, and flies a targeting reticle
-to wherever ``mouse_click`` is about to land.
+that gives the room TV a subtle "presence" for the assistant: a single soft
+luminous bloom, centered on screen, that stays completely hidden while the
+assistant is idle and only fades in while something is actually happening -
+listening, thinking, speaking, a click ping, a screen scan, the typing dots,
+a status caption, or a quick wake/error flash. When the activity ends it
+fades back out and disappears again.
 
 Everything is drawn on a plain :class:`tkinter.Canvas` (no external image
 assets) from ONE dedicated UI thread — like :mod:`client.viewer`'s ``cv2``
@@ -17,7 +19,11 @@ and is the only thing that ever touches ``tkinter`` or ``ctypes``.
 Click-through, on Windows, is done with a best-effort ``ctypes`` call that
 sets ``WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE`` on the window,
 so mouse clicks fall straight through to whatever is running underneath and
-the overlay can never steal focus or block the desktop.
+the overlay can never steal focus or block the desktop. The fade in/out is
+the Tk ``-alpha`` window attribute (combined with ``-transparentcolor`` for
+the click-through chroma key), eased over ~180 ms in and ~260 ms out; at
+rest the window is fully ``withdraw()``-n, not just blank, so nothing is on
+screen at all until something happens.
 
 Everything here is OPTIONAL and best-effort: if the window cannot be created
 for ANY reason (no display, headless CI, Tk not installed, the ``ctypes``
@@ -49,15 +55,15 @@ import queue
 import threading
 import time
 from collections.abc import Mapping
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# --- palette (sci-fi: cyan/teal, deep blue, soft white) ----------------------
-COLOR_CYAN = "#16f2e0"
-COLOR_DEEP_BLUE = "#0a1e3f"
-COLOR_SOFT_WHITE = "#eaf6ff"
-COLOR_RED = "#ff3b3b"
+# --- palette (soft luminous bloom: near-white core -> indigo/violet -> bg) ---
+BLOOM_CORE = "#F4F1FF"
+BLOOM_MID = "#8B7DFF"
+BLOOM_ERROR_MID = "#FF6B6B"
+TEXT_COLOR = "#D8D4F0"
 
 # --- state machine ------------------------------------------------------------
 STATE_IDLE = "idle"
@@ -77,18 +83,26 @@ _POSITIONS = ("bottom_right", "bottom_left", "top_right", "top_left", "center")
 DEFAULT_CHROMA = "#010101"
 
 # --- layout / timing tuning -----------------------------------------------------
-BASE_ORB_R = 42.0
-BASE_MARGIN = 130.0
+BASE_BLOOM_R = 130.0  # ~260px diameter at scale 1.0
+BLOOM_STEPS = 48  # concentric ovals in the precomputed colour ramp
 TICK_MS = 33  # ~30 FPS
 START_TIMEOUT_S = 5.0
 JOIN_TIMEOUT_S = 2.0
 QUEUE_MAXSIZE = 256
 STATUS_MAX_CHARS = 60
 TRAIL_STEPS = 8
-CLICK_CONVERGE_S = 0.35
-CLICK_PING_S = 0.45
-CLICK_TOTAL_S = CLICK_CONVERGE_S + CLICK_PING_S
-FLASH_DURATION_S = 0.6
+FADE_IN_S = 0.18
+FADE_OUT_S = 0.26
+_ALPHA_EPS = 0.004
+CLICK_TOTAL_S = 0.45
+CLICK_CONVERGE_S = CLICK_TOTAL_S  # kept as a separate name for API stability
+FLASH_DURATION_S = 0.45
+LISTEN_PERIOD_S = 2.5
+SPEAK_PERIOD_S = 1.1
+THINK_CRESCENT_PERIOD_S = 4.5
+SCAN_PERIOD_S = 2.5
+SCAN_BAND_H = 130.0
+TYPING_PERIOD_S = 1.2
 
 # --- best-effort Windows click-through styling (ctypes) -------------------------
 _GWL_EXSTYLE = -20
@@ -207,7 +221,7 @@ def norm_to_px(x_norm: Any, y_norm: Any, width: int, height: int) -> Tuple[int, 
 
     Out-of-range values are clamped rather than rejected (a slightly
     over/under-shooting vision-model coordinate is common and should still
-    animate a reticle at the nearest edge, not raise).
+    animate the click ring at the nearest edge, not raise).
     """
     x = _clamp01(x_norm)
     y = _clamp01(y_norm)
@@ -225,10 +239,11 @@ def _reticle_trail(
 ):
     """``steps + 1`` points interpolated from ``start_px`` to ``end_px``.
 
-    Used to draw the brief cursor trail between two consecutive
-    :meth:`OverlayHUD.click_at` targets, so a chain of clicks reads as the
-    assistant "moving the mouse". Pure and deterministic: the first point is
-    always ``start_px`` and the last is always ``end_px``.
+    Pure geometry helper for a chain of consecutive :meth:`OverlayHUD.click_at`
+    targets. Kept as a small, independently-testable utility even though the
+    current click visual (a single contracting ring) no longer renders a
+    dotted trail between points. Deterministic: the first point is always
+    ``start_px`` and the last is always ``end_px``.
     """
     steps = max(1, int(steps))
     sx, sy = start_px
@@ -237,10 +252,13 @@ def _reticle_trail(
 
 
 def _anchor_point(position: str, width: int, height: int, margin: float) -> Tuple[float, float]:
-    """Where the orb's center sits for a given ``position`` config value.
+    """Where a ``position`` config value points on screen.
 
-    Unknown positions fall back to :data:`DEFAULT_POSITION` rather than
-    raising, matching this module's "never break the caller" philosophy.
+    The bloom itself is always centered now (see :meth:`OverlayHUD._redraw`);
+    this pure helper is kept for API/test stability and is available for a
+    future "shift the status caption toward a corner" tweak. Unknown
+    positions fall back to :data:`DEFAULT_POSITION` rather than raising,
+    matching this module's "never break the caller" philosophy.
     """
     pos = position if position in _POSITIONS else DEFAULT_POSITION
     if pos == "bottom_right":
@@ -254,8 +272,85 @@ def _anchor_point(position: str, width: int, height: int, margin: float) -> Tupl
     return width / 2.0, height / 2.0
 
 
+def _hex_to_rgb(color: str) -> Tuple[int, int, int]:
+    text = str(color).lstrip("#")
+    if len(text) != 6:
+        raise ValueError(f"expected a 6-digit hex colour, got {color!r}")
+    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+
+
+def _rgb_to_hex(rgb: Tuple[float, float, float]) -> str:
+    r, g, b = (max(0, min(255, int(round(v)))) for v in rgb)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _lerp_color(c1: str, c2: str, t: float) -> str:
+    """Interpolate two ``#rrggbb`` colours; ``t=0`` -> ``c1``, ``t=1`` -> ``c2``."""
+    t = _clamp01(t)
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    return _rgb_to_hex((_lerp(r1, r2, t), _lerp(g1, g2, t), _lerp(b1, b2, t)))
+
+
+def _build_bloom_ramp(core: str, mid: str, edge: str, steps: int = BLOOM_STEPS) -> List[str]:
+    """Precompute a ``steps``-long colour ramp: ``core`` -> ``mid`` -> ``edge``.
+
+    Drives the "soft bloom" glow: ~48 concentric filled ovals, each one
+    index further out, painted with the matching ramp colour so the whole
+    thing reads as a genuine soft blur with no visible edge. Index ``0`` is
+    the brightest core colour; the last index is ``edge`` (normally the
+    chroma background colour, so the outermost ovals fade to fully
+    transparent via ``-transparentcolor``). Pure and deterministic, so the
+    interpolation can be unit-tested without ever opening a window.
+    """
+    steps = max(2, int(steps))
+    ramp: List[str] = []
+    for i in range(steps):
+        t = i / (steps - 1)
+        if t <= 0.5:
+            ramp.append(_lerp_color(core, mid, t / 0.5))
+        else:
+            ramp.append(_lerp_color(mid, edge, (t - 0.5) / 0.5))
+    return ramp
+
+
+def _ease_in_out(t: float) -> float:
+    """Smoothstep ease curve, clamped to ``[0, 1]`` on both ends."""
+    t = _clamp01(t)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _fade_alpha(elapsed_s: float, duration_s: float, start_alpha: float, end_alpha: float) -> float:
+    """The window ``-alpha`` value ``elapsed_s`` into an eased fade of ``duration_s``."""
+    if duration_s <= 0:
+        return end_alpha
+    return _lerp(start_alpha, end_alpha, _ease_in_out(elapsed_s / duration_s))
+
+
+def _is_active(
+    state: str,
+    status: str,
+    scanning: bool,
+    typing_on: bool,
+    flash_active: bool,
+    click_active: bool,
+) -> bool:
+    """Hidden-at-idle decision: is there anything worth showing right now?
+
+    ``True`` whenever the assistant is doing something - a non-idle state
+    (listening/thinking/speaking), a screen scan, the typing dots, a flash,
+    a click ping, or a status caption. ``False`` only when all of those are
+    quiet, which is when the overlay is fully withdrawn. This is
+    unconditional: :attr:`OverlayHUD.idle_hidden` is accepted for backwards
+    compatibility but no longer changes this decision.
+    """
+    if state != STATE_IDLE:
+        return True
+    return bool(scanning or typing_on or flash_active or click_active or status)
+
+
 class OverlayHUD:
-    """Transparent click-through sci-fi HUD, driven from one dedicated UI thread.
+    """Transparent click-through HUD - a single centered soft bloom, hidden at rest.
 
     Construction never fails and never touches ``tkinter``/``ctypes`` — only
     :meth:`start` does, off on its own thread. Every public method is safe to
@@ -269,10 +364,27 @@ class OverlayHUD:
         self.enabled = _as_bool(_attr(cfg, "enabled", True), True)
         position = str(_attr(cfg, "position", DEFAULT_POSITION) or DEFAULT_POSITION).strip().lower()
         self.position = position if position in _POSITIONS else DEFAULT_POSITION
+        # Vestigial: hiding at idle is unconditional now. Still accepted (and
+        # stored) so existing configs/callers do not break.
         self.idle_hidden = _as_bool(_attr(cfg, "idle_hidden", False), False)
         scale = _as_float(_attr(cfg, "scale", 1.0), 1.0)
         self.scale = scale if scale > 0 else 1.0
         self.chroma = str(_attr(cfg, "chroma", DEFAULT_CHROMA) or DEFAULT_CHROMA)
+
+        # Colour ramps for the bloom are pure functions of (core, mid, edge)
+        # and never change after construction, so precompute them once.
+        # ``chroma`` is normally a "#rrggbb" hex string, but construction
+        # must never fail even if a config hands us something odd (a named
+        # Tk colour, garbage, ...) - fall back to the default hex for the
+        # ramp's edge colour in that case; ``self.chroma`` itself (used for
+        # the actual window/-transparentcolor) is left untouched.
+        try:
+            _ramp_edge = self.chroma if len(str(self.chroma).lstrip("#")) == 6 else DEFAULT_CHROMA
+            self._ramp_normal = _build_bloom_ramp(BLOOM_CORE, BLOOM_MID, _ramp_edge, BLOOM_STEPS)
+            self._ramp_error = _build_bloom_ramp(BLOOM_CORE, BLOOM_ERROR_MID, _ramp_edge, BLOOM_STEPS)
+        except (ValueError, TypeError):  # pragma: no cover - defensive, chroma is normally valid hex
+            self._ramp_normal = _build_bloom_ramp(BLOOM_CORE, BLOOM_MID, DEFAULT_CHROMA, BLOOM_STEPS)
+            self._ramp_error = _build_bloom_ramp(BLOOM_CORE, BLOOM_ERROR_MID, DEFAULT_CHROMA, BLOOM_STEPS)
 
         self._lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
@@ -295,6 +407,12 @@ class OverlayHUD:
         self._flash: Optional[Tuple[str, float]] = None
         self._click_anim: Optional[dict] = None
         self._last_click_px: Optional[Tuple[float, float]] = None
+        self._bloom_item_ids: Optional[List[Any]] = None
+        self._mapped = False
+        self._alpha = 0.0
+        self._fade_target = 0.0
+        self._fade_from = 0.0
+        self._fade_t0 = 0.0
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -307,6 +425,9 @@ class OverlayHUD:
         after this returns. Any failure - no display, Tk missing, the
         ``ctypes`` styling call failing - logs exactly ONE warning and flips
         :attr:`enabled` to ``False``; every other method then becomes a no-op.
+        The window starts fully hidden (``withdraw()``-n): nothing appears
+        on screen until an actual event (state/status/scan/click/typing/flash)
+        makes it fade in.
         """
         if not self.enabled:
             return
@@ -349,7 +470,7 @@ class OverlayHUD:
     # public API - thread-safe, never blocks, never raises
     # ------------------------------------------------------------------
     def set_state(self, state: Any) -> None:
-        """Switch the orb's animation: one of :data:`VALID_STATES`.
+        """Switch the bloom's animation: one of :data:`VALID_STATES`.
 
         An unknown state is logged at DEBUG and ignored - never raised to the
         caller (see :func:`_validate_state` for the pure validation logic).
@@ -364,25 +485,23 @@ class OverlayHUD:
         self._post(("state", normalized))
 
     def set_status(self, text: Any) -> None:
-        """Short caption shown near the orb; ``""`` (or ``None``) clears it."""
+        """Short caption shown just below the bloom; ``""`` (or ``None``) clears it."""
         if not self.enabled:
             return
         self._post(("status", _truncate_status(text)))
 
     def scan_screen(self, on: bool = True) -> None:
-        """Toggle the screen-scan sweep (while a screenshot/vision call is in flight)."""
+        """Toggle the soft screen-scan sweep (while a screenshot/vision call is in flight)."""
         if not self.enabled:
             return
         self._post(("scan", bool(on)))
 
     def click_at(self, x_norm: Any, y_norm: Any) -> None:
-        """Animate a targeting reticle flying to and pinging at ``(x_norm, y_norm)``.
+        """Animate a soft ring contracting onto ``(x_norm, y_norm)`` and fading out.
 
         Coordinates are normalized 0..1 (clamped, never raise on an
         out-of-range or slightly malformed value); non-numeric input is
-        logged at DEBUG and dropped. A trail is drawn from the previous
-        reticle position to this one, so a chain of clicks reads as the
-        assistant moving the mouse.
+        logged at DEBUG and dropped.
         """
         if not self.enabled:
             return
@@ -395,13 +514,13 @@ class OverlayHUD:
         self._post(("click", x, y))
 
     def typing(self, on: bool = True) -> None:
-        """Toggle the small pulsing "typing" glyph near the orb."""
+        """Toggle the three small pulsing "typing" dots below the bloom."""
         if not self.enabled:
             return
         self._post(("typing", bool(on)))
 
     def flash(self, kind: str) -> None:
-        """A quick accent flash: ``"wake"`` (bright rings) or ``"error"`` (red)."""
+        """A quick accent flash: ``"wake"`` (bright bloom expansion) or ``"error"`` (soft red)."""
         if not self.enabled:
             return
         normalized = str(kind or "").strip().lower()
@@ -445,6 +564,10 @@ class OverlayHUD:
         cannot make it click-through, is just as useless to us as no display
         at all, so any failure anywhere in this method disables the whole HUD
         rather than showing a half-working (possibly click-blocking) window.
+
+        The window is built at full size and then immediately withdrawn:
+        hidden-at-idle is the resting state, and it only ever deiconifies
+        from :meth:`_redraw` once something is actually happening.
         """
         import tkinter as tk
 
@@ -456,6 +579,7 @@ class OverlayHUD:
             root.overrideredirect(True)
             root.attributes("-topmost", True)
             root.attributes("-transparentcolor", self.chroma)
+            root.attributes("-alpha", 0.0)
             root.config(bg=self.chroma)
             root.resizable(False, False)
             canvas = tk.Canvas(
@@ -465,6 +589,7 @@ class OverlayHUD:
             canvas.pack(fill="both", expand=True)
             root.update_idletasks()
             self._apply_click_through(root)
+            root.withdraw()
         except Exception:
             try:
                 root.destroy()
@@ -477,6 +602,12 @@ class OverlayHUD:
         self._canvas_w = width
         self._canvas_h = height
         self._last_click_px = None
+        self._bloom_item_ids = None
+        self._mapped = False
+        self._alpha = 0.0
+        self._fade_target = 0.0
+        self._fade_from = 0.0
+        self._fade_t0 = 0.0
 
     @staticmethod
     def _apply_click_through(root: Any) -> None:
@@ -542,6 +673,8 @@ class OverlayHUD:
     def _teardown_tk(self) -> None:
         root, self._root = self._root, None
         self._canvas = None
+        self._bloom_item_ids = None
+        self._mapped = False
         if root is None:
             return
         try:
@@ -558,162 +691,201 @@ class OverlayHUD:
     # ------------------------------------------------------------------
     def _redraw(self, now: float) -> None:
         canvas = self._canvas
-        if canvas is None:
+        root = self._root
+        if canvas is None or root is None:
             return
-        canvas.delete("all")
-        width, height = self._canvas_w, self._canvas_h
-        margin = BASE_MARGIN * self.scale
-        cx, cy = _anchor_point(self.position, width, height, margin)
-        radius = BASE_ORB_R * self.scale
 
         flash_active = self._flash_active(now)
         click_active = self._click_active(now)
-        quiet = (
-            self._state == STATE_IDLE
-            and not self._scanning
-            and not self._typing_on
-            and not flash_active
-            and not click_active
-            and not self._status
+        active = _is_active(
+            self._state, self._status, self._scanning, self._typing_on,
+            flash_active, click_active,
         )
-        if self.idle_hidden and quiet:
-            return  # nothing at all while idle and quiet, per idle_hidden=True
+        target = 1.0 if active else 0.0
+        if target != self._fade_target:
+            self._fade_from = self._alpha
+            self._fade_target = target
+            self._fade_t0 = now
+        duration = FADE_IN_S if target >= 1.0 else FADE_OUT_S
+        alpha = _fade_alpha(now - self._fade_t0, duration, self._fade_from, target)
+        self._alpha = alpha
+
+        if alpha <= _ALPHA_EPS and target <= 0.0:
+            if self._mapped:
+                self._hide_window()
+            return
+
+        if not self._mapped:
+            self._show_window()
+        try:
+            root.attributes("-alpha", max(0.0, min(1.0, alpha)))
+        except Exception:  # pragma: no cover - best-effort, window may be closing
+            pass
+
+        width, height = self._canvas_w, self._canvas_h
+        cx, cy = width / 2.0, height / 2.0
+        radius = BASE_BLOOM_R * self.scale
 
         if self._scanning:
             self._draw_scan(canvas, width, height, now)
+        else:
+            canvas.delete("scan")
 
-        self._draw_orb(canvas, cx, cy, radius, now)
+        self._draw_bloom(canvas, cx, cy, radius, now, flash_active)
 
         if self._status:
             self._draw_status(canvas, cx, cy, radius)
+        else:
+            canvas.delete("status")
 
         if self._typing_on:
             self._draw_typing(canvas, cx, cy, radius, now)
+        else:
+            canvas.delete("typing")
 
         if click_active:
             self._draw_click(canvas, now)
-
-        if flash_active:
-            self._draw_flash(canvas, cx, cy, now)
-
-    def _draw_orb(self, c: Any, cx: float, cy: float, r: float, now: float) -> None:
-        breathing = 1.0 + 0.08 * math.sin(now * 1.6)
-        br = r * breathing
-        if self._state == STATE_LISTENING:
-            self._draw_listening(c, cx, cy, br, now)
-        elif self._state == STATE_THINKING:
-            self._draw_thinking(c, cx, cy, br, now)
-        elif self._state == STATE_SPEAKING:
-            self._draw_speaking(c, cx, cy, br, now)
         else:
-            self._draw_idle_orb(c, cx, cy, br)
+            canvas.delete("click")
 
-    def _draw_idle_orb(self, c: Any, cx: float, cy: float, r: float) -> None:
-        # soft halo (stipple degrades gracefully to a solid blob on platforms
-        # without canvas stipple support - never a hard failure either way)
-        c.create_oval(cx - r * 1.8, cy - r * 1.8, cx + r * 1.8, cy + r * 1.8,
-                       fill=COLOR_CYAN, outline="", stipple="gray12")
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=COLOR_CYAN, outline="")
-        core = r * 0.45
-        c.create_oval(cx - core, cy - core, cx + core, cy + core, fill=COLOR_SOFT_WHITE, outline="")
+    def _show_window(self) -> None:
+        try:
+            self._root.deiconify()
+        except Exception:  # pragma: no cover - best-effort
+            pass
+        self._mapped = True
 
-    def _draw_listening(self, c: Any, cx: float, cy: float, r: float, now: float) -> None:
-        core = r * 0.55
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=COLOR_CYAN, outline="")
-        c.create_oval(cx - core, cy - core, cx + core, cy + core, fill=COLOR_SOFT_WHITE, outline="")
-        period = 1.6
-        rings = 3
-        for i in range(rings):
-            phase = ((now / period) + i / rings) % 1.0
-            ring_r = r * (1.3 + phase * 2.2)
-            width = max(0, int(round((1.0 - phase) * 3 * self.scale)))
-            if width <= 0:
-                continue
-            c.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
-                           outline=COLOR_CYAN, width=width)
+    def _hide_window(self) -> None:
+        try:
+            self._root.withdraw()
+        except Exception:  # pragma: no cover - best-effort
+            pass
+        self._mapped = False
 
-    def _draw_thinking(self, c: Any, cx: float, cy: float, r: float, now: float) -> None:
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=COLOR_DEEP_BLUE,
-                       outline=COLOR_CYAN, width=max(1, int(round(1.5 * self.scale))))
-        core = r * 0.4
-        c.create_oval(cx - core, cy - core, cx + core, cy + core, fill=COLOR_CYAN, outline="")
-        spin_r = r * 1.6
-        angle = (now * 220.0) % 360.0
-        c.create_arc(cx - spin_r, cy - spin_r, cx + spin_r, cy + spin_r,
-                     start=angle, extent=70, style="arc", outline=COLOR_CYAN,
-                     width=max(1, int(round(2.5 * self.scale))))
-        angle2 = (-now * 140.0) % 360.0
-        spin_r2 = spin_r * 0.75
-        c.create_arc(cx - spin_r2, cy - spin_r2, cx + spin_r2, cy + spin_r2,
-                     start=angle2, extent=40, style="arc", outline=COLOR_SOFT_WHITE,
-                     width=max(1, int(round(1.5 * self.scale))))
-        for i in range(6):
-            pangle = math.radians((now * 60.0 + i * 60.0) % 360.0)
-            prad = r * (1.9 + 0.25 * math.sin(now * 2.0 + i))
-            px = cx + prad * math.cos(pangle)
-            py = cy + prad * math.sin(pangle)
-            ps = max(1.0, 1.5 * self.scale)
-            c.create_oval(px - ps, py - ps, px + ps, py + ps, fill=COLOR_SOFT_WHITE, outline="")
+    # -- the bloom: ~48 reused concentric ovals, recoloured every frame -----
+    def _ensure_bloom_items(self, c: Any) -> None:
+        if self._bloom_item_ids is not None:
+            return
+        self._bloom_item_ids = [
+            c.create_oval(0, 0, 0, 0, fill=self.chroma, outline="")
+            for _ in range(BLOOM_STEPS)
+        ]
 
-    def _draw_speaking(self, c: Any, cx: float, cy: float, r: float, now: float) -> None:
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=COLOR_CYAN, outline="")
-        core = r * 0.5
-        c.create_oval(cx - core, cy - core, cx + core, cy + core, fill=COLOR_SOFT_WHITE, outline="")
-        bars = 24
-        base = r * 1.3
-        for i in range(bars):
-            angle = 2.0 * math.pi * i / bars
-            wobble = (
-                (0.5 + 0.5 * math.sin(now * 6.0 + i * 0.9))
-                * (0.5 + 0.5 * math.sin(now * 2.3 - i * 0.4))
-            )
-            outer = base + r * 0.5 * wobble
-            x1, y1 = cx + base * math.cos(angle), cy + base * math.sin(angle)
-            x2, y2 = cx + outer * math.cos(angle), cy + outer * math.sin(angle)
-            c.create_line(x1, y1, x2, y2, fill=COLOR_CYAN, width=max(1, int(round(2 * self.scale))))
-        pulse = (math.sin(now * 3.0) + 1.0) / 2.0
-        pr = r * (1.15 + 0.15 * pulse)
-        c.create_oval(cx - pr, cy - pr, cx + pr, cy + pr, outline=COLOR_SOFT_WHITE,
-                       width=max(1, int(round(1.5 * self.scale))))
+    def _draw_bloom(self, c: Any, cx: float, cy: float, base_radius: float, now: float, flash_active: bool) -> None:
+        state = self._state
+        ramp = self._ramp_normal
+        brightness = 1.0
+        size_mult = 1.0
+        crescent_phase: Optional[float] = None
+
+        if state == STATE_LISTENING:
+            wave = math.sin(2.0 * math.pi * (now % LISTEN_PERIOD_S) / LISTEN_PERIOD_S)
+            size_mult = 1.0 + 0.05 * wave
+            brightness = 1.05 + 0.05 * wave
+        elif state == STATE_THINKING:
+            brightness = 0.8
+            crescent_phase = (now / THINK_CRESCENT_PERIOD_S) % 1.0
+        elif state == STATE_SPEAKING:
+            wave = math.sin(2.0 * math.pi * (now % SPEAK_PERIOD_S) / SPEAK_PERIOD_S)
+            pulse = max(0.0, wave)
+            size_mult = 1.0 + 0.04 * pulse
+            brightness = 0.95 + 0.15 * pulse
+        else:
+            brightness = 0.72
+
+        flash_boost = 0.0
+        if flash_active and self._flash is not None:
+            kind, t0 = self._flash
+            progress = _clamp01((now - t0) / FLASH_DURATION_S)
+            eased = _ease_in_out(progress)
+            flash_boost = 1.0 - eased
+            size_mult = max(size_mult, 1.0 + 0.9 * flash_boost)
+            brightness = max(brightness, 1.0 + 0.5 * flash_boost)
+            ramp = self._ramp_error if kind == FLASH_ERROR else self._ramp_normal
+
+        radius = max(1.0, base_radius * size_mult)
+        self._ensure_bloom_items(c)
+        ids = self._bloom_item_ids or []
+        n = len(ids)
+        if n == 0:
+            return
+        core_color = ramp[0]
+        for idx in range(n):
+            step = n - 1 - idx
+            frac = step / (n - 1)
+            r = radius * frac
+            color = ramp[step]
+            if brightness > 1.0:
+                color = _lerp_color(color, core_color, min(1.0, brightness - 1.0))
+            elif brightness < 1.0:
+                color = _lerp_color(color, self.chroma, (1.0 - brightness) * 0.6)
+            item = ids[idx]
+            if r < 0.5:
+                c.coords(item, cx - 0.5, cy - 0.5, cx + 0.5, cy + 0.5)
+            else:
+                c.coords(item, cx - r, cy - r, cx + r, cy + r)
+            c.itemconfig(item, fill=color)
+
+        if crescent_phase is not None:
+            self._draw_crescent(c, cx, cy, radius, crescent_phase)
+        else:
+            c.delete("crescent")
+
+    def _draw_crescent(self, c: Any, cx: float, cy: float, radius: float, phase: float) -> None:
+        """A softly brighter crescent drifting under the "thinking" bloom.
+
+        A couple of large, low-contrast arcs blended into the ramp colour -
+        deliberately NOT a thin spinner - so it reads as something slowly
+        moving under frosted glass.
+        """
+        c.delete("crescent")
+        mid_color = self._ramp_normal[len(self._ramp_normal) // 2]
+        glow = _lerp_color(mid_color, BLOOM_CORE, 0.45)
+        angle = phase * 360.0
+        r1 = radius * 0.72
+        w1 = max(6.0, radius * 0.55)
+        c.create_arc(cx - r1, cy - r1, cx + r1, cy + r1, start=angle, extent=120,
+                     style="arc", outline=glow, width=w1, tags="crescent")
+        r2 = radius * 0.5
+        w2 = max(4.0, radius * 0.35)
+        c.create_arc(cx - r2, cy - r2, cx + r2, cy + r2, start=angle + 190, extent=80,
+                     style="arc", outline=glow, width=w2, tags="crescent")
 
     def _draw_scan(self, c: Any, width: int, height: int, now: float) -> None:
-        period = 2.2
-        phase = (now / period) % 1.0
-        y = phase * height
-        step = max(40, int(round(80 * self.scale)))
-        for gx in range(0, width, step):
-            c.create_line(gx, 0, gx, height, fill=COLOR_DEEP_BLUE, width=1)
-        for gy in range(0, height, step):
-            c.create_line(0, gy, width, gy, fill=COLOR_DEEP_BLUE, width=1)
-        for i, dy in enumerate((0, -14, -28, -44)):
-            yy = y + dy
-            if yy < 0:
-                yy += height
-            line_width = max(1, 3 - i)
-            c.create_line(0, yy, width, yy, fill=COLOR_CYAN, width=line_width)
+        """A barely-there, feathered horizontal light band sweeping down once per cycle."""
+        c.delete("scan")
+        band_h = SCAN_BAND_H * self.scale
+        phase = (now % SCAN_PERIOD_S) / SCAN_PERIOD_S
+        y = -band_h + phase * (height + 2.0 * band_h)
+        strips = 14
+        for i in range(strips):
+            t = i / (strips - 1)
+            feather = max(0.0, 1.0 - abs(t - 0.5) * 2.0)
+            color = _lerp_color(self.chroma, BLOOM_MID, feather * 0.35)
+            strip_top = y - band_h / 2.0 + t * band_h
+            strip_h = band_h / strips + 1.0
+            c.create_rectangle(0, strip_top, width, strip_top + strip_h, fill=color, outline="", tags="scan")
 
-    def _draw_status(self, c: Any, cx: float, cy: float, r: float) -> None:
-        font = ("Consolas", max(9, int(round(11 * self.scale))))
-        if "left" in self.position:
-            x, y, anchor = cx + r * 1.6, cy, "w"
-        elif self.position == "center":
-            x, y, anchor = cx, cy - r * 1.8, "s"
-        else:
-            x, y, anchor = cx - r * 1.6, cy, "e"
-        c.create_text(x, y, text=self._status, anchor=anchor, fill=COLOR_SOFT_WHITE, font=font)
+    def _draw_status(self, c: Any, cx: float, cy: float, radius: float) -> None:
+        c.delete("status")
+        font = ("Segoe UI Light", max(9, int(round(13 * self.scale))))
+        y = cy + radius + 26.0 * self.scale
+        c.create_text(cx, y, text=self._status, anchor="n", fill=TEXT_COLOR, font=font, tags="status")
 
-    def _draw_typing(self, c: Any, cx: float, cy: float, r: float, now: float) -> None:
-        base_x = cx - r * 1.2
-        base_y = cy + r * 1.4
+    def _draw_typing(self, c: Any, cx: float, cy: float, radius: float, now: float) -> None:
+        c.delete("typing")
+        y = cy + radius + 26.0 * self.scale + (24.0 * self.scale if self._status else 0.0)
+        spacing = 14.0 * self.scale
+        start_x = cx - spacing
         for i in range(3):
-            t = (now * 3.0 + i * 0.9) % (2 * math.pi)
-            pulse = (math.sin(t) + 1.0) / 2.0
-            radius = (1.5 + 2.0 * pulse) * self.scale
-            x = base_x - i * 10.0 * self.scale
-            c.create_oval(x - radius, base_y - radius, x + radius, base_y + radius,
-                           fill=COLOR_SOFT_WHITE, outline="")
+            phase = ((now / TYPING_PERIOD_S) + i * 0.28) % 1.0
+            glow = 0.5 - 0.5 * math.cos(phase * 2.0 * math.pi)
+            color = _lerp_color(self.chroma, TEXT_COLOR, 0.25 + 0.75 * glow)
+            r = 3.0 * self.scale
+            x = start_x + i * spacing
+            c.create_oval(x - r, y - r, x + r, y + r, fill=color, outline="", tags="typing")
 
-    # -- click reticle: rotating brackets converge, then ping ---------------
+    # -- click: one soft ring, contracts onto the point and fades out -------
     def _click_active(self, now: float) -> bool:
         anim = self._click_anim
         if anim is None:
@@ -724,52 +896,20 @@ class OverlayHUD:
         return True
 
     def _draw_click(self, c: Any, now: float) -> None:
+        c.delete("click")
         anim = self._click_anim
         if anim is None:  # pragma: no cover - guarded by _click_active already
             return
         t = now - anim["t0"]
-        sx, sy = anim["start"]
+        progress = _ease_in_out(t / CLICK_TOTAL_S)
         ex, ey = anim["end"]
+        radius = _lerp(46.0 * self.scale, 3.0 * self.scale, progress)
+        color = _lerp_color(BLOOM_CORE, self.chroma, progress)
+        width = max(1.0, _lerp(2.5, 0.4, progress) * self.scale)
+        c.create_oval(ex - radius, ey - radius, ex + radius, ey + radius,
+                       outline=color, width=width, tags="click")
 
-        if (sx, sy) != (ex, ey):
-            trail = _reticle_trail((sx, sy), (ex, ey))
-            fade = max(0.0, 1.0 - t / CLICK_TOTAL_S)
-            for i, (px, py) in enumerate(trail):
-                frac = i / max(1, len(trail) - 1)
-                size = max(1.0, 2.0 * self.scale * (1.0 - frac * 0.5) * fade)
-                c.create_oval(px - size, py - size, px + size, py + size,
-                               fill=COLOR_CYAN, outline="")
-
-        if t < CLICK_CONVERGE_S:
-            progress = t / CLICK_CONVERGE_S
-            radius = (30.0 * (1.0 - progress) + 8.0) * self.scale
-            angle = 360.0 * (1.0 - progress) * 2.0
-            self._draw_crosshair(c, ex, ey, radius, angle)
-        else:
-            pt = t - CLICK_CONVERGE_S
-            progress = min(1.0, pt / CLICK_PING_S)
-            ping_r = (8.0 + progress * 40.0) * self.scale
-            width = max(0, int(round((1.0 - progress) * 3 * self.scale)))
-            if width > 0:
-                c.create_oval(ex - ping_r, ey - ping_r, ex + ping_r, ey + ping_r,
-                               outline=COLOR_CYAN, width=width)
-            self._draw_crosshair(c, ex, ey, 8.0 * self.scale, 0.0)
-
-    def _draw_crosshair(self, c: Any, x: float, y: float, r: float, angle_deg: float) -> None:
-        bracket = max(4.0, r * 0.5)
-        for base_angle in (45, 135, 225, 315):
-            a = math.radians(base_angle + angle_deg)
-            bx = x + r * math.cos(a)
-            by = y + r * math.sin(a)
-            c.create_line(
-                bx, by,
-                bx + bracket * math.cos(a + math.pi), by + bracket * math.sin(a + math.pi),
-                fill=COLOR_CYAN, width=max(1, int(round(2 * self.scale))),
-            )
-        dot = 2.0 * self.scale
-        c.create_oval(x - dot, y - dot, x + dot, y + dot, fill=COLOR_SOFT_WHITE, outline="")
-
-    # -- accent flash: expanding rings ---------------------------------------
+    # -- accent flash: state is read by _draw_bloom, this just tracks timing -
     def _flash_active(self, now: float) -> bool:
         flash = self._flash
         if flash is None:
@@ -779,24 +919,6 @@ class OverlayHUD:
             self._flash = None
             return False
         return True
-
-    def _draw_flash(self, c: Any, cx: float, cy: float, now: float) -> None:
-        flash = self._flash
-        if flash is None:  # pragma: no cover - guarded by _flash_active already
-            return
-        kind, t0 = flash
-        color = COLOR_RED if kind == FLASH_ERROR else COLOR_SOFT_WHITE
-        progress = min(1.0, (now - t0) / FLASH_DURATION_S)
-        for i in range(3):
-            ring_progress = min(1.0, progress + i * 0.15)
-            if i > 0 and ring_progress >= 1.0:
-                continue
-            radius = (20.0 + ring_progress * 260.0) * self.scale
-            width = max(0, int(round((1.0 - ring_progress) * 4 * self.scale)))
-            if width <= 0:
-                continue
-            c.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
-                           outline=color, width=width)
 
 
 # ------------------------------------------------------------------------------
@@ -811,10 +933,17 @@ def _run_demo() -> None:
         print("Overlay could not start (no display / Tk unavailable?) - demo aborted")
         return
 
-    print("Overlay demo running - watch the bottom-right corner of the TV. Ctrl+C to stop early.")
+    print(
+        "Overlay demo running - watch the centre of the TV. It stays completely "
+        "hidden until something happens, then fades in. Ctrl+C to stop early."
+    )
     try:
-        hud.set_state(STATE_IDLE)
+        print("... hidden (idle, nothing on screen) ...")
         time.sleep(2.0)
+
+        print("... wake flash ...")
+        hud.flash(FLASH_WAKE)
+        time.sleep(1.0)
 
         hud.set_state(STATE_LISTENING)
         hud.set_status("listening")
@@ -824,35 +953,30 @@ def _run_demo() -> None:
         hud.set_status("thinking")
         time.sleep(2.5)
 
-        hud.scan_screen(True)
         hud.set_status("looking at the screen")
+        hud.scan_screen(True)
         time.sleep(2.5)
         hud.scan_screen(False)
 
         hud.set_status("clicking around")
-        for point in ((0.2, 0.3), (0.8, 0.2), (0.5, 0.8)):
-            hud.click_at(*point)
-            time.sleep(0.9)
+        hud.click_at(0.3, 0.4)
+        time.sleep(0.6)
+        hud.click_at(0.7, 0.6)
+        time.sleep(0.6)
 
         hud.typing(True)
         hud.set_status("typing")
         time.sleep(2.0)
         hud.typing(False)
 
-        hud.set_status("")
-        hud.flash(FLASH_WAKE)
-        time.sleep(1.0)
-
         hud.set_state(STATE_SPEAKING)
         hud.set_status("speaking")
         time.sleep(3.0)
 
-        hud.flash(FLASH_ERROR)
-        time.sleep(1.0)
-
+        print("... fading out and hidden again ...")
         hud.set_state(STATE_IDLE)
         hud.set_status("")
-        time.sleep(2.0)
+        time.sleep(1.0)
     except KeyboardInterrupt:
         pass
     finally:
