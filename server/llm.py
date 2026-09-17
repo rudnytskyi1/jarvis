@@ -1,0 +1,482 @@
+"""LLM with tool calling: Ollama native or OpenAI-compatible (SPEC §3).
+
+Two providers, selected by ``cfg.server.llm.provider``:
+
+* ``"ollama_native"`` (default) — ``POST {base}/api/chat`` via ``httpx`` with
+  ``stream: false``, ``think: cfg.llm.think`` (off by default, which disables
+  Qwen3 reasoning) and ``options: {num_predict, temperature}``. Native tool calls
+  already carry their ``arguments`` as an object.
+* ``"openai"`` — the ``openai`` package against ``cfg.llm.base_url``; there tool
+  arguments arrive as a JSON string and are parsed defensively.
+
+Tool loop: up to ``cfg.llm.max_tool_rounds`` rounds. Each round executes the
+model's tool calls in order through the :data:`ToolExecutor` callback supplied by
+``server/app.py``, appends the assistant message plus one ``role: "tool"``
+message per call with the REAL result, and asks for the next completion. The loop
+stops at the first reply without tool calls; if the round cap is hit, one final
+completion is requested with no tools at all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Iterable
+
+import httpx
+
+from server.tools import TOOL_NAMES, TOOLS
+
+log = logging.getLogger("jarvis.server.llm")
+
+PROVIDER_OLLAMA_NATIVE = "ollama_native"
+PROVIDER_OPENAI = "openai"
+
+#: Network timeout for one completion (Ollama on a 30B model can be slow).
+#: No SDK-level retries: a hung request is reported instead of doubled.
+REQUEST_TIMEOUT_S = 180.0
+MAX_RETRIES = 0
+
+#: Result handed to the model when no tool executor is wired up.
+NO_EXECUTOR_RESULT: dict[str, Any] = {
+    "ok": False,
+    "error": "tool execution is not available",
+}
+
+#: Executes one tool call and returns its result as a JSON-serializable dict.
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_MARKDOWN_CHARS_RE = re.compile(r"[*_`#>|]+")
+_WHITESPACE_RE = re.compile(r"\s+")
+#: Space left in front of punctuation after markdown was stripped ("Done , sir").
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.!?;:…])")
+
+
+@dataclass
+class ToolCall:
+    """Normalized tool call from the model."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    raw_arguments: str = "{}"
+
+
+@dataclass
+class LlmResult:
+    """Outcome of one utterance: the spoken text plus every tool call executed."""
+
+    text: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    rounds: int = 0
+
+
+def native_base_url(base_url: str) -> str:
+    """Ollama's native API root: the configured base URL without a trailing ``/v1``."""
+    base = str(base_url or "").strip().rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[: -len("/v1")].rstrip("/")
+    return base or "http://127.0.0.1:11434"
+
+
+def _strip_thinking(text: str) -> str:
+    """Drop ``<think>`` blocks a reasoning model may leak into its content."""
+    cleaned = _THINK_BLOCK_RE.sub(" ", text)
+    if "</think>" in cleaned:
+        cleaned = cleaned.rsplit("</think>", 1)[-1]
+    if "<think>" in cleaned:
+        cleaned = cleaned.split("<think>", 1)[0]
+    return cleaned
+
+
+def clean_reply(text: str | None) -> str:
+    """Strip reasoning and markdown noise — the reply is spoken aloud, not rendered."""
+    if not text:
+        return ""
+    # Delete the markers instead of replacing them: "**Done**, sir" must not
+    # become "Done , sir" — the text is spoken and stored in the history.
+    cleaned = _strip_thinking(str(text))
+    cleaned = _MARKDOWN_CHARS_RE.sub("", cleaned)
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned)
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    return cleaned.strip()
+
+
+def _arguments_to_dict(raw: Any) -> tuple[dict[str, Any] | None, str]:
+    """Return ``(args_dict, raw_json_string)`` for a tool call's arguments.
+
+    ``args_dict`` is ``None`` when the arguments could not be parsed — such a call
+    must be dropped, not executed with empty arguments.
+    """
+    if isinstance(raw, dict):
+        try:
+            return dict(raw), json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return dict(raw), "{}"
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="replace")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}, "{}"
+    if not isinstance(raw, str):
+        log.warning("Unknown tool argument type: %r", type(raw).__name__)
+        return None, "{}"
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        log.warning("The model sent unparsable tool arguments: %r", raw)
+        return None, raw
+    if isinstance(parsed, dict):
+        return parsed, raw
+    log.warning("Tool arguments are not an object: %r", raw)
+    return None, raw
+
+
+def normalize_tool_calls(tool_calls: Iterable[Any] | None) -> list[ToolCall]:
+    """Convert SDK tool-call objects (or native dicts) into :class:`ToolCall` records."""
+    result: list[ToolCall] = []
+    if not tool_calls:
+        return result
+
+    for index, call in enumerate(tool_calls, start=1):
+        if isinstance(call, ToolCall):
+            result.append(call)
+            continue
+        if isinstance(call, dict):
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            name = function.get("name") or call.get("name")
+            raw_args = function.get("arguments") if "arguments" in function else call.get("arguments")
+            call_id = call.get("id")
+        else:
+            function = getattr(call, "function", None)
+            name = getattr(function, "name", None) if function is not None else getattr(call, "name", None)
+            raw_args = (
+                getattr(function, "arguments", None)
+                if function is not None
+                else getattr(call, "arguments", None)
+            )
+            call_id = getattr(call, "id", None)
+
+        if not isinstance(name, str) or not name.strip():
+            log.warning("Skipping a tool call without a name: %r", call)
+            continue
+        args, raw = _arguments_to_dict(raw_args)
+        if args is None:
+            log.warning("Skipping call to %s: could not parse arguments %r", name.strip(), raw)
+            continue
+        result.append(
+            ToolCall(
+                id=str(call_id) if call_id else f"call_{index}",
+                name=name.strip(),
+                arguments=args,
+                raw_arguments=raw,
+            )
+        )
+    return result
+
+
+def looks_like_unfinished_reasoning(raw_content: str, truncated: bool) -> bool:
+    """True when the content is a reasoning monologue that never reached an answer.
+
+    With ``think: false`` Ollama stops parsing reasoning, so a Qwen3 model that
+    reasons anyway writes it into ``content`` and closes it with ``</think>``
+    before the real reply (:func:`clean_reply` keeps only that tail). If the
+    token budget runs out first there is no closing tag and no answer at all —
+    that text must never be read aloud.
+    """
+    return bool(truncated and raw_content.strip() and "</think>" not in raw_content)
+
+
+def _result_to_content(result: Any) -> str:
+    """Serialize a tool result for the ``role: "tool"`` message."""
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return json.dumps({"ok": False, "error": "unserializable tool result"})
+
+
+class LlmClient:
+    """Chat client with tool calling for both supported providers.
+
+    :meth:`generate` is a coroutine: the HTTP request itself runs in a worker
+    thread, and tool calls are awaited on the event loop through the executor.
+    """
+
+    def __init__(self, cfg_llm: Any) -> None:
+        self.provider = str(getattr(cfg_llm, "provider", PROVIDER_OLLAMA_NATIVE) or PROVIDER_OLLAMA_NATIVE).strip().lower()
+        if self.provider not in {PROVIDER_OLLAMA_NATIVE, PROVIDER_OPENAI}:
+            log.warning(
+                "Unknown llm.provider=%r — falling back to %s",
+                self.provider,
+                PROVIDER_OLLAMA_NATIVE,
+            )
+            self.provider = PROVIDER_OLLAMA_NATIVE
+        self.model = str(cfg_llm.model)
+        self.base_url = str(cfg_llm.base_url)
+        self.native_url = native_base_url(self.base_url)
+        self.think = bool(getattr(cfg_llm, "think", False))
+        try:
+            self.temperature = float(cfg_llm.temperature)
+        except (TypeError, ValueError):
+            self.temperature = 0.6
+        try:
+            self.max_tokens = int(cfg_llm.max_tokens)
+        except (TypeError, ValueError):
+            self.max_tokens = 1024
+        try:
+            self.max_tool_rounds = max(1, int(getattr(cfg_llm, "max_tool_rounds", 4)))
+        except (TypeError, ValueError):
+            self.max_tool_rounds = 4
+        self.api_key = str(getattr(cfg_llm, "api_key", "") or "ollama")
+
+        #: Cleared when the server rejects the "think" field (older Ollama builds).
+        self._send_think = True
+        #: With reasoning parsing off the model may write its reasoning into the
+        #: content; with think=true Ollama keeps it in a separate field instead.
+        self._reasoning_may_leak = (self.provider == PROVIDER_OPENAI) or not self.think
+        self._http: httpx.Client | None = None
+        self._client: Any = None
+
+        if self.provider == PROVIDER_OLLAMA_NATIVE:
+            self._http = httpx.Client(timeout=REQUEST_TIMEOUT_S)
+            log.info(
+                "LLM: %s via %s/api/chat (native, think=%s, max_tool_rounds=%d)",
+                self.model,
+                self.native_url,
+                self.think,
+                self.max_tool_rounds,
+            )
+        else:
+            from openai import OpenAI
+
+            self._client = OpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=REQUEST_TIMEOUT_S,
+                max_retries=MAX_RETRIES,
+            )
+            log.info(
+                "LLM: %s via %s (openai-compatible, max_tool_rounds=%d)",
+                self.model,
+                self.base_url,
+                self.max_tool_rounds,
+            )
+
+    # ------------------------------------------------------------ provider calls
+
+    def _chat_native(
+        self, messages: list[dict[str, Any]], with_tools: bool
+    ) -> tuple[str, list[ToolCall]]:
+        """Blocking ``POST /api/chat`` against Ollama's own API."""
+        http = self._http
+        if http is None:
+            raise RuntimeError("the native LLM client is closed")
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "num_predict": self.max_tokens,
+                "temperature": self.temperature,
+            },
+        }
+        if self._send_think:
+            payload["think"] = self.think
+        if with_tools:
+            payload["tools"] = TOOLS
+
+        url = f"{self.native_url}/api/chat"
+        try:
+            response = http.post(url, json=payload)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text if exc.response is not None else ""
+            if self._send_think and "think" in body.lower():
+                # Older Ollama builds reject the field for non-reasoning models.
+                log.warning("Ollama rejected the 'think' field — retrying without it")
+                self._send_think = False
+                payload.pop("think", None)
+                response = http.post(url, json=payload)
+                response.raise_for_status()
+            else:
+                log.error("Ollama returned HTTP %s: %s", exc.response.status_code, body[:300])
+                raise
+
+        data = response.json()
+        message = data.get("message") if isinstance(data, dict) else None
+        if not isinstance(message, dict):
+            log.warning("Ollama returned no message object")
+            return "", []
+        raw_content = str(message.get("content") or "")
+        text = clean_reply(raw_content)
+        truncated = str(data.get("done_reason") or "") == "length"
+        if text and self._reasoning_may_leak and looks_like_unfinished_reasoning(raw_content, truncated):
+            log.warning(
+                "The model spent the whole %d-token budget on reasoning — dropping it. "
+                "Raise server.llm.max_tokens or turn server.llm.think on.",
+                self.max_tokens,
+            )
+            text = ""
+        calls = normalize_tool_calls(message.get("tool_calls"))
+        return text, calls
+
+    def _chat_openai(
+        self, messages: list[dict[str, Any]], with_tools: bool
+    ) -> tuple[str, list[ToolCall]]:
+        """Blocking completion through the OpenAI-compatible endpoint."""
+        if self._client is None:
+            raise RuntimeError("the OpenAI-compatible LLM client is closed")
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if with_tools:
+            kwargs["tools"] = TOOLS
+        completion = self._client.chat.completions.create(**kwargs)
+        choices = getattr(completion, "choices", None) or []
+        if not choices:
+            log.warning("The LLM returned no choices")
+            return "", []
+        message = choices[0].message
+        raw_content = str(getattr(message, "content", None) or "")
+        text = clean_reply(raw_content)
+        truncated = str(getattr(choices[0], "finish_reason", "") or "") == "length"
+        if text and self._reasoning_may_leak and looks_like_unfinished_reasoning(raw_content, truncated):
+            log.warning(
+                "The model spent the whole %d-token budget on reasoning — dropping it. "
+                "Raise server.llm.max_tokens.",
+                self.max_tokens,
+            )
+            text = ""
+        calls = normalize_tool_calls(getattr(message, "tool_calls", None))
+        return text, calls
+
+    async def _chat(
+        self, messages: list[dict[str, Any]], with_tools: bool
+    ) -> tuple[str, list[ToolCall]]:
+        """One completion, executed in a worker thread."""
+        if self.provider == PROVIDER_OLLAMA_NATIVE:
+            return await asyncio.to_thread(self._chat_native, messages, with_tools)
+        return await asyncio.to_thread(self._chat_openai, messages, with_tools)
+
+    # ---------------------------------------------------------- message building
+
+    def _assistant_message(self, text: str, calls: list[ToolCall]) -> dict[str, Any]:
+        """Rebuild the assistant turn (with its tool calls) for the next round."""
+        if self.provider == PROVIDER_OLLAMA_NATIVE:
+            tool_calls = [
+                {"function": {"name": call.name, "arguments": call.arguments}}
+                for call in calls
+            ]
+        else:
+            tool_calls = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.raw_arguments or "{}"},
+                }
+                for call in calls
+            ]
+        return {"role": "assistant", "content": text or "", "tool_calls": tool_calls}
+
+    def _tool_message(self, call: ToolCall, result: Any) -> dict[str, Any]:
+        """One ``role: "tool"`` message carrying the real execution result."""
+        message: dict[str, Any] = {
+            "role": "tool",
+            "name": call.name,
+            "content": _result_to_content(result),
+        }
+        if self.provider == PROVIDER_OLLAMA_NATIVE:
+            message["tool_name"] = call.name
+        else:
+            message["tool_call_id"] = call.id
+        return message
+
+    # ------------------------------------------------------------------ tool loop
+
+    async def _run_tool(self, executor: ToolExecutor | None, call: ToolCall) -> dict[str, Any]:
+        """Execute one tool call, converting any failure into a result dict."""
+        if call.name not in TOOL_NAMES:
+            log.warning("The model called an unknown tool %r", call.name)
+            return {"ok": False, "error": f"unknown tool: {call.name}"}
+        if executor is None:
+            return dict(NO_EXECUTOR_RESULT)
+        try:
+            result = await executor(call.name, dict(call.arguments))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Tool %s failed", call.name)
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(result, dict):
+            return result
+        return {"ok": True, "result": result}
+
+    async def generate(
+        self,
+        messages: list[dict[str, Any]],
+        executor: ToolExecutor | None = None,
+    ) -> LlmResult:
+        """Run one utterance through the tool loop and return the spoken reply."""
+        history: list[dict[str, Any]] = list(messages)
+        executed: list[ToolCall] = []
+
+        for round_index in range(1, self.max_tool_rounds + 1):
+            text, calls = await self._chat(history, with_tools=True)
+            log.info(
+                "LLM round %d/%d: text %r, %d tool call(s) (%s)",
+                round_index,
+                self.max_tool_rounds,
+                text,
+                len(calls),
+                ", ".join(call.name for call in calls) or "-",
+            )
+            if not calls:
+                return LlmResult(text=text, tool_calls=executed, rounds=round_index)
+
+            history.append(self._assistant_message(text, calls))
+            for call in calls:
+                result = await self._run_tool(executor, call)
+                log.info("Tool %s%s -> %s", call.name, call.arguments, result)
+                history.append(self._tool_message(call, result))
+                executed.append(call)
+
+        # Round cap hit: ask for the spoken reply with no tools available.
+        log.info("Tool round cap (%d) reached — asking for a final reply", self.max_tool_rounds)
+        text, _ = await self._chat(history, with_tools=False)
+        log.info("LLM final reply: %r", text)
+        return LlmResult(text=text, tool_calls=executed, rounds=self.max_tool_rounds)
+
+    def close(self) -> None:
+        """Release the HTTP resources of whichever provider is in use."""
+        for target in (self._http, self._client):
+            closer = getattr(target, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    log.debug("Could not close the LLM HTTP client", exc_info=True)
+        self._http = None
+        self._client = None
+
+
+__all__ = [
+    "LlmClient",
+    "LlmResult",
+    "ToolCall",
+    "ToolExecutor",
+    "clean_reply",
+    "looks_like_unfinished_reasoning",
+    "native_base_url",
+    "normalize_tool_calls",
+    "PROVIDER_OLLAMA_NATIVE",
+    "PROVIDER_OPENAI",
+    "REQUEST_TIMEOUT_S",
+]

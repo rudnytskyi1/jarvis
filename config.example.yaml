@@ -1,0 +1,82 @@
+# Jarvis config template. Copy to config.yaml and adjust.
+# Both PCs use the same file: the server reads the server section, the client reads client.
+
+server:
+  host: 0.0.0.0
+  port: 8765
+
+  stt:
+    model: large-v3          # faster-whisper
+    device: cuda
+    compute_type: float16
+    language: null           # null = auto-detect (en/ru); "en" pins English
+
+  llm:
+    provider: ollama_native  # ollama_native (recommended: can disable thinking) | openai
+    base_url: http://127.0.0.1:11434/v1   # /v1 is stripped automatically for ollama_native
+    model: qwen3:30b                      # Qwen3-30B-A3B; tool calling verified
+    api_key: ollama
+    think: false             # disable Qwen3 reasoning for fast voice replies
+    vision_model: qwen3-vl:30b            # used by look_at_screen
+    temperature: 0.6
+    max_tokens: 1024
+    max_tool_rounds: 4       # how many tool-call rounds per utterance
+    history_turns: 12        # how many recent exchanges to keep
+
+  tts:
+    engine: silero
+    language: en
+    model_id: v3_en
+    speaker: en_0            # en_0 .. en_117 (v3_en voices)
+    sample_rate: 48000
+
+client:
+  # Via ngrok (works from any network, including dorm Wi-Fi with client isolation):
+  server_url: wss://dorm-smart-un-iversity-of-nebr-omaha.ngrok.app/ws
+  # Direct LAN (faster, if the PCs can see each other):
+  # server_url: ws://192.168.1.100:8765/ws   # IP of the 5090 PC
+  client_id: livingroom
+
+  wakeword:
+    word: rowan
+    phrases: [rowan, roan, rowen]          # spellings Vosk actually hears
+    vosk_model: models/vosk-model-small-en-us-0.15
+
+  audio:
+    input_device: null       # null = default mic; or an index (3) or name part ("Yeti")
+    output_device: null
+    sample_rate: 16000       # do not change: Whisper/VAD/Vosk run at 16 kHz
+
+  vad:
+    aggressiveness: 2        # 0..3, higher = cuts silence/noise harder
+    silence_ms: 800          # pause that ends an utterance
+    max_utterance_s: 15
+    pre_roll_ms: 300         # audio from BEFORE the trigger included in the recording
+
+  followup_window_s: 6       # after a reply, listen N more seconds without wake word (0 = off)
+
+  apps: {}                   # optional overrides: spoken name -> exe path.
+                             # Any installed app is found automatically (Start Menu + Store apps);
+                             # add entries only when the automatic match picks the wrong thing, e.g.:
+                             # browser: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+  devices: []                # no physical devices yet. When they arrive, e.g.:
+    # - name: led strip      # Magic Home Wi-Fi LED controller
+    #   type: magichome
+    #   area: room
+    #   description: LED strip behind the TV
+    #   host: 192.168.1.50
+    # - name: garland        # Tuya / Smart Life strip
+    #   type: tuya
+    #   area: room
+    #   description: window garland
+    #   dev_id: "xxxxxxxxxxxx"
+    #   host: 192.168.1.51
+    #   local_key: "yyyyyyyyyyyy"
+    #   version: 3.3
+    # - name: main light     # SwitchBot Bot pressing a wall switch
+    #   type: switchbot_bot
+    #   area: room
+    #   description: main room light (button pusher on the wall switch)
+    #   mac: "AA:BB:CC:DD:EE:FF"
+    #   mode: press          # press | lever

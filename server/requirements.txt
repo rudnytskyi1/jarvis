@@ -1,0 +1,25 @@
+# Jarvis brain server (RTX 5090 PC) — pip install -r server/requirements.txt
+# Versions are deliberately unpinned: torch and faster-whisper are already
+# installed in the conda env "jarvis".
+
+# WebSocket / HTTP
+fastapi
+uvicorn[standard]
+websockets
+
+# STT
+faster-whisper
+
+# LLM: Ollama native /api/chat (httpx) and the OpenAI-compatible provider
+httpx
+openai
+
+# TTS: Silero via torch.hub (torch/torchaudio are already in the env; hubconf needs omegaconf)
+torch
+torchaudio
+omegaconf
+
+# Shared
+numpy
+pyyaml
+pydantic
