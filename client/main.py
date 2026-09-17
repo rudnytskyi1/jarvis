@@ -204,6 +204,7 @@ class JarvisClient:
             sample_rate=self.sample_rate,
             frame_ms=self.frame_ms,
             pre_roll_ms=pre_roll_ms,
+            min_speech_ms=int(getattr(vad_cfg, "min_speech_ms", 250)),
         )
         self.preroll = RingBuffer(int(math.ceil(pre_roll_ms / float(self.frame_ms))))
 

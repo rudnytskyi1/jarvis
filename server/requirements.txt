@@ -18,6 +18,7 @@ openai
 torch
 torchaudio
 omegaconf
+num2words  # spells numbers/times out in words - Silero cannot pronounce digits
 
 # Shared
 numpy

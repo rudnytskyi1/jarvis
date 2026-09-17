@@ -235,7 +235,7 @@ cfg.client.server_url        # "ws://192.168.x.x:8765/ws"
 cfg.client.client_id
 cfg.client.wakeword.{word, phrases, vosk_model}                 # phrases: list[str]
 cfg.client.audio.{input_device, output_device, sample_rate}     # devices: int|str|None
-cfg.client.vad.{aggressiveness, silence_ms, max_utterance_s, pre_roll_ms}
+cfg.client.vad.{aggressiveness, silence_ms, max_utterance_s, pre_roll_ms, min_speech_ms}
 cfg.client.followup_window_s # float, 0 = off
 cfg.client.apps              # dict[str, str] friendly name -> exe path/command (OVERRIDES on top of the app index; may be empty)
 cfg.client.devices           # list[DeviceConfig]; [] is the current default (no physical devices yet)

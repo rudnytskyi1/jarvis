@@ -37,6 +37,13 @@ VALID_SAMPLE_RATES = (8000, 16000, 32000, 48000)
 VALID_FRAME_MS = (10, 20, 30)
 #: Default lead-in: how long we wait for the user to start speaking.
 DEFAULT_LEAD_IN_S = 5.0
+#: The user always gets at least this long to start talking (after the wake
+#: word, after a reply, and again after a discarded noise blip).
+MIN_LEAD_IN_S = 3.0
+#: A "started" recording whose voiced content never reaches min_speech_ms is a
+#: noise blip: it is discarded without ever being streamed to the server, and
+#: listening continues. At most this many blips per record() call.
+MAX_NOISE_RESETS = 3
 #: Default amount of pre-speech audio kept in front of the utterance (SPEC §6
 #: ``client.vad.pre_roll_ms``); the rest of the lead-in silence is discarded.
 DEFAULT_PRE_ROLL_MS = 300
@@ -61,6 +68,7 @@ class VadRecorder:
         onset_frames: int = 3,
         onset_window: int = 5,
         pre_roll_ms: int = DEFAULT_PRE_ROLL_MS,
+        min_speech_ms: int = 250,
     ) -> None:
         sample_rate = int(sample_rate)
         frame_ms = int(frame_ms)
@@ -92,6 +100,7 @@ class VadRecorder:
         except (TypeError, ValueError):
             pre_roll_frames = int(round(DEFAULT_PRE_ROLL_MS / self.frame_ms))
         self.pre_roll_frames = max(self.onset_window, pre_roll_frames)
+        self.min_speech_frames = max(1, int(round(max(0, int(min_speech_ms)) / self.frame_ms)))
         self._vad = webrtcvad.Vad(aggressiveness)
 
     # -- helpers ---------------------------------------------------------
@@ -133,10 +142,11 @@ class VadRecorder:
 
         Returns the recorded PCM, or ``None`` if no speech started in time.
         """
-        lead_in = self.lead_in_s if lead_in_s is None else max(0.2, float(lead_in_s))
-        collected: List[bytes] = []
-        if pre_roll:
-            collected.append(pre_roll)
+        lead_in = self.lead_in_s if lead_in_s is None else float(lead_in_s)
+        # The user always gets at least MIN_LEAD_IN_S to start talking.
+        lead_in = max(MIN_LEAD_IN_S, lead_in)
+        base_roll: List[bytes] = [pre_roll] if pre_roll else []
+        collected: List[bytes] = list(base_roll)
         # Frames captured before speech starts: a bounded ring, so a long lead-in
         # (5 s, or followup_window_s) is not prepended to the utterance.
         lead_in_ring: Deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
@@ -152,10 +162,27 @@ class VadRecorder:
         # 10% of the last silence_ms worth of frames were flagged as speech.
         tail: Deque[bool] = collections.deque(maxlen=silence_limit)
         tail_allowed_speech = max(0, int(silence_limit * 0.1))
+        # Nothing is streamed to the server until min_speech_frames voiced frames
+        # have been seen. A "recording" that ends before that is a noise blip: it
+        # is dropped without the server ever hearing about it, and listening
+        # resumes so noise cannot eat the user's window to speak.
+        emitted = False
+        voiced = 0
+        noise_resets = 0
         speech_started_at = 0.0
         now = time.monotonic()
         deadline = now + lead_in
         last_frame_at = now
+
+        def _reset_listening() -> None:
+            nonlocal started, voiced, emitted, collected
+            started = False
+            voiced = 0
+            emitted = False
+            collected = list(base_roll)
+            window.clear()
+            tail.clear()
+            lead_in_ring.clear()
 
         while not finished:
             chunk = await read_frame()
@@ -170,6 +197,7 @@ class VadRecorder:
             last_frame_at = now
             pending += chunk
 
+            noise_blip = False
             while len(pending) >= self.frame_bytes:
                 frame = pending[: self.frame_bytes]
                 pending = pending[self.frame_bytes :]
@@ -181,17 +209,27 @@ class VadRecorder:
                     if sum(window) >= self.onset_frames:
                         started = True
                         speech_started_at = now
+                        voiced = sum(window)
                         tail.clear()
                         collected.extend(lead_in_ring)
                         lead_in_ring.clear()
-                        log.info("Speech detected, recording...")
-                        await self._emit(on_audio, b"".join(collected))
+                        log.debug("Possible speech onset, buffering...")
                     continue
 
                 collected.append(frame)
-                await self._emit(on_audio, frame)
+                if speech:
+                    voiced += 1
+                if not emitted and voiced >= self.min_speech_frames:
+                    emitted = True
+                    log.info("Speech detected, recording...")
+                    await self._emit(on_audio, b"".join(collected))
+                elif emitted:
+                    await self._emit(on_audio, frame)
                 tail.append(speech)
                 if len(tail) == silence_limit and sum(tail) <= tail_allowed_speech:
+                    if not emitted:
+                        noise_blip = True
+                        break
                     log.debug(
                         "~%d ms of (near-)silence - end of the utterance",
                         silence_limit * self.frame_ms,
@@ -199,14 +237,30 @@ class VadRecorder:
                     finished = True
                     break
                 if (now - speech_started_at) >= self.max_utterance_s:
+                    if not emitted:
+                        noise_blip = True
+                        break
                     log.info("Maximum utterance length reached (%.0f s)", self.max_utterance_s)
                     finished = True
                     break
 
+            if noise_blip:
+                noise_resets += 1
+                log.info(
+                    "Discarded a noise blip (%d/%d) - still listening",
+                    noise_resets,
+                    MAX_NOISE_RESETS,
+                )
+                if noise_resets >= MAX_NOISE_RESETS:
+                    return None
+                _reset_listening()
+                deadline = max(deadline, time.monotonic() + MIN_LEAD_IN_S)
+                continue
+
             if not started and time.monotonic() >= deadline:
                 return None
 
-        if not started:
+        if not emitted:
             return None
         audio = b"".join(collected)
         log.info("Recorded %.2f s of audio", len(audio) / float(self.sample_rate * SAMPLE_WIDTH))

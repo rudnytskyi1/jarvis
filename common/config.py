@@ -187,6 +187,9 @@ class VADConfig(_Strict):
     silence_ms: int = Field(default=800, ge=0)
     max_utterance_s: float = Field(default=15.0, gt=0.0)
     pre_roll_ms: int = Field(default=300, ge=0)
+    #: Minimum voiced audio for a recording to count as an utterance; anything
+    #: shorter is a noise blip - discarded without contacting the server.
+    min_speech_ms: int = Field(default=250, ge=0)
 
 
 class DeviceConfig(BaseModel):

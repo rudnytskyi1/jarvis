@@ -45,6 +45,91 @@ def sanitize_text(text: str | None) -> str:
     return cleaned
 
 
+# -- number spelling ---------------------------------------------------------
+# Silero (v3_en especially) cannot pronounce digits: "2:16" comes out garbled
+# or is dropped outright. Every number is spelled out in words before synthesis.
+
+try:
+    from num2words import num2words as _num2words
+except ImportError:  # pragma: no cover - the fallback speaks digit by digit
+    _num2words = None
+
+_DIGIT_WORDS = {
+    "en": ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"],
+    "ru": ["ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"],
+}
+_THOUSANDS_COMMA_RE = re.compile(r"(?<=\d),(?=\d{3}\b)")
+_TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})(?::\d{2})?\s*(a\.?m\.?|p\.?m\.?)?(?=\W|$)", re.IGNORECASE)
+_PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_ORDINAL_RE = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+_DECIMAL_RE = re.compile(r"\b(\d+)\.(\d+)\b")
+_INT_RE = re.compile(r"\d+")
+
+
+def _digits_one_by_one(number: str, lang: str) -> str:
+    words = _DIGIT_WORDS.get(lang, _DIGIT_WORDS["en"])
+    return " ".join(words[int(d)] for d in number if d.isdigit())
+
+
+def _cardinal(number: str, lang: str) -> str:
+    if _num2words is not None:
+        try:
+            return str(_num2words(int(number), lang=lang))
+        except (ValueError, OverflowError, NotImplementedError):
+            pass
+    return _digits_one_by_one(number, lang)
+
+
+def _ordinal(number: str, lang: str) -> str:
+    if _num2words is not None:
+        try:
+            return str(_num2words(int(number), lang=lang, to="ordinal"))
+        except (ValueError, OverflowError, NotImplementedError):
+            pass
+    return _cardinal(number, lang)
+
+
+def _spell_time(match: re.Match[str], lang: str) -> str:
+    hour, minute = int(match.group(1)), int(match.group(2))
+    suffix = (match.group(3) or "").lower().replace(".", "")
+    if hour > 23 or minute > 59:
+        return match.group(0)
+    parts = [_cardinal(str(hour), lang)]
+    if minute == 0:
+        if lang == "en" and not suffix:
+            parts.append("o'clock")
+    elif minute < 10:
+        parts.append("oh" if lang == "en" else "ноль")
+        parts.append(_cardinal(str(minute), lang))
+    else:
+        parts.append(_cardinal(str(minute), lang))
+    if suffix:
+        parts.append("ay em" if suffix == "am" else "pee em")
+    return " ".join(parts)
+
+
+def spell_numbers(text: str, lang: str) -> str:
+    """Spell out times, percentages, ordinals, decimals and integers as words."""
+    if not text or not any(ch.isdigit() for ch in text):
+        return text
+    lang = "ru" if str(lang).lower().startswith("ru") else "en"
+    out = _THOUSANDS_COMMA_RE.sub("", text)
+    out = _TIME_RE.sub(lambda m: _spell_time(m, lang), out)
+    out = _PERCENT_RE.sub(
+        lambda m: f"{spell_numbers(m.group(1), lang)} " + ("процентов" if lang == "ru" else "percent"),
+        out,
+    )
+    out = _ORDINAL_RE.sub(lambda m: _ordinal(m.group(1), lang), out)
+    out = _DECIMAL_RE.sub(
+        lambda m: f"{_cardinal(m.group(1), lang)} "
+        + ("точка" if lang == "ru" else "point")
+        + f" {_digits_one_by_one(m.group(2), lang)}",
+        out,
+    )
+    out = _INT_RE.sub(lambda m: _cardinal(m.group(0), lang), out)
+    return out
+
+
 def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     """Split a long reply into sentence groups of at most ``max_chars`` characters."""
     text = text.strip()
@@ -212,7 +297,7 @@ class TtsEngine:
         """
         if not self.available:
             return b""
-        cleaned = sanitize_text(text)
+        cleaned = sanitize_text(spell_numbers(text, self.language))
         if not cleaned:
             log.info("Nothing left to speak after cleaning the text")
             return b""

@@ -54,6 +54,7 @@ client:
     silence_ms: 700          # pause that ends an utterance
     max_utterance_s: 15
     pre_roll_ms: 300         # audio from BEFORE the trigger included in the recording
+    min_speech_ms: 250       # shorter voiced bursts are noise blips - dropped, listening continues
 
   followup_window_s: 6       # after a reply, listen N more seconds without wake word (0 = off)
 
