@@ -179,8 +179,12 @@ class FaceConfig(_Strict):
     presence_ttl_s: float = Field(default=30.0, gt=0.0)
     #: An unknown face present for this long triggers the proactive greeting.
     greet_after_s: float = Field(default=10.0, ge=0.0)
-    #: At most one proactive greeting per this window (0 = no cooldown).
+    #: v1.7: at most one greeting of the SAME STRANGER per this window
+    #: (0 = no cooldown). Per person, not per room.
     greeting_cooldown_s: float = Field(default=300.0, ge=0.0)
+    #: v1.7: the same, for somebody Rowan already knows by name. Longer,
+    #: because a familiar face does not need introducing every few minutes.
+    greeting_cooldown_known_s: float = Field(default=900.0, ge=0.0)
     #: Multi-frame bursts (v1.4 burst): frames pulled per camera_request when
     #: the server wants more than one shot (staged enroll_face's samples).
     burst_size: int = Field(default=3, ge=1, le=5)

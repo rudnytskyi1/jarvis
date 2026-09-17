@@ -126,6 +126,9 @@ KNOWN_VOICE_HOLDOFF_S = 180.0
 #: The greeting gate is polled every second; repeat the same "no greeting
 #: because X" line at most this often so the log stays readable.
 GREET_BLOCK_LOG_S = 20.0
+#: v1.7: two people walking in together should both be greeted, but not in the
+#: same breath - this is the floor between any two proactive greetings.
+GREETING_MIN_GAP_S = 20.0
 #: v1.6: how long an annotated detections photo stays on the room screen.
 IMAGE_SHOW_TTL_S = 60.0
 
@@ -154,8 +157,23 @@ GREETING_COMPANY_HINT = (
     "naturally that you can see the stranger is here with them (use their "
     "names), then ask the stranger's name."
 )
+#: v1.7: the same one-off instruction for somebody Rowan already knows by name.
+#: Familiar people are greeted too, just far less often than strangers - see
+#: ``server.face.greeting_cooldown_known_s``.
+GREETING_REQUEST_KNOWN = (
+    "[system event: nobody is speaking to you right now. The room camera can "
+    "see {name}, whom you recognize by face, and you have not said hello to "
+    "them in a while.] Greet {name} out loud, following your persona: ONE "
+    "short, warm sentence. You MUST say the name '{name}' out loud in it — "
+    "this is the whole point, a hello without their name is wrong. Never ask "
+    "what their name is, you already know it. Do not introduce yourself, they "
+    "know who you are. Do not ask what they need. Do not call any tools, just "
+    "speak."
+)
 #: Spoken when the LLM is unreachable or answers nothing at all.
 SAY_FALLBACK_GREETING = "Good day. I am Rowan, the assistant of this room."
+#: The same, for a person whose name Rowan does know.
+SAY_FALLBACK_GREETING_KNOWN = "Hello again, {name}."
 #: While voice enrollment is collecting samples the user needs room to speak:
 #: the follow-up window the client holds open after our reply (SPEC §4 say.listen_s).
 ENROLL_LISTEN_S = 12.0
@@ -624,8 +642,14 @@ class Connection:
         self._enroll_face_task: asyncio.Task | None = None
         #: Monotonic clock of the last TTS stream pushed to the client.
         self._last_audio_at = 0.0
-        #: Monotonic clock of the last proactive greeting (0 = never greeted).
+        #: Monotonic clock of the last proactive greeting of ANYBODY (0 = never).
+        #: Only spaces two greetings apart; who is due is per person, below.
         self._last_greeting_at = 0.0
+        #: v1.7: label -> monotonic clock of the last contact with that person,
+        #: either a greeting Rowan spoke or an utterance they spoke to him.
+        #: Talking to somebody IS saying hello to them, so a conversation
+        #: restarts their cooldown and Rowan never greets mid-exchange.
+        self._greeted_at: dict[str, float] = {}
         #: Which gate last said no (a stable key, not the formatted message) and
         #: when it was logged - the throttle behind :meth:`_greet_blocked`.
         self._greet_block_key = ""
@@ -1431,17 +1455,68 @@ class Connection:
             return
         self._greet_task = asyncio.create_task(self._greeting_loop())
 
-    def _greet_config(self) -> tuple[float, float]:
+    def _greet_config(self) -> tuple[float, float, float]:
+        """``(greet_after_s, unknown_cooldown_s, known_cooldown_s)`` from the config."""
         face_cfg = getattr(getattr(self.cfg, "server", None), "face", None)
-        try:
-            after = float(getattr(face_cfg, "greet_after_s", 10.0))
-        except (TypeError, ValueError):
-            after = 10.0
-        try:
-            cooldown = float(getattr(face_cfg, "greeting_cooldown_s", 300.0))
-        except (TypeError, ValueError):
-            cooldown = 300.0
-        return after, cooldown
+
+        def _read(name: str, fallback: float) -> float:
+            try:
+                return float(getattr(face_cfg, name, fallback))
+            except (TypeError, ValueError):
+                return fallback
+
+        return (
+            _read("greet_after_s", 10.0),
+            _read("greeting_cooldown_s", 300.0),
+            _read("greeting_cooldown_known_s", 900.0),
+        )
+
+    def _greeted_recently(self, label: str, cooldown_s: float, now: float) -> bool:
+        """True when ``label`` was greeted (or spoke to us) inside ``cooldown_s``."""
+        last = self._greeted_at.get(label)
+        if last is None:
+            return False
+        if cooldown_s <= 0.0:
+            return False
+        return now - last < cooldown_s
+
+    def _greet_target(
+        self, greet_after_s: float, unknown_cooldown_s: float, known_cooldown_s: float
+    ) -> str | None:
+        """Who is due a hello right now: a name, :data:`LABEL_UNKNOWN`, or ``None``.
+
+        A stranger outranks a familiar face — introducing yourself matters more
+        than saying hello again. Among familiar faces the one Rowan has gone
+        longest without greeting goes first, so two people who walked in
+        together both get their turn instead of one of them being greeted twice.
+        """
+        now = time.monotonic()
+
+        if (
+            self.presence.has_fresh_unknown_face()
+            and self.presence.unknown_present_for() >= greet_after_s
+            and not self._known_face_alone()
+            and not self._greeted_recently(LABEL_UNKNOWN, unknown_cooldown_s, now)
+            # An unknown face moments after a known voice spoke is almost
+            # certainly that same person at a bad angle - unless the camera can
+            # see somebody the names present do not account for.
+            and not (
+                self._last_known_voice_at
+                and now - self._last_known_voice_at < KNOWN_VOICE_HOLDOFF_S
+                and not self._extra_person_present()
+            )
+        ):
+            return LABEL_UNKNOWN
+
+        due = [
+            label
+            for label in self.presence.present()
+            if label != LABEL_UNKNOWN
+            and not self._greeted_recently(label, known_cooldown_s, now)
+        ]
+        if due:
+            return min(due, key=lambda label: self._greeted_at.get(label, float("-inf")))
+        return None
 
     def _extra_person_present(self) -> bool:
         """True when the room holds MORE people than the ones Rowan can name.
@@ -1475,18 +1550,26 @@ class Connection:
             return False
         return not self._extra_person_present()
 
-    def _may_greet(self, greet_after_s: float, cooldown_s: float) -> bool:
-        """True when an unknown face has waited long enough and the room is idle.
+    def _may_greet(
+        self, greet_after_s: float, unknown_cooldown_s: float, known_cooldown_s: float
+    ) -> str | None:
+        """Who Rowan should greet right now, or ``None`` when nobody should be.
 
-        BUG 2: gated STRICTLY on the presence tracker holding a
-        CURRENTLY-FRESH unknown FACE match (:meth:`PresenceTracker.has_fresh_unknown_face`)
-        — a face the face engine actually detected and could not match to any
-        enrolled profile within the last ``presence_ttl_s`` — never on a bare
-        YOLO person count (which never touches the tracker's unknown bucket,
-        see :meth:`PresenceTracker.note_persons`) and never on a label that
-        has already expired. If the face engine is unavailable or disabled
-        this returns ``False`` unconditionally: no face engine means no face
-        was ever really seen, so there is nothing to greet.
+        v1.7: each person carries their own cooldown, so a familiar face gets a
+        hello again after ``greeting_cooldown_known_s`` and a stranger after
+        ``greeting_cooldown_s`` — see :meth:`_greet_target`. Everything below
+        is the "is the room quiet enough to speak at all" half of the decision.
+
+        BUG 2: the stranger branch is gated STRICTLY on the presence tracker
+        holding a CURRENTLY-FRESH unknown FACE match
+        (:meth:`PresenceTracker.has_fresh_unknown_face`) — a face the face
+        engine actually detected and could not match to any enrolled profile
+        within the last ``presence_ttl_s`` — never on a bare YOLO person count
+        (which never touches the tracker's unknown bucket, see
+        :meth:`PresenceTracker.note_persons`) and never on a label that has
+        already expired. If the face engine is unavailable or disabled this
+        returns ``None`` unconditionally: no face engine means no face was
+        ever really seen, so there is nobody to greet.
         """
         engine = _face
         if not self.face_enabled or engine is None or not engine.available:
@@ -1500,40 +1583,22 @@ class Connection:
         now = time.monotonic()
         if self._last_audio_at and now - self._last_audio_at < GREETING_QUIET_S:
             return self._greet_blocked("audio", "audio was flowing seconds ago")
-        if self._last_greeting_at and now - self._last_greeting_at < cooldown_s:
+        if self._last_greeting_at and now - self._last_greeting_at < GREETING_MIN_GAP_S:
             return self._greet_blocked(
-                "cooldown",
-                f"already greeted {now - self._last_greeting_at:.0f}s ago "
-                f"(cooldown {cooldown_s:.0f}s)",
+                "min_gap",
+                f"the last greeting was only {now - self._last_greeting_at:.0f}s ago",
             )
-        # v1.6: a KNOWN voice on THIS connection recently, or a known face
-        # alone with exactly one YOLO person, means the "unknown" face is
-        # almost certainly that same not-yet-enrolled/badly-angled person.
-        # Neither applies once there are visibly MORE people than Rowan can
-        # name - that extra person is a real stranger and gets greeted.
-        if (
-            self._last_known_voice_at
-            and now - self._last_known_voice_at < KNOWN_VOICE_HOLDOFF_S
-            and not self._extra_person_present()
-        ):
-            return self._greet_blocked(
-                "known_voice",
-                f"a known voice spoke {now - self._last_known_voice_at:.0f}s ago "
-                f"and nobody extra is in frame (holdoff {KNOWN_VOICE_HOLDOFF_S:.0f}s)",
-            )
-        if self._known_face_alone():
-            return self._greet_blocked("known_alone", "a known face is alone in frame")
-        if not self.presence.has_fresh_unknown_face():
-            return self._greet_blocked("no_unknown_face", "no unmatched face was detected recently")
-        if self.presence.unknown_present_for() < greet_after_s:
-            return self._greet_blocked(
-                "waiting",
-                f"the unknown face has only been there "
-                f"{self.presence.unknown_present_for():.0f}s of {greet_after_s:.0f}s",
-            )
-        return True
 
-    def _greet_blocked(self, key: str, reason: str) -> bool:
+        target = self._greet_target(greet_after_s, unknown_cooldown_s, known_cooldown_s)
+        if target is None:
+            return self._greet_blocked(
+                "nobody_due",
+                f"nobody is due a hello (strangers every {unknown_cooldown_s:.0f}s, "
+                f"familiar faces every {known_cooldown_s:.0f}s)",
+            )
+        return target
+
+    def _greet_blocked(self, key: str, reason: str) -> None:
         """Log WHY no greeting happened (throttled) and return ``False``.
 
         The greeting gate is polled once a second, so this would otherwise
@@ -1564,23 +1629,27 @@ class Connection:
         return False
 
     async def _greeting_loop(self) -> None:
-        """Poll the presence tracker and greet an unknown face once (SPEC v1.4)."""
-        greet_after_s, cooldown_s = self._greet_config()
+        """Poll the presence tracker and greet whoever is due (SPEC v1.4, v1.7)."""
+        greet_after_s, unknown_cooldown_s, known_cooldown_s = self._greet_config()
         if greet_after_s <= 0.0:
             log.info("Proactive greetings are off (server.face.greet_after_s = 0)")
             return
         log.info(
-            "Greeting task armed: unknown face for %.0f s, at most one per %.0f s",
-            greet_after_s, cooldown_s,
+            "Greeting task armed: a stranger after %.0f s and again every %.0f s, "
+            "a familiar face again every %.0f s",
+            greet_after_s, unknown_cooldown_s, known_cooldown_s,
         )
         while True:
             await asyncio.sleep(GREETING_POLL_S)
             try:
                 if self._reply_lock.locked():
                     continue
-                if not self._may_greet(greet_after_s, cooldown_s):
+                target = self._may_greet(greet_after_s, unknown_cooldown_s, known_cooldown_s)
+                if target is None:
                     continue
-                await self._greet_unknown(greet_after_s, cooldown_s)
+                await self._greet_person(
+                    target, greet_after_s, unknown_cooldown_s, known_cooldown_s
+                )
             except asyncio.CancelledError:
                 raise
             except (WebSocketDisconnect, RuntimeError):
@@ -1589,40 +1658,59 @@ class Connection:
             except Exception:
                 log.exception("The greeting task failed — it keeps running")
 
-    async def _greet_unknown(self, greet_after_s: float, cooldown_s: float) -> None:
-        """Generate ONE greeting and push it as an unsolicited say + TTS block."""
+    def _greeting_request(self, target: str) -> str:
+        """The one-off instruction that produces a hello for ``target``."""
+        if target != LABEL_UNKNOWN:
+            return GREETING_REQUEST_KNOWN.format(name=target)
+        # Tell the model who the stranger is standing next to, by name.
+        known_now = [
+            label for label in self.presence.present() if label != LABEL_UNKNOWN
+        ]
+        request = GREETING_REQUEST
+        if known_now:
+            request += GREETING_COMPANY_HINT.format(names=", ".join(sorted(known_now)))
+        return request
+
+    async def _greet_person(
+        self,
+        target: str,
+        greet_after_s: float,
+        unknown_cooldown_s: float,
+        known_cooldown_s: float,
+    ) -> None:
+        """Generate ONE greeting for ``target`` and push it as a say + TTS block."""
         session, brain, voice = self.session, _llm, _tts
         if session is None or brain is None or voice is None:
             return
         async with self._reply_lock:
-            # The room may have changed while we waited for the lock.
-            if not self._may_greet(greet_after_s, cooldown_s):
+            # The room may have changed while we waited for the lock, and the
+            # person due a hello may now be somebody else.
+            target = self._may_greet(greet_after_s, unknown_cooldown_s, known_cooldown_s)
+            if target is None:
                 return
-            # Start the cooldown before speaking: a failed greeting must not be
-            # retried every second either.
-            self._last_greeting_at = time.monotonic()
+            # Start both cooldowns before speaking: a greeting that fails to
+            # generate must not be retried every second either.
+            now = time.monotonic()
+            self._last_greeting_at = now
+            self._greeted_at[target] = now
             engine = _face
             # BUG 2: log every input the gate decided on, so a wrong greeting
             # (or a missing one) can be diagnosed from the log alone.
             log.info(
-                "Greeting decision: fresh_unknown_face=%s present_for=%.0fs "
-                "greet_after_s=%.0f cooldown_s=%.0f face_enabled=%s "
-                "face_available=%s known_face_alone=%s",
+                "Greeting decision: target=%s fresh_unknown_face=%s present_for=%.0fs "
+                "greet_after_s=%.0f cooldowns=(stranger %.0fs, familiar %.0fs) "
+                "face_enabled=%s face_available=%s known_face_alone=%s",
+                target,
                 self.presence.has_fresh_unknown_face(),
                 self.presence.unknown_present_for(),
                 greet_after_s,
-                cooldown_s,
+                unknown_cooldown_s,
+                known_cooldown_s,
                 self.face_enabled,
                 bool(engine is not None and engine.available),
                 self._known_face_alone(),
             )
-            # Tell the model who the stranger is standing next to, by name.
-            known_now = [
-                label for label in self.presence.present() if label != LABEL_UNKNOWN
-            ]
-            request = GREETING_REQUEST
-            if known_now:
-                request += GREETING_COMPANY_HINT.format(names=", ".join(sorted(known_now)))
+            request = self._greeting_request(target)
             try:
                 result = await brain.generate(
                     session.messages(request), self._refuse_tools
@@ -1634,11 +1722,15 @@ class Connection:
                 log.exception("The greeting could not be generated")
                 text = ""
             if not text:
-                text = SAY_FALLBACK_GREETING
-            session.remember(GREETING_REQUEST, text)
+                text = (
+                    SAY_FALLBACK_GREETING
+                    if target == LABEL_UNKNOWN
+                    else SAY_FALLBACK_GREETING_KNOWN.format(name=target)
+                )
+            session.remember(request, text)
             await self.send_json({"type": proto.MSG_SAY, "text": text})
             await self._stream_tts(voice, text)
-        log.info("Greeting spoken: %r", text)
+        log.info("Greeting spoken to %s: %r", target, text)
 
     async def _refuse_tools(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Tool executor for the greeting: proactive speech may not act.
@@ -2262,7 +2354,13 @@ class Connection:
             if name != speaker_mod.ROLE_UNKNOWN:
                 # v1.6: holds the greeting off while a known voice was just
                 # heard on this connection (see _may_greet).
-                self._last_known_voice_at = time.monotonic()
+                # v1.7: talking to somebody counts as having said hello to
+                # them, so their per-person cooldown restarts here. Without
+                # this Rowan would interrupt a conversation to greet the very
+                # person he is mid-conversation with.
+                heard_at = time.monotonic()
+                self._last_known_voice_at = heard_at
+                self._greeted_at[name] = heard_at
             pending = self._enroll_pending
             if pending:
                 # v1.6: every attempt counts its seconds, even a failed one —

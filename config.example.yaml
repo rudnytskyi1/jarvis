@@ -37,7 +37,8 @@ server:
     threshold: 0.45          # cosine similarity for a face to match a profile
     presence_ttl_s: 30       # forget someone this long after last seeing them
     greet_after_s: 10        # greet an unknown face after this many seconds
-    greeting_cooldown_s: 300 # at most one proactive greeting per this window
+    greeting_cooldown_s: 300       # greet the SAME stranger again after this long
+    greeting_cooldown_known_s: 900 # greet the same KNOWN person again after this long
     burst_size: 3             # frames per multi-frame camera pull (v1.4 burst)
     enroll_bursts: 3          # background bursts enroll_face pulls after its first sample
 

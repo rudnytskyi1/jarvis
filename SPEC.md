@@ -89,8 +89,15 @@ v1.4 — **camera, faces, presence** (the C920 on the room PC):
   conversation is active, the server generates ONE short greeting through the
   LLM (offering voice enrollment once, per persona rules) and pushes it as an
   unsolicited `say` + `tts_start…tts_end` block. The client therefore reads the
-  socket BETWEEN utterances too and plays such proactive audio only when idle;
-  at most one greeting per `greeting_cooldown_s`.
+  socket BETWEEN utterances too and plays such proactive audio only when idle.
+- **Per-person greeting cooldowns (v1.7)**: cooldowns are tracked per person,
+  not per room. The same stranger is greeted again after `greeting_cooldown_s`;
+  somebody the server recognises by name is greeted again after
+  `greeting_cooldown_known_s`. A stranger outranks a familiar face when both
+  are due, and at most one greeting is spoken per `GREETING_MIN_GAP_S` so two
+  people arriving together are greeted one after the other rather than at once.
+  An utterance from an identified voice restarts that person's cooldown, so a
+  greeting never interrupts a conversation with the person being greeted.
 - **New server tools**: `look_at_camera {"query": str}` — pull a camera frame,
   answer through the vision model (same pipeline and permissions as
   `look_at_screen`). `enroll_face {"name": str}` — pull a frame, embed the
@@ -98,7 +105,8 @@ v1.4 — **camera, faces, presence** (the C920 on the room PC):
   everyone may enroll themselves). After voice enrollment completes, the model
   offers `enroll_face` ("look at the camera for a second").
 - Config §6: `server.face.{enabled, threshold, presence_ttl_s, greet_after_s,
-  greeting_cooldown_s}` (true, 0.45, 30.0, 10.0, 300.0) and
+  greeting_cooldown_s, greeting_cooldown_known_s}`
+  (true, 0.45, 30.0, 10.0, 300.0, 900.0) and
   `client.camera.{enabled, index, fps, model, face_check_interval_s}`
   (true, 0, 5, "yolo11n.pt", 5.0). Camera deps live in
   `client/requirements-camera.txt` (ultralytics, opencv-python; torch with CUDA

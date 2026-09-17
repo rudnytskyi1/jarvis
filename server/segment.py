@@ -43,6 +43,30 @@ SAM3_PACKAGE_DIR = REPO_ROOT / "third_party" / "sam3" / "server"
 BOX_COLOR = (0xFF, 0x33, 0x55)
 BOX_WIDTH_PX = 3
 
+_GIB = float(1024 ** 3)
+#: Free VRAM required before SAM3 is loaded at all. The checkpoint alone is
+#: ~3.45 GB and the grounding pass needs room on top of it, on a GPU shared
+#: with Ollama (chat + vision models held resident for hours) and
+#: faster-whisper. Checking first is not just politeness: a CUDA out-of-memory
+#: raised INSIDE a kernel arrives as ``torch.AcceleratorError``, not
+#: ``torch.cuda.OutOfMemoryError``, and can leave this process's CUDA context
+#: unusable - it once hung the very next Whisper transcription forever and left
+#: the assistant deaf to its wake word until the server was restarted by hand.
+LOAD_FREE_VRAM_BYTES = int(6 * _GIB)
+#: Free VRAM required for one inference once the model is already resident.
+RUN_FREE_VRAM_BYTES = int(2 * _GIB)
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """True for any flavour of CUDA out-of-memory, whatever class it arrives as.
+
+    ``torch.cuda.OutOfMemoryError`` is only raised when the caching allocator
+    itself refuses; an allocation failing inside a kernel surfaces as a plain
+    ``torch.AcceleratorError``/``RuntimeError`` whose message carries the real
+    reason, so the message is the only reliable signal.
+    """
+    return "out of memory" in str(exc).lower()
+
 
 def _label_font(image_height: int) -> Any:
     """A readable TrueType font scaled to the image, or PIL's default.
@@ -192,6 +216,18 @@ class Sam3Engine:
             return True
         return self.enabled and self._failed_reason is None
 
+    # ------------------------------------------------------------------ memory
+
+    @staticmethod
+    def _free_vram(torch: Any) -> int | None:
+        """Bytes free on the GPU right now, or ``None`` if it cannot be read."""
+        try:
+            free, _total = torch.cuda.mem_get_info()
+            return int(free)
+        except Exception:  # noqa: BLE001 - a driver that will not answer is not fatal
+            log.debug("Could not read free GPU memory", exc_info=True)
+            return None
+
     # ------------------------------------------------------------------ loading
 
     def _load(self) -> str | None:
@@ -226,6 +262,23 @@ class Sam3Engine:
                     "SAM3 needs a CUDA GPU, but none is available on this machine"
                 )
                 return self._failed_reason
+
+            # Having a CUDA device says nothing about having room on it: this
+            # GPU also holds Ollama's chat and vision models (resident for
+            # hours) and faster-whisper. Refuse up front rather than find out
+            # inside a kernel - see LOAD_FREE_VRAM_BYTES for why that matters.
+            # Deliberately NOT latched into _failed_reason: memory frees up.
+            free = self._free_vram(torch)
+            if free is not None and free < LOAD_FREE_VRAM_BYTES:
+                log.warning(
+                    "Not loading SAM3: only %.1f GB free on the GPU, it needs about %.0f GB",
+                    free / _GIB, LOAD_FREE_VRAM_BYTES / _GIB,
+                )
+                return (
+                    f"not enough free GPU memory to load SAM3 right now "
+                    f"({free / _GIB:.1f} GB free, it needs about "
+                    f"{LOAD_FREE_VRAM_BYTES / _GIB:.0f} GB)"
+                )
 
             try:
                 from sam3.model_builder import (  # noqa: PLC0415 - lazy, heavy
@@ -317,6 +370,19 @@ class Sam3Engine:
         if width <= 0 or height <= 0:
             return {"ok": False, "error": "the image has no usable size"}
 
+        free = self._free_vram(torch)
+        if free is not None and free < RUN_FREE_VRAM_BYTES:
+            log.warning(
+                "Skipping SAM3 for %r: only %.1f GB free on the GPU", text, free / _GIB
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"not enough free GPU memory to look for that right now "
+                    f"({free / _GIB:.1f} GB free)"
+                ),
+            }
+
         log.info("SAM3: looking for %r in a %dx%d image", text, width, height)
         try:
             with self._lock:
@@ -327,6 +393,27 @@ class Sam3Engine:
             torch.cuda.empty_cache()
             return {"ok": False, "error": "not enough GPU memory for SAM3 right now"}
         except Exception as exc:
+            if _is_cuda_oom(exc):
+                # A raw CUDA out-of-memory from inside a kernel, NOT a
+                # torch.cuda.OutOfMemoryError. The context may be unusable
+                # from here on, and the next thing to touch it was Whisper,
+                # which hung forever and left the assistant deaf. Take SAM3
+                # out of service rather than risk a second one.
+                log.error(
+                    "SAM3 hit a raw CUDA out-of-memory for %r - turning it off "
+                    "until the server restarts, so it cannot take the GPU down with it",
+                    text,
+                )
+                with self._lock:
+                    self._processor = None
+                    self._failed_reason = (
+                        "SAM3 ran out of GPU memory and is off until the server restarts"
+                    )
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001 - the context may already be gone
+                    pass
+                return {"ok": False, "error": "not enough GPU memory for SAM3 right now"}
             log.exception("SAM3 segmentation failed for %r", text)
             return {"ok": False, "error": f"SAM3 segmentation failed: {exc}"}
 
