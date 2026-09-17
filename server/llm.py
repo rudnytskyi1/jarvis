@@ -357,6 +357,49 @@ def _arguments_to_dict(raw: Any) -> tuple[dict[str, Any] | None, str]:
     return None, raw
 
 
+#: millard sometimes writes a tool call as TEXT in these template tags instead
+#: of emitting a structured call: "<tool_call>look_at_camera<parameter=query>..."
+#: or "<function=enroll_voice><parameter=name>Drew". Rather than waste a whole
+#: retry round each time, recover the intended call from the artifact. Anchored
+#: on the tag so ordinary prose can never be mistaken for a call.
+_RECOVER_NAME_RE = re.compile(
+    r"<\s*(?:tool_?call|function)\s*(?:=\s*)?>?\s*([a-z_][a-z0-9_]*)",
+    re.IGNORECASE,
+)
+_RECOVER_PARAM_RE = re.compile(
+    r"<\s*parameter\s*=\s*([a-z_][a-z0-9_]*)\s*>?\s*"
+    r"(.*?)(?=<\s*(?:parameter|/?\s*(?:tool_?call|function))|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def recover_tool_calls(raw_content: str, valid_names: Iterable[str]) -> list[ToolCall]:
+    """Parse a tool call the model wrote as TEXT into a real :class:`ToolCall`.
+
+    Only recovers when the parsed name is an ACTUAL tool - never guesses from
+    free prose - so a sentence that merely mentions a tool name cannot be
+    misfired into a call. Returns an empty list when nothing is recoverable.
+    """
+    text = str(raw_content or "")
+    known = {n for n in valid_names}
+    calls: list[ToolCall] = []
+    for index, match in enumerate(_RECOVER_NAME_RE.finditer(text), start=1):
+        name = match.group(1).strip()
+        if name not in known:
+            continue
+        # Parameters that appear before the NEXT tool-call tag belong to this one.
+        tail_start = match.end()
+        next_call = _RECOVER_NAME_RE.search(text, tail_start)
+        tail = text[tail_start : next_call.start() if next_call else len(text)]
+        args: dict[str, Any] = {}
+        for pm in _RECOVER_PARAM_RE.finditer(tail):
+            value = pm.group(2).strip().strip('"').strip()
+            if value:
+                args[pm.group(1).strip()] = value
+        calls.append(ToolCall(id=f"recovered_{index}", name=name, arguments=args, raw_arguments=""))
+    return calls
+
+
 def normalize_tool_calls(tool_calls: Iterable[Any] | None) -> list[ToolCall]:
     """Convert SDK tool-call objects (or native dicts) into :class:`ToolCall` records."""
     result: list[ToolCall] = []
@@ -555,6 +598,15 @@ class LlmClient:
             )
             text = ""
         calls = normalize_tool_calls(message.get("tool_calls"))
+        if not calls and _TOOL_ARTIFACT_RE.search(raw_content):
+            recovered = recover_tool_calls(raw_content, TOOL_NAMES)
+            if recovered:
+                log.info(
+                    "Recovered %d tool call(s) millard wrote as text: %s",
+                    len(recovered), ", ".join(c.name for c in recovered),
+                )
+                # The artifact text is not a real spoken reply - drop it.
+                return "", recovered
         return text, calls
 
     def _chat_openai(
@@ -801,6 +853,7 @@ __all__ = [
     "contains_sight_claim",
     "SIGHT_CLAIM_PHRASES",
     "VISION_TOOLS",
+    "recover_tool_calls",
     "FORCE_LOOK_MESSAGE",
     "PROVIDER_OLLAMA_NATIVE",
     "PROVIDER_OPENAI",
