@@ -16,6 +16,7 @@ Public API (SPEC section 6)::
     cfg.server.llm.max_tool_rounds  # 4
     cfg.server.speaker.threshold    # 0.72 (voice matching, v1.3)
     cfg.server.face.threshold       # 0.45 (face matching + presence, v1.4)
+    cfg.server.face.{burst_size, enroll_bursts}  # v1.4 burst: 3, 3 (multi-frame camera pulls)
     cfg.server.segment.{enabled, checkpoint, confidence}  # v1.5: SAM3 find_object
     cfg.server.tts.speaker          # "en_0"
     cfg.client.server_url           # "ws://192.168.1.100:8765/ws"
@@ -170,6 +171,13 @@ class FaceConfig(_Strict):
     greet_after_s: float = Field(default=10.0, ge=0.0)
     #: At most one proactive greeting per this window (0 = no cooldown).
     greeting_cooldown_s: float = Field(default=300.0, ge=0.0)
+    #: Multi-frame bursts (v1.4 burst): frames pulled per camera_request when
+    #: the server wants more than one shot (staged enroll_face's samples).
+    burst_size: int = Field(default=3, ge=1, le=5)
+    #: How many extra background bursts enroll_face pulls after its immediate
+    #: first sample (spaced a few seconds apart while the person turns their
+    #: head), on top of that first one.
+    enroll_bursts: int = Field(default=3, ge=0)
 
 
 class SegmentConfig(_Strict):

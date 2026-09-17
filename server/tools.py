@@ -386,8 +386,11 @@ TOOLS: list[dict[str, Any]] = [
                     "target": {
                         "type": "string",
                         "description": (
-                            "A short noun phrase for what to find, e.g. 'cola can' "
-                            "or 'backpack'."
+                            "A short SIMPLE noun for what to find - prefer 'bottle' "
+                            "over 'water bottle', 'can' over 'cola can': the detector "
+                            "matches broad concepts better. If a search returns zero "
+                            "but the thing is probably there, retry ONCE with a "
+                            "simpler or more generic word before answering."
                         ),
                     },
                     "source": {

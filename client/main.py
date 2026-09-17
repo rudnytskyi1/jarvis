@@ -1139,10 +1139,19 @@ class JarvisClient:
         :mod:`client.camera` owns the reply, including ``camera_error`` when it
         has no picture to give (the mirror of ``screenshot_error``). A client
         without a camera answers the error itself so the server's tool call
-        fails immediately instead of waiting for its timeout.
+        fails immediately instead of waiting for its timeout. ``burst`` (v1.4
+        burst extension) asks for that many frames instead of one; absent or
+        invalid, it defaults to a single frame exactly as before.
         """
         request_id = str(msg.get("id") or "")
-        log.info("Camera frame requested (id=%s)", request_id or "?")
+        try:
+            burst = int(msg.get("burst") or 1)
+        except (TypeError, ValueError):
+            burst = 1
+        log.info(
+            "Camera frame requested (id=%s)%s",
+            request_id or "?", f" burst={burst}" if burst != 1 else "",
+        )
         camera = self.camera
         if camera is None:
             await self.ws.send_json(
@@ -1154,7 +1163,7 @@ class JarvisClient:
             )
             return
         try:
-            await camera.serve_request(request_id)
+            await camera.serve_request(request_id, burst)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the camera never breaks the client

@@ -10,12 +10,20 @@ video:
   with a confidence of at least :data:`CONF_THRESHOLD`,
 * whenever the picture changes it sends ``camera_state`` (debounced, at least
   :data:`STATE_DEBOUNCE_S` apart),
-* while at least one person is visible it pushes ONE JPEG every
-  ``cfg.client.camera.face_check_interval_s`` as ``camera_frame``
-  (``reason: "presence"``, id ``p<N>``) so the server can match faces,
-* and it answers the server's ``camera_request`` from the latest frame
-  (``reason: "request"``), the way :mod:`client.screen` answers a
-  ``screenshot_request``.
+* while at least one person is visible it pushes a burst of :data:`FACE_BURST`
+  JPEGs every ``cfg.client.camera.face_check_interval_s`` as ``camera_frame``
+  (``reason: "presence"``, id ``p<N>``, headers carrying ``seq``/``of``) so the
+  server can match faces over several frames instead of just one,
+* and it answers the server's ``camera_request`` -- one frame, or a burst of
+  up to :data:`common.protocol.CAMERA_BURST_MAX` when the request carries a
+  ``burst`` count (``reason: "request"``) -- the way :mod:`client.screen`
+  answers a ``screenshot_request``.
+
+Every burst (pulled or pushed) is a sequence of header+binary pairs sharing one
+``id``, each header numbering itself ``seq`` of ``of`` total, captured roughly
+:data:`BURST_FRAME_INTERVAL_S` apart from FRESH frames of the capture thread
+(never the same JPEG resent twice) and sent back to back under one hold of the
+wire lock so nothing else can slip between the pairs of one burst.
 
 Everything about the camera is optional. ``cv2`` and ``ultralytics`` are
 imported lazily inside the worker threads, and any failure — missing packages,
@@ -28,7 +36,7 @@ Wiring (see :mod:`client.main`)::
     camera = CameraService(cfg.client.camera)
     camera.start(loop, ws.send_json, ws.send_bytes, send_lock=wire_lock)
     ...
-    await camera.serve_request(request_id)   # answers camera_request
+    await camera.serve_request(request_id, burst)   # answers camera_request
     camera.stop()
 
 ``send_lock`` is the client's "one binary sequence at a time" lock: the server
@@ -48,6 +56,7 @@ from collections.abc import Mapping
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from common.protocol import (
+    CAMERA_BURST_MAX,
     CAMERA_FORMAT,
     CAMERA_REASON_PRESENCE,
     CAMERA_REASON_REQUEST,
@@ -78,6 +87,15 @@ STALE_FRAME_S = 10.0
 MAX_READ_FAILURES = 30
 #: How long :meth:`CameraService.stop` waits for its worker threads.
 JOIN_TIMEOUT_S = 3.0
+#: Burst extension (v1.4): how many frames one periodic presence push carries.
+FACE_BURST = 3
+#: Burst extension (v1.4): gap between frames of one burst, request or presence
+#: ("~250 ms apart" per SPEC).
+BURST_FRAME_INTERVAL_S = 0.25
+#: Burst extension (v1.4): how long :meth:`CameraService._await_fresh_frame`
+#: waits for a genuinely new capture-thread frame before giving up on one slot
+#: of a burst (a stalled camera must not hang the whole request).
+FRESH_FRAME_WAIT_S = 0.5
 
 SendJson = Callable[[Dict[str, Any]], Awaitable[None]]
 SendBytes = Callable[[bytes], Awaitable[None]]
@@ -93,6 +111,8 @@ __all__ = [
     "JPEG_QUALITY",
     "STATE_DEBOUNCE_S",
     "CONF_THRESHOLD",
+    "FACE_BURST",
+    "BURST_FRAME_INTERVAL_S",
     "CameraUnavailable",
     "CameraService",
 ]
@@ -387,6 +407,68 @@ class CameraService:
             return None, float("inf")
         return frame, max(0.0, time.monotonic() - ts)
 
+    def _latest_frame_ts(self) -> Tuple[Any, float]:
+        """The newest captured frame and its OWN monotonic timestamp (not age).
+
+        Used by :meth:`_await_fresh_frame` to tell burst frames apart: an age
+        alone cannot say whether two reads a few milliseconds apart landed on
+        the same capture-thread frame or two different ones.
+        """
+        with self._frame_lock:
+            return self._frame, self._frame_ts
+
+    def _await_fresh_frame(self, newer_than: float) -> Tuple[Any, float]:
+        """Block briefly for a capture-thread frame newer than ``newer_than``.
+
+        One slot of a burst must never resend the same JPEG twice: the capture
+        thread normally refreshes far faster than :data:`BURST_FRAME_INTERVAL_S`,
+        but this polls a little longer (up to :data:`FRESH_FRAME_WAIT_S`) as a
+        safety net for a slow or throttled camera, rather than trusting the
+        sleep alone. Gives up and returns ``(None, 0.0)`` when nothing fresh (or
+        nothing at all, or nothing fresher than :data:`STALE_FRAME_S`) turns up
+        in time -- never blocks longer than that, never raises.
+        """
+        deadline = time.monotonic() + FRESH_FRAME_WAIT_S
+        while True:
+            frame, ts = self._latest_frame_ts()
+            if frame is not None and ts > newer_than:
+                age = max(0.0, time.monotonic() - ts)
+                if age <= STALE_FRAME_S:
+                    return frame, ts
+            if time.monotonic() >= deadline:
+                return None, 0.0
+            time.sleep(0.02)
+
+    def _capture_burst_sync(self, count: int) -> list:
+        """Capture up to ``count`` fresh frames ~250 ms apart, JPEG-encoded.
+
+        Synchronous by design: called either via ``asyncio.to_thread`` (a
+        ``camera_request``, which has no frame in hand yet) or directly from
+        the YOLO worker thread (a presence push, which is already off the
+        event loop). Stops early and returns whatever was captured so far the
+        moment a fresh frame cannot be had or its encoding fails -- a partial
+        burst is still useful to the caller (the server's ``best_face`` picks
+        the best of whatever arrives), this never raises.
+
+        :returns: ``[(jpeg_bytes, width, height), …]``, shortest at ``[]``.
+        """
+        pairs: list = []
+        newer_than = -1.0
+        for seq in range(1, max(1, count) + 1):
+            if seq > 1:
+                time.sleep(BURST_FRAME_INTERVAL_S)
+            frame, ts = self._await_fresh_frame(newer_than)
+            if frame is None:
+                break
+            newer_than = ts
+            try:
+                jpeg, width, height = self._encode(frame)
+            except Exception as exc:  # noqa: BLE001 - encoding must not kill the caller
+                log.debug("Could not encode burst frame %d/%d: %s", seq, count, exc)
+                break
+            pairs.append((jpeg, width, height))
+        return pairs
+
     # ------------------------------------------------------------------
     # detection thread
     # ------------------------------------------------------------------
@@ -425,7 +507,7 @@ class CameraService:
                     self._detect_errors = 0
                     self._publish_state(persons, objects)
                     if persons >= 1:
-                        self._maybe_push_presence(frame)
+                        self._maybe_push_presence()
             remaining = interval - (time.monotonic() - started)
             if remaining > 0:
                 self._stop_event.wait(remaining)
@@ -520,20 +602,36 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_frame (SPEC v1.4)
     # ------------------------------------------------------------------
-    def _maybe_push_presence(self, frame: Any) -> None:
+    def _maybe_push_presence(self) -> None:
+        """Push a :data:`FACE_BURST`-frame burst while somebody is visible (v1.4 burst).
+
+        Runs on the YOLO worker thread, so the whole burst is captured here
+        synchronously (a few hundred ms of sleeps on a background thread costs
+        nothing) and only the actual SEND is handed to the event loop.
+        """
         now = time.monotonic()
         if now - self._last_presence_push < self.face_check_interval_s:
             return
+        lock = self._send_lock
+        if lock is not None and lock.locked():
+            # The microphone is streaming an utterance (or another burst is
+            # going out): the server would read our JPEGs as audio. Skip the
+            # whole push -- including the capture -- the next one comes in
+            # face_check_interval_s.
+            log.debug("Skipping a presence burst - the socket is busy")
+            return
         self._last_presence_push = now
         try:
-            jpeg, width, height = self._encode(frame)
-        except Exception as exc:  # noqa: BLE001 - encoding must not kill the thread
-            log.debug("Could not encode the presence frame: %s", exc)
+            pairs = self._capture_burst_sync(FACE_BURST)
+        except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the thread
+            log.debug("Could not capture the presence burst: %s", exc)
+            return
+        if not pairs:
             return
         self._frame_seq += 1
         frame_id = f"p{self._frame_seq}"
         self._submit(
-            self._send_frame(frame_id, CAMERA_REASON_PRESENCE, jpeg, width, height, skip_if_busy=True)
+            self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True)
         )
 
     def _encode(self, frame: Any) -> Tuple[bytes, int, int]:
@@ -557,26 +655,63 @@ class CameraService:
             raise CameraUnavailable("JPEG encoding failed")
         return bytes(buffer.tobytes() if hasattr(buffer, "tobytes") else buffer), width, height
 
-    async def _send_frame(
+    async def _send_burst(
         self,
         frame_id: str,
         reason: str,
-        jpeg: bytes,
-        width: int,
-        height: int,
+        pairs: list,
         skip_if_busy: bool = False,
     ) -> None:
-        """Send the ``camera_frame`` header plus its single binary frame."""
+        """Send ``pairs`` as that many ``camera_frame`` header+binary pairs.
+
+        All of them go out under ONE hold of the wire lock (SPEC v1.4 burst),
+        so nothing else -- streamed microphone audio, a screenshot -- can slip
+        between the frames of a single burst. ``skip_if_busy`` mirrors the old
+        single-frame behaviour for presence pushes: if the wire is busy right
+        now, drop the whole burst rather than wait for it (the next one comes
+        in ``face_check_interval_s``); a server-requested burst always waits.
+        """
         send_json, send_bytes = self._send_json, self._send_bytes
-        if send_json is None or send_bytes is None:
+        if send_json is None or send_bytes is None or not pairs:
             return
         lock = self._send_lock
         if lock is not None and lock.locked() and skip_if_busy:
-            # The microphone is streaming an utterance (or a screenshot is going
-            # out): the server would read our JPEG as audio. Skip this push; the
-            # next one comes in face_check_interval_s.
-            log.debug("Skipping presence frame %s - the socket is busy", frame_id)
+            log.debug("Skipping a %s burst %s - the socket is busy", reason, frame_id)
             return
+        total = len(pairs)
+        log.debug(
+            "Sending a %s frame burst %s: %d frame(s)", reason, frame_id, total
+        )
+        try:
+            if lock is None:
+                for seq, (jpeg, width, height) in enumerate(pairs, start=1):
+                    await self._send_pair(
+                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height
+                    )
+            else:
+                async with lock:
+                    for seq, (jpeg, width, height) in enumerate(pairs, start=1):
+                        await self._send_pair(
+                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reconnects are routine
+            self._note_send_failure("camera_frame", exc)
+
+    @staticmethod
+    async def _send_pair(
+        send_json: SendJson,
+        send_bytes: SendBytes,
+        frame_id: str,
+        reason: str,
+        seq: int,
+        total: int,
+        jpeg: bytes,
+        width: int,
+        height: int,
+    ) -> None:
+        """Send one ``camera_frame`` header plus its single binary frame."""
         header = {
             "type": MSG_CAMERA_FRAME,
             "id": frame_id,
@@ -584,23 +719,15 @@ class CameraService:
             "format": CAMERA_FORMAT,
             "w": int(width),
             "h": int(height),
+            "seq": int(seq),
+            "of": int(total),
         }
         log.debug(
-            "Sending camera frame %s (%s): %dx%d, %d bytes",
-            frame_id, reason, width, height, len(jpeg),
+            "Sending camera frame %s (%s) %d/%d: %dx%d, %d bytes",
+            frame_id, reason, seq, total, width, height, len(jpeg),
         )
-        try:
-            if lock is None:
-                await send_json(header)
-                await send_bytes(jpeg)
-            else:
-                async with lock:
-                    await send_json(header)
-                    await send_bytes(jpeg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - reconnects are routine
-            self._note_send_failure("camera_frame", exc)
+        await send_json(header)
+        await send_bytes(jpeg)
 
     async def _send_error(self, request_id: str, error: str) -> None:
         """Mirror of ``screenshot_error`` (SPEC v1.4): no binary frame follows."""
@@ -628,19 +755,39 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_request (SPEC v1.4)
     # ------------------------------------------------------------------
-    async def serve_request(self, request_id: str) -> None:
-        """Answer the server's ``camera_request`` from the latest frame.
+    async def serve_request(self, request_id: str, burst: int = 1) -> None:
+        """Answer the server's ``camera_request`` with ``burst`` frame(s) (v1.4 burst).
+
+        Captures ``burst`` frames roughly :data:`BURST_FRAME_INTERVAL_S` apart,
+        each one confirmed fresh from the capture thread (never the same JPEG
+        resent twice), then sends them as that many header+binary pairs sharing
+        ``request_id`` -- all under one hold of the wire lock -- each header
+        carrying ``seq``/``of``. ``burst=1`` (the default, and every pre-burst
+        caller) behaves exactly as the single-frame request always did.
 
         Never raises: a missing camera, a stale frame or an encoding error all
         come back to the server as ``camera_error`` so its tool call fails fast
-        instead of waiting for a timeout.
+        instead of waiting for a timeout; a burst that manages SOME frames but
+        not all of them still answers with what it has (a partial burst beats
+        none for the server's best-face selection).
         """
         request_id = str(request_id or "")
         if not self._enabled:
             await self._send_error(request_id, "the camera is not available on this client")
             return
-        frame, age = self._latest_frame()
-        if frame is None:
+        count = max(1, min(_as_int(burst, 1), CAMERA_BURST_MAX))
+
+        try:
+            pairs = await asyncio.to_thread(self._capture_burst_sync, count)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the client
+            error = str(exc).strip() or exc.__class__.__name__
+            log.warning("Could not capture the requested camera frame(s): %s", error)
+            await self._send_error(request_id, error)
+            return
+
+        if not pairs:
             reason = (
                 "the camera has no frame yet (still starting up)"
                 if self.running
@@ -648,25 +795,12 @@ class CameraService:
             )
             await self._send_error(request_id, reason)
             return
-        if age > STALE_FRAME_S:
-            await self._send_error(
-                request_id, f"the last camera frame is {age:.0f} s old - the camera stalled"
-            )
-            return
-        try:
-            jpeg, width, height = await asyncio.to_thread(self._encode, frame)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - any encoding failure
-            error = str(exc).strip() or exc.__class__.__name__
-            log.warning("Could not encode the requested camera frame: %s", error)
-            await self._send_error(request_id, error)
-            return
+
         log.info(
-            "Answering the camera request (id=%s): %dx%d, %d bytes",
-            request_id or "?", width, height, len(jpeg),
+            "Answering the camera request (id=%s): %d/%d frame(s)",
+            request_id or "?", len(pairs), count,
         )
-        await self._send_frame(request_id, CAMERA_REASON_REQUEST, jpeg, width, height)
+        await self._send_burst(request_id, CAMERA_REASON_REQUEST, pairs)
 
     # ------------------------------------------------------------------
     # thread -> event loop

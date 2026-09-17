@@ -37,11 +37,13 @@ server:
     presence_ttl_s: 30       # forget someone this long after last seeing them
     greet_after_s: 10        # greet an unknown face after this many seconds
     greeting_cooldown_s: 300 # at most one proactive greeting per this window
+    burst_size: 3             # frames per multi-frame camera pull (v1.4 burst)
+    enroll_bursts: 3          # background bursts enroll_face pulls after its first sample
 
   segment:                   # SAM3 open-vocabulary object finder (v1.5, find_object tool)
     enabled: true
     checkpoint: third_party/sam3/server/model/sam3.pt   # resolved relative to the repo root
-    confidence: 0.5           # SAM3's own confidence threshold for keeping a match
+    confidence: 0.5           # SAM3 match threshold
 
   tts:
     engine: silero
@@ -109,4 +111,6 @@ client:
     #   description: main room light (button pusher on the wall switch)
     #   mac: "AA:BB:CC:DD:EE:FF"
     #   mode: press          # press | lever
+
+
 

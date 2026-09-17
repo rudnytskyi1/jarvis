@@ -24,6 +24,16 @@ share one request/binary-frame machinery, tagged by SOURCE. Unsolicited
 the ``{presence}`` block of the system prompt and the proactive greeting of an
 unknown face. Everything camera-related is best-effort: a missing, broken or
 disabled camera/face stack never disturbs the voice pipeline.
+
+v1.4 burst extension: a ``camera_request`` may ask for several frames at once
+(``burst``, up to :data:`common.protocol.CAMERA_BURST_MAX`) and presence
+pushes are themselves small bursts, each frame header carrying ``seq``/``of``
+(see :meth:`Connection._request_image`, :meth:`Connection._buffer_presence_frame`).
+Staged face enrollment (:meth:`Connection._run_enroll_face`) uses this to take
+its first sample immediately and a background task (per connection, cancelled
+on disconnect) to keep sampling a few seconds longer while the person turns
+their head, mirroring how voice enrollment collects extra samples over several
+utterances instead of blocking the first reply.
 """
 
 from __future__ import annotations
@@ -84,6 +94,13 @@ SCREENSHOT_TIMEOUT_S = 120.0
 #: A camera grab is one frame of an already-running capture: far quicker than a
 #: screenshot, and the client answers with camera_error when it has no camera.
 CAMERA_TIMEOUT_S = 30.0
+#: v1.4 burst: per-pair timeout once a request asks for more than one frame,
+#: so a multi-frame pull's overall wait is capped around ``burst * 5s`` instead
+#: of ``burst * CAMERA_TIMEOUT_S`` -- a burst frame is just as quick as a single
+#: one (same already-running capture), it is only the head-turn spacing in
+#: enroll_face that takes real seconds, and that lives in the background task,
+#: not in this per-frame wait.
+CAMERA_BURST_FRAME_TIMEOUT_S = 5.0
 
 #: Image sources sharing the request/binary-frame machinery (SPEC §4, v1.4).
 SOURCE_SCREEN = "screen"
@@ -125,6 +142,10 @@ SAY_FALLBACK_GREETING = "Good day. I am Rowan, the assistant of this room."
 #: While voice enrollment is collecting samples the user needs room to speak:
 #: the follow-up window the client holds open after our reply (SPEC §4 say.listen_s).
 ENROLL_LISTEN_S = 12.0
+#: v1.4 burst: gap between the background bursts of a staged face enrollment
+#: ("2-3 s apart" per SPEC); at the default 3 background bursts this totals
+#: the ~9 s SPEC describes.
+ENROLL_FACE_INTERVAL_S = 3.0
 
 #: SPEC §4: the error sent when STT produced nothing (shared with the client).
 ERROR_EMPTY_TRANSCRIPT = proto.ERR_EMPTY_TRANSCRIPT
@@ -141,7 +162,10 @@ class ImageFrame:
     client multiplies the normalized click coordinates by (a camera frame has
     no desktop, so they simply repeat ``w``/``h``). ``source`` is
     :data:`SOURCE_SCREEN` or :data:`SOURCE_CAMERA`, ``reason`` tells a pulled
-    frame from a pushed presence frame.
+    frame from a pushed presence frame. ``seq``/``of`` (v1.4 burst) are the
+    1-based position of this frame within its burst and the burst's total size
+    — ``1``/``1`` for a plain single frame, which is every screenshot and every
+    pre-burst camera frame.
     """
 
     jpeg: bytes
@@ -151,6 +175,8 @@ class ImageFrame:
     screen_h: int
     source: str = SOURCE_SCREEN
     reason: str = REASON_REQUEST
+    seq: int = 1
+    of: int = 1
 
 
 #: v1.1 name of the same record; screenshots are just the ``screen`` source.
@@ -423,6 +449,11 @@ class Connection:
         self._pending_actions: dict[str, asyncio.Future] = {}
         #: Image source tag -> the future waiting for that JPEG (SPEC §4, v1.4).
         self._image_futures: dict[str, asyncio.Future] = {}
+        #: Image source tag -> lock serializing pulls of that source (v1.4
+        #: burst): the enroll_face background sampler and a fresh utterance's
+        #: own look_at_camera/enroll_face could otherwise both try to pull a
+        #: camera frame at once and race on the single _image_futures slot.
+        self._image_pull_locks: dict[str, asyncio.Lock] = {}
         #: Image source tag -> the request id that future is waiting for.
         self._image_ids: dict[str, str] = {}
         #: Set by an image header: whose JPEG the next binary frame carries.
@@ -452,13 +483,21 @@ class Connection:
         self.presence = PresenceTracker(getattr(face_cfg, "presence_ttl_s", 30.0))
         #: Last ``camera_state``: ``{"persons": int, "objects": dict, "ts": float}``.
         self.camera_state: dict[str, Any] | None = None
-        #: True while a presence frame is being matched (later ones are dropped).
+        #: True while a presence burst is being matched (later ones are dropped).
         self._presence_busy = False
         self._presence_tasks: set[asyncio.Task] = set()
+        #: v1.4 burst: frames of the presence mini-burst currently being
+        #: assembled, keyed by the burst's own id so an incomplete burst never
+        #: gets mixed up with the next one.
+        self._presence_burst_id = ""
+        self._presence_burst_frames: list[ImageFrame] = []
         #: Serializes reply streaming: an utterance reply and a proactive
         #: greeting can never interleave on the wire.
         self._reply_lock = asyncio.Lock()
         self._greet_task: asyncio.Task | None = None
+        #: v1.4 burst: background task collecting the extra staged samples of
+        #: the enroll_face currently in progress on this connection, if any.
+        self._enroll_face_task: asyncio.Task | None = None
         #: Monotonic clock of the last TTS stream pushed to the client.
         self._last_audio_at = 0.0
         #: Monotonic clock of the last proactive greeting (0 = never greeted).
@@ -711,6 +750,11 @@ class Connection:
                 log.info("An image header had no size — the JPEG says %dx%d", width, height)
             else:
                 log.warning("An image header had no size and the JPEG could not be measured")
+        # v1.4 burst: seq/of default to 1/1 so a header without them (an older
+        # client, or a screenshot which never carries them) is just a plain
+        # single frame, exactly like before the burst extension.
+        seq = _positive_int(header.get("seq")) or 1
+        of = _positive_int(header.get("of")) or 1
         return ImageFrame(
             jpeg=jpeg,
             w=int(width or 0),
@@ -720,6 +764,8 @@ class Connection:
             screen_h=int(header.get("screen_h") or height or 0),
             source=str(header.get("source") or SOURCE_SCREEN),
             reason=str(header.get("reason") or REASON_REQUEST),
+            seq=seq,
+            of=max(of, seq),
         )
 
     def _deliver_image(self, data: bytes) -> None:
@@ -741,10 +787,10 @@ class Connection:
         frame = self._build_frame(data, header)
         if source == SOURCE_CAMERA and reason == REASON_PRESENCE:
             log.debug(
-                "Presence frame from %s (%d KB, %dx%d)",
-                self.peer, len(frame.jpeg) // 1024, frame.w, frame.h,
+                "Presence frame from %s (%d KB, %dx%d) %d/%d",
+                self.peer, len(frame.jpeg) // 1024, frame.w, frame.h, frame.seq, frame.of,
             )
-            self._on_presence_frame(frame)
+            self._buffer_presence_frame(frame)
             return
         if not waiting or future is None:
             log.warning("%s bytes arrived with nothing waiting for them", source)
@@ -868,100 +914,232 @@ class Connection:
         request_id: str,
         request_type: str,
         timeout_s: float,
-    ) -> ImageFrame | str:
-        """Pull one JPEG from the client and wait for it (SPEC §4, v1.4).
+        burst: int = 1,
+    ) -> list[ImageFrame] | str:
+        """Pull one or more JPEGs from the client and wait for them (SPEC §4, v1.4).
 
-        Shared by ``screenshot_request`` and ``camera_request``: only the
-        source tag, the message type and the timeout differ. Returns the
-        :class:`ImageFrame` on success, or an error message ready to be handed
-        to the LLM as a tool result.
+        Shared by ``screenshot_request`` (always ``burst=1``) and
+        ``camera_request`` (``burst`` 1-5, v1.4's burst extension): only the
+        source tag, the message type, the timeout and the burst size differ.
+        Sends ONE request, then waits for up to ``burst`` header+binary pairs
+        sharing its id, each pair awaited with its own timeout — a per-pair
+        timeout, same mechanism as the single-frame wait always used, so a slow
+        client fails one pair at a time instead of the whole burst together —
+        and stops as soon as a frame reports ``seq >= of``. A burst request
+        also asks for at most :data:`proto.CAMERA_BURST_MAX` frames.
+
+        :returns: the frames collected so far as a list — non-empty on any
+            success, even a partial burst (a caller doing best-of-burst
+            selection, like ``enroll_face``, can use what arrived) — or an
+            error string ready to be handed to the LLM as a tool result when
+            NOTHING could be captured at all. Single-frame callers
+            (``burst=1``) get a length-1 list on success, unchanged otherwise.
+
+        Serialized per source (:attr:`_image_pull_locks`): the enroll_face
+        background task and a fresh utterance's own camera tool call could
+        otherwise both be pulling a camera frame at the same time and stomp on
+        each other's single ``_image_futures[source]`` slot.
         """
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._image_futures[source] = future
-        self._image_ids[source] = request_id
+        async with self._pull_lock(source):
+            return await self._request_image_locked(source, request_id, request_type, timeout_s, burst)
+
+    def _pull_lock(self, source: str) -> asyncio.Lock:
+        lock = self._image_pull_locks.get(source)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._image_pull_locks[source] = lock
+        return lock
+
+    async def _request_image_locked(
+        self,
+        source: str,
+        request_id: str,
+        request_type: str,
+        timeout_s: float,
+        burst: int = 1,
+    ) -> list[ImageFrame] | str:
+        """The body of :meth:`_request_image`, run under its per-source lock."""
+        requested = max(1, min(int(burst or 1), proto.CAMERA_BURST_MAX))
+        payload: dict[str, Any] = {"type": request_type, "id": request_id}
+        if source == SOURCE_CAMERA and requested != 1:
+            payload["burst"] = requested
         try:
-            await self.send_json({"type": request_type, "id": request_id})
-            log.info("Requested a %s frame (%s)", source, request_id)
-            captured = await asyncio.wait_for(future, timeout=timeout_s)
-        except asyncio.TimeoutError:
-            log.warning("%s request %s timed out after %.0f s", source, request_id, timeout_s)
-            return proto.ERR_CLIENT_TIMEOUT
+            await self.send_json(payload)
         except (WebSocketDisconnect, RuntimeError) as exc:
             log.warning("Could not request a %s frame (%s): %s", source, request_id, exc)
             return "client disconnected"
-        finally:
-            self._image_futures.pop(source, None)
-            self._image_ids.pop(source, None)
-            # Only drop an announcement that belongs to THIS request: a
-            # presence frame may have been announced while we were waiting.
-            if (
-                self._expect_image == source
-                and str(self._image_header.get("reason") or "") != REASON_PRESENCE
-            ):
-                self._expect_image = None
-                self._image_header = {}
+        log.info(
+            "Requested a %s frame (%s)%s",
+            source, request_id, f", burst={requested}" if requested != 1 else "",
+        )
 
-        if isinstance(captured, ImageFrame):
-            return captured
-        if isinstance(captured, dict):
-            return str(captured.get("error") or f"{source} capture failed")
-        return f"{source} capture failed"
+        per_pair_timeout = timeout_s if requested <= 1 else min(timeout_s, CAMERA_BURST_FRAME_TIMEOUT_S)
+        loop = asyncio.get_running_loop()
+        collected: list[ImageFrame] = []
+        error: str | None = None
+        for _ in range(requested):
+            future: asyncio.Future = loop.create_future()
+            self._image_futures[source] = future
+            self._image_ids[source] = request_id
+            try:
+                captured = await asyncio.wait_for(future, timeout=per_pair_timeout)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "%s request %s timed out after %.0f s (%d/%d frame(s) received)",
+                    source, request_id, per_pair_timeout, len(collected), requested,
+                )
+                error = proto.ERR_CLIENT_TIMEOUT
+                break
+            except (WebSocketDisconnect, RuntimeError) as exc:
+                log.warning("Could not wait for a %s frame (%s): %s", source, request_id, exc)
+                error = "client disconnected"
+                break
+            finally:
+                self._image_futures.pop(source, None)
+                self._image_ids.pop(source, None)
+                # Only drop an announcement that belongs to THIS request: a
+                # presence frame may have been announced while we were waiting.
+                if (
+                    self._expect_image == source
+                    and str(self._image_header.get("reason") or "") != REASON_PRESENCE
+                ):
+                    self._expect_image = None
+                    self._image_header = {}
+
+            if isinstance(captured, ImageFrame):
+                collected.append(captured)
+                if captured.seq >= max(captured.of, 1):
+                    break
+                continue
+            if isinstance(captured, dict):
+                error = str(captured.get("error") or f"{source} capture failed")
+            else:
+                error = f"{source} capture failed"
+            break
+
+        if collected:
+            return collected
+        return error or f"{source} capture failed"
 
     async def _request_screenshot(self, shot_id: str) -> ImageFrame | str:
         """Ask the client for a screenshot of the room PC (SPEC §4)."""
-        return await self._request_image(
+        result = await self._request_image(
             SOURCE_SCREEN, shot_id, proto.MSG_SCREENSHOT_REQUEST, SCREENSHOT_TIMEOUT_S
         )
+        return result[0] if isinstance(result, list) else result
 
     async def _request_camera_frame(self, frame_id: str) -> ImageFrame | str:
         """Ask the client for one frame of the room camera (SPEC v1.4)."""
-        return await self._request_image(
+        result = await self._request_image(
             SOURCE_CAMERA, frame_id, proto.MSG_CAMERA_REQUEST, CAMERA_TIMEOUT_S
+        )
+        return result[0] if isinstance(result, list) else result
+
+    async def _request_camera_burst(self, frame_id: str, burst: int) -> list[ImageFrame] | str:
+        """Ask the client for a burst of camera frames (SPEC v1.4 burst).
+
+        Used by staged face enrollment, which needs several angles of the same
+        person to pick the best one from — ``look_at_camera`` and
+        ``find_object`` keep pulling a single frame via
+        :meth:`_request_camera_frame`.
+        """
+        return await self._request_image(
+            SOURCE_CAMERA, frame_id, proto.MSG_CAMERA_REQUEST, CAMERA_TIMEOUT_S, burst=burst
         )
 
     # ------------------------------------------------------------------ presence
 
-    def _on_presence_frame(self, frame: ImageFrame) -> None:
-        """Match one pushed camera frame against the face profiles (SPEC v1.4).
+    def _buffer_presence_frame(self, frame: ImageFrame) -> None:
+        """Accumulate one frame of a presence mini-burst (SPEC v1.4 burst).
+
+        The client now pushes presence as a burst of several frames sharing
+        one id, headers carrying ``seq``/``of`` — dispatched to matching once
+        the last one (``seq >= of``) arrives, or at once for a plain single
+        frame (``of == 1``), so pre-burst behaviour is unchanged.
+        """
+        if frame.id and frame.id != self._presence_burst_id:
+            # A new burst started (or the previous one was abandoned mid-way,
+            # e.g. after a busy-matcher drop) — start collecting fresh.
+            self._presence_burst_id = frame.id
+            self._presence_burst_frames = []
+        self._presence_burst_frames.append(frame)
+        if frame.seq >= max(frame.of, 1) or len(self._presence_burst_frames) >= max(frame.of, 1):
+            burst = self._presence_burst_frames
+            self._presence_burst_frames = []
+            self._presence_burst_id = ""
+            self._on_presence_frame(burst)
+
+    def _on_presence_frame(self, frames: list[ImageFrame]) -> None:
+        """Match one completed presence burst against the face profiles (v1.4).
 
         Detection and embedding are heavy, so they run in a worker thread from
         a background task: the receive loop stays free for audio and action
-        results. While one frame is being matched later ones are dropped —
+        results. While one burst is being matched later ones are dropped —
         presence only needs the most recent picture, never a backlog.
         """
         engine = _face
-        if not self.face_enabled or engine is None or not engine.available:
+        if not self.face_enabled or engine is None or not engine.available or not frames:
             return
         if self._presence_busy:
-            log.debug("Dropping a presence frame — the previous one is still being matched")
+            log.debug("Dropping a presence burst — the previous one is still being matched")
             return
         self._presence_busy = True
-        task = asyncio.create_task(self._match_presence(frame))
+        task = asyncio.create_task(self._match_presence(frames))
         self._presence_tasks.add(task)
         task.add_done_callback(self._presence_tasks.discard)
 
-    async def _match_presence(self, frame: ImageFrame) -> None:
-        """Embed every face of a presence frame and update the tracker."""
+    async def _match_presence(self, frames: list[ImageFrame]) -> None:
+        """Match every frame of a presence burst and update the tracker (v1.4 burst).
+
+        Runs face matching over ALL frames of the burst instead of just one —
+        a person's face may be a bad angle or blurry in any single frame — and
+        keeps, per label, the BEST match score seen across the burst: a named
+        person counts as present the moment ANY frame matches them above the
+        threshold, deduplicated by name so several frames of the same person
+        never inflate to several entries. Unrecognised faces have no identity
+        to dedupe by, so instead the largest COUNT of unmatched faces seen in
+        any single frame is kept — the best estimate of how many distinct
+        strangers are actually in view (summing across frames would double
+        count the same stranger appearing in more than one frame).
+        """
         try:
             engine, registry = _face, _voices
             if engine is None or registry is None:
                 return
-            faces = await asyncio.to_thread(engine.detect_and_embed, frame.jpeg)
-            if not faces:
-                # Nobody recognisable in this frame; the ttl handles the rest.
-                return
             profiles = await asyncio.to_thread(registry.face_profiles)
-            labels: list[str] = []
-            for _area, embedding in faces:
-                name, _score = engine.match(embedding, profiles)
-                labels.append(name or LABEL_UNKNOWN)
+            best_named: dict[str, float] = {}
+            max_unknown = 0
+            any_face = False
+            for frame in frames:
+                faces = await asyncio.to_thread(engine.detect_and_embed, frame.jpeg)
+                if not faces:
+                    continue
+                any_face = True
+                frame_unknown = 0
+                for _area, embedding in faces:
+                    name, score = engine.match(embedding, profiles)
+                    if name:
+                        if score > best_named.get(name, -1.0):
+                            best_named[name] = score
+                    else:
+                        frame_unknown += 1
+                max_unknown = max(max_unknown, frame_unknown)
+            if not any_face:
+                # Nobody recognisable in this burst; the ttl handles the rest.
+                return
+            labels = list(best_named.keys()) + [LABEL_UNKNOWN] * max_unknown
             self.presence.note_faces(labels)
-            log.info("Presence in the room: %s", ", ".join(labels))
+            parts = [f"{name} ({score:.2f})" for name, score in best_named.items()]
+            if max_unknown:
+                parts.append(f"{max_unknown} unknown")
+            log.info(
+                "Presence in the room (burst of %d): %s",
+                len(frames), ", ".join(parts) if parts else "nobody matched",
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Could not match a presence frame")
+            log.exception("Could not match a presence burst")
         finally:
             self._presence_busy = False
 
@@ -1163,7 +1341,16 @@ class Connection:
         return result
 
     async def _run_enroll_face(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Store the largest face of a fresh camera frame for ``name`` (SPEC v1.4)."""
+        """Stage a face profile like voice enrollment (SPEC v1.4 burst).
+
+        The FIRST burst is pulled and stored right away — the best face across
+        it (by ``det_score * sqrt(bbox_area)``, see :meth:`server.face.FaceEngine.best_face`)
+        becomes the person's first face sample, creating them like
+        ``enroll_voice`` does. A background task then keeps sampling for a few
+        more seconds so the tool call itself returns fast, mirroring how voice
+        enrollment collects its extra samples from the utterances that follow
+        instead of blocking the first reply.
+        """
         name = " ".join(str(args.get("name") or "").split())
         frame_id = f"c{self._camera_seq}"
         self._camera_seq += 1
@@ -1185,19 +1372,22 @@ class Connection:
                 "voice enrollment still works"
             )
 
-        log.info("enroll_face (%s) for %s", frame_id, name)
-        captured = await self._request_camera_frame(frame_id)
+        face_cfg = getattr(getattr(self.cfg, "server", None), "face", None)
+        burst_size = max(1, _positive_int(getattr(face_cfg, "burst_size", 3)) or 3)
+        enroll_bursts = max(0, _positive_int(getattr(face_cfg, "enroll_bursts", 3)) or 0)
+
+        log.info("enroll_face (%s) for %s: first burst of %d frame(s)", frame_id, name, burst_size)
+        captured = await self._request_camera_burst(frame_id, burst_size)
         if isinstance(captured, str):
             return fail(captured)
 
-        faces = await asyncio.to_thread(engine.detect_and_embed, captured.jpeg)
-        if not faces:
+        best = await asyncio.to_thread(engine.best_face, [frame.jpeg for frame in captured])
+        if best is None:
             return fail(
-                "no face was visible in the camera frame - ask them to look "
+                "no face was visible in the camera frames - ask them to look "
                 "straight at the camera and try once more"
             )
-        # The largest face is the person standing in front of the camera.
-        _area, embedding = faces[0]
+        embedding, score = best
         try:
             role, status = await asyncio.to_thread(
                 _voices.add_face_embedding, name, embedding
@@ -1208,9 +1398,95 @@ class Connection:
             log.exception("Could not store a face sample for %s", name)
             return fail(f"could not store the face sample: {exc}")
 
-        result = {"ok": True, "role": role, "status": status, "faces_seen": len(faces)}
+        result: dict[str, Any] = {
+            "ok": True,
+            "role": role,
+            "status": status,
+            "faces_seen": len(captured),
+            "score": round(float(score), 3),
+        }
+        if enroll_bursts > 0:
+            result["next"] = (
+                "tell them to keep looking at the camera and slowly turn their "
+                "head left and right for the next several seconds - more "
+                "samples are collected automatically, no need to call this again"
+            )
+            self._start_enroll_face_task(name, enroll_bursts, burst_size)
         record["result"] = result
         return result
+
+    def _start_enroll_face_task(self, name: str, enroll_bursts: int, burst_size: int) -> None:
+        """Start the background sampler for ``name`` (SPEC v1.4 burst).
+
+        Per-connection and singular: a second ``enroll_face`` call (same
+        person or not) replaces whatever background sampling is still running
+        rather than piling up several of them on one camera.
+        """
+        previous = self._enroll_face_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._enroll_face_task = asyncio.create_task(
+            self._enroll_face_background(name, enroll_bursts, burst_size)
+        )
+
+    async def _enroll_face_background(self, name: str, enroll_bursts: int, burst_size: int) -> None:
+        """Collect extra face samples for ``name`` after the immediate one (v1.4 burst).
+
+        Pulls ``enroll_bursts`` more bursts, :data:`ENROLL_FACE_INTERVAL_S`
+        apart (so the whole run is roughly ``enroll_bursts *
+        ENROLL_FACE_INTERVAL_S`` — about 9 s at the defaults), each burst
+        contributing its own best-face embedding to the person (the per-person
+        cap in :mod:`server.speaker` still applies). Never raises: a failed or
+        empty burst is simply skipped — the person already has their first
+        sample from the immediate call. Cancelled on disconnect
+        (:meth:`Connection.close`).
+        """
+        added = 0
+        for i in range(enroll_bursts):
+            try:
+                await asyncio.sleep(ENROLL_FACE_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+            engine, registry = _face, _voices
+            if engine is None or registry is None or not self.face_enabled:
+                continue
+            frame_id = f"c{self._camera_seq}"
+            self._camera_seq += 1
+            try:
+                captured = await self._request_camera_burst(frame_id, burst_size)
+                if isinstance(captured, str):
+                    log.debug(
+                        "enroll_face background burst %d/%d failed for %s: %s",
+                        i + 1, enroll_bursts, name, captured,
+                    )
+                    continue
+                best = await asyncio.to_thread(engine.best_face, [frame.jpeg for frame in captured])
+                if best is None:
+                    continue
+                embedding, _score = best
+                await asyncio.to_thread(registry.add_face_embedding, name, embedding)
+                added += 1
+            except asyncio.CancelledError:
+                raise
+            except (WebSocketDisconnect, RuntimeError):
+                log.info("Client %s is gone - enroll_face background sampling stops", self.peer)
+                return
+            except Exception:
+                log.exception(
+                    "enroll_face background sampling failed for %s (burst %d/%d)",
+                    name, i + 1, enroll_bursts,
+                )
+
+        total = "?"
+        try:
+            if _voices is not None:
+                total = str(len(_voices.face_profiles().get(name, [])))
+        except Exception:
+            log.debug("Could not read the final face sample count for %s", name, exc_info=True)
+        log.info(
+            "Face enrollment for %s finished: %d extra sample(s) added (%s total)",
+            name, added, total,
+        )
 
     async def _run_find_object(self, args: dict[str, Any]) -> dict[str, Any]:
         """Count and locate objects described by ``target`` with SAM3 (v1.5).
@@ -1574,11 +1850,14 @@ class Connection:
 
     async def close(self) -> None:
         """Cancel everything still in flight and fail every pending wait."""
-        for background in (self._greet_task, *tuple(self._presence_tasks)):
+        for background in (self._greet_task, self._enroll_face_task, *tuple(self._presence_tasks)):
             if background is not None and not background.done():
                 background.cancel()
         self._greet_task = None
+        self._enroll_face_task = None
         self._presence_tasks.clear()
+        self._presence_burst_frames = []
+        self._presence_burst_id = ""
 
         task = self._task
         self._task = None
