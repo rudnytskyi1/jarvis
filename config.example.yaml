@@ -19,7 +19,7 @@ server:
     api_key: ollama
     think: false             # disable Qwen3 reasoning for fast voice replies
     vision_model: millard-qwen4:latest    # same model as chat = zero VRAM swapping on screen questions
-    temperature: 0.6
+    temperature: 0.3         # low keeps tool use disciplined (no claimed-but-not-done actions)
     max_tokens: 1024
     max_tool_rounds: 6       # how many tool-call rounds per utterance (computer-use chains need headroom)
     history_turns: 12        # how many recent exchanges to keep
