@@ -439,7 +439,7 @@ class CameraService:
                 return None, 0.0
             time.sleep(0.02)
 
-    def _capture_burst_sync(self, count: int) -> list:
+    def _capture_burst_sync(self, count: int, full: bool = False) -> list:
         """Capture up to ``count`` fresh frames ~250 ms apart, JPEG-encoded.
 
         Synchronous by design: called either via ``asyncio.to_thread`` (a
@@ -450,6 +450,9 @@ class CameraService:
         burst is still useful to the caller (the server's ``best_face`` picks
         the best of whatever arrives), this never raises.
 
+        :param full: v1.6 -- skip the usual :data:`MAX_SIDE_PX` downscale for
+            every frame of this burst (``find_object`` wants native
+            resolution); ``False`` (the default) is the pre-v1.6 behaviour.
         :returns: ``[(jpeg_bytes, width, height), …]``, shortest at ``[]``.
         """
         pairs: list = []
@@ -462,7 +465,7 @@ class CameraService:
                 break
             newer_than = ts
             try:
-                jpeg, width, height = self._encode(frame)
+                jpeg, width, height = self._encode(frame, full=full)
             except Exception as exc:  # noqa: BLE001 - encoding must not kill the caller
                 log.debug("Could not encode burst frame %d/%d: %s", seq, count, exc)
                 break
@@ -634,8 +637,12 @@ class CameraService:
             self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True)
         )
 
-    def _encode(self, frame: Any) -> Tuple[bytes, int, int]:
-        """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80."""
+    def _encode(self, frame: Any, full: bool = False) -> Tuple[bytes, int, int]:
+        """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80.
+
+        :param full: v1.6 -- skip the downscale entirely for this frame
+            (``find_object`` wants the detector to see native resolution).
+        """
         cv2 = self._cv2
         if cv2 is None:  # pragma: no cover - only reachable before the first frame
             raise CameraUnavailable("OpenCV is not loaded")
@@ -643,7 +650,7 @@ class CameraService:
         if width <= 0 or height <= 0:
             raise CameraUnavailable("the camera returned an empty frame")
         longest = max(width, height)
-        if longest > MAX_SIDE_PX:
+        if not full and longest > MAX_SIDE_PX:
             scale = MAX_SIDE_PX / float(longest)
             width = max(1, int(round(width * scale)))
             height = max(1, int(round(height * scale)))
@@ -755,7 +762,7 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_request (SPEC v1.4)
     # ------------------------------------------------------------------
-    async def serve_request(self, request_id: str, burst: int = 1) -> None:
+    async def serve_request(self, request_id: str, burst: int = 1, full: bool = False) -> None:
         """Answer the server's ``camera_request`` with ``burst`` frame(s) (v1.4 burst).
 
         Captures ``burst`` frames roughly :data:`BURST_FRAME_INTERVAL_S` apart,
@@ -764,6 +771,10 @@ class CameraService:
         ``request_id`` -- all under one hold of the wire lock -- each header
         carrying ``seq``/``of``. ``burst=1`` (the default, and every pre-burst
         caller) behaves exactly as the single-frame request always did.
+
+        :param full: v1.6 -- honor the request's ``"full": true`` (skip the
+            usual downscale for every frame of this pull; ``find_object``
+            wants native resolution).
 
         Never raises: a missing camera, a stale frame or an encoding error all
         come back to the server as ``camera_error`` so its tool call fails fast
@@ -778,7 +789,7 @@ class CameraService:
         count = max(1, min(_as_int(burst, 1), CAMERA_BURST_MAX))
 
         try:
-            pairs = await asyncio.to_thread(self._capture_burst_sync, count)
+            pairs = await asyncio.to_thread(self._capture_burst_sync, count, full)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the client

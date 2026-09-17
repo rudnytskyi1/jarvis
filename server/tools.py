@@ -1,18 +1,18 @@
 """OpenAI-style tool schemas exposed to the LLM, plus protocol helpers (SPEC §5).
 
-Twelve tools. Execution matrix:
+Thirteen tools. Execution matrix:
 
 * ``set_light``, ``set_switch``, ``pc_control``, ``run_command`` are CLIENT
   actions — forwarded to the room PC as protocol action items with the model's
   arguments verbatim; the tool result is the client's ``action_result``.
 * ``look_at_screen``, ``click_screen``, ``remember``, ``enroll_voice``,
-  ``set_role``, v1.4's ``look_at_camera`` / ``enroll_face`` and v1.5's
-  ``find_object`` run SERVER-side and are never forwarded verbatim.
-  ``click_screen`` runs a screenshot through the vision model in
-  ``server/app.py`` and then sends the client one :data:`MOUSE_CLICK_TOOL`
-  action with normalized coordinates; the camera/screen tools (including
-  ``find_object``) pull a frame with a ``camera_request``/``screenshot_request``
-  and answer from it.
+  ``set_role``, v1.4's ``look_at_camera`` / ``enroll_face``, v1.5's
+  ``find_object`` and v1.6's ``rename_person`` run SERVER-side and are never
+  forwarded verbatim. ``click_screen`` runs a screenshot through the vision
+  model in ``server/app.py`` and then sends the client one
+  :data:`MOUSE_CLICK_TOOL` action with normalized coordinates; the
+  camera/screen tools (including ``find_object``) pull a frame with a
+  ``camera_request``/``screenshot_request`` and answer from it.
 
 The same schema list is used by both LLM providers: Ollama's native ``/api/chat``
 accepts the OpenAI tool format unchanged.
@@ -409,6 +409,38 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "rename_person",
+            "description": (
+                "Correct or change an enrolled person's name — voice, face, or "
+                "both. Call it IMMEDIATELY when someone gives their real name "
+                "during or after enrollment, for example they say 'actually my "
+                "name is X' or they were enrolled under a placeholder and now "
+                "give a real one. Allowed for the speaker renaming THEMSELVES "
+                "(any role), or for an admin renaming anyone. Works even while "
+                "enrollment is still in progress. If new_name already belongs "
+                "to someone else, the two profiles are merged into one person. "
+                "Never tell someone a name cannot be changed — call this "
+                "instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_name": {
+                        "type": "string",
+                        "description": "The name currently on file (or being enrolled under).",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "The corrected or real name to use instead.",
+                    },
+                },
+                "required": ["old_name", "new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_role",
             "description": (
                 "Change an enrolled person's role. Only an admin speaker may do this "
@@ -440,7 +472,8 @@ CLIENT_TOOLS: frozenset[str] = frozenset(
 #: ``look_at_camera`` and ``enroll_face`` (v1.4) pull a camera frame with a
 #: ``camera_request`` and then run the vision model / the face engine here.
 #: ``find_object`` (v1.5) pulls a camera or screen frame the same way and runs
-#: it through SAM3 (``server/segment.py``).
+#: it through SAM3 (``server/segment.py``). ``rename_person`` (v1.6) only ever
+#: touches ``data/people.json`` — nothing is sent to the client for it.
 SERVER_TOOLS: frozenset[str] = frozenset(
     {
         "look_at_screen",
@@ -451,6 +484,7 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "look_at_camera",
         "enroll_face",
         "find_object",
+        "rename_person",
     }
 )
 

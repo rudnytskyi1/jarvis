@@ -37,13 +37,21 @@ Server -> Client
 * ``{"type": MSG_ACTIONS, "items": [{"id": str, "tool": str, "args": {...}}]}``
   -- may be sent several times per utterance (one per tool round).
 * ``{"type": MSG_SCREENSHOT_REQUEST, "id": str}``
-* ``{"type": MSG_CAMERA_REQUEST, "id": str, "burst": int}`` -- v1.4: pull one or more
-  camera frames. ``burst`` is optional (default :data:`CAMERA_BURST_DEFAULT`, capped at
-  :data:`CAMERA_BURST_MAX`); the client answers with that many ``camera_frame``
-  header+binary pairs sharing ``id`` (see the seq/of note above).
+* ``{"type": MSG_CAMERA_REQUEST, "id": str, "burst": int, "full": bool}`` -- v1.4:
+  pull one or more camera frames. ``burst`` is optional (default
+  :data:`CAMERA_BURST_DEFAULT`, capped at :data:`CAMERA_BURST_MAX`); the client
+  answers with that many ``camera_frame`` header+binary pairs sharing ``id``
+  (see the seq/of note above). ``full`` (v1.6, optional, default false) skips
+  the usual downscale for THIS pull only -- used by ``find_object`` so the
+  object detector sees the frame at native camera resolution.
 * ``{"type": MSG_SAY, "text": str}``
 * ``{"type": MSG_TTS_START, "sr": int, "format": "pcm_s16le", "channels": 1}``
   followed by binary PCM frames and ``{"type": MSG_TTS_END}``
+* ``{"type": MSG_IMAGE_SHOW, "id": str, "w": int, "h": int, "title": str,
+  "ttl_s": float}`` followed by exactly ONE binary frame with a JPEG -- v1.6:
+  show a photo on the room screen (``find_object`` pushes its annotated
+  detections here). ``ttl_s`` is how long the client keeps it up (default 60 on
+  the client side if omitted); a newer image replaces whatever is showing.
 * ``{"type": MSG_ERROR, "message": str}``
 
 Order per utterance: transcript -> zero or more rounds of actions and/or
@@ -53,11 +61,18 @@ v1.4: ``say`` + ``tts_start`` ... ``tts_end`` may also arrive UNSOLICITED betwee
 utterances (the proactive greeting of an unknown face), so the client keeps
 reading the socket while idle and plays such audio only when it is not busy.
 
+v1.6: ``image_show`` + its binary JPEG may also arrive UNSOLICITED, in EITHER
+idle or conversation mode (a tool call mid-utterance pushes it before the
+reply's own ``say``/``tts_start``): the reader handles the header+binary pair
+itself in both modes, never treating it as microphone audio, TTS or a
+conversation message.
+
 Binary-frame disambiguation: the client sends binary frames only between
 ``utterance_start``/``utterance_end`` and as the single frame announced by a
 ``screenshot`` or ``camera_frame`` header; they never overlap. A ``camera_frame``
 burst is several header+binary pairs sent back to back under the client's wire
-lock, so this rule still holds pair by pair.
+lock, so this rule still holds pair by pair. The server's ``image_show`` header
+is likewise always followed by exactly one binary frame.
 """
 
 from __future__ import annotations
@@ -89,6 +104,8 @@ MSG_CAMERA_REQUEST = "camera_request"
 MSG_SAY = "say"
 MSG_TTS_START = "tts_start"
 MSG_TTS_END = "tts_end"
+#: v1.6: show a photo on the room screen (header, then one binary JPEG frame).
+MSG_IMAGE_SHOW = "image_show"
 MSG_ERROR = "error"
 
 # --- shared literals used inside the frames ---------------------------------
@@ -157,6 +174,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_SAY,
         MSG_TTS_START,
         MSG_TTS_END,
+        MSG_IMAGE_SHOW,
         MSG_ERROR,
     }
 )
@@ -179,6 +197,7 @@ __all__ = [
     "MSG_SAY",
     "MSG_TTS_START",
     "MSG_TTS_END",
+    "MSG_IMAGE_SHOW",
     "MSG_ERROR",
     "WS_PATH",
     "AUDIO_FORMAT",

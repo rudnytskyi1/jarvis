@@ -57,7 +57,7 @@ from common.config import load_config
 from server import speaker as speaker_mod
 from server.face import FaceEngine
 from server.llm import LlmClient
-from server.segment import Sam3Engine
+from server.segment import Sam3Engine, draw_boxes
 from server.session import NO_PRESENCE_TEXT, Session
 from server.speaker import VoiceRegistry
 from server.storage import DialogLog, Memory
@@ -119,6 +119,12 @@ GREETING_POLL_S = 1.0
 #: A proactive greeting never starts right on top of audio the client may still
 #: be playing, nor immediately after an exchange ended.
 GREETING_QUIET_S = 5.0
+#: v1.6: hold the greeting when a KNOWN voice spoke on THIS connection within
+#: this window - a recent real conversation makes an unknown face on camera
+#: almost certainly that same person seen from a bad angle, not a stranger.
+KNOWN_VOICE_HOLDOFF_S = 180.0
+#: v1.6: how long an annotated detections photo stays on the room screen.
+IMAGE_SHOW_TTL_S = 60.0
 
 #: The camera frame is a photo of a room — the vision prompt is written for
 #: screenshots, so the query says what it is actually looking at.
@@ -134,8 +140,8 @@ GREETING_REQUEST = (
     "[system event: nobody is speaking to you right now. The room camera has "
     "been seeing a person you do not recognize for several seconds.] Greet them "
     "out loud, following your persona: one or two short sentences, introduce "
-    "yourself briefly and offer once to remember their voice. Do not call any "
-    "tools, just speak."
+    "yourself, ASK FOR THEIR NAME, and offer once to remember their voice. Do "
+    "not call any tools, just speak."
 )
 #: Spoken when the LLM is unreachable or answers nothing at all.
 SAY_FALLBACK_GREETING = "Good day. I am Rowan, the assistant of this room."
@@ -301,6 +307,34 @@ class PresenceTracker:
         self._unknown_count = 0
         self._empty_since = None
 
+    def reconcile(self, persons: int) -> None:
+        """Drop the unknown bucket when named labels already cover YOLO (v1.6).
+
+        The same not-yet-enrolled (or badly-angled) person can be seen as BOTH
+        a named label (a good-angle frame matched them) and the unknown bucket
+        (a worse-angle frame, or an older presence sighting that has not
+        expired yet) at once, which used to tell the owner "you and an
+        unknown person" while they were alone. If YOLO's own person count is
+        already met or exceeded by the named labels currently tracked, that
+        unknown sighting cannot be a second real person, so it is dropped.
+        Does nothing when YOLO reports zero (no fresh signal to reconcile
+        against) or there is no unknown bucket to begin with.
+        """
+        if persons <= 0:
+            return
+        self._expire()
+        if LABEL_UNKNOWN not in self._seen:
+            return
+        named = sum(1 for label in self._seen if label != LABEL_UNKNOWN)
+        if named >= persons:
+            log.debug(
+                "Presence reconcile: %d named label(s) already cover the %d "
+                "YOLO person(s) - dropping the unknown bucket",
+                named, persons,
+            )
+            del self._seen[LABEL_UNKNOWN]
+            self._unknown_count = 0
+
     # -- queries ---------------------------------------------------------
 
     def _expire(self) -> None:
@@ -413,7 +447,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _segment = None
 
 
-app = FastAPI(title="Jarvis brain server", version="1.4", lifespan=lifespan)
+app = FastAPI(title="Jarvis brain server", version="1.6", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -468,6 +502,8 @@ class Connection:
         self._screenshot_seq = 1
         self._camera_seq = 1
         self._memory_seq = 1
+        #: v1.6: id counter for image_show pushes (find_object's annotated photo).
+        self._image_seq = 1
         self._utterance_actions: list[dict[str, Any]] = []
         self._task: asyncio.Task | None = None
 
@@ -504,6 +540,9 @@ class Connection:
         self._last_audio_at = 0.0
         #: Monotonic clock of the last proactive greeting (0 = never greeted).
         self._last_greeting_at = 0.0
+        #: v1.6: monotonic clock of the last utterance a KNOWN voice spoke on
+        #: this connection (0 = never) - holds the greeting off (see _may_greet).
+        self._last_known_voice_at = 0.0
 
     # ------------------------------------------------------------------ sending
 
@@ -668,6 +707,7 @@ class Connection:
         previous = self.camera_state or {}
         self.camera_state = {"persons": persons, "objects": objects, "ts": time.time()}
         self.presence.note_persons(persons)
+        self.presence.reconcile(persons)
         if previous.get("persons") != persons or previous.get("objects") != objects:
             # Only person-count changes earn a console line; object-label churn
             # (a phone appearing/disappearing) goes to DEBUG to keep it readable.
@@ -809,7 +849,9 @@ class Connection:
 
     async def _execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """ToolExecutor for :meth:`server.llm.LlmClient.generate` (SPEC §5 matrix)."""
-        denial = speaker_mod.check_permission(self._speaker_role, name, args)
+        denial = speaker_mod.check_permission(
+            self._speaker_role, name, args, self._speaker_name
+        )
         if denial is not None:
             log.info(
                 "Denied %s for %s (%s)", name, self._speaker_name, self._speaker_role
@@ -827,6 +869,8 @@ class Connection:
             return await self._run_enroll_voice(args)
         if name == "set_role":
             return await self._run_set_role(args)
+        if name == "rename_person":
+            return await self._run_rename_person(args)
         if name == "look_at_camera":
             return await self._run_look_at_camera(args)
         if name == "enroll_face":
@@ -837,12 +881,28 @@ class Connection:
         return {"ok": False, "error": f"unknown tool: {name}"}
 
     async def _run_enroll_voice(self, args: dict[str, Any]) -> dict[str, Any]:
-        """SPEC v1.3: store the current utterance as a voice sample."""
+        """SPEC v1.3/v1.6: store the current utterance as a voice sample.
+
+        v1.6: rejects placeholder names (Guest/User/Friend, ...) outright —
+        the model must ask for the person's real name instead — and starts
+        the pending enrollment tracking both accepted SAMPLES and total voiced
+        SECONDS (see :meth:`_enroll_progress_note`); it only completes once
+        both :data:`speaker_mod.ENROLL_MIN_SAMPLES` and
+        :data:`speaker_mod.MIN_ENROLL_SPEECH_S` are met.
+        """
         if _voices is None or not _voices.enabled:
             return {"ok": False, "error": "speaker recognition is disabled"}
         if not self._current_pcm:
             return {"ok": False, "error": "no utterance audio to sample"}
         name = str(args.get("name") or "").strip()
+        if speaker_mod.is_placeholder_name(name):
+            return {
+                "ok": False,
+                "error": (
+                    f"{name!r} is a placeholder name, not a real one - ask for "
+                    "their actual name before enrolling them"
+                ),
+            }
         try:
             role, status = await asyncio.to_thread(
                 _voices.enroll, name, self._current_pcm, self.sample_rate
@@ -851,7 +911,8 @@ class Connection:
             return {"ok": False, "error": str(exc)}
         self._enroll_pending = {
             "name": name,
-            "remaining": speaker_mod.ENROLL_EXTRA_SAMPLES,
+            "samples": 1,
+            "total_speech_s": speaker_mod.estimate_speech_seconds(self._current_pcm),
         }
         record = {
             "id": f"v{self._memory_seq}",
@@ -865,11 +926,22 @@ class Connection:
             "ok": True,
             "role": role,
             "status": status,
-            "next": (
-                f"ask {name} to say {speaker_mod.ENROLL_EXTRA_SAMPLES} more full "
-                "sentences - they are collected automatically"
-            ),
+            "next": self._enroll_progress_note(self._enroll_pending),
         }
+
+    @staticmethod
+    def _enroll_progress_note(pending: dict[str, Any]) -> str:
+        """Progress phrase for the model to relay (SPEC v1.6, both notes below)."""
+        name = pending.get("name") or "the speaker"
+        remaining_s = max(
+            0.0, speaker_mod.MIN_ENROLL_SPEECH_S - float(pending.get("total_speech_s") or 0.0)
+        )
+        if remaining_s > 0:
+            return (
+                f"about {remaining_s:.0f} more second(s) of speech needed for "
+                f"{name} - ask them to keep talking"
+            )
+        return f"one more full sentence needed for {name} - ask them to keep talking"
 
     async def _run_set_role(self, args: dict[str, Any]) -> dict[str, Any]:
         """SPEC v1.3: admin-only role change (permission already checked)."""
@@ -882,6 +954,38 @@ class Connection:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "role": applied}
+
+    async def _run_rename_person(self, args: dict[str, Any]) -> dict[str, Any]:
+        """SPEC v1.6: rename (or merge) an enrolled person.
+
+        Permission (admin, or the speaker renaming themselves) is already
+        checked by :func:`server.speaker.check_permission` before this ever
+        runs. Also updates an in-progress enrollment's pending name, so a
+        rename mid-enrollment keeps collecting samples under the corrected
+        name instead of losing them.
+        """
+        if _voices is None or not _voices.enabled:
+            return {"ok": False, "error": "speaker recognition is disabled"}
+        old_name = " ".join(str(args.get("old_name") or "").split())
+        new_name = " ".join(str(args.get("new_name") or "").split())
+        try:
+            role, status = await asyncio.to_thread(
+                _voices.rename_person, old_name, new_name
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        pending = self._enroll_pending
+        if pending and str(pending.get("name") or "").strip().lower() == old_name.lower():
+            pending["name"] = new_name
+            log.info("Enrollment in progress for %s renamed to %s", old_name, new_name)
+        if self._speaker_name.strip().lower() == old_name.lower():
+            self._speaker_name = new_name
+            if status == "merged":
+                self._speaker_role = role
+
+        log.info("rename_person: %s -> %s (%s, %s)", old_name, new_name, role, status)
+        return {"ok": True, "role": role, "status": status}
 
     async def _run_client_action(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Send one action to the client and wait for its ``action_result``."""
@@ -918,6 +1022,7 @@ class Connection:
         request_type: str,
         timeout_s: float,
         burst: int = 1,
+        full: bool = False,
     ) -> list[ImageFrame] | str:
         """Pull one or more JPEGs from the client and wait for them (SPEC §4, v1.4).
 
@@ -942,9 +1047,14 @@ class Connection:
         background task and a fresh utterance's own camera tool call could
         otherwise both be pulling a camera frame at the same time and stomp on
         each other's single ``_image_futures[source]`` slot.
+
+        :param full: v1.6, camera only - ask the client to skip its usual
+            downscale for this pull (``find_object`` wants native resolution).
         """
         async with self._pull_lock(source):
-            return await self._request_image_locked(source, request_id, request_type, timeout_s, burst)
+            return await self._request_image_locked(
+                source, request_id, request_type, timeout_s, burst, full
+            )
 
     def _pull_lock(self, source: str) -> asyncio.Lock:
         lock = self._image_pull_locks.get(source)
@@ -960,12 +1070,15 @@ class Connection:
         request_type: str,
         timeout_s: float,
         burst: int = 1,
+        full: bool = False,
     ) -> list[ImageFrame] | str:
         """The body of :meth:`_request_image`, run under its per-source lock."""
         requested = max(1, min(int(burst or 1), proto.CAMERA_BURST_MAX))
         payload: dict[str, Any] = {"type": request_type, "id": request_id}
         if source == SOURCE_CAMERA and requested != 1:
             payload["burst"] = requested
+        if source == SOURCE_CAMERA and full:
+            payload["full"] = True
         try:
             await self.send_json(payload)
         except (WebSocketDisconnect, RuntimeError) as exc:
@@ -1035,6 +1148,17 @@ class Connection:
         """Ask the client for one frame of the room camera (SPEC v1.4)."""
         result = await self._request_image(
             SOURCE_CAMERA, frame_id, proto.MSG_CAMERA_REQUEST, CAMERA_TIMEOUT_S
+        )
+        return result[0] if isinstance(result, list) else result
+
+    async def _request_camera_frame_full(self, frame_id: str) -> ImageFrame | str:
+        """Ask the client for one FULL-resolution camera frame (SPEC v1.6).
+
+        ``find_object`` wants the object detector to see the frame at native
+        camera resolution instead of the usual <=1280px presence downscale.
+        """
+        result = await self._request_image(
+            SOURCE_CAMERA, frame_id, proto.MSG_CAMERA_REQUEST, CAMERA_TIMEOUT_S, full=True
         )
         return result[0] if isinstance(result, list) else result
 
@@ -1202,6 +1326,20 @@ class Connection:
             cooldown = 300.0
         return after, cooldown
 
+    def _known_face_alone(self) -> bool:
+        """True when a known face is present together with exactly one YOLO person (v1.6).
+
+        That combination almost certainly means the "unknown" face the
+        greeting task is looking at is really the same known person caught at
+        a bad angle or not yet enrolled by face - not a second, genuine
+        stranger - so the greeting must hold fire.
+        """
+        persons = int((self.camera_state or {}).get("persons") or 0)
+        if persons != 1:
+            return False
+        present = self.presence.present()
+        return any(label != LABEL_UNKNOWN for label in present)
+
     def _may_greet(self, greet_after_s: float, cooldown_s: float) -> bool:
         """True when an unknown face has waited long enough and the room is idle."""
         engine = _face
@@ -1217,6 +1355,16 @@ class Connection:
         if self._last_audio_at and now - self._last_audio_at < GREETING_QUIET_S:
             return False
         if self._last_greeting_at and now - self._last_greeting_at < cooldown_s:
+            return False
+        # v1.6: a KNOWN voice on THIS connection recently, or a known face
+        # alone with exactly one YOLO person, means the "unknown" face is
+        # almost certainly that same not-yet-enrolled/badly-angled person.
+        if (
+            self._last_known_voice_at
+            and now - self._last_known_voice_at < KNOWN_VOICE_HOLDOFF_S
+        ):
+            return False
+        if self._known_face_alone():
             return False
         return self.presence.unknown_present_for() >= greet_after_s
 
@@ -1498,6 +1646,10 @@ class Connection:
         (same request/binary-frame machinery, chosen by ``source``), then runs
         it through :class:`server.segment.Sam3Engine` in a worker thread — SAM3
         inference is blocking CUDA work and must never touch the event loop.
+        A camera pull asks for FULL resolution (SPEC v1.6): the detector
+        should see the frame the way the C920 actually captured it, not the
+        <=1280px size presence pulls use. On a successful match (count > 0)
+        the boxes are drawn on the frame and pushed to the room screen (v1.6).
         """
         target = " ".join(str(args.get("target") or "").split())
         source = str(args.get("source") or SOURCE_CAMERA).strip().lower()
@@ -1526,7 +1678,7 @@ class Connection:
         if source == SOURCE_SCREEN:
             captured = await self._request_screenshot(frame_id)
         else:
-            captured = await self._request_camera_frame(frame_id)
+            captured = await self._request_camera_frame_full(frame_id)
         if isinstance(captured, str):
             return fail(captured)
 
@@ -1539,8 +1691,49 @@ class Connection:
                 result["summary"] = "found 1 match"
             else:
                 result["summary"] = f"found {count} matches"
+            if count > 0:
+                await self._push_detections_photo(captured, target, result)
         record["result"] = result
         return result
+
+    async def _push_detections_photo(
+        self, frame: ImageFrame, target: str, result: dict[str, Any]
+    ) -> None:
+        """Draw find_object's boxes on the pulled frame and show it (SPEC v1.6).
+
+        Best-effort: a failure here never touches ``result["ok"]`` — the tool
+        call already succeeded, only the bonus photo on the TV is at risk.
+        """
+        try:
+            count = int(result.get("count") or 0)
+            annotated = await asyncio.to_thread(
+                draw_boxes, frame.jpeg, result.get("boxes") or [], result.get("scores") or []
+            )
+            title = f"{target} - {count} found"
+            await self._send_image_show(annotated, frame.w, frame.h, title, IMAGE_SHOW_TTL_S)
+            result["note"] = "the annotated photo is now on the room screen - mention it"
+        except (WebSocketDisconnect, RuntimeError):
+            raise
+        except Exception:
+            log.exception("Could not push the find_object detections photo")
+
+    async def _send_image_show(
+        self, jpeg: bytes, w: int, h: int, title: str, ttl_s: float
+    ) -> None:
+        """Push one ``image_show`` header + its single binary JPEG (SPEC v1.6)."""
+        image_id = f"img{self._image_seq}"
+        self._image_seq += 1
+        await self.send_json(
+            {
+                "type": proto.MSG_IMAGE_SHOW,
+                "id": image_id,
+                "w": int(w),
+                "h": int(h),
+                "title": str(title),
+                "ttl_s": float(ttl_s),
+            }
+        )
+        await self.ws.send_bytes(jpeg)
 
     async def _run_click_screen(self, args: dict[str, Any]) -> dict[str, Any]:
         """Locate a described element on the screen and click it (SPEC §5, tool 6).
@@ -1643,9 +1836,16 @@ class Connection:
             )
             self._start_greeting_task()
         if self._task is not None and not self._task.done():
-            log.warning("Client %s sent a new utterance while the previous one is running", self.peer)
-            await self.send_error("busy with the previous utterance")
-            return
+            # v1.6: a new utterance INTERRUPTS the one in flight (the user said
+            # the wake word to stop a chain that was doing the wrong thing).
+            log.info("New utterance from %s interrupts the reply in flight", self.peer)
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - the old turn must not break the new one
+                log.debug("The cancelled turn ended noisily", exc_info=True)
         # A separate task: the receive loop must keep delivering action_result
         # and screenshot messages while the tool loop waits for them.
         self._task = asyncio.create_task(self._process_utterance(pcm))
@@ -1718,27 +1918,40 @@ class Connection:
                 _voices.identify, pcm, self.sample_rate
             )
             self._speaker_name, self._speaker_role, self._speaker_score = name, role, score
+            if name != speaker_mod.ROLE_UNKNOWN:
+                # v1.6: holds the greeting off while a known voice was just
+                # heard on this connection (see _may_greet).
+                self._last_known_voice_at = time.monotonic()
             pending = self._enroll_pending
             if pending:
+                # v1.6: every attempt counts its seconds, even a failed one —
+                # a too-short sample still tells us something about progress,
+                # it just asks for a LONGER sentence instead of "keep talking".
+                sample_s = speaker_mod.estimate_speech_seconds(pcm)
                 try:
                     await asyncio.to_thread(
                         _voices.enroll, pending["name"], pcm, self.sample_rate
                     )
-                    pending["remaining"] -= 1
                 except ValueError as exc:
-                    enroll_note = f" [enrollment: sample skipped - {exc}]"
+                    pending["total_speech_s"] = pending.get("total_speech_s", 0.0) + sample_s
+                    enroll_note = (
+                        f" [enrollment: that sample was too short to use for "
+                        f"{pending['name']} ({exc}) - ask for a LONGER sentence; "
+                        f"{self._enroll_progress_note(pending)}]"
+                    )
                 else:
-                    if pending["remaining"] <= 0:
+                    pending["samples"] = pending.get("samples", 0) + 1
+                    pending["total_speech_s"] = pending.get("total_speech_s", 0.0) + sample_s
+                    if speaker_mod.enrollment_complete(
+                        pending["samples"], pending["total_speech_s"]
+                    ):
                         self._enroll_pending = None
                         enroll_note = (
                             f" [enrollment: done - {pending['name']}'s voice profile "
                             "is complete, tell them so]"
                         )
                     else:
-                        enroll_note = (
-                            f" [enrollment: {pending['remaining']} sample(s) left for "
-                            f"{pending['name']} - ask them to say one more sentence]"
-                        )
+                        enroll_note = f" [enrollment: {self._enroll_progress_note(pending)}]"
 
         # The LLM sees who is talking and the live room view; permissions are
         # enforced server-side. Presence rides here (not in the system prompt)

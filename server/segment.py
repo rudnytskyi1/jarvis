@@ -38,6 +38,64 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: Directory holding the importable ``sam3`` package (scouted, not re-explored).
 SAM3_PACKAGE_DIR = REPO_ROOT / "third_party" / "sam3" / "server"
 
+#: v1.6: box color for the annotated detections photo pushed to the room
+#: screen (``#FF3355``, as PIL RGB).
+BOX_COLOR = (0xFF, 0x33, 0x55)
+BOX_WIDTH_PX = 3
+
+
+def draw_boxes(
+    jpeg_bytes: bytes,
+    boxes: list[Any] | None,
+    scores: list[Any] | None = None,
+    quality: int = 85,
+) -> bytes:
+    """Draw ``find_object``'s boxes on ``jpeg_bytes`` (v1.6, PIL, pure-python).
+
+    ``boxes`` are normalized ``[x1, y1, x2, y2]`` (0..1, exactly what
+    :meth:`Sam3Engine.segment` returns) — each drawn as a 3px rectangle in
+    :data:`BOX_COLOR` with its score as a small label above it. Used to put
+    the detections on the room TV so the owner can see what was found.
+
+    Never raises: any failure (bad bytes, an unreadable box row, no PIL) logs
+    and returns ``jpeg_bytes`` UNCHANGED, so a broken annotation never blocks
+    the photo push. Returns the input unchanged (no-op) when there is nothing
+    to draw.
+    """
+    if not jpeg_bytes or not boxes:
+        return jpeg_bytes
+    try:
+        from PIL import Image, ImageDraw  # noqa: PLC0415 - lazy, matches the rest of the module
+
+        with Image.open(io.BytesIO(jpeg_bytes)) as handle:
+            handle.load()
+            image = handle.convert("RGB")
+        width, height = image.size
+        draw = ImageDraw.Draw(image)
+        scores = scores or []
+        for index, box in enumerate(boxes):
+            try:
+                x1, y1, x2, y2 = (float(v) for v in box)
+            except (TypeError, ValueError):
+                log.warning("Skipping a malformed detection box: %r", box)
+                continue
+            rect = (x1 * width, y1 * height, x2 * width, y2 * height)
+            draw.rectangle(rect, outline=BOX_COLOR, width=BOX_WIDTH_PX)
+            if index < len(scores):
+                try:
+                    label = f"{float(scores[index]):.2f}"
+                except (TypeError, ValueError):
+                    label = ""
+                if label:
+                    label_y = max(0.0, rect[1] - 14)
+                    draw.text((rect[0] + 2, label_y), label, fill=BOX_COLOR)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=max(1, min(95, int(quality))))
+        return buffer.getvalue()
+    except Exception:
+        log.exception("Could not draw detection boxes on the frame - using the plain photo")
+        return jpeg_bytes
+
 
 class Sam3Engine:
     """Lazy SAM3 wrapper backing the ``find_object`` tool.
@@ -258,4 +316,4 @@ class Sam3Engine:
         return {"ok": True, "count": len(boxes_out), "boxes": boxes_out, "scores": scores_out}
 
 
-__all__ = ["Sam3Engine", "SAM3_PACKAGE_DIR"]
+__all__ = ["Sam3Engine", "SAM3_PACKAGE_DIR", "draw_boxes", "BOX_COLOR", "BOX_WIDTH_PX"]

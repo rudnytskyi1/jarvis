@@ -15,7 +15,7 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
-def test_twelve_tools_exposed():
+def test_thirteen_tools_exposed():
     assert tool_names() == {
         "set_light",
         "set_switch",
@@ -29,6 +29,7 @@ def test_twelve_tools_exposed():
         "look_at_camera",
         "enroll_face",
         "find_object",
+        "rename_person",
     }
 
 
@@ -47,6 +48,7 @@ def test_matrix_split():
         "look_at_camera",
         "enroll_face",
         "find_object",
+        "rename_person",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")
@@ -54,6 +56,8 @@ def test_matrix_split():
     assert not is_client_tool("look_at_camera") and not is_client_tool("enroll_face")
     # v1.5: find_object (SAM3) is server-side too, same as the other camera tools.
     assert not is_client_tool("find_object")
+    # v1.6: rename_person is server-side too (data/people.json only).
+    assert not is_client_tool("rename_person")
     assert SERVER_TOOLS.isdisjoint(CLIENT_TOOLS)
     assert set(tool_names()) == SERVER_TOOLS | CLIENT_TOOLS
 
@@ -70,6 +74,12 @@ def test_find_object_args():
     params = tool["function"]["parameters"]
     assert params["required"] == ["target"]
     assert set(params["properties"]["source"]["enum"]) == {"camera", "screen"}
+
+
+def test_rename_person_args():
+    tool = next(t for t in TOOLS if t["function"]["name"] == "rename_person")
+    params = tool["function"]["parameters"]
+    assert params["required"] == ["old_name", "new_name"]
 
 
 def test_pc_control_command_enum():

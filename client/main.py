@@ -27,8 +27,11 @@ background task (:meth:`JarvisClient._reader_loop`) owns ``ws.recv()`` for the
 lifetime of a connection and routes what it reads:
 
 * ``camera_request`` — answered at any moment from :mod:`client.camera`;
-* during a conversation — everything (binary frames included) goes into an
-  ``asyncio.Queue`` that :meth:`JarvisClient._receive_response` consumes;
+* ``image_show`` (v1.6) — its header + single binary JPEG are handled
+  directly by the reader in EITHER mode and handed to :mod:`client.viewer`,
+  never queued as a conversation message or mistaken for TTS/mic audio;
+* during a conversation — everything else (binary frames included) goes into
+  an ``asyncio.Queue`` that :meth:`JarvisClient._receive_response` consumes;
 * while idle — a proactive ``say`` + ``tts_start``…``tts_end`` block is played
   through the speakers, and the wake word cuts it short and starts listening.
 
@@ -66,6 +69,7 @@ from common.protocol import (
     MSG_CAMERA_REQUEST,
     MSG_ERROR,
     MSG_HELLO,
+    MSG_IMAGE_SHOW,
     MSG_READY,
     MSG_SAY,
     MSG_SCREENSHOT,
@@ -108,6 +112,16 @@ try:
 except Exception as _camera_exc:  # noqa: BLE001 - pragma: no cover
     _CAMERA_IMPORT_ERROR = f"{type(_camera_exc).__name__}: {_camera_exc}"
     CameraService = None  # type: ignore[assignment]
+
+#: v1.6: the detections-photo viewer only lazily touches cv2 (inside its own
+#: methods), but the import is still guarded the same way as the camera
+#: stack — a broken checkout must never be able to stop the voice client.
+_VIEWER_IMPORT_ERROR: Optional[str] = None
+try:
+    from client.viewer import ImageViewer
+except Exception as _viewer_exc:  # noqa: BLE001 - pragma: no cover
+    _VIEWER_IMPORT_ERROR = f"{type(_viewer_exc).__name__}: {_viewer_exc}"
+    ImageViewer = None  # type: ignore[assignment]
 
 #: Audio format announced in ``utterance_start`` (SPEC §4).
 PCM_FORMAT = getattr(_protocol, "AUDIO_FORMAT", "pcm_s16le")
@@ -336,6 +350,13 @@ class JarvisClient:
         else:
             self.camera = CameraService(camera_cfg)
 
+        # -- v1.6: detections photo (find_object's image_show) -------------
+        self.viewer: Optional[Any] = ImageViewer() if ImageViewer is not None else None
+        if self.viewer is None:
+            log.debug("The detections viewer is not importable: %s", _VIEWER_IMPORT_ERROR)
+        #: The image_show header awaiting its single binary JPEG frame.
+        self._pending_image_show: Optional[Dict[str, Any]] = None
+
     # ------------------------------------------------------------------
     # setup / teardown
     # ------------------------------------------------------------------
@@ -373,6 +394,12 @@ class JarvisClient:
                 await asyncio.to_thread(camera.stop)
             except Exception as exc:  # pragma: no cover - teardown
                 log.debug("Error while stopping the camera: %s", exc)
+        viewer = self.viewer
+        if viewer is not None:
+            try:
+                await asyncio.to_thread(viewer.close)
+            except Exception as exc:  # pragma: no cover - teardown
+                log.debug("Error while stopping the detections viewer: %s", exc)
         task, self._action_task = self._action_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -493,6 +520,10 @@ class JarvisClient:
         await self._cancel_task(task, "socket reader")
         self._idle_stream_active = False
         self._idle_tts_active = False
+        # v1.6: an image_show header with no binary yet must not survive a
+        # dropped connection - the next frame on a fresh connection would
+        # otherwise be misrouted to the viewer instead of audio/TTS.
+        self._pending_image_show = None
         self._drain_inbox("message from the previous connection")
 
     def _drain_inbox(self, what: str) -> int:
@@ -535,7 +566,11 @@ class JarvisClient:
     async def _route_message(self, msg: Any) -> None:
         """Send one server message where it belongs (see the module docstring)."""
         if isinstance(msg, bytes):
-            if self._idle_stream_active:
+            if self._pending_image_show is not None:
+                # v1.6: the JPEG announced by an image_show header, in EITHER
+                # mode - never microphone audio, TTS or a conversation message.
+                await self._on_image_show_binary(msg)
+            elif self._idle_stream_active:
                 await self._on_idle_tts_chunk(msg)
             elif self._mode == MODE_CONVERSATION:
                 self._inbox.put_nowait(msg)
@@ -544,6 +579,11 @@ class JarvisClient:
             return
 
         mtype = msg.get("type")
+        if mtype == MSG_IMAGE_SHOW:
+            # v1.6: handled directly here, in both idle and conversation mode -
+            # the header just announces the ONE binary frame that follows it.
+            self._pending_image_show = dict(msg)
+            return
         if mtype == MSG_CAMERA_REQUEST:
             # Answered in both modes: the server pulls frames for
             # look_at_camera / enroll_face whenever it likes.
@@ -726,8 +766,19 @@ class JarvisClient:
         while not self._stopping:
             result = await self._handle_utterance(pre_roll, lead_in)
             if result == RESULT_BARGE_IN:
-                # The wake word cut the reply short: acknowledge and listen for
-                # the new command right away, no wake word needed.
+                # The wake word cut the turn short: drop whatever the abandoned
+                # reply left in the inbox, acknowledge, and listen for the new
+                # command right away - no wake word needed. The server cancels
+                # its in-flight task when the new utterance arrives.
+                stale = 0
+                while not self._inbox.empty():
+                    try:
+                        self._inbox.get_nowait()
+                        stale += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if stale:
+                    log.debug("Dropped %d stale message(s) of the abandoned turn", stale)
                 await self._beep(BEEP_FREQ_HZ, BEEP_MS)
                 pre_roll = self._drain_beep_window()
                 lead_in = None
@@ -908,8 +959,17 @@ class JarvisClient:
         self._barged = False
         result = RESULT_OK
         self._start_thinking()
+        # The wake word can interrupt the WHOLE turn, not only the spoken
+        # reply: while the server grinds through a long tool chain, saying
+        # "rowan" abandons this turn and records a new command (the server
+        # cancels the old task when the new utterance arrives).
+        self._start_barge_watch()
         try:
             while True:
+                if self._barged:
+                    log.info("Turn interrupted by the wake word - abandoning the reply")
+                    result = RESULT_BARGE_IN
+                    break
                 msg = await self._next_message()
                 if isinstance(msg, bytes):
                     await self._on_tts_chunk(msg)
@@ -937,11 +997,10 @@ class JarvisClient:
                     await self._on_tts_start(msg)
                     if self._says_wake_word(self._last_say):
                         # Rowan is about to SAY its own name: the mic would hear
-                        # it from the speakers and barge in on itself. Skip the
-                        # watcher for this one reply.
+                        # it from the speakers and barge in on itself. Stop the
+                        # watcher for this one playback.
                         log.info("Reply contains the wake word - barge-in off for it")
-                    else:
-                        self._start_barge_watch()
+                        await self._stop_barge_watch()
                 elif mtype == MSG_TTS_END:
                     self._tts_active = False
                     await self._stop_barge_watch()
@@ -1148,9 +1207,12 @@ class JarvisClient:
             burst = int(msg.get("burst") or 1)
         except (TypeError, ValueError):
             burst = 1
+        full = bool(msg.get("full"))  # v1.6: skip the downscale for this pull
         log.info(
-            "Camera frame requested (id=%s)%s",
-            request_id or "?", f" burst={burst}" if burst != 1 else "",
+            "Camera frame requested (id=%s)%s%s",
+            request_id or "?",
+            f" burst={burst}" if burst != 1 else "",
+            " full" if full else "",
         )
         camera = self.camera
         if camera is None:
@@ -1163,11 +1225,39 @@ class JarvisClient:
             )
             return
         try:
-            await camera.serve_request(request_id, burst)
+            await camera.serve_request(request_id, burst, full=full)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the camera never breaks the client
             log.warning("Could not answer the camera request: %s", exc)
+
+    # ------------------------------------------------------------------
+    # detections photo (SPEC v1.6, S->C image_show)
+    # ------------------------------------------------------------------
+    async def _on_image_show_binary(self, data: bytes) -> None:
+        """Hand the JPEG announced by ``image_show`` to :mod:`client.viewer`.
+
+        Accepted in BOTH idle and conversation mode (see ``_route_message``):
+        ``find_object`` can push this mid-utterance, well before the reply's
+        own ``say``/``tts_start``. Runs the viewer in a worker thread since
+        the first call may lazily import ``cv2``, which must never stall the
+        reader task.
+        """
+        header = self._pending_image_show or {}
+        self._pending_image_show = None
+        title = str(header.get("title") or "Jarvis")
+        try:
+            ttl_s = float(header.get("ttl_s") or 0.0)
+        except (TypeError, ValueError):
+            ttl_s = 0.0
+        log.info("Detections photo received (%r, %d bytes)", title, len(data))
+        if self.viewer is None:
+            log.debug("No detections viewer available - ignoring the photo")
+            return
+        try:
+            await asyncio.to_thread(self.viewer.show, data, title, ttl_s)
+        except Exception as exc:  # noqa: BLE001 - never let a viewer bug break the reader
+            log.warning("Could not show the detections photo: %s", exc)
 
     # ------------------------------------------------------------------
     # actions (executed by W3's dispatcher)

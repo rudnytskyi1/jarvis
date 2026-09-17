@@ -30,6 +30,14 @@ ROLE_TRUSTED = "trusted"
 ROLE_USER = "user"
 ROLE_UNKNOWN = "unknown"
 ROLES = (ROLE_ADMIN, ROLE_TRUSTED, ROLE_USER)
+#: Rank used to pick the winning role when ``rename_person`` merges two
+#: profiles (v1.6) - a merge must never demote whichever identity was admin.
+_ROLE_RANK = {ROLE_USER: 0, ROLE_TRUSTED: 1, ROLE_ADMIN: 2}
+
+
+def _higher_role(a: str, b: str) -> str:
+    """The more privileged of two roles (ties keep ``a``)."""
+    return a if _ROLE_RANK.get(a, 0) >= _ROLE_RANK.get(b, 0) else b
 
 DEFAULT_DATA_DIR = Path("data")
 #: v1.4: one registry file for voices, faces and roles.
@@ -47,10 +55,23 @@ LEGACY_VOICE_KEY = "embeddings"
 
 #: Extra samples collected after ``enroll_voice`` stored the first one.
 ENROLL_EXTRA_SAMPLES = 2
+#: v1.6: total accepted samples (first + extra) an enrollment needs at minimum.
+ENROLL_MIN_SAMPLES = 1 + ENROLL_EXTRA_SAMPLES
+#: v1.6: total voiced seconds (summed across every accepted sample) an
+#: enrollment needs at minimum, alongside :data:`ENROLL_MIN_SAMPLES`. A handful
+#: of one-word samples used to "complete" an enrollment on a profile too thin
+#: to actually recognize the person later.
+MIN_ENROLL_SPEECH_S = 10.0
 #: Cap per person so the profile file cannot grow without bound.
 MAX_SAMPLES_PER_PERSON = 10
 
+#: v1.6: names nobody should actually be enrolled under - the model must ask
+#: for the real name instead (enroll_voice and rename_person both reject them).
+PLACEHOLDER_NAMES = frozenset({"guest", "user", "friend"})
+
 _INT16_SCALE = 32768.0
+#: Mic wire format (SPEC §4): 16 kHz mono s16le, 2 bytes per sample.
+_PCM_SECOND_BYTES = 16000 * 2
 
 # ---------------------------------------------------------------------------
 # permissions
@@ -84,10 +105,23 @@ _TRUSTED_TOOLS = frozenset(
 )
 #: Tools that need admin.
 _ADMIN_TOOLS = frozenset({"run_command", "set_role"})
+#: ``rename_person`` (v1.6) is NOT in any tier above: its own admin-or-self
+#: rule lives directly in :func:`check_permission` because, unlike every other
+#: tool, it depends on WHO is speaking, not just their role.
 
 
-def check_permission(role: str, tool: str, args: dict[str, Any] | None) -> str | None:
-    """Return None when allowed, or the denial message for the LLM."""
+def check_permission(
+    role: str,
+    tool: str,
+    args: dict[str, Any] | None,
+    speaker_name: str | None = None,
+) -> str | None:
+    """Return None when allowed, or the denial message for the LLM.
+
+    ``speaker_name`` (v1.6) is only used by ``rename_person``: unlike every
+    other tool, its permission depends on WHO is talking, not just their role
+    - the speaker may always rename their own profile, whatever their role.
+    """
     role = role if role in ROLES else ROLE_UNKNOWN
 
     def deny(needed: str) -> str:
@@ -99,6 +133,19 @@ def check_permission(role: str, tool: str, args: dict[str, Any] | None) -> str |
 
     if tool in _EVERYONE_TOOLS:
         return None
+    if tool == "rename_person":
+        if role == ROLE_ADMIN:
+            return None
+        old_name = " ".join(str((args or {}).get("old_name") or "").split()).lower()
+        current = " ".join(str(speaker_name or "").split()).lower()
+        if old_name and current and old_name == current:
+            return None
+        return (
+            f"permission denied: rename_person requires admin, or the speaker "
+            f"being the person renamed, but the current speaker's role is "
+            f"{role} - politely refuse and suggest asking an authorized person "
+            "or the person themselves"
+        )
     if tool in _ADMIN_TOOLS:
         return None if role == ROLE_ADMIN else deny("admin")
     if tool in _TRUSTED_TOOLS:
@@ -123,6 +170,39 @@ def pcm_to_float32(pcm_s16le: bytes) -> np.ndarray:
     usable = len(pcm_s16le) - (len(pcm_s16le) % 2)
     samples = np.frombuffer(memoryview(pcm_s16le)[:usable], dtype="<i2")
     return samples.astype(np.float32) / _INT16_SCALE
+
+
+def is_placeholder_name(name: Any) -> bool:
+    """True when ``name`` is a reserved placeholder (v1.6, e.g. "Guest").
+
+    ``enroll_voice`` and ``rename_person`` both reject these - the model must
+    ask for the person's real name instead of enrolling them under one.
+    """
+    cleaned = " ".join(str(name or "").split()).strip().lower()
+    return cleaned in PLACEHOLDER_NAMES
+
+
+def estimate_speech_seconds(pcm_s16le: bytes | None) -> float:
+    """Rough voiced-seconds estimate for one accepted sample (v1.6).
+
+    The mic wire format is fixed (16 kHz mono s16le, SPEC §4), so this is a
+    plain byte-count conversion - not a VAD measurement, just the same
+    estimate :data:`MIN_ENROLL_SPEECH_S` is defined against.
+    """
+    if not pcm_s16le:
+        return 0.0
+    return max(0.0, len(pcm_s16le) / float(_PCM_SECOND_BYTES))
+
+
+def enrollment_complete(samples: int, total_speech_s: float) -> bool:
+    """True once an in-progress enrollment has both enough samples and speech.
+
+    v1.6: a handful of very short "yes"/"okay" samples used to complete
+    enrollment in 3 turns while producing a profile too thin to recognize the
+    person later, so BOTH :data:`ENROLL_MIN_SAMPLES` and
+    :data:`MIN_ENROLL_SPEECH_S` must be met.
+    """
+    return samples >= ENROLL_MIN_SAMPLES and total_speech_s >= MIN_ENROLL_SPEECH_S
 
 
 def _vector_list(raw: Any) -> list[list[float]]:
@@ -327,6 +407,11 @@ class VoiceRegistry:
         cleaned = " ".join(str(name or "").split())
         if not cleaned:
             raise ValueError("enroll_voice needs a non-empty name")
+        if is_placeholder_name(cleaned):
+            raise ValueError(
+                f"{cleaned!r} is a placeholder name, not a real one - ask for "
+                "their actual name before enrolling them"
+            )
         embedding = self._embed(pcm_s16le, sample_rate)
         if embedding is None:
             raise ValueError(
@@ -402,6 +487,60 @@ class VoiceRegistry:
         log.info("Role of %s set to %s", cleaned, role)
         return role
 
+    def rename_person(self, old_name: str, new_name: str) -> tuple[str, str]:
+        """Rename ``old_name`` to ``new_name`` (v1.6); returns ``(role, status)``.
+
+        Renames in place when ``new_name`` is not enrolled yet. When it
+        already is, the two profiles MERGE: voice and face embeddings are
+        concatenated (still capped at :data:`MAX_SAMPLES_PER_PERSON` each) and
+        the higher of the two roles wins, so neither a self-rename nor an
+        admin merging two profiles can ever demote an admin. Works mid
+        enrollment too - the caller (``server/app.py``) is the one that also
+        updates any in-progress enrollment's pending name.
+
+        :raises ValueError: either name is empty, ``new_name`` is a reserved
+            placeholder, or ``old_name`` has no profile.
+        :returns: ``(role, "renamed same name"|"renamed"|"merged")``.
+        """
+        old_clean = " ".join(str(old_name or "").split())
+        new_clean = " ".join(str(new_name or "").split())
+        if not old_clean:
+            raise ValueError("rename_person needs a non-empty old_name")
+        if not new_clean:
+            raise ValueError("rename_person needs a non-empty new_name")
+        if is_placeholder_name(new_clean):
+            raise ValueError(
+                f"{new_clean!r} is a placeholder name, not a real one - ask "
+                "for their actual name"
+            )
+        with self._lock:
+            person = self._people.get(old_clean)
+            if person is None:
+                known = ", ".join(sorted(self._people)) or "(nobody enrolled yet)"
+                raise ValueError(f"no profile for {old_clean!r}; enrolled: {known}")
+            role = str(person.get("role") or ROLE_USER)
+            if old_clean.lower() == new_clean.lower():
+                return role, "renamed same name"
+
+            target = self._people.get(new_clean)
+            if target is None:
+                self._people[new_clean] = self._people.pop(old_clean)
+                self._save_locked()
+                log.info("Renamed %s -> %s (%s)", old_clean, new_clean, role)
+                return role, "renamed"
+
+            # Merge into the existing target profile.
+            merged_role = _higher_role(str(target.get("role") or ROLE_USER), role)
+            target[VOICE_KEY] = list(target.get(VOICE_KEY) or []) + list(person.get(VOICE_KEY) or [])
+            del target[VOICE_KEY][:-MAX_SAMPLES_PER_PERSON]
+            target[FACE_KEY] = list(target.get(FACE_KEY) or []) + list(person.get(FACE_KEY) or [])
+            del target[FACE_KEY][:-MAX_SAMPLES_PER_PERSON]
+            target["role"] = merged_role
+            del self._people[old_clean]
+            self._save_locked()
+            log.info("Merged %s into existing profile %s (%s)", old_clean, new_clean, merged_role)
+            return merged_role, "merged"
+
 
 #: v1.4 name of the same class — it owns voices, faces and roles alike.
 PeopleRegistry = VoiceRegistry
@@ -419,11 +558,17 @@ __all__ = [
     "FACE_KEY",
     "LEGACY_VOICE_KEY",
     "ENROLL_EXTRA_SAMPLES",
+    "ENROLL_MIN_SAMPLES",
+    "MIN_ENROLL_SPEECH_S",
     "MAX_SAMPLES_PER_PERSON",
+    "PLACEHOLDER_NAMES",
     "SAFE_PC_COMMANDS",
     "check_permission",
     "normalize_people",
     "pcm_to_float32",
+    "is_placeholder_name",
+    "estimate_speech_seconds",
+    "enrollment_complete",
     "VoiceRegistry",
     "PeopleRegistry",
 ]

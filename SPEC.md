@@ -105,6 +105,53 @@ v1.4 — **camera, faces, presence** (the C920 on the room PC):
   installed separately) so the base client stays light; without them the client
   logs one clear warning and runs voice-only.
 
+v1.6 — **UX polish: detections photo, smarter greeting/presence, longer voice
+enrollment, renaming**:
+- **Detections photo on the TV**: new protocol message
+  `image_show {"type","id","w","h","title","ttl_s"}` (server -> client) followed
+  by ONE binary JPEG. The client accepts it in BOTH idle and conversation mode
+  (never mistaken for mic audio, TTS or a conversation message) and hands it to
+  `client/viewer.py`: a borderless, always-on-top OpenCV window driven from ONE
+  dedicated thread (`imshow`/`waitKey` — never from asyncio), auto-closing after
+  `ttl_s` (default 60 s); a newer image replaces the current one. Without `cv2`
+  it falls back to `data/last_detections.jpg` + `os.startfile`. After a
+  successful `find_object` with `count > 0`, the server draws the boxes on the
+  pulled frame (PIL, 3px rectangles + score labels, `#FF3355`), pushes it via
+  `image_show` (title `"<target> - N found"`, ttl 60) and adds
+  `"note": "the annotated photo is now on the room screen - mention it"` to the
+  tool result. Camera pulls for `find_object` request FULL resolution:
+  `camera_request` gains an optional `"full": true` (client skips the usual
+  1280px downscale for that one pull).
+- **Greeting asks the name, only for true strangers**: the greeting instruction
+  now explicitly asks the person for their NAME. The greeting task additionally
+  holds fire when a KNOWN voice spoke within the last 3 minutes on this
+  connection, or a KNOWN face is currently present together with exactly one
+  YOLO person — that "unknown" face is almost certainly the same
+  not-yet-enrolled or badly-angled person, not a second stranger.
+- **Presence reconcile**: `PresenceTracker` drops the unknown bucket once YOLO
+  reports N persons and there are already >= N fresh NAMED labels — the same
+  person at a bad angle was being double-counted, telling the owner "you and an
+  unknown person" while they were alone.
+- **Voice enrollment needs 10 seconds minimum**: `server/speaker.py` tracks
+  per-enrollment total voiced seconds (estimate: pcm bytes / (16000*2) per
+  accepted sample). Enrollment completes only once BOTH >= 3 samples AND
+  >= 10.0 s total speech are collected (`MIN_ENROLL_SPEECH_S = 10.0`); the
+  pending state in `server/app.py` stays open until then, each sample's
+  transcript-prefix note reports progress ("about N more seconds of speech
+  needed - ask them to keep talking"), and `say.listen_s` stays 12 while
+  pending. A too-short sample still counts its seconds, but the note asks for a
+  LONGER sentence instead.
+- **Rename a person**: new server tool `rename_person {"old_name","new_name"}`
+  — allowed when the requesting speaker IS `old_name` (self-rename, any role)
+  or is admin (`server/speaker.py: check_permission`'s own tier, since it
+  depends on WHO is speaking, not just their role); merges into an existing
+  target profile (embeddings concatenated, higher role wins) or renames in
+  place, and works mid-enrollment (updates the pending enrollment's name too).
+  `enroll_voice` (and `rename_person`'s `new_name`) reject placeholder names
+  (Guest/User/Friend) with a clear error; the persona is told to call
+  `rename_person` immediately when someone gives their real name, and to never
+  enroll anyone under a placeholder.
+
 Both machines check out the same repo. One `config.yaml` (copied from
 `config.example.yaml`) with `server:` and `client:` sections; each process reads its
 own section. Python 3.11+ (conda env `jarvis` exists on the brain PC:
