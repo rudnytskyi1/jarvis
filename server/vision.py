@@ -198,14 +198,12 @@ class VisionClient:
         #: Keep the vision model resident between screen questions, exactly like
         #: the chat model — with one model serving both there is nothing to swap.
         self.keep_alive = str(getattr(cfg_llm, "keep_alive", "4h") or "4h")
-        #: MUST match the chat model's num_ctx. Ollama reloads a model from disk
-        #: whenever a request changes runner options like num_ctx — with chat and
-        #: vision on the same model but different num_ctx, every screen question
-        #: paid two ~15 s reloads (chat->vision->chat). Same value = zero reloads.
-        try:
-            self.num_ctx = max(1024, int(getattr(cfg_llm, "num_ctx", 8192)))
-        except (TypeError, ValueError):
-            self.num_ctx = 8192
+        #: Small context on purpose. The vision model (qwen3-vl:8b) is a SEPARATE
+        #: model from the chat model now, so it must fit in VRAM ALONGSIDE millard
+        #: (22 GB) with OLLAMA_MAX_LOADED_MODELS>=2. A vision prompt + one image is
+        #: well under 4k tokens; 4096 keeps the model at ~6 GB (vs ~10 GB at its
+        #: 32k default) so both stay resident and there is nothing to swap.
+        self.num_ctx = 4096
         #: Cleared when the server rejects the "think" field (older Ollama builds).
         self._send_think = True
         self._client = httpx.Client(timeout=REQUEST_TIMEOUT_S)
