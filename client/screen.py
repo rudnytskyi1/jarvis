@@ -1,26 +1,33 @@
-"""Screen capture for the room client (SPEC §7, v1.1).
+"""Screen capture for the room client (SPEC §7, v1.1/v1.2).
 
-The server's ``look_at_screen`` tool asks this machine for a picture of its
-screen: it sends ``screenshot_request``, and the client answers with a
-``screenshot`` header followed by exactly ONE binary JPEG frame (SPEC §4).
+The server's ``look_at_screen`` and ``click_screen`` tools ask this machine for
+a picture of its screen: the server sends ``screenshot_request``, and the client
+answers with a ``screenshot`` header followed by exactly ONE binary JPEG frame
+(SPEC §4).
 
 Capture goes through Pillow's ``ImageGrab`` (Windows GDI) and is therefore
 blocking, so callers run it off the event loop::
 
     from client.screen import capture_jpeg
-    jpeg = await asyncio.to_thread(capture_jpeg)
+    capture = await asyncio.to_thread(capture_jpeg)
+    # capture.jpeg, capture.w/h (sent image), capture.screen_w/screen_h (desktop)
 
 The image is downscaled to at most :data:`MAX_WIDTH_PX` pixels wide and encoded
 as JPEG with quality :data:`JPEG_QUALITY` — enough detail for a vision model
-without pushing megabytes over the WebSocket. Any failure raises
-:class:`ScreenCaptureError` with a message the caller forwards verbatim in
-``screenshot_error``.
+without pushing megabytes over the WebSocket. v1.2 returns the dimensions
+alongside the bytes: the vision model answers ``click_screen`` in image pixels,
+so the server needs both the image size and the real desktop size to turn that
+answer into normalized screen coordinates for the client's ``mouse_click``.
+
+Any failure raises :class:`ScreenCaptureError` with a message the caller
+forwards verbatim in ``screenshot_error``.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+from dataclasses import dataclass
 from typing import Any, Tuple
 
 log = logging.getLogger(__name__)
@@ -36,6 +43,7 @@ __all__ = [
     "MAX_WIDTH_PX",
     "JPEG_QUALITY",
     "SCREENSHOT_FORMAT",
+    "Capture",
     "ScreenCaptureError",
     "capture_jpeg",
 ]
@@ -43,6 +51,24 @@ __all__ = [
 
 class ScreenCaptureError(RuntimeError):
     """The screen could not be grabbed or the image could not be encoded."""
+
+
+@dataclass(frozen=True)
+class Capture:
+    """One encoded screenshot plus the sizes the ``screenshot`` header carries.
+
+    :param jpeg: the encoded image bytes (the single binary frame).
+    :param w: width of the encoded image, after the downscale.
+    :param h: height of the encoded image, after the downscale.
+    :param screen_w: width of the real desktop, before the downscale.
+    :param screen_h: height of the real desktop, before the downscale.
+    """
+
+    jpeg: bytes
+    w: int
+    h: int
+    screen_w: int
+    screen_h: int
 
 
 def _load_pillow() -> Tuple[Any, Any]:
@@ -65,11 +91,13 @@ def _resample_filter(image_module: Any) -> Any:
     return image_module.LANCZOS  # pragma: no cover - Pillow < 9.1
 
 
-def capture_jpeg(max_width: int = MAX_WIDTH_PX, quality: int = JPEG_QUALITY) -> bytes:
-    """Grab the primary screen and return it as JPEG bytes.
+def capture_jpeg(max_width: int = MAX_WIDTH_PX, quality: int = JPEG_QUALITY) -> Capture:
+    """Grab the primary screen and return it as JPEG bytes plus its dimensions.
 
     :param max_width: downscale the grab so it is at most this many pixels wide.
     :param quality: JPEG quality (1..95).
+    :returns: a :class:`Capture` with the encoded image and both sizes the
+        ``screenshot`` header needs (SPEC §4, C->S #6).
     :raises ScreenCaptureError: capture or encoding failed — the message is
         meant to be sent to the server as ``screenshot_error.error``.
     """
@@ -126,4 +154,10 @@ def capture_jpeg(max_width: int = MAX_WIDTH_PX, quality: int = JPEG_QUALITY) -> 
         encoded_size[1],
         len(data),
     )
-    return data
+    return Capture(
+        jpeg=data,
+        w=int(encoded_size[0]),
+        h=int(encoded_size[1]),
+        screen_w=int(width),
+        screen_h=int(height),
+    )

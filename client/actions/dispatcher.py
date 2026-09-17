@@ -9,6 +9,11 @@ The client main loop receives ``{"type": "actions", "items": [{"id", "tool", "ar
 The third element is the data the LLM gets back in ``action_result.output``
 (SPEC §4/§8): ``run_command`` output, app-resolver hints, ``None`` otherwise.
 
+Routing (SPEC §5): ``set_light`` / ``set_switch`` go to the device registry,
+``pc_control`` (including v1.2's ``minimize_app``) and ``run_command`` to
+:mod:`client.actions.pc`, and ``mouse_click`` — the action the server's
+``click_screen`` tool produces — to :meth:`PCController.mouse_click`.
+
 :meth:`Dispatcher.execute` never raises: every failure becomes
 ``(False, "...", output_or_None)`` so the main loop can report it back via
 ``action_result`` and keep listening. (``asyncio.CancelledError`` is intentionally
@@ -44,7 +49,17 @@ TOOL_SET_LIGHT = "set_light"
 TOOL_SET_SWITCH = "set_switch"
 TOOL_PC_CONTROL = "pc_control"
 TOOL_RUN_COMMAND = "run_command"
-TOOLS = frozenset({TOOL_SET_LIGHT, TOOL_SET_SWITCH, TOOL_PC_CONTROL, TOOL_RUN_COMMAND})
+#: v1.2: produced server-side by ``click_screen``, not called by the LLM directly.
+TOOL_MOUSE_CLICK = "mouse_click"
+TOOLS = frozenset(
+    {
+        TOOL_SET_LIGHT,
+        TOOL_SET_SWITCH,
+        TOOL_PC_CONTROL,
+        TOOL_RUN_COMMAND,
+        TOOL_MOUSE_CLICK,
+    }
+)
 
 #: keys of an action item (SPEC §4)
 KEY_ID = "id"
@@ -132,6 +147,11 @@ class Dispatcher:
             elif tool == TOOL_PC_CONTROL:
                 result = await asyncio.wait_for(
                     self._pc_control(args), timeout=PC_TIMEOUT_S
+                )
+                detail, output = result.detail, result.output
+            elif tool == TOOL_MOUSE_CLICK:
+                result = await asyncio.wait_for(
+                    self._mouse_click(args), timeout=PC_TIMEOUT_S
                 )
                 detail, output = result.detail, result.output
             elif tool == TOOL_RUN_COMMAND:
@@ -239,6 +259,13 @@ class Dispatcher:
         if not result.detail:
             return PCResult(f"pc_control: {command}", result.output)
         return result
+
+    async def _mouse_click(self, args: dict[str, Any]) -> PCResult:
+        """Click a point the server derived from the screenshot (SPEC §5 tool 6)."""
+
+        return await self.pc.mouse_click(
+            args.get("x_norm"), args.get("y_norm"), args.get("button")
+        )
 
     async def _run_command(self, args: dict[str, Any]) -> tuple[bool, str | None, str | None]:
         return await self.pc.run_command(args.get("command"))

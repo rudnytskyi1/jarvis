@@ -15,13 +15,13 @@ server:
   llm:
     provider: ollama_native  # ollama_native (recommended: can disable thinking) | openai
     base_url: http://127.0.0.1:11434/v1   # /v1 is stripped automatically for ollama_native
-    model: qwen3:30b                      # Qwen3-30B-A3B; tool calling verified
+    model: millard-qwen4:latest           # Qwen3.6-35B-A3B multimodal; tool calling + vision verified
     api_key: ollama
     think: false             # disable Qwen3 reasoning for fast voice replies
-    vision_model: qwen3-vl:8b             # used by look_at_screen; 8B fits next to the chat model (no VRAM swap)
+    vision_model: millard-qwen4:latest    # same model as chat = zero VRAM swapping on screen questions
     temperature: 0.6
     max_tokens: 1024
-    max_tool_rounds: 4       # how many tool-call rounds per utterance
+    max_tool_rounds: 6       # how many tool-call rounds per utterance (computer-use chains need headroom)
     history_turns: 12        # how many recent exchanges to keep
     keep_alive: 4h           # keep the chat model in VRAM (Ollama unloads after 5 m otherwise)
     num_ctx: 8192            # requested context window; the 32k model default wastes VRAM

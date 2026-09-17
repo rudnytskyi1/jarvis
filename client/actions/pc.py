@@ -1,10 +1,17 @@
-"""Windows actions on the room PC — ``pc_control`` and ``run_command`` (SPEC §5/§8).
+"""Windows actions on the room PC — ``pc_control``, ``run_command`` and
+``mouse_click`` (SPEC §5/§8).
 
 Implemented with pycaw (master volume) and plain ctypes ``SendInput`` (media keys,
-unicode typing, hotkey combos, mouse jiggle), plus Win32 calls for monitor power
-and suspend. Applications are resolved through :mod:`client.actions.apps`, which
-indexes everything installed (Start Menu + Store apps) on top of the
-``cfg.client.apps`` overrides.
+unicode typing, hotkey combos, mouse moves and clicks), plus Win32 calls for
+monitor power, window minimizing and suspend. Applications are resolved through
+:mod:`client.actions.apps`, which indexes everything installed (Start Menu +
+Store apps) on top of the ``cfg.client.apps`` overrides.
+
+v1.2 adds two computer-use primitives: ``pc_control`` with ``minimize_app``
+(``EnumWindows`` over the app's processes, then ``ShowWindow(SW_MINIMIZE)``) and
+the standalone ``mouse_click`` action the server's ``click_screen`` tool
+produces — normalized 0..1 coordinates, scaled here to the real desktop
+resolution so the server never has to know it.
 
 All blocking work runs in worker threads (:func:`asyncio.to_thread`); the COM
 apartment needed by pycaw is initialised inside the worker thread.
@@ -13,7 +20,9 @@ apartment needed by pycaw is initialised inside the worker thread.
 from __future__ import annotations
 
 import asyncio
+import csv
 import ctypes
+import io
 import logging
 import subprocess
 import sys
@@ -28,6 +37,7 @@ from .apps import (
     AppError,
     AppIndex,
     decode_console_output,
+    normalize_app_name,
     powershell_executable,
 )
 
@@ -47,6 +57,7 @@ CMD_DISPLAY_ON = "display_on"
 CMD_SLEEP = "sleep"
 CMD_OPEN_APP = "open_app"
 CMD_CLOSE_APP = "close_app"
+CMD_MINIMIZE_APP = "minimize_app"
 CMD_TYPE_TEXT = "type_text"
 CMD_HOTKEY = "hotkey"
 
@@ -65,10 +76,49 @@ PC_COMMANDS = frozenset(
         CMD_SLEEP,
         CMD_OPEN_APP,
         CMD_CLOSE_APP,
+        CMD_MINIMIZE_APP,
         CMD_TYPE_TEXT,
         CMD_HOTKEY,
     }
 )
+
+# --- mouse_click (SPEC §5 tool 6 / §8) ---------------------------------------
+BUTTON_LEFT = "left"
+BUTTON_RIGHT = "right"
+BUTTON_DOUBLE = "double"
+
+#: spoken/model variants accepted for the ``button`` argument
+MOUSE_BUTTONS: dict[str, str] = {
+    "": BUTTON_LEFT,
+    "left": BUTTON_LEFT,
+    "l": BUTTON_LEFT,
+    "primary": BUTTON_LEFT,
+    "click": BUTTON_LEFT,
+    "right": BUTTON_RIGHT,
+    "r": BUTTON_RIGHT,
+    "secondary": BUTTON_RIGHT,
+    "context": BUTTON_RIGHT,
+    "double": BUTTON_DOUBLE,
+    "double click": BUTTON_DOUBLE,
+    "double_click": BUTTON_DOUBLE,
+    "doubleclick": BUTTON_DOUBLE,
+    "dblclick": BUTTON_DOUBLE,
+    "left double": BUTTON_DOUBLE,
+    "left_double": BUTTON_DOUBLE,
+}
+
+#: pause between the two clicks of a double click (below the Windows default
+#: double-click time of 500 ms, far enough apart for slow UI frameworks)
+DOUBLE_CLICK_GAP_S = 0.12
+
+#: pause after moving the cursor so hover states settle before the button press
+CLICK_SETTLE_S = 0.04
+
+#: how long ``tasklist`` may take while looking up an app's process ids
+TASKLIST_TIMEOUT_S = 15.0
+
+#: how many window titles a ``minimize_app`` result names back to the LLM
+MAX_REPORTED_WINDOWS = 3
 
 #: volume step for ``volume_up`` / ``volume_down`` (5 %)
 VOLUME_STEP = 0.05
@@ -96,6 +146,29 @@ _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
 _MOUSEEVENTF_MOVE = 0x0001
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_MOUSEEVENTF_RIGHTDOWN = 0x0008
+_MOUSEEVENTF_RIGHTUP = 0x0010
+
+#: button name -> (press flag, release flag); "double" reuses the left pair
+_MOUSE_BUTTON_EVENTS: dict[str, tuple[int, int]] = {
+    BUTTON_LEFT: (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
+    BUTTON_RIGHT: (_MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
+    BUTTON_DOUBLE: (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
+}
+
+#: GetSystemMetrics indices for the primary screen size
+_SM_CXSCREEN = 0
+_SM_CYSCREEN = 1
+
+#: ShowWindow command and the window styles/attributes used by minimize_app
+_SW_MINIMIZE = 6
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
+#: DwmGetWindowAttribute index telling whether a window is cloaked — UWP apps
+#: keep invisible "cloaked" frame windows around that must not count as open.
+_DWMWA_CLOAKED = 14
 
 VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
@@ -231,8 +304,21 @@ class _INPUT(ctypes.Structure):
     _fields_ = (("type", wintypes.DWORD), ("union", _INPUTUNION))
 
 
+#: EnumWindows callback signature: ``BOOL (HWND hwnd, LPARAM lparam)``
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+class _WindowInfo(NamedTuple):
+    """One visible top-level window found by :func:`_list_windows`."""
+
+    hwnd: int
+    pid: int
+    title: str
+
+
 _dll_lock = threading.Lock()
 _user32_dll: Any = None
+_dwmapi_dll: Any = None
 
 
 def _require_windows() -> None:
@@ -257,8 +343,56 @@ def _user32() -> Any:
                 wintypes.LPARAM,
             )
             dll.SendMessageW.restype = wintypes.LPARAM
+            # window enumeration / minimizing (SPEC §8, minimize_app)
+            dll.EnumWindows.argtypes = (_WNDENUMPROC, wintypes.LPARAM)
+            dll.EnumWindows.restype = wintypes.BOOL
+            dll.GetWindowThreadProcessId.argtypes = (
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.DWORD),
+            )
+            dll.GetWindowThreadProcessId.restype = wintypes.DWORD
+            dll.IsWindowVisible.argtypes = (wintypes.HWND,)
+            dll.IsWindowVisible.restype = wintypes.BOOL
+            dll.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+            dll.ShowWindow.restype = wintypes.BOOL
+            dll.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+            dll.GetWindowTextLengthW.restype = ctypes.c_int
+            dll.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+            dll.GetWindowTextW.restype = ctypes.c_int
+            dll.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+            dll.GetWindowLongW.restype = wintypes.LONG
+            # cursor / screen geometry (SPEC §8, mouse_click)
+            dll.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+            dll.SetCursorPos.restype = wintypes.BOOL
+            dll.GetSystemMetrics.argtypes = (ctypes.c_int,)
+            dll.GetSystemMetrics.restype = ctypes.c_int
             _user32_dll = dll
         return _user32_dll
+
+
+def _dwmapi() -> Any:
+    """Return a configured ``dwmapi`` handle, or ``None`` when unavailable."""
+
+    global _dwmapi_dll
+    if not _IS_WINDOWS:
+        return None
+    with _dll_lock:
+        if _dwmapi_dll is None:
+            try:
+                dll = ctypes.WinDLL("dwmapi")
+            except OSError as exc:  # pragma: no cover - dwmapi ships with Vista+
+                log.debug("dwmapi is unavailable, cloaked windows will count: %s", exc)
+                _dwmapi_dll = False
+                return None
+            dll.DwmGetWindowAttribute.argtypes = (
+                wintypes.HWND,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            )
+            dll.DwmGetWindowAttribute.restype = ctypes.c_long
+            _dwmapi_dll = dll
+        return _dwmapi_dll or None
 
 
 def _send_input(*events: _INPUT) -> None:
@@ -312,6 +446,17 @@ def _mouse_move_event(dx: int, dy: int) -> _INPUT:
             mi=_MOUSEINPUT(
                 dx=dx, dy=dy, mouseData=0, dwFlags=_MOUSEEVENTF_MOVE, time=0, dwExtraInfo=0
             )
+        ),
+    )
+
+
+def _mouse_button_event(flags: int) -> _INPUT:
+    """A button press/release at the cursor's current position (no movement)."""
+
+    return _INPUT(
+        type=_INPUT_MOUSE,
+        union=_INPUTUNION(
+            mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=flags, time=0, dwExtraInfo=0)
         ),
     )
 
@@ -636,6 +781,248 @@ def _sync_close_process(image_name: str) -> str:
     return output or f"process {image_name} terminated"
 
 
+# --- windows: minimize_app (SPEC §8, v1.2) -----------------------------------
+
+
+def _window_title(hwnd: Any) -> str:
+    """Read a window's caption; empty string when it has none."""
+
+    user32 = _user32()
+    length = int(user32.GetWindowTextLengthW(hwnd))
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    if int(user32.GetWindowTextW(hwnd, buffer, length + 1)) <= 0:
+        return ""
+    return buffer.value
+
+
+def _is_cloaked(hwnd: Any) -> bool:
+    """True for a DWM-cloaked window (a suspended/background UWP frame).
+
+    Those windows report ``IsWindowVisible() == TRUE`` while being nowhere on
+    screen, so minimizing one would look like success without the user seeing
+    anything happen.
+    """
+
+    dwmapi = _dwmapi()
+    if dwmapi is None:
+        return False
+    cloaked = wintypes.DWORD(0)
+    result = dwmapi.DwmGetWindowAttribute(
+        hwnd, _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+    )
+    return result == 0 and cloaked.value != 0
+
+
+def _list_windows() -> list[_WindowInfo]:
+    """Every visible top-level window that belongs to a real application.
+
+    ``EnumWindows`` walks the top-level windows of the desktop; tool windows,
+    cloaked frames and captionless helper windows are dropped because none of
+    them is something a user would think of as "the app's window".
+    """
+
+    _require_windows()
+    user32 = _user32()
+    windows: list[_WindowInfo] = []
+
+    @_WNDENUMPROC
+    def collect(hwnd: Any, _lparam: Any) -> bool:
+        # An exception inside a ctypes callback cannot reach the caller, so a
+        # window that misbehaves is skipped instead of breaking enumeration.
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if int(user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)) & _WS_EX_TOOLWINDOW:
+                return True
+            title = _window_title(hwnd)
+            if not title or _is_cloaked(hwnd):
+                return True
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            windows.append(_WindowInfo(hwnd=int(hwnd), pid=int(pid.value), title=title))
+        except Exception as exc:  # noqa: BLE001 - one bad window must not stop the walk
+            log.debug("skipping a window during enumeration: %s", exc)
+        return True
+
+    ctypes.set_last_error(0)
+    if not user32.EnumWindows(collect, 0) and not windows:
+        code = ctypes.get_last_error()
+        if code:
+            raise PCActionError(f"EnumWindows failed (error code {code})")
+    return windows
+
+
+def _sync_process_ids(image_name: str) -> set[int]:
+    """Process ids of every running instance of ``image_name`` (via ``tasklist``)."""
+
+    _require_windows()
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed command, name from the app index
+            ["tasklist", "/FO", "CSV", "/NH", "/FI", f"IMAGENAME eq {image_name}"],
+            capture_output=True,
+            creationflags=_CREATE_NO_WINDOW,
+            timeout=TASKLIST_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("tasklist timed out while looking for '%s'", image_name)
+        return set()
+    except OSError as exc:
+        log.warning("could not run tasklist for '%s': %s", image_name, exc)
+        return set()
+
+    if completed.returncode != 0:
+        log.debug("tasklist exited with code %s for '%s'", completed.returncode, image_name)
+        return set()
+
+    # CSV rows look like: "chrome.exe","12345","Console","1","250 000 K".
+    # When nothing matches, tasklist prints an INFO line instead of rows.
+    wanted = image_name.strip().casefold()
+    pids: set[int] = set()
+    for row in csv.reader(io.StringIO(decode_console_output(completed.stdout))):
+        if len(row) < 2 or row[0].strip().casefold() != wanted:
+            continue
+        digits = "".join(char for char in row[1] if char.isdigit())
+        if digits:
+            pids.add(int(digits))
+    return pids
+
+
+#: vendor words that say nothing about which app a window belongs to
+_GENERIC_NAME_WORDS = frozenset(
+    {"microsoft", "windows", "google", "app", "the", "and", "for", "new"}
+)
+
+#: punctuation trimmed off a word before comparing captions to app names
+_WORD_TRIM = ".,:;!?()[]{}\"'|*<>/\\–—"
+
+
+def _name_words(text: str) -> set[str]:
+    """Significant words of a normalised caption/app name (4+ chars, no vendor)."""
+
+    words = set()
+    for raw in text.split():
+        word = raw.strip(_WORD_TRIM)
+        if len(word) >= 4 and word not in _GENERIC_NAME_WORDS:
+            words.add(word)
+    return words
+
+
+def _title_matches(title: str, query: str) -> bool:
+    """Match a window caption against a normalised app name (UWP fallback)."""
+
+    normalized = normalize_app_name(title)
+    if not normalized or not query:
+        return False
+    if query in normalized:
+        return True
+    # "Photos" (window) vs "Microsoft Photos" (Start Menu name); short captions
+    # like "a" would match anything, so they do not count.
+    if len(normalized) >= 3 and normalized in query:
+        return True
+    # Store apps usually put the document first and drop the vendor prefix
+    # ("image.png - Photos"), so one shared significant word is enough.
+    return bool(_name_words(normalized) & _name_words(query))
+
+
+def _sync_minimize_app(image_name: str | None, display_name: str) -> list[str]:
+    """Minimize every visible window of an app. Returns the titles minimized.
+
+    Desktop apps are found by process id (``tasklist`` on the exe name that the
+    app index resolved); Store/UWP entries have no exe, so their windows are
+    matched by caption against the app's display name (SPEC §8).
+    """
+
+    _require_windows()
+    pids = _sync_process_ids(image_name) if image_name else set()
+    windows = _list_windows()
+
+    targets = [window for window in windows if window.pid in pids] if pids else []
+    if not targets:
+        query = normalize_app_name(display_name)
+        targets = [window for window in windows if _title_matches(window.title, query)]
+
+    user32 = _user32()
+    minimized: list[str] = []
+    for window in targets:
+        user32.ShowWindow(window.hwnd, _SW_MINIMIZE)
+        minimized.append(window.title)
+    return minimized
+
+
+# --- mouse_click (SPEC §5 tool 6 / §8, v1.2) ---------------------------------
+
+
+def _sync_mouse_click(x_norm: float, y_norm: float, button: str) -> tuple[int, int, int, int]:
+    """Move the cursor to a normalized point and click. Returns ``(x, y, w, h)``."""
+
+    _require_windows()
+    user32 = _user32()
+    screen_w = int(user32.GetSystemMetrics(_SM_CXSCREEN))
+    screen_h = int(user32.GetSystemMetrics(_SM_CYSCREEN))
+    if screen_w <= 0 or screen_h <= 0:
+        raise PCActionError("could not read the screen resolution (GetSystemMetrics returned 0)")
+
+    # 1.0 maps to the last pixel, not one past the right/bottom edge.
+    x_px = max(0, min(screen_w - 1, int(x_norm * screen_w)))
+    y_px = max(0, min(screen_h - 1, int(y_norm * screen_h)))
+    if not user32.SetCursorPos(x_px, y_px):
+        raise PCActionError(
+            f"SetCursorPos({x_px}, {y_px}) failed (error code {ctypes.get_last_error()})"
+        )
+    time.sleep(CLICK_SETTLE_S)
+
+    down, up = _MOUSE_BUTTON_EVENTS[button]
+    clicks = 2 if button == BUTTON_DOUBLE else 1
+    for index in range(clicks):
+        if index:
+            time.sleep(DOUBLE_CLICK_GAP_S)
+        _send_input(_mouse_button_event(down), _mouse_button_event(up))
+    return x_px, y_px, screen_w, screen_h
+
+
+def parse_click_coordinate(value: Any, field: str) -> float:
+    """Parse a normalized 0..1 screen coordinate coming from the server."""
+
+    if value is None or isinstance(value, bool):
+        raise PCActionError(f"mouse_click needs '{field}' as a number between 0 and 1")
+    if isinstance(value, str):
+        text = value.strip().replace(",", ".")
+        try:
+            number = float(text)
+        except ValueError as exc:
+            raise PCActionError(
+                f"unclear mouse_click {field} {value!r}: expected a number between 0 and 1"
+            ) from exc
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        raise PCActionError(
+            f"unclear mouse_click {field} {value!r}: expected a number between 0 and 1"
+        )
+    if not 0.0 <= number <= 1.0:
+        raise PCActionError(
+            f"mouse_click {field}={number} is outside 0..1 "
+            f"(coordinates are fractions of the screen, not pixels)"
+        )
+    return number
+
+
+def parse_mouse_button(value: Any) -> str:
+    """Normalise the ``button`` argument to left / right / double."""
+
+    text = "" if value is None else str(value).strip().casefold().replace("-", " ")
+    button = MOUSE_BUTTONS.get(text)
+    if button is None:
+        raise PCActionError(
+            f"unknown mouse button '{value}' (supported: "
+            f"{BUTTON_LEFT}, {BUTTON_RIGHT}, {BUTTON_DOUBLE})"
+        )
+    return button
+
+
 # --- controller --------------------------------------------------------------
 
 
@@ -734,6 +1121,9 @@ class PCController:
         if name == CMD_OPEN_APP:
             return await self._open_app(value)
 
+        if name == CMD_MINIMIZE_APP:
+            return await self.minimize_app(value)
+
         # CMD_CLOSE_APP
         return await self._close_app(value)
 
@@ -763,6 +1153,48 @@ class PCController:
             return False, message, clipped
         log.info("run_command: finished, %d chars of output", len(clipped or ""))
         return True, None, clipped
+
+    # -- minimize_app / mouse_click (v1.2) ----------------------------------
+
+    async def minimize_app(self, value: Any) -> PCResult:
+        """Minimize every window of an app (``pc_control`` ``minimize_app``)."""
+
+        entry = await self._resolve_app(value)
+        titles = await asyncio.to_thread(
+            _sync_minimize_app, entry.process_name(), entry.name
+        )
+        if not titles:
+            raise PCActionError(
+                f"no open window found for '{entry.name}' - it does not seem to be running"
+            )
+        log.info("pc_control: minimized %d window(s) of '%s'", len(titles), entry.name)
+        named = ", ".join(titles[:MAX_REPORTED_WINDOWS])
+        detail = f"minimized {len(titles)} window(s) of {entry.name}"
+        return PCResult(f"{detail}: {named}" if named else detail)
+
+    async def mouse_click(
+        self, x_norm: Any, y_norm: Any, button: Any = None
+    ) -> PCResult:
+        """Click a normalized screen point (the server's ``click_screen`` tool).
+
+        ``x_norm``/``y_norm`` are fractions of the screen (0..1) computed by the
+        server from the vision model's answer, so this side owns the only real
+        pixel arithmetic: the desktop resolution read from ``GetSystemMetrics``.
+        """
+
+        x_value = parse_click_coordinate(x_norm, "x_norm")
+        y_value = parse_click_coordinate(y_norm, "y_norm")
+        name = parse_mouse_button(button)
+        _require_windows()
+
+        x_px, y_px, screen_w, screen_h = await asyncio.to_thread(
+            _sync_mouse_click, x_value, y_value, name
+        )
+        log.info(
+            "mouse_click: %s click at %d,%d of %dx%d (%.3f, %.3f)",
+            name, x_px, y_px, screen_w, screen_h, x_value, y_value,
+        )
+        return PCResult(f"{name} click at {x_px},{y_px} on a {screen_w}x{screen_h} screen")
 
     # -- helpers ------------------------------------------------------------
 
@@ -848,7 +1280,11 @@ class PCController:
 
 
 __all__ = [
+    "BUTTON_DOUBLE",
+    "BUTTON_LEFT",
+    "BUTTON_RIGHT",
     "MODIFIER_KEYS",
+    "MOUSE_BUTTONS",
     "NAMED_KEYS",
     "PC_COMMANDS",
     "PCActionError",
@@ -856,6 +1292,8 @@ __all__ = [
     "PCResult",
     "RUN_COMMAND_OUTPUT_LIMIT",
     "RUN_COMMAND_TIMEOUT_S",
+    "parse_click_coordinate",
     "parse_hotkey",
+    "parse_mouse_button",
     "truncate_output",
 ]

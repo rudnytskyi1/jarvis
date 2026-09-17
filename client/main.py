@@ -71,7 +71,7 @@ from client.audio import (
     frame_bytes,
 )
 from client.devices.registry import build_registry
-from client.screen import SCREENSHOT_FORMAT, capture_jpeg
+from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
 from client.vad import VadRecorder
 from client.wakeword import WakeWordDetector
 from client.ws_client import WSClient, WSDisconnected
@@ -523,6 +523,11 @@ class JarvisClient:
     async def _handle_screenshot_request(self, msg: Dict[str, Any]) -> None:
         """Answer ``screenshot_request``: a header plus exactly ONE binary frame.
 
+        The header carries both sizes (SPEC §4, C->S #6): ``w``/``h`` of the
+        downscaled image that is actually sent, and ``screen_w``/``screen_h`` of
+        the real desktop. The server needs both to turn the vision model's pixel
+        coordinates into the normalized ones a ``mouse_click`` action expects.
+
         A capture failure is reported as ``screenshot_error`` and no binary
         frame is sent, so the server can turn it into a tool result instead of
         waiting for the full 120 s.
@@ -530,7 +535,7 @@ class JarvisClient:
         request_id = str(msg.get("id") or "")
         log.info("Screenshot requested (id=%s) - capturing the screen", request_id or "?")
         try:
-            jpeg = await asyncio.to_thread(capture_jpeg)
+            capture: Capture = await asyncio.to_thread(capture_jpeg)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -542,10 +547,26 @@ class JarvisClient:
             return
 
         await self.ws.send_json(
-            {"type": MSG_SCREENSHOT, "id": request_id, "format": SCREENSHOT_FORMAT}
+            {
+                "type": MSG_SCREENSHOT,
+                "id": request_id,
+                "format": SCREENSHOT_FORMAT,
+                "w": capture.w,
+                "h": capture.h,
+                "screen_w": capture.screen_w,
+                "screen_h": capture.screen_h,
+            }
         )
-        await self.ws.send_bytes(jpeg)
-        log.info("Screenshot sent (id=%s): %d bytes", request_id or "?", len(jpeg))
+        await self.ws.send_bytes(capture.jpeg)
+        log.info(
+            "Screenshot sent (id=%s): %dx%d image of a %dx%d screen, %d bytes",
+            request_id or "?",
+            capture.w,
+            capture.h,
+            capture.screen_w,
+            capture.screen_h,
+            len(capture.jpeg),
+        )
 
     # ------------------------------------------------------------------
     # actions (executed by W3's dispatcher)

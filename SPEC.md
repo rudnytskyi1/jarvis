@@ -119,11 +119,17 @@ All code imports `common/` with repo root on `sys.path` (entry points run as
   `server/session.py`.
 - `server/tools.py` — OpenAI-style tool JSON schemas for the six tools in §5, plus
   helpers to convert tool calls into protocol action items.
-- `server/vision.py` — `describe_screenshot(jpeg_bytes, query) -> str`: POST to
-  Ollama native `/api/chat` with `model: cfg.llm.vision_model`, one user message
-  `{content: query-with-instructions, images: [base64 jpeg]}`, `stream: false`,
-  no tools. Timeout 120 s; on failure return an error string (the LLM sees it as
-  the tool result — never raise).
+- `server/vision.py` — two entry points, both POST to Ollama native `/api/chat`
+  with `model: cfg.llm.vision_model`, `stream: false`, `think: false`,
+  `keep_alive` matching the chat model, no tools; timeout 120 s; on failure
+  return an error value (the LLM sees it as the tool result — never raise):
+  - `describe_screenshot(jpeg_bytes, query) -> str` — the prompt demands
+    specific detail relevant to the query: window titles, video/list titles,
+    button labels, visible text; explicitly forbids one-word summaries.
+  - `locate_on_screen(jpeg_bytes, target, img_w, img_h) -> (x_norm, y_norm) | None`
+    — asks for the click point of `target` as JSON `{"x": int, "y": int}` in
+    image pixels (Qwen-VL grounding); parse JSON first, fall back to the first
+    two integers via regex; clamp to the image, normalize by `img_w`/`img_h`.
 - `server/storage.py` — `DialogLog.append(entry: dict)` writes one JSON line to
   `data/dialogs/YYYY-MM-DD.jsonl` (entry: ts ISO, client_id, transcript, language,
   reply, actions list, per-stage durations); `Memory.facts() -> list[str]` and
@@ -157,7 +163,7 @@ Client → Server:
 3. binary frames: raw PCM s16le mono 16 kHz chunks
 4. `{"type": "utterance_end"}`
 5. `{"type": "action_result", "id": str, "ok": bool, "error": str|null, "output": str|null}` — REQUIRED after executing each action, in order. `output` carries data the LLM needs back (e.g. `run_command` stdout, truncated to 4000 chars); null when there is none.
-6. `{"type": "screenshot", "id": str, "format": "jpeg"}` followed by exactly ONE binary frame with the JPEG bytes — reply to `screenshot_request`. On capture failure: `{"type": "screenshot_error", "id": str, "error": str}` and no binary frame.
+6. `{"type": "screenshot", "id": str, "format": "jpeg", "w": int, "h": int, "screen_w": int, "screen_h": int}` followed by exactly ONE binary frame with the JPEG bytes — reply to `screenshot_request`. `w`/`h` are the (downscaled) image dimensions, `screen_w`/`screen_h` the real desktop resolution — the server needs both to translate vision-model pixel coordinates into normalized screen coordinates. On capture failure: `{"type": "screenshot_error", "id": str, "error": str}` and no binary frame.
 
 Server → Client:
 1. `{"type": "ready"}` — reply to `hello`.
@@ -184,10 +190,11 @@ then `error` with message `"empty transcript"` — no LLM call.
 
 ## 5. Tools / actions
 
-Six tools exposed to the LLM. Execution matrix: `set_light`, `set_switch`,
+Seven tools exposed to the LLM. Execution matrix: `set_light`, `set_switch`,
 `pc_control`, `run_command` are CLIENT actions (forwarded as protocol action
-items, args verbatim; result = the client's `action_result`). `look_at_screen`
-and `remember` are SERVER-side (never sent as actions).
+items, args verbatim; result = the client's `action_result`). `look_at_screen`,
+`click_screen` and `remember` are SERVER-side (never forwarded verbatim;
+`click_screen` internally produces a `mouse_click` client action — see below).
 
 1. **`set_light`** — control a light device (LED strip etc.).
    `{"device": str (device name from config), "state": "on"|"off", "brightness": int 1–100 (optional), "color": "#RRGGBB" (optional)}`
@@ -195,7 +202,9 @@ and `remember` are SERVER-side (never sent as actions).
    `{"device": str, "action": "on"|"off"|"press"|"toggle"}`
    (Bots in press mode treat "toggle"/"on"/"off" as a single press.)
 3. **`pc_control`** — control the room PC (the client machine itself).
-   `{"command": "volume_set"|"volume_up"|"volume_down"|"mute"|"unmute"|"media_play_pause"|"media_next"|"media_prev"|"display_off"|"display_on"|"sleep"|"open_app"|"close_app"|"type_text"|"hotkey", "value": str|int|null}`
+   `{"command": "volume_set"|"volume_up"|"volume_down"|"mute"|"unmute"|"media_play_pause"|"media_next"|"media_prev"|"display_off"|"display_on"|"sleep"|"open_app"|"close_app"|"minimize_app"|"type_text"|"hotkey", "value": str|int|null}`
+   `minimize_app` minimizes all top-level windows of the named app (resolved
+   like `close_app`; works for UWP apps too via window enumeration by process).
    `value`: `volume_set` int 0–100; `open_app`/`close_app` an app name — resolved
    by the client's installed-app index (§8 apps.py): `cfg.client.apps` overrides
    first, then fuzzy match over ALL installed apps; unknown → error result naming
@@ -207,8 +216,20 @@ and `remember` are SERVER-side (never sent as actions).
    in `action_result.output`. Non-zero exit → `ok: false` with output still set.
 5. **`look_at_screen`** — see the room PC's screen. `{"query": str}` — what to look
    for/answer. Server-side: request screenshot from client, run `server/vision.py`,
-   tool result = the vision model's answer text.
-6. **`remember`** — save a fact to persistent memory. `{"fact": str}` — one
+   tool result = the vision model's answer text. The vision prompt demands
+   SPECIFIC detail (titles, names, visible text, list items), not a one-word
+   summary.
+6. **`click_screen`** — click something visible on the screen.
+   `{"target": str (visual description, e.g. "the search box at the top" or
+   "the GO button"), "button": "left"|"right"|"double" (optional, default left)}`.
+   Server-side pipeline: screenshot → `vision.locate_on_screen` asks the vision
+   model for the pixel coordinates of the target (JSON `{"x":…,"y":…}`; tolerant
+   parsing with a numbers-regex fallback) → normalize by the screenshot's `w`/`h`
+   → send the client a **`mouse_click`** action:
+   `{"tool": "mouse_click", "args": {"x_norm": float 0–1, "y_norm": float 0–1, "button": "left"|"right"|"double"}}`
+   (client multiplies by `screen_w`/`screen_h`, moves the cursor, clicks).
+   Tool result: ok, or an error saying the target was not found.
+7. **`remember`** — save a fact to persistent memory. `{"fact": str}` — one
    self-contained English sentence. Server-side: `Memory.add`, result `{"ok": true}`.
 
 Tool descriptions (in `server/tools.py`) must tell the model: reply in English;
@@ -277,10 +298,12 @@ required keys → clear startup error naming the key.
   the recorded bytes (or None if no speech at all within a lead-in timeout of 5 s).
 - `client/ws_client.py` — `websockets` library wrapper: connect, send json/binary,
   async iterate messages, reconnect loop.
-- `client/screen.py` (v1.1) — `capture_jpeg() -> bytes`: full primary-screen
+- `client/screen.py` (v1.1) — `capture_jpeg() -> Capture`: full primary-screen
   screenshot via Pillow `ImageGrab.grab()`, downscale to max width 1600 px,
-  JPEG quality 80. Runs in `asyncio.to_thread`. Raises with a clear message on
-  failure (caller converts to `screenshot_error`).
+  JPEG quality 80. `Capture` carries `jpeg: bytes`, `w`/`h` (image dims after
+  downscale) and `screen_w`/`screen_h` (real desktop resolution) for the
+  screenshot header (§4). Runs in `asyncio.to_thread`. Raises with a clear
+  message on failure (caller converts to `screenshot_error`).
 
 Deps (client/requirements.txt): `vosk`, `sounddevice`, `webrtcvad-wheels`
 (NOT `webrtcvad` — no Windows wheels), `websockets`, `numpy`, `pyyaml`, `pydantic`,
@@ -310,7 +333,17 @@ Deps (client/requirements.txt): `vosk`, `sounddevice`, `webrtcvad-wheels`
     returned as the action's `output`; kill the process tree on timeout;
   - `open_app`/`close_app`: resolve via `client/actions/apps.py` (below);
     `close_app` kills by exe name (`taskkill /IM <exe> /F`) for desktop apps,
-    error for UWP apps it cannot map to a process.
+    error for UWP apps it cannot map to a process;
+  - `minimize_app` (v1.2): resolve the app name, find the process ids (by exe
+    basename, or by matching `Get-Process` main-window titles as a fallback),
+    enumerate its top-level windows (`EnumWindows` + `GetWindowThreadProcessId`
+    via ctypes) and `ShowWindow(hwnd, SW_MINIMIZE)` each visible one; error if
+    no window was found;
+  - `mouse_click` action (v1.2, produced by the server's `click_screen`):
+    `x_norm`/`y_norm` floats 0–1 → `SetCursorPos(int(x_norm*screen_w),
+    int(y_norm*screen_h))` + `SendInput` button events; `button` left/right,
+    `"double"` = two left clicks ~120 ms apart. Routed by the dispatcher as its
+    own tool name, not through `pc_control`.
 - `client/actions/apps.py` (v1.1) — installed-app index + resolver:
   - Index built once at startup (and lazily refreshed if a lookup misses):
     run `powershell -NoProfile -Command "Get-StartApps | ConvertTo-Json"` —

@@ -1,12 +1,14 @@
 """OpenAI-style tool schemas exposed to the LLM, plus protocol helpers (SPEC §5).
 
-Six tools. Execution matrix:
+Seven tools. Execution matrix:
 
 * ``set_light``, ``set_switch``, ``pc_control``, ``run_command`` are CLIENT
   actions — forwarded to the room PC as protocol action items with the model's
   arguments verbatim; the tool result is the client's ``action_result``.
-* ``look_at_screen`` and ``remember`` run SERVER-side and are never sent as
-  actions.
+* ``look_at_screen``, ``click_screen`` and ``remember`` run SERVER-side and are
+  never forwarded verbatim. ``click_screen`` runs a screenshot through the
+  vision model in ``server/app.py`` and then sends the client one
+  :data:`MOUSE_CLICK_TOOL` action with normalized coordinates.
 
 The same schema list is used by both LLM providers: Ollama's native ``/api/chat``
 accepts the OpenAI tool format unchanged.
@@ -103,11 +105,12 @@ TOOLS: list[dict[str, Any]] = [
             "name": "pc_control",
             "description": (
                 "Control the room PC (the one connected to the TV): volume, media keys, "
-                "display on/off, sleep, opening and closing applications, typing text and "
-                "pressing hotkeys. Use it for every request about sound, music, video, the "
-                "display, or starting and closing programs. For open_app and close_app pass "
-                "the name the user said — the PC matches it against everything installed, "
-                "and a failed match comes back with the closest names so you can retry once. "
+                "display on/off, sleep, opening, closing and minimising applications, "
+                "typing text and pressing hotkeys. Use it for every request about sound, "
+                "music, video, the display, or starting, closing and hiding programs. For "
+                "open_app, close_app and minimize_app pass the name the user said — the PC "
+                "matches it against everything installed, and a failed match comes back "
+                "with the closest names so you can retry once. "
                 + _COMMON_HINT
             ),
             "parameters": {
@@ -129,6 +132,7 @@ TOOLS: list[dict[str, Any]] = [
                             "sleep",
                             "open_app",
                             "close_app",
+                            "minimize_app",
                             "type_text",
                             "hotkey",
                         ],
@@ -137,8 +141,9 @@ TOOLS: list[dict[str, Any]] = [
                     "value": {
                         "type": ["string", "integer", "null"],
                         "description": (
-                            "volume_set: a number from 0 to 100. open_app/close_app: the "
-                            "application name (for example chrome, spotify, steam). "
+                            "volume_set: a number from 0 to 100. "
+                            "open_app/close_app/minimize_app: the application name (for "
+                            "example chrome, spotify, steam). "
                             "type_text: the text to type into the focused window. "
                             "hotkey: a combo such as ctrl+shift+t or alt+f4. "
                             "Omit it for every other command."
@@ -206,6 +211,46 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "click_screen",
+            "description": (
+                "Click something that is visible on the room PC's screen. Describe the "
+                "target the way you would point at it for a person — what it looks like, "
+                "what it says and where it is — for example 'the search box at the top of "
+                "the page', 'the red GO button on the right', 'the first video in the "
+                "results list'. The screen is looked at first, so the description must "
+                "match what is actually there; use look_at_screen when you are not sure. "
+                "Combine it with pc_control type_text to type into what you clicked and "
+                "pc_control hotkey (for example enter) to submit: click the box, type the "
+                "text, press enter. Use it to operate websites and apps like a human "
+                "would. " + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "What to click, described visually: its text or label, its "
+                            "appearance and its place on the screen, e.g. "
+                            "'the search field at the top with the magnifier icon'."
+                        ),
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "double"],
+                        "description": (
+                            "left is a normal click (default), right opens the context "
+                            "menu, double opens a file or folder. Omit it for a normal click."
+                        ),
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "remember",
             "description": (
                 "Save a lasting fact to your permanent memory. Use it when someone shares "
@@ -238,8 +283,36 @@ CLIENT_TOOLS: frozenset[str] = frozenset(
     {"set_light", "set_switch", "pc_control", "run_command"}
 )
 
-#: Tools executed on the server; never sent to the client.
-SERVER_TOOLS: frozenset[str] = frozenset({"look_at_screen", "remember"})
+#: Tools executed on the server; never sent to the client as they are called.
+SERVER_TOOLS: frozenset[str] = frozenset({"look_at_screen", "click_screen", "remember"})
+
+#: Client action produced by the server-side ``click_screen`` pipeline (SPEC §5,
+#: §8): ``{"x_norm": float, "y_norm": float, "button": "left"|"right"|"double"}``.
+#: It is not a tool the model may call, so it is absent from :data:`TOOLS`.
+MOUSE_CLICK_TOOL = "mouse_click"
+
+#: Mouse buttons the client understands; anything else falls back to ``left``.
+CLICK_BUTTONS: tuple[str, ...] = ("left", "right", "double")
+DEFAULT_CLICK_BUTTON = "left"
+
+
+def normalize_click_button(value: Any) -> str:
+    """Map the model's ``button`` argument onto a value the client accepts."""
+    button = str(value or "").strip().lower()
+    if button in CLICK_BUTTONS:
+        return button
+    if button:
+        log.warning("Unknown click button %r — using %s", value, DEFAULT_CLICK_BUTTON)
+    return DEFAULT_CLICK_BUTTON
+
+
+def mouse_click_args(x_norm: float, y_norm: float, button: Any = None) -> dict[str, Any]:
+    """Build the args of a :data:`MOUSE_CLICK_TOOL` action (coordinates clamped to 0..1)."""
+    return {
+        "x_norm": min(max(float(x_norm), 0.0), 1.0),
+        "y_norm": min(max(float(y_norm), 0.0), 1.0),
+        "button": normalize_click_button(button),
+    }
 
 
 def is_client_tool(name: str) -> bool:
@@ -343,6 +416,11 @@ __all__ = [
     "TOOL_NAMES",
     "CLIENT_TOOLS",
     "SERVER_TOOLS",
+    "MOUSE_CLICK_TOOL",
+    "CLICK_BUTTONS",
+    "DEFAULT_CLICK_BUTTON",
+    "normalize_click_button",
+    "mouse_click_args",
     "is_client_tool",
     "action_item",
     "actions_from_tool_calls",

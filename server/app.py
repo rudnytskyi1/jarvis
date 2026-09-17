@@ -8,6 +8,11 @@ The utterance pipeline runs in its own task so the receive loop keeps reading
 ``action_result`` and ``screenshot`` messages while the LLM waits for them. All
 model inference (Whisper, LLM, Silero) runs in worker threads via
 ``asyncio.to_thread`` so the event loop never blocks.
+
+Server-side tools (SPEC §5): ``look_at_screen`` describes a screenshot,
+``click_screen`` locates the described element in that screenshot and sends the
+client a single ``mouse_click`` action, and ``remember`` writes to the memory
+file. Everything else is forwarded to the client verbatim.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -31,7 +37,13 @@ from server.llm import LlmClient
 from server.session import Session
 from server.storage import DialogLog, Memory
 from server.stt import SttEngine
-from server.tools import CLIENT_TOOLS, action_item
+from server.tools import (
+    CLIENT_TOOLS,
+    MOUSE_CLICK_TOOL,
+    action_item,
+    mouse_click_args,
+    normalize_click_button,
+)
 from server.tts import TtsEngine
 from server.vision import VisionClient
 
@@ -57,6 +69,74 @@ SCREENSHOT_TIMEOUT_S = 120.0
 ERROR_EMPTY_TRANSCRIPT = proto.ERR_EMPTY_TRANSCRIPT
 SAY_AFTER_ACTIONS = "Done."
 SAY_NOT_UNDERSTOOD = "Sorry, I did not catch that."
+
+
+@dataclass(frozen=True)
+class Screenshot:
+    """One screenshot from the client, with the sizes from its header (SPEC §4).
+
+    ``w``/``h`` describe the JPEG itself — the vision model answers in those
+    pixels — while ``screen_w``/``screen_h`` are the real desktop resolution the
+    client multiplies the normalized click coordinates by.
+    """
+
+    jpeg: bytes
+    w: int
+    h: int
+    screen_w: int
+    screen_h: int
+
+
+def _positive_int(value: Any) -> int | None:
+    """Return ``value`` as a positive int, or ``None`` when it is missing/bogus."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    """Read ``(width, height)`` out of the JPEG's own SOF marker.
+
+    Only used when a screenshot header arrives without ``w``/``h`` — per SPEC §4
+    the client always sends them, but an older client must not break the
+    ``look_at_screen`` tool. Returns ``None`` when the bytes are not a JPEG.
+    """
+    total = len(data)
+    if total < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    index = 2
+    while index + 3 < total:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        index += 2
+        if marker == 0xFF:  # fill byte: the real marker follows
+            index -= 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:  # standalone markers
+            continue
+        if marker == 0xDA:  # start of scan: entropy-coded data, no sizes left
+            return None
+        if index + 2 > total:
+            return None
+        length = int.from_bytes(data[index : index + 2], "big")
+        if length < 2:
+            return None
+        # SOF0..SOF15 carry the frame size; C4/C8/CC are Huffman/arithmetic tables.
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if index + 7 > total:
+                return None
+            height = int.from_bytes(data[index + 3 : index + 5], "big")
+            width = int.from_bytes(data[index + 5 : index + 7], "big")
+            if width > 0 and height > 0:
+                return width, height
+            return None
+        index += length
+    return None
+
 
 _config: Any = None
 _stt: SttEngine | None = None
@@ -114,7 +194,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _dialogs = None
 
 
-app = FastAPI(title="Jarvis brain server", version="1.1", lifespan=lifespan)
+app = FastAPI(title="Jarvis brain server", version="1.2", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -150,6 +230,8 @@ class Connection:
         self._screenshot_id: str | None = None
         #: Set by a ``screenshot`` header: the next binary frame is the JPEG.
         self._expect_screenshot_bytes = False
+        #: Sizes from the last ``screenshot`` header, consumed by that JPEG frame.
+        self._screenshot_header: dict[str, int | None] = {}
 
         # --- per-utterance state ---
         self._action_seq = 1
@@ -309,18 +391,29 @@ class Connection:
             log.warning(
                 "Screenshot id mismatch: got %r, waiting for %r", shot_id, self._screenshot_id
             )
+        # SPEC §4: the header carries the image size and the desktop resolution;
+        # both are kept next to the bytes so click_screen can aim the cursor.
+        self._screenshot_header = {
+            "w": _positive_int(payload.get("w")),
+            "h": _positive_int(payload.get("h")),
+            "screen_w": _positive_int(payload.get("screen_w")),
+            "screen_h": _positive_int(payload.get("screen_h")),
+        }
         self._expect_screenshot_bytes = True
 
     def _on_screenshot_error(self, payload: dict[str, Any]) -> None:
         error = str(payload.get("error") or "screenshot failed")
         log.warning("Client %s could not capture the screen: %s", self.peer, error)
         self._expect_screenshot_bytes = False
+        self._screenshot_header = {}
         future = self._screenshot_future
         if future is not None and not future.done():
             future.set_result({"error": error})
 
     def _deliver_screenshot(self, data: bytes) -> None:
         self._expect_screenshot_bytes = False
+        header = self._screenshot_header
+        self._screenshot_header = {}
         future = self._screenshot_future
         if future is None or future.done():
             log.warning("Screenshot bytes arrived with nothing waiting for them")
@@ -329,8 +422,32 @@ class Connection:
             log.warning("Screenshot from %s is too large (%d bytes)", self.peer, len(data))
             future.set_result({"error": "screenshot too large"})
             return
-        log.info("Screenshot received from %s (%d KB)", self.peer, len(data) // 1024)
-        future.set_result(bytes(data))
+
+        jpeg = bytes(data)
+        width = header.get("w")
+        height = header.get("h")
+        if width is None or height is None:
+            # The client always sends the size (SPEC §4); measure the JPEG itself
+            # only so an older client keeps working for look_at_screen.
+            measured = _jpeg_size(jpeg)
+            if measured is not None:
+                width = width or measured[0]
+                height = height or measured[1]
+                log.info("Screenshot header had no size — the JPEG says %dx%d", width, height)
+            else:
+                log.warning("Screenshot header had no size and the JPEG could not be measured")
+        shot = Screenshot(
+            jpeg=jpeg,
+            w=int(width or 0),
+            h=int(height or 0),
+            screen_w=int(header.get("screen_w") or width or 0),
+            screen_h=int(header.get("screen_h") or height or 0),
+        )
+        log.info(
+            "Screenshot received from %s (%d KB, image %dx%d, screen %dx%d)",
+            self.peer, len(jpeg) // 1024, shot.w, shot.h, shot.screen_w, shot.screen_h,
+        )
+        future.set_result(shot)
 
     # ------------------------------------------------------------------ tool executor
 
@@ -340,6 +457,8 @@ class Connection:
             return await self._run_client_action(name, args)
         if name == "look_at_screen":
             return await self._run_look_at_screen(args)
+        if name == "click_screen":
+            return await self._run_click_screen(args)
         if name == "remember":
             return await self._run_remember(args)
         log.warning("Tool %r has no server-side handler", name)
@@ -373,6 +492,38 @@ class Connection:
         record["result"] = result
         return result
 
+    async def _request_screenshot(self, shot_id: str) -> Screenshot | str:
+        """Ask the client for a screenshot (SPEC §4).
+
+        Returns the :class:`Screenshot` on success, or an error message ready to
+        be handed to the LLM as a tool result.
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._screenshot_future = future
+        self._screenshot_id = shot_id
+        try:
+            await self.send_json({"type": proto.MSG_SCREENSHOT_REQUEST, "id": shot_id})
+            log.info("Requested a screenshot (%s)", shot_id)
+            captured = await asyncio.wait_for(future, timeout=SCREENSHOT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("Screenshot %s timed out after %.0f s", shot_id, SCREENSHOT_TIMEOUT_S)
+            return proto.ERR_CLIENT_TIMEOUT
+        except (WebSocketDisconnect, RuntimeError) as exc:
+            log.warning("Could not request screenshot %s: %s", shot_id, exc)
+            return "client disconnected"
+        finally:
+            self._screenshot_future = None
+            self._screenshot_id = None
+            self._expect_screenshot_bytes = False
+            self._screenshot_header = {}
+
+        if isinstance(captured, Screenshot):
+            return captured
+        if isinstance(captured, dict):
+            return str(captured.get("error") or "screenshot failed")
+        return "screenshot failed"
+
     async def _run_look_at_screen(self, args: dict[str, Any]) -> dict[str, Any]:
         """Ask the client for a screenshot and describe it with the vision model."""
         query = " ".join(str(args.get("query") or "").split())
@@ -385,31 +536,66 @@ class Connection:
             record["result"] = {"ok": False, "error": "vision model is not loaded"}
             return record["result"]
 
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._screenshot_future = future
-        self._screenshot_id = shot_id
-        try:
-            await self.send_json({"type": proto.MSG_SCREENSHOT_REQUEST, "id": shot_id})
-            log.info("Requested a screenshot (%s): %r", shot_id, query)
-            answer_source = await asyncio.wait_for(future, timeout=SCREENSHOT_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            log.warning("Screenshot %s timed out after %.0f s", shot_id, SCREENSHOT_TIMEOUT_S)
-            answer_source = {"error": proto.ERR_CLIENT_TIMEOUT}
-        except (WebSocketDisconnect, RuntimeError) as exc:
-            log.warning("Could not request screenshot %s: %s", shot_id, exc)
-            answer_source = {"error": "client disconnected"}
-        finally:
-            self._screenshot_future = None
-            self._screenshot_id = None
-            self._expect_screenshot_bytes = False
-
-        if isinstance(answer_source, dict):
-            result: dict[str, Any] = {"ok": False, "error": str(answer_source.get("error"))}
+        log.info("look_at_screen (%s): %r", shot_id, query)
+        captured = await self._request_screenshot(shot_id)
+        if isinstance(captured, str):
+            result: dict[str, Any] = {"ok": False, "error": captured}
         else:
-            answer = await _vision.describe_screenshot(answer_source, query)
+            answer = await _vision.describe_screenshot(captured.jpeg, query)
             result = {"ok": True, "answer": answer}
 
+        record["result"] = result
+        return result
+
+    async def _run_click_screen(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Locate a described element on the screen and click it (SPEC §5, tool 6).
+
+        Screenshot -> ``vision.locate_on_screen`` (pixels of the received image)
+        -> one ``mouse_click`` action with normalized coordinates -> the client's
+        own ``action_result``, which is what the LLM gets back.
+        """
+        target = " ".join(str(args.get("target") or "").split())
+        button = normalize_click_button(args.get("button"))
+        shot_id = f"s{self._screenshot_seq}"
+        self._screenshot_seq += 1
+        record: dict[str, Any] = {"id": shot_id, "tool": "click_screen", "args": dict(args)}
+        self._utterance_actions.append(record)
+
+        if not target:
+            record["result"] = {
+                "ok": False,
+                "error": "click_screen needs a target: describe what to click",
+            }
+            return record["result"]
+        if _vision is None:
+            record["result"] = {"ok": False, "error": "vision model is not loaded"}
+            return record["result"]
+
+        log.info("click_screen (%s): %r with the %s button", shot_id, target, button)
+        captured = await self._request_screenshot(shot_id)
+        if isinstance(captured, str):
+            record["result"] = {"ok": False, "error": captured}
+            return record["result"]
+        if captured.w <= 0 or captured.h <= 0:
+            log.warning("Screenshot %s has no usable size — cannot aim the click", shot_id)
+            record["result"] = {
+                "ok": False,
+                "error": "the screenshot came without its size, so the click cannot be aimed",
+            }
+            return record["result"]
+
+        point = await _vision.locate_on_screen(captured.jpeg, target, captured.w, captured.h)
+        if point is None:
+            result: dict[str, Any] = {
+                "ok": False,
+                "error": f"could not find {target} on the screen",
+            }
+            record["result"] = result
+            return result
+
+        click_args = mouse_click_args(point[0], point[1], button)
+        record["point"] = dict(click_args)
+        result = await self._run_client_action(MOUSE_CLICK_TOOL, click_args)
         record["result"] = result
         return result
 
@@ -630,6 +816,8 @@ class Connection:
         if self._screenshot_future is not None and not self._screenshot_future.done():
             self._screenshot_future.set_result({"error": "client disconnected"})
         self._screenshot_future = None
+        self._screenshot_header = {}
+        self._expect_screenshot_bytes = False
 
 
 @app.websocket("/ws")
