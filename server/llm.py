@@ -141,6 +141,36 @@ def announces_undone_action(text: str) -> bool:
     return _FUTURE_INTENT_RE.search(text) is not None
 
 
+#: A reply that REPORTS an action in the past ("the photo has been hidden",
+#: "I've closed it", "volume is now at thirty") while no tool ran at all is a
+#: lie of the same family as the broken promise - the thing never happened.
+DONE_CLAIM_PHRASES: tuple[str, ...] = (
+    r"\b(?:has|have)\s+been\s+\w+(?:ed|en|ut|one)\b",
+    r"\bi(?:'ve| have)\s+(?:closed|hidden|opened|set|muted|unmuted|started|stopped|"
+    r"typed|clicked|removed|deleted|saved|changed|paused|played)\b",
+    r"\bis\s+now\s+(?:closed|hidden|open|gone|off|on|muted|unmuted|paused|playing|"
+    r"minimi[sz]ed|maximi[sz]ed|full\s*screen)\b",
+    r"\b(?:closed|hidden|removed|opened|minimi[sz]ed|maximi[sz]ed)\s+(?:it|that|the)\b",
+    r"\bi\s+(?:just\s+)?(?:closed|hid|opened|set|muted|clicked|typed|removed)\b",
+    r"^\s*(?:done|okay,? done|all set)\b",
+)
+_DONE_CLAIM_RE = re.compile("|".join(DONE_CLAIM_PHRASES), re.IGNORECASE)
+
+#: Injected once when the reply reports a completed action but nothing ran.
+FORCE_DONE_MESSAGE = (
+    "[system: you told the user something was already done, but you called no "
+    "tool this turn, so it did NOT happen. Do it NOW with the right tool. If it "
+    "cannot be done, say that plainly instead.]"
+)
+
+
+def claims_completed_action(text: str) -> bool:
+    """True when ``text`` reports an action as already completed."""
+    if not text:
+        return False
+    return _DONE_CLAIM_RE.search(text) is not None
+
+
 def contains_sight_claim(text: str) -> bool:
     """True when ``text`` makes a first-person sight claim (BUG 3).
 
@@ -619,22 +649,29 @@ class LlmClient:
                     history.append({"role": "assistant", "content": text})
                     history.append({"role": "user", "content": FORCE_LOOK_MESSAGE})
                     continue
-                # A promised action ("I'll do that now") with NO tool executed
-                # this whole turn is a broken promise: force one real attempt.
+                # A promised action ("I'll do that now") or one REPORTED as done
+                # ("the photo has been hidden") with NO tool executed this whole
+                # turn never happened: force one real attempt.
                 if (
                     not forced_act_retried
                     and round_index < self.max_tool_rounds
-                    and announces_undone_action(text)
                     and not executed
+                    and (announces_undone_action(text) or claims_completed_action(text))
                 ):
                     forced_act_retried = True
+                    promised = announces_undone_action(text)
                     log.warning(
-                        "Reply promises an action but ran no tool - forcing one "
-                        "retry: %r",
+                        "Reply %s an action but ran no tool - forcing one retry: %r",
+                        "promises" if promised else "claims",
                         text,
                     )
                     history.append({"role": "assistant", "content": text})
-                    history.append({"role": "user", "content": FORCE_ACT_MESSAGE})
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": FORCE_ACT_MESSAGE if promised else FORCE_DONE_MESSAGE,
+                        }
+                    )
                     continue
                 history.append({"role": "assistant", "content": text})
                 return LlmResult(
