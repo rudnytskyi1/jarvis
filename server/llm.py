@@ -50,6 +50,13 @@ NO_EXECUTOR_RESULT: dict[str, Any] = {
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+#: Malformed inline tool-call syntax the model sometimes writes INTO its text
+#: instead of a structured call ("<toolcall <function=enrollface <parameter=…").
+#: It must never be spoken aloud, and a round that produced it is retried once.
+_TOOL_ARTIFACT_RE = re.compile(
+    r"<\s*/?\s*(?:tool_?call|function(?:=[^\s<>]*)?|parameter(?:=[^\s<>]*)?)\s*/?>?",
+    re.IGNORECASE,
+)
 _MARKDOWN_CHARS_RE = re.compile(r"[*_`#>|]+")
 _WHITESPACE_RE = re.compile(r"\s+")
 #: Space left in front of punctuation after markdown was stripped ("Done , sir").
@@ -100,6 +107,7 @@ def clean_reply(text: str | None) -> str:
     # Delete the markers instead of replacing them: "**Done**, sir" must not
     # become "Done , sir" — the text is spoken and stored in the history.
     cleaned = _strip_thinking(str(text))
+    cleaned = _TOOL_ARTIFACT_RE.sub("", cleaned)
     cleaned = _MARKDOWN_CHARS_RE.sub("", cleaned)
     cleaned = _WHITESPACE_RE.sub(" ", cleaned)
     cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
@@ -438,8 +446,21 @@ class LlmClient:
         history: list[dict[str, Any]] = list(messages)
         executed: list[ToolCall] = []
 
+        artifact_retried = False
         for round_index in range(1, self.max_tool_rounds + 1):
             text, calls = await self._chat(history, with_tools=True)
+            if (
+                not calls
+                and text
+                and _TOOL_ARTIFACT_RE.search(text)
+                and not artifact_retried
+            ):
+                # The model wrote a broken tool call into its text instead of a
+                # structured one - the tool never ran and the garbage would be
+                # spoken. One re-ask usually produces a proper call.
+                artifact_retried = True
+                log.warning("Malformed inline tool call in the reply - retrying the round")
+                text, calls = await self._chat(history, with_tools=True)
             log.info(
                 "LLM round %d/%d: text %r, %d tool call(s) (%s)",
                 round_index,
