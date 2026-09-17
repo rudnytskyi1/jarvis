@@ -1461,10 +1461,17 @@ class Connection:
                             f"{pending['name']} - ask them to say one more sentence]"
                         )
 
-        # The LLM sees who is talking; permissions are enforced server-side.
+        # The LLM sees who is talking and the live room view; permissions are
+        # enforced server-side. Presence rides here (not in the system prompt)
+        # so the prompt prefix stays byte-identical and Ollama's cache holds.
+        try:
+            room_text = self.presence_text()
+        except Exception:  # noqa: BLE001 - presence must never break a reply
+            room_text = ""
+        room_part = f" [room: {room_text}]" if room_text else ""
         prefixed = (
             f"[speaker: {self._speaker_name} | role: {self._speaker_role}]"
-            f"{enroll_note} {text}"
+            f"{room_part}{enroll_note} {text}"
         )
 
         # 2. LLM with the tool loop — tools are executed for real (SPEC §3, §5)

@@ -31,6 +31,14 @@ PRESENCE_PLACEHOLDER = "{presence}"
 
 #: Shown instead of the device list when the client reported no devices.
 NO_DEVICES_TEXT = "(no devices configured)"
+
+#: Static text put where ``{presence}`` sits in the prompt file — the live view
+#: itself rides in each user message's prefix so the system prompt never changes
+#: and Ollama's prompt cache keeps working.
+PRESENCE_STATIC_TEXT = (
+    "The live room view is given in the [room: ...] prefix of each user "
+    "message, next to the [speaker: ...] prefix. Trust it the same way."
+)
 #: Shown instead of the fact list when nothing has been remembered yet.
 NO_MEMORY_TEXT = "(no saved facts yet)"
 #: Shown when the camera is off, missing or sees nobody (SPEC v1.4).
@@ -244,8 +252,16 @@ class Session:
 
     @property
     def system_prompt(self) -> str:
-        """The prompt for the next completion, with live presence filled in."""
-        return self._base_prompt.replace(PRESENCE_PLACEHOLDER, self.presence_text)
+        """The prompt for the next completion.
+
+        Deliberately STATIC between turns: a system prompt that changes (the
+        live presence text used to be substituted here) invalidates Ollama's
+        prompt-prefix cache, forcing a full re-prefill of the prompt plus the
+        whole history on every request — measured at 8-15 s per reply. The live
+        room view now travels in the ``[room: …]`` prefix of each user message
+        instead (see ``server/app.py``).
+        """
+        return self._base_prompt.replace(PRESENCE_PLACEHOLDER, PRESENCE_STATIC_TEXT)
 
     @property
     def device_names(self) -> list[str]:
