@@ -584,6 +584,16 @@ SERVER_TOOLS: frozenset[str] = frozenset(
 #: Client action produced by the server-side ``click_screen`` pipeline (SPEC §5,
 #: §8): ``{"x_norm": float, "y_norm": float, "button": "left"|"right"|"double"}``.
 #: It is not a tool the model may call, so it is absent from :data:`TOOLS`.
+#: v1.7.1: each tool's FIRST declared parameter. When the model writes a call
+#: as text with one positional argument - 'lookatcamera("what is here?")' - that
+#: value can only belong to this parameter, so recovery can rebuild the call.
+FIRST_TOOL_ARG: dict[str, str] = {
+    tool["function"]["name"]: next(
+        iter(tool["function"].get("parameters", {}).get("properties", {})), ""
+    )
+    for tool in TOOLS
+}
+
 MOUSE_CLICK_TOOL = "mouse_click"
 
 #: Mouse buttons the client understands; anything else falls back to ``left``.
@@ -736,6 +746,7 @@ __all__ = [
     "TOOL_NAMES",
     "CLIENT_TOOLS",
     "SERVER_TOOLS",
+    "FIRST_TOOL_ARG",
     "MOUSE_CLICK_TOOL",
     "CLICK_BUTTONS",
     "DEFAULT_CLICK_BUTTON",

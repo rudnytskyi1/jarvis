@@ -28,7 +28,7 @@ from typing import Any, Awaitable, Callable, Iterable
 
 import httpx
 
-from server.tools import TOOL_NAMES, TOOLS
+from server.tools import FIRST_TOOL_ARG, TOOL_NAMES, TOOLS
 
 log = logging.getLogger("jarvis.server.llm")
 
@@ -371,6 +371,26 @@ _RECOVER_PARAM_RE = re.compile(
     r"(.*?)(?=<\s*(?:parameter|/?\s*(?:tool_?call|function))|$)",
     re.IGNORECASE | re.DOTALL,
 )
+#: The other shape the model writes instead of calling: a bare function call in
+#: the text, 'lookatcamera("What does the room look like?")'. Underscores are
+#: often dropped, so the name is matched loosely and then resolved against the
+#: real tool names. Anchored at a word boundary with an opening bracket, so
+#: ordinary prose cannot match.
+_RECOVER_CALL_RE = re.compile(
+    r"\b([a-z][a-z0-9_]{3,})\s*\(\s*(.*?)\s*\)", re.IGNORECASE | re.DOTALL
+)
+
+
+def _resolve_tool_name(written: str, known: set[str]) -> str | None:
+    """Match a name the model wrote (often without underscores) to a real tool."""
+    candidate = written.strip().lower()
+    if candidate in known:
+        return candidate
+    squashed = candidate.replace("_", "")
+    for name in known:
+        if name.replace("_", "") == squashed:
+            return name
+    return None
 
 
 def recover_tool_calls(raw_content: str, valid_names: Iterable[str]) -> list[ToolCall]:
@@ -396,6 +416,31 @@ def recover_tool_calls(raw_content: str, valid_names: Iterable[str]) -> list[Too
             value = pm.group(2).strip().strip('"').strip()
             if value:
                 args[pm.group(1).strip()] = value
+        calls.append(ToolCall(id=f"recovered_{index}", name=name, arguments=args, raw_arguments=""))
+    if calls:
+        return calls
+
+    # No template tags: look for a bare 'toolname(...)' written into the text.
+    for index, match in enumerate(_RECOVER_CALL_RE.finditer(text), start=1):
+        name = _resolve_tool_name(match.group(1), known)
+        if name is None:
+            continue
+        inner = match.group(2).strip()
+        args: dict[str, Any] = {}
+        if inner:
+            try:
+                parsed = json.loads(inner)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except (ValueError, TypeError):
+                parsed = None
+            if not args:
+                # A single positional argument: give it to the tool's first
+                # required parameter, which is the only one it can be.
+                value = inner.strip().strip('"').strip("'").strip()
+                first = FIRST_TOOL_ARG.get(name)
+                if first and value:
+                    args = {first: value}
         calls.append(ToolCall(id=f"recovered_{index}", name=name, arguments=args, raw_arguments=""))
     return calls
 
@@ -598,7 +643,11 @@ class LlmClient:
             )
             text = ""
         calls = normalize_tool_calls(message.get("tool_calls"))
-        if not calls and _TOOL_ARTIFACT_RE.search(raw_content):
+        if not calls and raw_content.strip():
+            # The model sometimes writes the call into its text instead of
+            # emitting one - in template tags, or as a bare toolname(...).
+            # Recovering it costs nothing and saves a whole retry round;
+            # recover_tool_calls only ever matches a REAL tool name.
             recovered = recover_tool_calls(raw_content, TOOL_NAMES)
             if recovered:
                 log.info(

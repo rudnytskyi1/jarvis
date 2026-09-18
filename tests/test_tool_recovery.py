@@ -58,3 +58,35 @@ def test_two_calls_in_one_blob_split_their_parameters():
         ("pc_control", {"command": "type_text", "value": "hi"}),
         ("pc_control", {"command": "hotkey", "value": "enter"}),
     ]
+
+
+# -- the other shape: a bare function call written into the text -------------
+
+def test_recovers_a_bare_call_with_a_dropped_underscore():
+    # Exactly what the log caught: lookatcamera("...") written as the reply.
+    got = recover_tool_calls('lookatcamera("What does the room look like right now?")', TOOL_NAMES)
+    assert names(got) == [("look_at_camera", {"query": "What does the room look like right now?"})]
+
+
+def test_recovers_a_bare_call_with_json_arguments():
+    got = recover_tool_calls('look_at_camera({"query": "who is here"})', TOOL_NAMES)
+    assert names(got) == [("look_at_camera", {"query": "who is here"})]
+
+
+def test_a_positional_argument_goes_to_the_first_parameter():
+    got = recover_tool_calls('show_photo("camera")', TOOL_NAMES)
+    assert names(got) == [("show_photo", {"which": "camera"})]
+
+
+def test_ordinary_speech_with_brackets_is_not_a_call():
+    for prose in (
+        "That costs about twenty (roughly) dollars.",
+        "I will now take a picture for you.",
+        "Calls lookatcamera to capture the scene.",
+        "The meeting (on Tuesday) is cancelled.",
+    ):
+        assert recover_tool_calls(prose, TOOL_NAMES) == []
+
+
+def test_a_bare_call_to_something_that_is_not_a_tool_is_ignored():
+    assert recover_tool_calls('makecoffee("strong")', TOOL_NAMES) == []

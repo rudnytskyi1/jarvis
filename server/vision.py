@@ -12,7 +12,7 @@ native ``/api/chat`` endpoint with ``stream: false``, ``think: false``, a long
 * :meth:`VisionClient.locate_on_screen` — Qwen-VL grounding: returns the
   normalized click point of a described element, or ``None`` when the model did
   not name one. The answer is mapped onto the screenshot's own pixels before it
-  is normalized, see :data:`GROUNDING_GRID`.
+  is normalized by the image size, see :data:`GROUNDING_GRID`.
 
 Neither call ever raises: a failure becomes an error string (describe) or
 ``None`` (locate), because the caller has to keep the tool loop running.
@@ -73,27 +73,30 @@ DESCRIBE_PROMPT_TEMPLATE = (
     "Question: {query}"
 )
 
-#: Qwen-VL grounding answers on a normalized 0-1000 grid, and it does so
-#: whatever the prompt asks for: the configured model returns the very same
-#: numbers for the same element in a 1600x900 and in a 1280x800 screenshot, and
-#: claims they are "pixels" when asked to declare the scale. Asking for the grid
-#: it actually uses is therefore the only way to aim the cursor correctly;
-#: coordinates ABOVE this value cannot come from that grid and are read as raw
-#: image pixels instead, so a vision model that really answers in pixels still
-#: works.
+#: v1.7.1: Qwen2.5-VL answers grounding in ABSOLUTE PIXELS of the image it was
+#: given - always, whatever the prompt asks for. Measured on a real YouTube
+#: screenshot whose search box sits at (730, 143) of 1600x900: asked for a
+#: 0-1000 grid it replied y=142 at 1600x900 and y=92 at 1024x576. The number
+#: SCALES WITH THE IMAGE, which is what pixels do and a normalized grid does
+#: not. The old code read those pixel values as grid coordinates whenever they
+#: fell under 1000 and divided by 1000, which is why "click the YouTube search
+#: box" landed on the microphone icon - and, at the older 1024-wide size, in the
+#: browser's address bar, so a typed query became a Google search.
+#: Kept only for callers and tests that still name it; nothing rescales by it.
 GROUNDING_GRID = 1000
 
 #: Grounding prompt. The model is told the real size of the image it is looking
-#: at (SPEC §3) and answers on the normalized grid above.
+#: at (SPEC §3) and answers in pixels of that image.
 LOCATE_PROMPT_TEMPLATE = (
     "You are looking at a screenshot of a Windows PC screen. The image is "
     "{width} pixels wide and {height} pixels high.\n"
     "Find this element: {target}\n"
-    "Give the single best point to click on it — the centre of the element — on "
-    "the normalized grid: x = 0 at the left edge and x = {grid} at the right "
-    "edge, y = 0 at the top edge and y = {grid} at the bottom edge.\n"
-    'Reply with strict JSON and nothing else: {{"x": <integer 0-{grid}>, '
-    '"y": <integer 0-{grid}>}}. '
+    "Give the single best point to click on it — the CENTRE of the element — in "
+    "absolute PIXEL coordinates of this image: x from 0 at the left edge to "
+    "{width} at the right edge, y from 0 at the top edge to {height} at the "
+    "bottom edge.\n"
+    'Reply with strict JSON and nothing else: {{"x": <integer 0-{width}>, '
+    '"y": <integer 0-{height}>}}. '
     "No explanation, no units, no markdown, no code fences.\n"
     "If the element is not visible anywhere on this screen, reply with exactly: "
     "not found"
@@ -147,6 +150,30 @@ def _point_from_mapping(data: Any) -> tuple[float, float] | None:
     if x is None or y is None:
         return None
     return x, y
+
+
+def to_normalized(
+    raw_x: float, raw_y: float, width: int, height: int
+) -> tuple[float, float, str]:
+    """Turn the model's answer into ``(x_norm, y_norm, space)`` in 0..1.
+
+    Qwen2.5-VL answers in absolute PIXELS of the image it was handed, whatever
+    the prompt asks for (see :data:`GROUNDING_GRID`). The one other reading
+    worth keeping is a 0-1 fraction, which is unmistakable because both values
+    are no larger than 1. Anything out of frame is clamped rather than dropped:
+    a slightly overshooting coordinate should still click the nearest edge.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    if raw_x <= 1.0 and raw_y <= 1.0:
+        space = "0-1 fraction"
+        x, y = raw_x * width, raw_y * height
+    else:
+        space = "pixels"
+        x, y = float(raw_x), float(raw_y)
+    x = min(max(x, 0.0), float(width))
+    y = min(max(y, 0.0), float(height))
+    return x / float(width), y / float(height), space
 
 
 def parse_point(reply: str) -> tuple[float, float] | None:
@@ -408,19 +435,8 @@ class VisionClient:
             return None
 
         raw_x, raw_y = point
-        if raw_x <= GROUNDING_GRID and raw_y <= GROUNDING_GRID:
-            # The normalized grounding grid the prompt asked for.
-            space = f"0-{GROUNDING_GRID}"
-            x = raw_x / GROUNDING_GRID * width
-            y = raw_y / GROUNDING_GRID * height
-        else:
-            # Off the grid: the model answered in raw pixels of the image.
-            space = "pixels"
-            x, y = raw_x, raw_y
-        x = min(max(x, 0.0), float(width))
-        y = min(max(y, 0.0), float(height))
-        x_norm = x / float(width)
-        y_norm = y / float(height)
+        x_norm, y_norm, space = to_normalized(raw_x, raw_y, width, height)
+        x, y = x_norm * width, y_norm * height
         log.info(
             "Located %r at %.0f,%.0f px of %dx%d -> %.3f,%.3f (%s reply %r)",
             description, x, y, width, height, x_norm, y_norm, space, answer,
@@ -460,6 +476,7 @@ __all__ = [
     "locate_on_screen",
     "parse_point",
     "GROUNDING_GRID",
+    "to_normalized",
     "REQUEST_TIMEOUT_S",
     "DEFAULT_QUERY",
 ]
