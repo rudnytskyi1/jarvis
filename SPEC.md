@@ -454,8 +454,9 @@ required keys → clear startup error naming the key.
      per item, including `output` when the dispatcher returns one); answer
      `screenshot_request` via `client/screen.py`,
   6. play TTS stream as it arrives (`audio.py` output stream at server-declared `sr`),
-  7. if `followup_window_s > 0`: after playback, run VAD listening for up to that many
-     seconds; if speech detected → go to step 3 (skip wake word); else back to step 2.
+  7. if `followup_window_s > 0`: after playback, wait 2 s (`FOLLOWUP_ECHO_GUARD_S`, so the
+     tail of our own reply is not heard as speech), then run VAD listening for up to that
+     many seconds; if speech detected → go to step 3 (skip wake word); else back to step 2.
 - `client/audio.py` — `sounddevice`. Input: 16 kHz mono int16 blocks of 480 samples
   (30 ms). Output: playback of raw PCM at given samplerate; also `play_beep(freq, ms)`.
 - `client/wakeword.py` — Vosk `KaldiRecognizer(model, 16000, json.dumps([*phrases, "[unk]"]))`

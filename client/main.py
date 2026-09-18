@@ -149,7 +149,10 @@ NO_SPEECH_BEEP_MS = 90
 #: Pause before the follow-up window opens: the room is still ringing with the
 #: tail of our own reply (speaker-to-mic echo), which VAD would otherwise pick
 #: up as speech and send to the server as a phantom empty utterance.
-FOLLOWUP_ECHO_GUARD_S = 0.5
+#: Two seconds at the owner's request - half a second was not enough room on a
+#: TV with real speakers, and it also gives the person a beat to start talking
+#: instead of the microphone opening while the reply is still hanging in the air.
+FOLLOWUP_ECHO_GUARD_S = 2.0
 #: "Thinking" sounds: when the server takes longer than this to start replying
 #: (vision, tool rounds), a soft two-tone blip repeats so the user knows Jarvis
 #: is working rather than stuck. Silenced the moment the reply begins.
