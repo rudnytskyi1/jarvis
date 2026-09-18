@@ -2459,13 +2459,27 @@ class Connection:
             frame = next(iter(self._last_frames.values()))
             jpeg, w, h, title = frame.jpeg, frame.w, frame.h, "the last photo"
         else:
-            return done(
-                {
-                    "ok": False,
-                    "error": "there is no photo yet - look at the camera or the "
-                    "screen first, then show it",
-                }
-            )
+            # Nothing cached: TAKE one. "Photograph the room and show me" is a
+            # single action to the person asking, and refusing it because no
+            # earlier look happened to cache a frame is just a missing step
+            # the model then has to guess. Showing a frame that already exists
+            # still wins above - "show me the photo you described" must never
+            # silently become a different moment.
+            want_screen = which in ("screen", "desktop", "monitor")
+            if want_screen:
+                frame_id = f"s{self._screenshot_seq}"
+                self._screenshot_seq += 1
+                captured = await self._request_screenshot(frame_id)
+                title = "the screen"
+            else:
+                frame_id = f"c{self._camera_seq}"
+                self._camera_seq += 1
+                captured = await self._request_camera_frame_full(frame_id)
+                title = "the room"
+            if isinstance(captured, str):
+                return done({"ok": False, "error": captured})
+            jpeg, w, h = captured.jpeg, captured.w, captured.h
+            log.info("show_photo had nothing cached - took a fresh %s photo", title)
 
         try:
             await self._send_image_show(jpeg, w, h, title, IMAGE_SHOW_TTL_S)

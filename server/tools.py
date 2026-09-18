@@ -310,12 +310,17 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "show_photo",
             "description": (
-                "Put the picture you ALREADY took up on the room screen, without "
-                "taking a new one. Use it whenever the user asks to see, show or "
-                "display the photo you just looked at or described ('show me', "
-                "'can I see it', 'put it on the screen'). Never take a fresh "
-                "look_at_camera/look_at_screen for that - they would capture a "
-                "different moment than the one you described. " + _COMMON_HINT
+                "Put a picture up on the room screen. Use it for EVERY request to "
+                "see, show or display something - 'show me', 'can I see it', 'put "
+                "it on the screen', 'take a photo of the room and show me'. If you "
+                "already looked at the camera or the screen, it shows THAT exact "
+                "frame, so never take a fresh look_at_camera/look_at_screen just to "
+                "show it - that would capture a different moment than the one you "
+                "described. If nothing has been captured yet it takes the photo "
+                "itself, so 'photograph the room and show me' is this ONE call and "
+                "nothing else. 'which' picks the source: camera (the room), screen, "
+                "detections (the last annotated find_object photo), or hide to take "
+                "the picture down. " + _COMMON_HINT
             ),
             "parameters": {
                 "type": "object",
