@@ -17,7 +17,7 @@ Start-Sleep -Seconds 2
 
 Write-Host "== (re)registering the interactive task =="
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument ("-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}\scripts\run-client.ps1`"" -f $Root) `
+    -Argument ("-NoProfile -ExecutionPolicy Bypass -File `"{0}\scripts\run-client.ps1`"" -f $Root) `
     -WorkingDirectory $Root
 $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\Anton" -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)

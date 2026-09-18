@@ -8,7 +8,7 @@ if not exist config.yaml (
     echo [i] config.yaml created from config.example.yaml - fill in your devices (LED strip, SwitchBot)
 )
 
-echo [i] Starting the Jarvis client hidden in the background.
-echo     Logs: data\client.log      Stop it with: taskkill /IM python.exe /F
-start "" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0scripts\run-client.ps1"
+echo [i] Starting the Jarvis client in its own window so you can watch the log.
+echo     Logs also go to: data\client.log      Stop it by closing that window.
+start "Jarvis client" powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-client.ps1"
 timeout /t 3 >nul

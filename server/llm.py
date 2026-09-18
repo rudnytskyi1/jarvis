@@ -587,6 +587,16 @@ class LlmClient:
 
     # ------------------------------------------------------------ provider calls
 
+    def _timing_note(self) -> str:
+        """" [prefill 8412 tok in 29.8s, gen 24 tok in 0.2s]" for the round log."""
+        t = getattr(self, "last_timing", None)
+        if not t:
+            return ""
+        return (
+            f" [prefill {t['prompt_tokens']} tok in {t['prefill_s']:.1f}s, "
+            f"gen {t['gen_tokens']} tok in {t['gen_s']:.1f}s]"
+        )
+
     def _chat_native(
         self, messages: list[dict[str, Any]], with_tools: bool
     ) -> tuple[str, list[ToolCall]]:
@@ -628,6 +638,19 @@ class LlmClient:
                 raise
 
         data = response.json()
+        # v1.7.1: where the round's time actually went. A prompt that misses
+        # Ollama's cache is re-prefilled in full - ~8400 tokens at roughly
+        # 280 tokens/s on this box - which dwarfs the generation and is the
+        # difference between a 1 s reply and a 30 s one.
+        try:
+            self.last_timing = {
+                "prompt_tokens": int(data.get("prompt_eval_count") or 0),
+                "prefill_s": float(data.get("prompt_eval_duration") or 0) / 1e9,
+                "gen_tokens": int(data.get("eval_count") or 0),
+                "gen_s": float(data.get("eval_duration") or 0) / 1e9,
+            }
+        except (TypeError, ValueError):
+            self.last_timing = None
         message = data.get("message") if isinstance(data, dict) else None
         if not isinstance(message, dict):
             log.warning("Ollama returned no message object")
@@ -804,12 +827,13 @@ class LlmClient:
                 log.warning("Malformed inline tool call in the reply - retrying the round")
                 text, calls = await self._chat(history, with_tools=True)
             log.info(
-                "LLM round %d/%d: text %r, %d tool call(s) (%s)",
+                "LLM round %d/%d: text %r, %d tool call(s) (%s)%s",
                 round_index,
                 self.max_tool_rounds,
                 text,
                 len(calls),
                 ", ".join(call.name for call in calls) or "-",
+                self._timing_note(),
             )
             if not calls:
                 # BUG 3: the reply is about to be spoken as final — this is
