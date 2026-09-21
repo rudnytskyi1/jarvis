@@ -28,14 +28,17 @@
 | Пункт | Статус | Доказательство |
 |---|---|---|
 | Схема БД и миграции (4.6) | готово | `migrations/0001_init.py` |
-| Слой решений Decider: интерфейс, Rules-провайдер, цепочка с таймаутом (раздел 5) | частично: нет LocalLLM и Jev, решения не пишутся в таблицу `decisions` | `hub/decider.py`, `tests/test_decider.py` |
-| Очередь GPU: классы приоритета, fair share по домам, таймауты (4.5) | частично: не подключена к пайплайну | `hub/gpu_queue.py`, `tests/test_gpu_queue.py` |
+| Слой решений Decider: интерфейс, Rules-провайдер, цепочка с таймаутом, политики уверенности (раздел 5) | частично: нет LocalLLM и Jev; точки D-02–D-09 ещё не переведены | `hub/decider.py`, `tests/test_decider.py`, `tests/test_decision_log.py` |
+| Решения пишутся в таблицу `decisions` (5.3) | готово | `hub/decision_log.py`, `tests/test_decision_log.py` |
+| Очередь GPU: классы приоритета, fair share по домам, таймауты, оценка ожидания (4.5) | готово: подключена к STT/LLM/лицам/vision/SAM3 | `hub/gpu_queue.py`, `tests/test_gpu_queue.py`, `tests/test_gpu_queue_wiring.py` |
 | Auth клиентов по токену, привязка сессии к `home_id`, rate limit (4.3) | готово | `hub/auth.py`, `hub/gateway.py`, тесты |
 | Gateway: приём `hello`, реестр комнат, квоты на реплики и кадры (4.4) | готово | `hub/gateway.py`, `tests/test_gateway.py` |
 | Авторизация подключена к живому `hello`: v1 проходит без токена, v2 без токена закрывается 4401 (4.3) | готово | `hub/app.py::Connection._authorize`, `tests/test_hello_auth.py` |
 | Хаб-БД поднимается при старте: миграции + сид комнат, отказ не роняет сервер (4.6, 4.7) | готово | `hub/main.py::_prepare_hub_database` |
 | Дома из конфига: сид таблицы `homes`, `config_rev` (4.2, 4.7) | готово | `hub/homes.py`, `tests/test_homes.py` |
-| vLLM-провайдер (F-402), роутер моделей (F-401) | не начато | — |
+| vLLM-провайдер: OpenAI-совместимый API, tool calling, guided JSON (F-402) | готово в коде | `hub/llm.py` (`PROVIDER_VLLM`, `structured_json`), `tests/test_llm_vllm_provider.py` |
+| Роутер моделей: уровни `local_fast`/`local_strong`/`cloud_cheap`/`cloud_strong`, D-10 (F-401) | готово в коде, выключено конфигом (`models.enabled: false`) | `hub/model_router.py`, `tests/test_model_router.py` |
+| Перелив при перегрузке очереди (F-403) | готово в коде, включается `models.routing.cloud_fallback` | `hub/model_router.py`, `hub/gpu_queue.py::wait_estimate` |
 | Устройства и сцены (F-501–F-504, F-506) | не начато | — |
 | Реестр скиллов, изоляция по дому, таймаут 20 с (F-405, F-406) | готово | `hub/skills_registry.py`, `tests/test_skills_registry.py` |
 | Аудит (F-706) | не начато | таблица `audit` в схеме |
