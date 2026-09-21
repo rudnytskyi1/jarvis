@@ -1,0 +1,16 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>Homes</h2>
+  {% if homes %}
+  <table>
+    <tr><th>Home</th><th>Name</th><th>Time zone</th><th>Owner</th><th>Clients</th><th>People</th><th>Config rev</th></tr>
+    {% for home in homes %}
+    <tr>
+      <td>{{ home.home_id }}</td><td>{{ home.name }}</td><td>{{ home.tz }}</td>
+      <td>{{ home.owner or '—' }}</td><td>{{ home.clients }}</td><td>{{ home.people }}</td>
+      <td>{{ home.config_rev }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>No homes are configured yet.</p>{% endif %}
+{% endblock %}

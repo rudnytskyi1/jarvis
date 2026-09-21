@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from common import protocol
+from common.ids import is_ulid
 from hub.camera_clip_receiver import CameraClipReceiver
 
 MP4 = b'\x00\x00\x00\x18ftypmp42' + b'\0' * 12
@@ -45,7 +46,12 @@ def test_valid_reply_matches_request_and_releases_pending_slot():
         value = receiver()
         pending = asyncio.create_task(value._request_camera_clip('clip1', 3, 5))
         await asyncio.sleep(0)
-        value.send_json.assert_awaited_once_with(dict(type=protocol.MSG_CAMERA_CLIP_REQUEST, id='clip1', seconds=3, fps=5))
+        value.send_json.assert_awaited_once()
+        request = value.send_json.await_args.args[0]
+        assert request == {**request, 'type': protocol.MSG_CAMERA_CLIP_REQUEST,
+                           'id': 'clip1', 'seconds': 3, 'fps': 5}
+        # ТЗ 4.5: the clip request carries the event id of this camera event.
+        assert is_ulid(request['event_id'])
         assert 'already' in await value._request_camera_clip('another')
         value._on_clip_header(header())
         assert value._expect_clip

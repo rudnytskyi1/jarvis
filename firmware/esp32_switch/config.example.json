@@ -1,0 +1,9 @@
+{
+  "device_id": "switch-livingroom-1",
+  "home_id": "livingroom",
+  "number": 1,
+  "wifi_ssid": "dorm-wifi",
+  "wifi_password": "заполнить на месте",
+  "broker": "192.168.1.10",
+  "servo_pin": 18
+}

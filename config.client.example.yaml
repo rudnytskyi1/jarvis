@@ -28,3 +28,10 @@ client:
   overlay:
     enabled: true
     position: bottom_right
+  # --- self-update from the hub's release tag (ТЗ 4.9) ---
+  ota:
+    enabled: false             # включите на тех ПК, которые обновляются сами
+    remote: origin
+    interval_s: 3600           # раз в час, как в ТЗ
+    healthy_after_s: 60        # столько новый тег должен прожить, иначе откат
+    state_path: data/ota_state.json

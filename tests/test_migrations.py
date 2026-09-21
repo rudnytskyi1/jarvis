@@ -23,9 +23,12 @@ def _tables(conn):
 def test_fresh_database_reaches_the_full_schema(tmp_path):
     conn = runner.connect(str(tmp_path / "hub.db"))
     try:
-        assert runner.migrate(conn) == [1]
+        assert runner.migrate(conn) == [1, 2, 3]
         assert REQUIRED_TABLES <= _tables(conn)
-        assert [row[0] for row in conn.execute("SELECT version FROM schema_version")] == [1]
+        assert [row[0] for row in conn.execute("SELECT version FROM schema_version")] == [1, 2, 3]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
+        assert "observed" in columns
+        assert "preset" in {row[1] for row in conn.execute("PRAGMA table_info(scenes)")}
     finally:
         conn.close()
 
@@ -35,7 +38,7 @@ def test_migrate_is_idempotent(tmp_path):
     try:
         runner.migrate(conn)
         assert runner.migrate(conn) == []
-        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 1
+        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 3
     finally:
         conn.close()
 

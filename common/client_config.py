@@ -148,6 +148,23 @@ class DeviceConfig(BaseModel):
         return merged
 
 
+class ClientOTAConfig(_Strict):
+    """Client updates from the hub's release tag (ТЗ 4.9).
+
+    Off by default: a room PC updates itself only when somebody switched the
+    feature on for that PC. The hub says *which* tag to run; the client fetches,
+    migrates its config, restarts, and rolls back if the new tag cannot stay up
+    for the guard window.
+    """
+
+    enabled: bool = False
+    remote: str = Field(default="origin", min_length=1, max_length=60)
+    interval_s: float = Field(default=3600.0, ge=60.0, le=86400.0)
+    #: How long a freshly checked-out tag must survive before it counts as good.
+    healthy_after_s: float = Field(default=60.0, ge=10.0, le=600.0)
+    state_path: str = Field(default="data/ota_state.json", min_length=1, max_length=200)
+
+
 class ClientConfig(_Strict):
     """Everything the room PC reads (``client``)."""
 
@@ -174,6 +191,8 @@ class ClientConfig(_Strict):
     apps: dict[str, str] = Field(default_factory=dict)
     #: Physical devices; empty by default (none are installed yet).
     devices: list[DeviceConfig] = Field(default_factory=list)
+    #: Self-update from the hub's release tag (ТЗ 4.9); off by default.
+    ota: ClientOTAConfig = Field(default_factory=ClientOTAConfig)
     #: Hub identity (ТЗ phase 0): which home this client belongs to and how it
     #: authenticates. ``hub_url`` falls back to the legacy ``server_url`` and the
     #: token itself is only ever read from the named environment variable.

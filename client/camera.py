@@ -58,6 +58,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from common.ids import new_ulid
 from common.protocol import (
     CAMERA_BURST_MAX,
     CAMERA_FORMAT,
@@ -225,6 +226,9 @@ class CameraService:
         self._sent_state: tuple[int, tuple[tuple[str, int], ...]] | None = None
         self._sent_state_at = 0.0
         self._last_presence_push = 0.0
+        #: ``event_id`` of the request being answered (ТЗ 4.5); empty for an
+        #: unsolicited presence push, which mints its own id.
+        self._request_event_id = ''
 
     # ------------------------------------------------------------------
     # state
@@ -823,11 +827,15 @@ class CameraService:
         self._last_presence_push = now
         self._frame_seq += 1
         frame_id = f'p{self._frame_seq}'
+        # ТЗ 4.5: an unprompted presence push is a background camera event too,
+        # so the client mints its own event id for the burst.
+        event_id = new_ulid()
         self._presence_pending.set()
-        if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks))) is None:
+        if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks),
+                                                       event_id)) is None:
             self._presence_pending.clear()
 
-    async def _encode_and_push_presence(self, frame, frame_id, tracks):
+    async def _encode_and_push_presence(self, frame, frame_id, tracks, event_id=''):
         try:
             # full=True: face recognition needs a CRISP face. The old 1280px /
             # quality-80 presence frame made the owner's own face score around
@@ -836,7 +844,8 @@ class CameraService:
             pairs = ([await asyncio.to_thread(self._encode, frame, full=True)] if frame is not None
                      else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
             if pairs:
-                await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True, tracks=tracks)
+                await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True,
+                                       tracks=tracks, event_id=event_id)
         except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the thread
             log.debug("Could not capture the presence burst: %s", exc)
             return
@@ -876,6 +885,7 @@ class CameraService:
         pairs: list,
         skip_if_busy: bool = False,
         tracks=None,
+        event_id: str = "",
     ) -> None:
         """Send ``pairs`` as that many ``camera_frame`` header+binary pairs.
 
@@ -903,7 +913,8 @@ class CameraService:
                     jpeg, width, height = pair[:3]
                     frame_tracks = pair[3] if len(pair) > 3 else tracks
                     await self._send_pair(
-                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height, frame_tracks
+                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
+                        frame_tracks, event_id
                     )
             else:
                 async with lock:
@@ -911,7 +922,8 @@ class CameraService:
                         jpeg, width, height = pair[:3]
                         frame_tracks = pair[3] if len(pair) > 3 else tracks
                         await self._send_pair(
-                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height, frame_tracks
+                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
+                            frame_tracks, event_id
                         )
         except asyncio.CancelledError:
             raise
@@ -930,6 +942,7 @@ class CameraService:
         width: int,
         height: int,
         tracks=None,
+        event_id: str = "",
     ) -> None:
         """Send one ``camera_frame`` header plus its single binary frame."""
         header = {
@@ -943,6 +956,10 @@ class CameraService:
             "of": int(total),
             "tracks": tracks,
         }
+        if event_id:
+            # ТЗ 4.5: the background camera event keeps the id the server minted
+            # (or the one this client minted for an unprompted presence push).
+            header["event_id"] = event_id
         log.debug(
             "Sending camera frame %s (%s) %d/%d: %dx%d, %d bytes",
             frame_id, reason, seq, total, width, height, len(jpeg),
@@ -956,9 +973,10 @@ class CameraService:
         if send_json is None:
             return
         try:
-            await send_json(
-                {"type": MSG_CAMERA_ERROR, "id": str(request_id), "error": str(error)}
-            )
+            payload = {"type": MSG_CAMERA_ERROR, "id": str(request_id), "error": str(error)}
+            if self._request_event_id:
+                payload["event_id"] = self._request_event_id
+            await send_json(payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -976,7 +994,8 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_request (SPEC v1.4)
     # ------------------------------------------------------------------
-    async def serve_request(self, request_id: str, burst: int = 1, full: bool = False) -> None:
+    async def serve_request(self, request_id: str, burst: int = 1, full: bool = False,
+                            event_id: str = "") -> None:
         """Answer the server's ``camera_request`` with ``burst`` frame(s) (v1.4 burst).
 
         Captures ``burst`` frames roughly :data:`BURST_FRAME_INTERVAL_S` apart,
@@ -999,6 +1018,8 @@ class CameraService:
         none for the server's best-face selection).
         """
         request_id = str(request_id or "")
+        # ТЗ 4.5: the server's event id is echoed on every header of the answer.
+        self._request_event_id = str(event_id or '')[:100]
         if not self._enabled:
             await self._send_error(request_id, "the camera is not available on this client")
             return
@@ -1024,10 +1045,11 @@ class CameraService:
             return
 
         log.info(
-            "Answering the camera request (id=%s): %d/%d frame(s)",
-            request_id or "?", len(pairs), count,
+            "Answering the camera request (id=%s, event %s): %d/%d frame(s)",
+            request_id or "?", self._request_event_id or "-", len(pairs), count,
         )
-        await self._send_burst(request_id, CAMERA_REASON_REQUEST, pairs)
+        await self._send_burst(request_id, CAMERA_REASON_REQUEST, pairs,
+                               event_id=self._request_event_id)
 
     # ------------------------------------------------------------------
     # thread -> event loop

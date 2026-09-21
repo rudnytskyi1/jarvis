@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -66,6 +67,11 @@ ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 class StructuredUnavailable(RuntimeError):
     """The endpoint could not answer under a JSON schema (ТЗ F-402)."""
+
+
+def _probability_key(token: str) -> str:
+    """A vocabulary token reduced to the word it is offering (``" yes"`` → ``yes``)."""
+    return re.sub(r"[^0-9a-z]+", "", (token or "").strip().lower())
 
 
 def _json_object(raw: str) -> dict[str, Any] | None:
@@ -932,6 +938,54 @@ class LlmClient:
         if parsed is None:
             raise StructuredUnavailable("the model did not return a JSON object")
         return parsed
+
+    async def first_token_probabilities(self, messages: list[dict[str, Any]], *,
+                                        max_tokens: int = 1) -> dict[str, float]:
+        """Probability of the first token, by ``logprobs`` (ТЗ 5.2).
+
+        The local decider uses this for yes/no questions: a probability can be
+        compared with the confidence policy (``auto_above``/``ask_below``),
+        while the word alone cannot. Tokens are grouped by the word they offer
+        (``" yes"``, ``"Yes"`` and ``"YES"`` all count as ``yes``), so a model
+        that spells its answer differently does not change the meaning.
+
+        Returns ``{}`` when the provider does not expose logprobs or the request
+        fails, which is the signal to fall back to a schema-constrained answer.
+        """
+        if self.provider not in OPENAI_COMPATIBLE or self._client is None:
+            return {}
+
+        def request() -> Any:
+            return self._client.chat.completions.create(
+                model=self.model, messages=messages, temperature=self.temperature,
+                max_tokens=max_tokens, logprobs=True, top_logprobs=5,
+            )
+
+        try:
+            completion = await asyncio.to_thread(request)
+        except Exception as exc:  # noqa: BLE001 - logprobs are a bonus, not a contract
+            log.debug("The endpoint does not offer logprobs (%s)", exc)
+            return {}
+        choices = getattr(completion, "choices", None) or []
+        if not choices:
+            return {}
+        logprobs = getattr(choices[0], "logprobs", None)
+        content = getattr(logprobs, "content", None) if logprobs is not None else None
+        if not content:
+            return {}
+        first = content[0]
+        candidates = getattr(first, "top_logprobs", None) or [first]
+        probabilities: dict[str, float] = {}
+        for candidate in candidates:
+            key = _probability_key(str(getattr(candidate, "token", "") or ""))
+            logprob = getattr(candidate, "logprob", None)
+            if not key or logprob is None:
+                continue
+            try:
+                probabilities[key] = probabilities.get(key, 0.0) + math.exp(float(logprob))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return probabilities
 
     async def _chat(
         self, messages: list[dict[str, Any]], with_tools: bool

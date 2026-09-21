@@ -9,7 +9,17 @@ from dataclasses import dataclass, field
 
 from hub.presence_alerts import RULE_RANGES
 from hub.telegram_admin_state import CAPABILITIES, ROLES, contains_secret
-from hub.telegram_admin_view import audit_text, profile_text, rule_text, rule_value, status_text, user_text
+from hub.telegram_admin_view import (
+    audit_text,
+    calibration_text,
+    profile_text,
+    rule_text,
+    rule_value,
+    scenes_text,
+    status_text,
+    switches_text,
+    user_text,
+)
 from hub.telegram_admin_view import display as _display
 
 TTL_SECONDS = 900
@@ -344,7 +354,9 @@ class TelegramAdmin:
             menu = [('Status', 'status'), ('Settings', 'settings'), ('Shared memory', 'memory'),
                     ('Personal memory', 'personal'), ('People profiles', 'profiles'),
                     ('Telegram users', 'users'), ('Computers and cameras', 'workplaces'),
-                    ('Notifications', 'alerts'), ('Audit log', 'audit')]
+                    ('Notifications', 'alerts'), ('Audit log', 'audit'),
+                    ('Calibration', 'calibration'), ('Wall switches', 'switches'),
+                    ('Scenes', 'scenes')]
             # Two buttons per row keeps the whole panel one screen tall on a phone.
             for index in range(0, len(menu), 2):
                 rows.append([button(label, kind='page', page=name) for label, name in menu[index:index + 2]])
@@ -591,6 +603,30 @@ class TelegramAdmin:
             events = await asyncio.to_thread(self.access.events, 20)
             text = audit_text(events)
             rows = [[button('Refresh', kind='page', page='audit')], self._back(panel)]
+        elif page == 'calibration':
+            result = await self._backend(panel, 'calibration.list')
+            text = calibration_text(result)
+            rows = [[button('Refresh', kind='page', page='calibration')], self._back(panel)]
+        elif page == 'switches':
+            result = await self._backend(panel, 'devices.list')
+            text = switches_text(result)
+            for item in (result.get('items') or [])[:8]:
+                rows.append([button('Set angles: ' + str(item.get('name')), kind='prompt',
+                                    action='devices.calibrate', payload={'device_id': item['id']},
+                                    label=f"Send the servo angles of {item.get('name')} as "
+                                          'closed,open in degrees, for example 0,90',
+                                    type='str', back='switches')])
+            rows += [[button('Refresh', kind='page', page='switches')], self._back(panel)]
+        elif page == 'scenes':
+            result = await self._backend(panel, 'scenes.list', payload)
+            text = scenes_text(result)
+            for item in (result.get('items') or [])[:8]:
+                rows.append([button(f"Run: {item.get('name')}", kind='confirm',
+                                    label=f"Run the scene {item.get('name')}?",
+                                    action=dict(action='scenes.run',
+                                                payload={'scene_id': item['scene_id']},
+                                                back='scenes'))])
+            rows += [[button('Refresh', kind='page', page='scenes')], self._back(panel)]
         else:
             text, rows = 'This section is no longer available.', [self._back(panel)]
         if len(rows) > 18 and page != 'workplaces':

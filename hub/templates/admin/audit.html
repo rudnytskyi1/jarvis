@@ -1,0 +1,18 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>Audit</h2>
+  {% if events %}
+  <table>
+    <tr><th>When</th><th>Who</th><th>Home</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr>
+    {% for event in events %}
+    <tr>
+      <td>{{ event.when }}</td><td>{{ event.actor }}</td><td>{{ event.home_id }}</td>
+      <td>{{ event.action }}</td><td>{{ event.target }}</td>
+      <td>{{ event.result }}</td><td>{{ event.detail }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>Nothing has been recorded yet.</p>{% endif %}
+  <p class="note">Privileged actions, settings changes and deletions only. Secrets never reach
+    this table.</p>
+{% endblock %}

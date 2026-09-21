@@ -1,0 +1,16 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>Clients</h2>
+  {% if clients %}
+  <table>
+    <tr><th>Client</th><th>Home</th><th>Kind</th><th>Token fingerprint</th><th>Version</th><th>Hardware</th><th>Last seen</th></tr>
+    {% for client in clients %}
+    <tr>
+      <td>{{ client.client_id }}</td><td>{{ client.home_id }}</td><td>{{ client.kind }}</td>
+      <td>{{ client.token }}</td><td>{{ client.version }}</td><td>{{ client.hw or '—' }}</td>
+      <td>{{ client.last_seen }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>No clients have been issued a token yet.</p>{% endif %}
+{% endblock %}

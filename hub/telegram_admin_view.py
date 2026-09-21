@@ -108,3 +108,73 @@ def audit_text(events):
         lines += ['', f'{when} · {label(row.get("event", "Action"))}',
                   'By Telegram user ' + str(row.get('actor')), display(row.get('details') or {})]
     return '\n'.join(lines)
+
+
+def calibration_text(result):
+    """The weekly calibration report of ТЗ 5.4: errors per type and provider."""
+    days = result.get('days', 7)
+    lines = [f'Decision calibration · last {display(days)} day(s)']
+    if result.get('ok') is False:
+        return lines[0] + '\n' + display(result.get('error'))
+    totals = result.get('totals') or {}
+    share = totals.get('error_share')
+    checked = display(totals.get('observed', 0))
+    errors = display(totals.get('errors', 0))
+    lines += ['', 'Decisions: ' + display(totals.get('decisions', 0)),
+              f'Checked against what happened: {checked}',
+              f'Errors: {errors}' + ('' if share is None else f' · {share:.1%} of checked'),
+              'A decision counts as an error when the turn contradicted it: the router promised a local command and none matched, or the self-check found the reply was right after all.']
+    if share is None:
+        lines.append('Nothing has been checked against what happened yet, so there is no error share to report.')
+    rows = result.get('rows') or []
+    if not rows:
+        lines += ['', 'No decisions were recorded in this window.']
+        return '\n'.join(lines)
+    lines.append('')
+    for row in rows[:12]:
+        row_share = row.get('error_share')
+        lines += [f"{label(row.get('type'))} · {display(row.get('provider'))}",
+                  f"  decisions {display(row.get('decisions'))} · checked {display(row.get('observed'))}"
+                  f" · errors {display(row.get('errors'))}"
+                  + ('' if row_share is None else f' ({row_share:.1%})'),
+                  f"  mean confidence {row.get('mean_confidence')} · mean latency {row.get('mean_latency_ms')} ms"]
+    if len(rows) > 12:
+        lines.append(f'Showing 12 of {len(rows)} type/provider pairs.')
+    return '\n'.join(lines)
+
+
+def switches_text(result):
+    """The ESP32 wall switches and their servo angles (ТЗ F-503)."""
+    lines = ['Wall switches']
+    if result.get('ok') is False:
+        return lines[0] + '\n' + display(result.get('error'))
+    items = result.get('items') or []
+    if not items:
+        return (lines[0] + '\nNo switch is registered yet. Add an ESP32 switch to a home, '
+                'then calibrate its servo here.')
+    for item in items:
+        state = 'calibrated' if item.get('calibrated') else 'factory angles'
+        lines += ['', f"{item.get('name')} · {item.get('home_id')}",
+                  f"  Adapter {display(item.get('adapter'))} · switch {display(item.get('switch'))}"
+                  f" · {state}",
+                  f"  Closed {display(item.get('closed_angle'))}° · open "
+                  f"{display(item.get('open_angle'))}° · hold {display(item.get('dwell_s'))} s"]
+    return '\n'.join(lines)
+
+
+def scenes_text(result):
+    """The scenes of this home and what they do (ТЗ F-506)."""
+    lines = ['Scenes']
+    if result.get('ok') is False:
+        return lines[0] + '\n' + display(result.get('error'))
+    items = result.get('items') or []
+    if not items:
+        return lines[0] + '\nNo scenes yet. The five presets appear on the next refresh.'
+    if result.get('created'):
+        lines.append('Presets created: ' + ', '.join(str(name) for name in result['created']))
+    for item in items:
+        lines += ['', f"{item.get('name')}{' (preset)' if item.get('preset') else ''}",
+                  f"  {display(item.get('steps'))} step(s): {str(item.get('summary') or '')[:180]}"]
+        if item.get('aliases'):
+            lines.append('  Also called: ' + ', '.join(str(alias) for alias in item['aliases']))
+    return '\n'.join(lines)

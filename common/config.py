@@ -46,6 +46,7 @@ from common.client_config import (
     AudioConfig,
     CameraConfig,
     ClientConfig,
+    ClientOTAConfig,
     DeviceConfig,
     OverlayConfig,
     RecordingConfig,
@@ -64,6 +65,8 @@ __all__ = [
     "FaceConfig",
     "SegmentConfig",
     "GpuQueueConfig",
+    "SkillReloadConfig",
+    "WebAdminConfig",
     "ModelsConfig",
     "ModelLevelConfig",
     "ModelRoutingConfig",
@@ -72,6 +75,7 @@ __all__ = [
     "TTSConfig",
     "MediaConfig",
     "ClientConfig",
+    "ClientOTAConfig",
     "WakewordConfig",
     "AudioConfig",
     "VADConfig",
@@ -550,6 +554,132 @@ class HomeConfig(_Strict):
         return value
 
 
+class StageTimeouts(_Strict):
+    """Per-stage budgets and the degradation rule (``server.timeouts``).
+
+    The budgets are the ones the latency table (ТЗ 15.1) gives for the local
+    models, plus a round budget for the model itself. Overrunning a budget must
+    never leave the room in silence: the stage that ran late is dropped and the
+    turn continues with what is available — a transcript without diarization,
+    an answer without voice identity, a spoken apology instead of a hang. Every
+    degradation is logged with the utterance id and counted in
+    ``/health.utterances``.
+    """
+
+    #: False restores the pre-degradation behaviour: only the GPU-queue
+    #: timeouts and ``server.diarization.timeout_s`` fire.
+    enabled: bool = True
+    #: VAD end → final transcript (without diarization).
+    stt_ms: int = Field(default=700, ge=50, le=600000)
+    #: The same deadline for the diarized path; overrunning it costs the
+    #: speaker labels, not the transcript.
+    diarization_ms: int = Field(default=700, ge=50, le=600000)
+    #: Voice identification (the ReID step of a turn).
+    speaker_ms: int = Field(default=700, ge=50, le=600000)
+    #: The whole model round. This is a stuck-generation guard, not the
+    #: end-to-end latency budget: it is deliberately far above 15.1's 1.2 s so
+    #: a slow-but-working model is never cut off.
+    reply_ms: int = Field(default=20000, ge=1000, le=600000)
+
+
+class DeciderConfig(_Strict):
+    """Which provider answers which decision, and how long it may think.
+
+    ТЗ 5.2: the order of providers per decision type and the per-provider
+    timeout are configuration, not code — swapping in the local model (or a
+    later Jev provider) must not be an edit of ``hub/app.py``. A decision type
+    missing from ``order`` keeps the built-in chain; a provider that is not
+    available at runtime (the local model is switched off) is skipped by the
+    chain itself, so a stale name is harmless.
+    """
+
+    #: 400 ms is the budget of ТЗ 15.1 for "transcript → generation starts".
+    timeout_ms: int = Field(default=400, ge=50, le=10000)
+    #: Decision type → providers, best first.
+    order: dict[str, list[str]] = Field(default_factory=dict)
+    #: ТЗ 5.4: the same question is answered once for this long (0 = no cache).
+    cache_ttl_s: float = Field(default=60.0, ge=0.0, le=3600.0)
+    cache_max_entries: int = Field(default=256, ge=1, le=10000)
+    #: ТЗ 5.4: how far back the weekly calibration report in the panel looks.
+    report_days: int = Field(default=7, ge=1, le=90)
+
+    @field_validator("order")
+    @classmethod
+    def _known_providers(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        known = {"rules", "local_llm", "jev"}
+        for decision_type, providers in value.items():
+            if not providers:
+                raise ValueError(f"decider.order.{decision_type} lists no provider")
+            unknown = sorted(set(providers) - known)
+            if unknown:
+                raise ValueError(
+                    f"decider.order.{decision_type} names unknown provider(s): "
+                    + ", ".join(unknown) + " (expected " + ", ".join(sorted(known)) + ")"
+                )
+        return value
+
+
+class SkillReloadConfig(_Strict):
+    """Hot reload of skill files (ТЗ F-405).
+
+    Reloading code while the hub serves rooms is a development convenience, not
+    production behaviour, so it is off unless somebody asks for it: the shipped
+    hub keeps running the skills it started with, and a room cannot be surprised
+    by a file that was being edited.
+    """
+
+    dev_reload: bool = False
+    interval_s: float = Field(default=2.0, ge=0.25, le=60.0)
+
+
+class WebAdminConfig(_Strict):
+    """The owner's web panel (ТЗ F-705).
+
+    The panel is reachable from the overlay network only — a phone on the
+    dorm's own Wi-Fi must not even see the login form. The password lives in
+    the environment (ТЗ 15.4: secrets never in the config file or in git).
+    """
+
+    enabled: bool = False
+    #: 127.0.0.1 by default: the overlay address belongs to the deployment.
+    host: str = "127.0.0.1"
+    port: int = Field(default=8099, ge=1, le=65535)
+    #: Overlay ranges allowed to reach the panel (Tailscale CGNAT + loopback).
+    allowed_networks: list[str] = Field(
+        default_factory=lambda: ["127.0.0.0/8", "100.64.0.0/10"], max_length=8)
+    password_env: str = Field(default="ROWAN_ADMIN_PASSWORD", min_length=4, max_length=60)
+    session_minutes: int = Field(default=60, ge=5, le=1440)
+
+    @field_validator("allowed_networks")
+    @classmethod
+    def _networks_are_cidrs(cls, value: list[str]) -> list[str]:
+        import ipaddress
+
+        for item in value:
+            try:
+                ipaddress.ip_network(str(item), strict=False)
+            except ValueError as exc:
+                raise ValueError(f"allowed_networks: {item!r} is not a network: {exc}") from exc
+        return value
+
+
+class StreamingReplyConfig(_Strict):
+    """Streaming answers (``server.streaming_reply``, ТЗ F-101).
+
+    The first sound of a reply has a budget of its own in the latency table
+    (ТЗ 15.1): 1.2 s after the end of speech. The budget only lives in the
+    config so a stand whose models are slower can be calibrated without
+    touching the code; the measurement itself is always on.
+    """
+
+    enabled: bool = True
+    #: End of speech -> the first audio frame on the wire (ТЗ 15.1).
+    first_audio_budget_ms: int = Field(default=1200, ge=100, le=10000)
+    #: Стартовать ход по промежуточному транскрипту, не дожидаясь финального
+    #: (P2-41). Выключено по умолчанию: сначала должен быть замер.
+    early_start: bool = False
+
+
 class ServerConfig(_Strict):
     """Everything the brain PC reads (``server``)."""
 
@@ -574,6 +704,13 @@ class ServerConfig(_Strict):
     media: MediaConfig = Field(default_factory=MediaConfig)
     vectors: VectorConfig = Field(default_factory=VectorConfig)
     outbound: OutboundConfig = Field(default_factory=OutboundConfig)
+    timeouts: StageTimeouts = Field(default_factory=StageTimeouts)
+    decider: DeciderConfig = Field(default_factory=DeciderConfig)
+    skills: SkillReloadConfig = Field(default_factory=SkillReloadConfig)
+    streaming_reply: StreamingReplyConfig = Field(default_factory=StreamingReplyConfig)
+    web_admin: WebAdminConfig = Field(default_factory=WebAdminConfig)
+    #: Release tag the room clients should run (ТЗ 4.9 OTA). Empty = не трогать.
+    client_release: str = Field(default="", max_length=60)
 
 
 # ---------------------------------------------------------------------------

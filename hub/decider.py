@@ -26,6 +26,14 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 Outcome = Literal["act", "log", "ask"]
 
+#: Decision types (ТЗ 5.3) whose answer the pipeline already has as a
+#: heuristic: the rules provider reports that answer when the caller passes it
+#: in ``context['heuristic']``, so the chain can stand in front of it.
+HEURISTIC_TYPES = frozenset({
+    "addressed", "hallucination", "action_result", "sight_claim",
+    "admin_rights", "injection", "follow_up",
+})
+
 
 class Decision(BaseModel, Generic[T]):
     """One typed judgement with a calibrated-looking confidence."""
@@ -41,6 +49,9 @@ class Decision(BaseModel, Generic[T]):
     #: the option list. It is what the ``decisions`` table hashes (ТЗ 5.3), so
     #: "why did Rowan do that?" is answerable after the log rotated.
     input_text: str = Field(default="", max_length=4000)
+    #: True when the answer came from the decision cache (ТЗ 5.4) instead of a
+    #: provider: the value is the same, but the latency was zero.
+    cached: bool = False
 
 
 class Decider(Protocol):
@@ -95,8 +106,15 @@ class RulesDecider:
     name = "rules"
 
     #: Above this many characters per second of audio the transcript cannot be
-    #: real speech in this pipeline (F-105, D-03).
-    chars_per_second_limit = 28.0
+    #: real speech in this pipeline (F-105, D-03). The engine's own thresholds
+    #: (:func:`hub.stt.is_probable_noise`) do the fine-grained work; this is the
+    #: coarse supplementary rule, so it only fires on the physically impossible
+    #: — fast speech reaches ~20 characters per second, and a phrase list of
+    #: 60 is well past anything a person can say.
+    chars_per_second_limit = 60.0
+    #: Below this much audio the question cannot be answered at all (D-03): a
+    #: cough, a test stub or half a second of noise carry no evidence.
+    min_audio_s = 1.0
 
     def __init__(self, *, wake_phrases: Iterable[str] = (), command_router: Callable[..., Any] | None = None):
         self.wake_phrases = tuple(wake_phrases)
@@ -125,6 +143,13 @@ class RulesDecider:
         if decision_type == "hallucination":
             return _decision(self._looks_impossible(context), 0.7, self.name, started,
                              str(context.get("text") or ""))
+        heuristic = context.get("heuristic")
+        if decision_type in HEURISTIC_TYPES and isinstance(heuristic, bool):
+            # ТЗ 5.3: the pipeline hands its own answer in, so the rules
+            # provider can stand in for it inside the chain. The confidence is
+            # the honest one: "no" from a heuristic is a guess, not a verdict.
+            return _decision(heuristic, 0.9 if heuristic else 0.6, self.name, started,
+                             str(context.get("text") or ""))
         raise NotImplementedError(f"the rules provider has no yes/no rule for {decision_type!r}")
 
     async def choose(self, question: str, options: Sequence[str], context: dict[str, Any], *,
@@ -145,6 +170,10 @@ class RulesDecider:
             if value not in options:
                 value = "local_strong" if "local_strong" in options else options[0]
             return _decision(value, 0.7, self.name, started, text)
+        heuristic = context.get("heuristic")
+        if decision_type in HEURISTIC_TYPES and isinstance(heuristic, str) and heuristic in options:
+            return _decision(heuristic, 0.9 if heuristic else 0.6, self.name, started,
+                             str(context.get("text") or ""))
         raise NotImplementedError(f"the rules provider has no choice rule for {decision_type!r}")
 
     async def score(self, question: str, context: dict[str, Any], *, scale: tuple[int, int],
@@ -158,7 +187,7 @@ class RulesDecider:
             duration = float(context.get("duration_s") or 0.0)
         except (TypeError, ValueError):
             return False
-        if duration <= 0:
+        if duration < self.min_audio_s:
             return False
         return len(text) / duration > self.chars_per_second_limit
 
@@ -169,11 +198,14 @@ class DecisionChain:
     def __init__(self, providers: Iterable[Decider], order: dict[str, Sequence[str]], *,
                  timeout_s: float = 0.4,
                  recorder: Callable[[Decision[Any], str, str], Awaitable[None] | None] | None = None,
-                 policies: dict[str, Policy] | None = None) -> None:
+                 policies: dict[str, Policy] | None = None,
+                 cache: Any = None) -> None:
         self.providers = {provider.name: provider for provider in providers}
         self.order = {key: tuple(value) for key, value in order.items()}
         self.timeout_s = timeout_s
         self.recorder = recorder
+        #: ``hub.decider_cache.DecisionCache`` or ``None`` (ТЗ 5.4).
+        self.cache = cache
         #: Per decision type: what a confidence means (ТЗ 5.4). A type with no
         #: policy is recorded as "pending", which is what the recorder saw
         #: before policies existed.
@@ -186,16 +218,32 @@ class DecisionChain:
         return [self.providers[name] for name in names if name in self.providers]
 
     async def _ask(self, method: str, decision_type: str, *args: Any, **kwargs: Any) -> Decision[Any]:
+        key: str | None = None
+        if self.cache is not None:
+            from hub.decider_cache import input_hash
+
+            key = input_hash(decision_type, method, *args, **kwargs)
+            hit = self.cache.get(key)
+            if hit is not None:
+                return hit
         for provider in self._chain(decision_type):
             call = getattr(provider, method)
             try:
                 result = await asyncio.wait_for(call(*args, decision_type=decision_type, **kwargs), self.timeout_s)
             except NotImplementedError:
                 continue
+            except DecisionUnavailable as exc:
+                # The provider was reachable but could not answer this question
+                # (a broken endpoint, an answer outside the offered options):
+                # the next provider in the chain gets its turn.
+                log.debug("decider %s could not answer %s (%s)", provider.name, decision_type, exc)
+                continue
             except TimeoutError:
                 log.debug("decider %s timed out on %s", provider.name, decision_type)
                 continue
             await self._record(result, decision_type)
+            if key is not None:
+                self.cache.put(key, result)
             return result
         raise DecisionUnavailable(f"no provider answered {decision_type!r}")
 

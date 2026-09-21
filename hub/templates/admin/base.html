@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rowan · owner panel</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; }
+    .note { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Rowan · owner panel</h1>
+  <nav>
+    <a href="/admin/homes">Homes</a>
+    <a href="/admin/clients">Clients</a>
+    <a href="/admin/people">People</a>
+    <a href="/admin/audit">Audit</a>
+    <a href="/admin/logout">Sign out</a>
+  </nav>
+  {% block content %}{% endblock %}
+  <p class="note">Reachable from the overlay network only. Tokens are shown as fingerprints
+    of their stored hashes — the tokens themselves are never kept.</p>
+</body>
+</html>

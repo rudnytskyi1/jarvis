@@ -1,0 +1,19 @@
+# Клиент комнаты на Linux (ТЗ 4.9). Нужен графический сеанс: HUD и микрофон.
+[Unit]
+Description=Rowan room client (microphone, camera, HUD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rowan
+ExecStart=/opt/rowan/.venv/bin/python -m client.main --config /opt/rowan/config.yaml
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/rowan/.env
+StandardOutput=append:/opt/rowan/data/logs/client.log
+StandardError=append:/opt/rowan/data/logs/client.log
+
+[Install]
+WantedBy=graphical.target

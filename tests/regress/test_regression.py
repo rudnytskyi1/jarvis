@@ -48,7 +48,7 @@ def load_fixtures() -> list[Fixture]:
 
 def test_fixture_file_is_well_formed_and_large_enough():
     fixtures = load_fixtures()
-    assert len(fixtures) >= 30, "the regression set must keep growing toward 100 recorded utterances"
+    assert len(fixtures) >= 100, "the regression set was carried to 100 recorded utterances (ТЗ 15.6)"
     assert len({item.id for item in fixtures}) == len(fixtures), "fixture ids must be unique"
     assert {item.language for item in fixtures} >= {"en", "ru"}, "at least two languages must be covered"
 
@@ -88,7 +88,7 @@ def test_routing_pass_rate_meets_the_threshold():
         elif result is not None:
             failures.append(f"{item.id}: expected the LLM route, got {result[0]}")
     executed = len(fixtures)
-    assert executed >= 30, f"only {executed} replayable fixtures; the set must keep growing toward 100"
+    assert executed >= 100, f"only {executed} replayable fixtures; the set must hold at least 100"
     rate = (executed - len(failures)) / executed
     assert rate >= PASS_THRESHOLD, (
         f"pass rate {rate:.0%} is below the {PASS_THRESHOLD:.0%} threshold; "

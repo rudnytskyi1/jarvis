@@ -36,3 +36,77 @@
 {"id": "ru-relative-volume-with-percent", "language": "ru", "transcript": "громче на 20 процентов", "expected_route": "llm", "expected_command": null, "notes": "relative change is not an absolute shortcut"}
 {"id": "en-play-music", "language": "en", "transcript": "play music", "expected_route": "llm", "expected_command": null, "notes": "needs the media tool"}
 {"id": "es-unmute", "language": "es", "transcript": "activa el sonido", "expected_route": "banter", "expected_command": null, "notes": "no spanish shortcut exists yet; needs an audio fixture"}
+{"id": "en-volume-percent-sign", "language": "en", "transcript": "volume 30%", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 30}, "notes": "percent sign is optional"}
+{"id": "en-volume-percent-word", "language": "en", "transcript": "volume 45 percent", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 45}, "notes": "spoken percent"}
+{"id": "en-volume-trailing-please", "language": "en", "transcript": "volume 55, please", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 55}, "notes": "polite suffix is stripped"}
+{"id": "en-volume-leading-please", "language": "en", "transcript": "please set the volume to 40", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 40}, "notes": "polite prefix is stripped"}
+{"id": "en-volume-set-without-the", "language": "en", "transcript": "set volume to 20", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 20}, "notes": "article is optional"}
+{"id": "en-volume-with-wake", "language": "en", "transcript": "rowan set the volume to 60", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 60}, "notes": "wake word then a phrasal command"}
+{"id": "en-volume-one", "language": "en", "transcript": "volume 1", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 1}, "notes": "single digit"}
+{"id": "en-volume-ninety-nine", "language": "en", "transcript": "volume 99", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 99}, "notes": "just below the upper bound"}
+{"id": "en-volume-mixed-case", "language": "en", "transcript": "Volume 70.", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 70}, "notes": "case and a final period"}
+{"id": "en-volume-wake-and-period", "language": "en", "transcript": "rowan, volume 80.", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 80}, "notes": "wake word with a comma"}
+{"id": "ru-volume-percent-sign", "language": "ru", "transcript": "громкость 25%", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 25}, "notes": "знак процента необязателен"}
+{"id": "ru-volume-percent-word", "language": "ru", "transcript": "громкость 25 процентов", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 25}, "notes": "проценты словом"}
+{"id": "ru-volume-ustanovi-no-na", "language": "ru", "transcript": "установи громкость 35", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 35}, "notes": "«на» необязательно"}
+{"id": "ru-volume-ustanovi-na", "language": "ru", "transcript": "установи громкость на 80", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 80}, "notes": "полная форма"}
+{"id": "ru-volume-with-wake", "language": "ru", "transcript": "rowan громкость 45", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 45}, "notes": "wake word then a russian command"}
+{"id": "ru-volume-zero", "language": "ru", "transcript": "громкость 0", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 0}, "notes": "нижняя граница"}
+{"id": "ru-volume-100", "language": "ru", "transcript": "громкость 100", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 100}, "notes": "верхняя граница"}
+{"id": "ru-volume-please-suffix", "language": "ru", "transcript": "громкость 65, please", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 65}, "notes": "вежливый хвост отбрасывается"}
+{"id": "en-mute-with-wake", "language": "en", "transcript": "rowan mute", "expected_route": "fast_command", "expected_command": {"command": "mute"}, "notes": "wake word stripping"}
+{"id": "en-mute-please", "language": "en", "transcript": "mute please", "expected_route": "fast_command", "expected_command": {"command": "mute"}, "notes": "polite suffix"}
+{"id": "en-mute-punctuated", "language": "en", "transcript": "Mute.", "expected_route": "fast_command", "expected_command": {"command": "mute"}, "notes": "case and punctuation"}
+{"id": "en-unmute-with-wake", "language": "en", "transcript": "rowan unmute", "expected_route": "fast_command", "expected_command": {"command": "unmute"}, "notes": "wake word stripping"}
+{"id": "ru-mute-with-wake", "language": "ru", "transcript": "rowan выключи звук", "expected_route": "fast_command", "expected_command": {"command": "mute"}, "notes": "wake word stripping"}
+{"id": "ru-unmute-please", "language": "ru", "transcript": "включи звук, please", "expected_route": "fast_command", "expected_command": {"command": "unmute"}, "notes": "вежливый хвост"}
+{"id": "en-next-track-please", "language": "en", "transcript": "next track please", "expected_route": "fast_command", "expected_command": {"command": "media_next"}, "notes": "polite suffix"}
+{"id": "en-next-track-with-wake", "language": "en", "transcript": "rowan next track", "expected_route": "fast_command", "expected_command": {"command": "media_next"}, "notes": "wake word stripping"}
+{"id": "en-previous-track-please", "language": "en", "transcript": "previous track please", "expected_route": "fast_command", "expected_command": {"command": "media_prev"}, "notes": "polite suffix"}
+{"id": "ru-next-track-with-wake", "language": "ru", "transcript": "rowan следующий трек", "expected_route": "fast_command", "expected_command": {"command": "media_next"}, "notes": "wake word stripping"}
+{"id": "ru-previous-track-please", "language": "ru", "transcript": "предыдущий трек please", "expected_route": "fast_command", "expected_command": {"command": "media_prev"}, "notes": "вежливый хвост"}
+{"id": "ru-previous-track-with-wake", "language": "ru", "transcript": "rowan предыдущий трек", "expected_route": "fast_command", "expected_command": {"command": "media_prev"}, "notes": "wake word stripping"}
+{"id": "en-volume-up-with-wake", "language": "en", "transcript": "rowan volume up", "expected_route": "fast_command", "expected_command": {"command": "volume_up"}, "notes": "wake word stripping"}
+{"id": "en-volume-down-please", "language": "en", "transcript": "volume down please", "expected_route": "fast_command", "expected_command": {"command": "volume_down"}, "notes": "polite suffix"}
+{"id": "ru-volume-up-with-wake", "language": "ru", "transcript": "rowan громче", "expected_route": "fast_command", "expected_command": {"command": "volume_up"}, "notes": "wake word stripping"}
+{"id": "ru-volume-down-please", "language": "ru", "transcript": "тише please", "expected_route": "fast_command", "expected_command": {"command": "volume_down"}, "notes": "вежливый хвост"}
+{"id": "en-open-chrome-please", "language": "en", "transcript": "open chrome please", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "chrome"}, "notes": "polite suffix"}
+{"id": "en-open-firefox-with-wake", "language": "en", "transcript": "rowan open firefox", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "firefox"}, "notes": "wake word stripping"}
+{"id": "en-open-steam", "language": "en", "transcript": "open steam", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "steam"}, "notes": "allow-listed app"}
+{"id": "en-open-spotify-punctuated", "language": "en", "transcript": "Open Spotify.", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "spotify"}, "notes": "case and punctuation"}
+{"id": "en-open-notepad-with-wake", "language": "en", "transcript": "rowan open notepad", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "notepad"}, "notes": "wake word stripping"}
+{"id": "en-open-calculator-please", "language": "en", "transcript": "open calculator please", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "calculator"}, "notes": "polite suffix"}
+{"id": "ru-open-chrome", "language": "ru", "transcript": "открой chrome", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "chrome"}, "notes": "русский глагол, английское имя"}
+{"id": "ru-open-firefox", "language": "ru", "transcript": "открой firefox", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "firefox"}, "notes": "русский глагол, английское имя"}
+{"id": "ru-open-spotify-with-wake", "language": "ru", "transcript": "rowan открой spotify", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "spotify"}, "notes": "wake word stripping"}
+{"id": "ru-open-calculator", "language": "ru", "transcript": "открой calculator", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "calculator"}, "notes": "русский глагол, английское имя"}
+{"id": "en-unmute-punctuated", "language": "en", "transcript": "Unmute!", "expected_route": "fast_command", "expected_command": {"command": "unmute"}, "notes": "case and punctuation"}
+{"id": "en-weather-forecast", "language": "en", "transcript": "what's the weather tomorrow", "expected_route": "llm", "expected_command": null, "notes": "ordinary question"}
+{"id": "en-time-question", "language": "en", "transcript": "what time is it", "expected_route": "llm", "expected_command": null, "notes": "ordinary question"}
+{"id": "en-arithmetic", "language": "en", "transcript": "what is 17 times 23", "expected_route": "llm", "expected_command": null, "notes": "arithmetic needs the model"}
+{"id": "en-reminder", "language": "en", "transcript": "remind me to buy milk", "expected_route": "llm", "expected_command": null, "notes": "scheduler work, not a shortcut"}
+{"id": "en-joke", "language": "en", "transcript": "tell me a joke", "expected_route": "llm", "expected_command": null, "notes": "chit-chat route"}
+{"id": "en-play-jazz", "language": "en", "transcript": "play some jazz", "expected_route": "llm", "expected_command": null, "notes": "needs the media tool"}
+{"id": "en-stop-music", "language": "en", "transcript": "stop the music", "expected_route": "llm", "expected_command": null, "notes": "state-aware media tool"}
+{"id": "en-turn-off-lights", "language": "en", "transcript": "turn off the lights", "expected_route": "llm", "expected_command": null, "notes": "device action, needs the tool loop"}
+{"id": "en-dim-lights", "language": "en", "transcript": "dim the lights to 30 percent", "expected_route": "llm", "expected_command": null, "notes": "device action, not a volume shortcut"}
+{"id": "en-increase-by-ten", "language": "en", "transcript": "increase the volume by 10", "expected_route": "llm", "expected_command": null, "notes": "relative change is not an absolute shortcut"}
+{"id": "ru-turn-off-light", "language": "ru", "transcript": "выключи свет", "expected_route": "llm", "expected_command": null, "notes": "действие с устройством, нужен tool loop"}
+{"id": "ru-math", "language": "ru", "transcript": "сколько будет два плюс два", "expected_route": "llm", "expected_command": null, "notes": "нужна модель"}
+{"id": "ru-joke", "language": "ru", "transcript": "расскажи шутку", "expected_route": "llm", "expected_command": null, "notes": "болтовня"}
+{"id": "ru-reminder", "language": "ru", "transcript": "напомни купить молоко", "expected_route": "llm", "expected_command": null, "notes": "планировщик, не горячий путь"}
+{"id": "ru-play-lofi", "language": "ru", "transcript": "включи lo-fi", "expected_route": "llm", "expected_command": null, "notes": "нужен медиа-инструмент"}
+{"id": "ru-alarm", "language": "ru", "transcript": "поставь будильник на 7 утра", "expected_route": "llm", "expected_command": null, "notes": "планировщик, не горячий путь"}
+{"id": "es-volume-up", "language": "es", "transcript": "sube el volumen", "expected_route": "llm", "expected_command": null, "notes": "испанского быстрого пути нет"}
+{"id": "es-weather", "language": "es", "transcript": "qué tiempo hace hoy", "expected_route": "llm", "expected_command": null, "notes": "испанского быстрого пути нет"}
+{"id": "ru-play-music", "language": "ru", "transcript": "включи музыку", "expected_route": "llm", "expected_command": null, "notes": "нужен медиа-инструмент"}
+{"id": "en-who-are-you", "language": "en", "transcript": "who are you", "expected_route": "llm", "expected_command": null, "notes": "chit-chat route"}
+{"id": "ru-greeting", "language": "ru", "transcript": "привет", "expected_route": "banter", "expected_command": null, "notes": "нужен живой распознаватель адресата"}
+{"id": "en-greeting", "language": "en", "transcript": "hello there", "expected_route": "banter", "expected_command": null, "notes": "needs live addressee detection"}
+{"id": "ru-thanks", "language": "ru", "transcript": "спасибо", "expected_route": "banter", "expected_command": null, "notes": "болтовня"}
+{"id": "en-how-are-you", "language": "en", "transcript": "how are you doing", "expected_route": "banter", "expected_command": null, "notes": "chit-chat"}
+{"id": "es-greeting", "language": "es", "transcript": "hola", "expected_route": "banter", "expected_command": null, "notes": "нужен живой распознаватель адресата"}
+{"id": "ru-whisper-hallucination", "language": "ru", "transcript": "субтитры сделал DimaTorzok", "expected_route": "not_addressed", "expected_command": null, "notes": "типовая галлюцинация Whisper на тишине"}
+{"id": "en-whisper-hallucination", "language": "en", "transcript": "thank you for watching", "expected_route": "not_addressed", "expected_command": null, "notes": "типовая галлюцинация Whisper на тишине"}
+{"id": "ru-background-chatter", "language": "ru", "transcript": "иди сюда", "expected_route": "not_addressed", "expected_command": null, "notes": "разговор не с ассистентом"}
+{"id": "en-background-chatter", "language": "en", "transcript": "did you see the game last night", "expected_route": "not_addressed", "expected_command": null, "notes": "разговор не с ассистентом"}

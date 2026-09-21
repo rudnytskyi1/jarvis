@@ -50,6 +50,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import signal
 import sys
 import time
@@ -83,6 +84,7 @@ from client.wakeword import WakeWordDetector
 from client.ws_client import WAIT_FOREVER, WSClient, WSDisconnected
 from common import protocol as _protocol
 from common.client_config import load_client_config as load_config
+from common.ids import new_ulid
 from common.protocol import (
     MSG_ACTION_RESULT,
     MSG_ACTIONS,
@@ -197,6 +199,17 @@ MODE_IDLE = "idle"
 MODE_CONVERSATION = "conversation"
 #: How often a waiting conversation re-checks that the reader is still alive.
 INBOX_POLL_S = 0.5
+
+
+def _ota_enabled(ccfg: Any) -> bool:
+    """True when this room PC updates itself from the hub's release tag (ТЗ 4.9)."""
+    return bool(getattr(getattr(ccfg, "ota", None), "enabled", False))
+
+
+def _ota_state_path(settings: Any) -> Path:
+    """Where the updater remembers the tag it runs and the one it may roll back to."""
+    raw = Path(str(getattr(settings, "state_path", "data/ota_state.json")))
+    return raw if raw.is_absolute() else Path(__file__).resolve().parents[1] / raw
 
 
 class _LinkDown:
@@ -321,6 +334,10 @@ class JarvisClient:
 
     def __init__(self, cfg: Any) -> None:
         self._stopping = False
+        #: ClientUpdater, built the first time the hub names a release (ТЗ 4.9).
+        self._updater = None
+        #: The tag the hub last asked for.
+        self._wanted_release = ""
         self.cfg = cfg
         self.ccfg = cfg.client
 
@@ -586,6 +603,7 @@ class JarvisClient:
         self._install_signal_handler()
         try:
             await self._setup_wakeword()
+            self._start_ota()
             self.audio_in.start()
             self._start_camera()
             try:
@@ -799,6 +817,9 @@ class JarvisClient:
             self._on_speaker_message(msg)
         elif mtype == MSG_CONFIG_UPDATE:
             self._apply_room_config(msg)
+        elif mtype == "release":
+            # ТЗ 4.9: the hub owns the version; this room updates itself.
+            self._on_release(msg)
         else:
             log.warning("Unknown message type from the server: %r", mtype)
 
@@ -834,6 +855,80 @@ class JarvisClient:
             score = 0.0
         log.info("Recognised speaker: %s (%.2f)", name or "(nobody)", score)
         self.overlay.speaker(name)
+
+    # -- self-update (ТЗ 4.9 OTA) ---------------------------------------------
+
+    def _ota(self):
+        """The updater, built once, or ``None`` when this room updates manually."""
+        if self._updater is None and _ota_enabled(self.ccfg):
+            from client.ota import ClientUpdater
+
+            settings = self.ccfg.ota
+            self._updater = ClientUpdater(
+                repo=Path(__file__).resolve().parents[1], remote=settings.remote,
+                interval_s=settings.interval_s, healthy_after_s=settings.healthy_after_s,
+                state_path=_ota_state_path(settings))
+        return self._updater
+
+    def _start_ota(self) -> None:
+        """Accept or roll back the last update, then watch the hour (ТЗ 4.9)."""
+        updater = self._ota()
+        if updater is None:
+            return
+        guard = updater.startup_guard()
+        if guard and guard.get("action") == "rollback":
+            log.info("Rolled back to release %s; restarting this room", guard["tag"])
+            self._restart_into_release()
+            return
+        asyncio.get_running_loop().create_task(self._ota_loop())
+
+    def _on_release(self, msg: dict[str, Any]) -> None:
+        """MSG_RELEASE: the hub named a tag; move to it in the background."""
+        tag = str(msg.get("tag") or "").strip()
+        self._wanted_release = tag
+        updater = self._ota()
+        if updater is None or not tag:
+            return
+        if not updater.due():
+            return
+        asyncio.get_running_loop().create_task(self._ota_move(updater, tag))
+
+    async def _ota_move(self, updater, tag: str) -> None:
+        try:
+            report = await updater.check(tag, force=True)
+        except Exception as exc:  # noqa: BLE001 - an update never crashes the room
+            log.warning("The update to %s failed (%s)", tag, exc)
+            return
+        if report and report.get("action") == "restart":
+            log.info("Restarting into release %s", tag)
+            self._restart_into_release()
+
+    async def _ota_loop(self) -> None:
+        """Check the hub once an hour, even across a reconnect (ТЗ 4.9)."""
+        updater = self._ota()
+        if updater is None:
+            return
+        asyncio.get_running_loop().create_task(self._ota_healthy_later(updater))
+        while not self._stopping:
+            await asyncio.sleep(60.0)
+            if not updater.due():
+                continue
+            tag = self._wanted_release
+            if not tag:
+                continue
+            await self._ota_move(updater, tag)
+
+    async def _ota_healthy_later(self, updater) -> None:
+        """A release that lives past the guard window is the one this room keeps."""
+        await asyncio.sleep(updater.healthy_after_s)
+        updater.mark_healthy()
+
+    def _restart_into_release(self) -> None:
+        """Replace this process with a fresh one so the new tag really runs."""
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except Exception as exc:  # noqa: BLE001 - ask the operator instead of dying silently
+            log.error("Could not restart into the new release (%s). Restart Rowan manually.", exc)
 
     def _apply_room_config(self, msg: dict[str, Any]) -> None:
         """MSG_CONFIG_UPDATE: the hub reloaded this room's settings (ТЗ 4.7).
@@ -1207,8 +1302,10 @@ class JarvisClient:
                 # ...and from this exact point on every incoming message belongs
                 # to this utterance, not to an unprompted greeting.
                 self._enter_conversation()
-                import uuid
-                self._live_turn_id = uuid.uuid4().hex
+                # ТЗ 4.5: the client mints the utterance id — a ULID, so turns
+                # sort by time in the logs — and stamps it on every frame of
+                # this turn. The hub echoes the same id back.
+                self._live_turn_id = new_ulid()
                 self._recording_live = True
                 await self.ws.send_json(
                     {
@@ -1241,7 +1338,9 @@ class JarvisClient:
                     await self._beep(NO_SPEECH_BEEP_FREQ_HZ, NO_SPEECH_BEEP_MS, volume=0.22)
                     return RESULT_NO_SPEECH
 
-                await self.ws.send_json({"type": MSG_UTTERANCE_END})
+                await self.ws.send_json(
+                    {"type": MSG_UTTERANCE_END, "utterance_id": self._live_turn_id}
+                )
                 log.debug(
                     "Sent %.2f s of audio",
                     len(audio) / float(self.sample_rate * SAMPLE_WIDTH),
@@ -1471,14 +1570,19 @@ class JarvisClient:
                     token = self._interrupt_id
                     audio = await self.vad.record(self._read_frame, pre_roll=preroll.snapshot(), lead_in_s=5)
                     if audio:
+                        # ТЗ 4.5: even a barge-in utterance owns an id, so the
+                        # hub can trace the request that interrupted a reply.
+                        turn_id = new_ulid()
                         async with self._wire_lock:
                             await self.ws.send_json({'type': MSG_UTTERANCE_START, 'sr': self.sample_rate,
+                                                     'utterance_id': turn_id,
                                                      'format': PCM_FORMAT, 'channels': CHANNELS, 'interrupt_id': token})
                             try:
                                 for piece in self._split_frames(audio):
                                     await self.ws.send_bytes(piece)
                             finally:
-                                await self.ws.send_json({'type': MSG_UTTERANCE_END})
+                                await self.ws.send_json({'type': MSG_UTTERANCE_END,
+                                                         'utterance_id': turn_id})
                 else:
                     await self.ws.send_json({'type': _protocol.MSG_INTERRUPT_REQUEST})
                 preroll.clear()
@@ -1640,6 +1744,7 @@ class JarvisClient:
         waiting for the full 120 s.
         """
         request_id = str(msg.get("id") or "")
+        event_id = str(msg.get("event_id") or "")[:100]
         log.info("Screenshot requested (id=%s) - capturing the screen", request_id or "?")
         # The HUD must never be baked into the picture the assistant is about
         # to study, so it goes off screen first and only comes back - shutter,
@@ -1660,9 +1765,10 @@ class JarvisClient:
             self.overlay.set_status("")
             error = str(exc).strip() or exc.__class__.__name__
             log.error("Screen capture failed: %s", error)
-            await self.ws.send_json(
-                {"type": MSG_SCREENSHOT_ERROR, "id": request_id, "error": error}
-            )
+            failure = {"type": MSG_SCREENSHOT_ERROR, "id": request_id, "error": error}
+            if event_id:
+                failure["event_id"] = event_id
+            await self.ws.send_json(failure)
             return
         finally:
             self.overlay.resume_capture()
@@ -1678,17 +1784,19 @@ class JarvisClient:
 
         # The header and its single binary frame must stay adjacent on the wire.
         async with self._wire_lock:
-            await self.ws.send_json(
-                {
-                    "type": MSG_SCREENSHOT,
-                    "id": request_id,
-                    "format": SCREENSHOT_FORMAT,
-                    "w": capture.w,
-                    "h": capture.h,
-                    "screen_w": capture.screen_w,
-                    "screen_h": capture.screen_h,
-                }
-            )
+            header = {
+                "type": MSG_SCREENSHOT,
+                "id": request_id,
+                "format": SCREENSHOT_FORMAT,
+                "w": capture.w,
+                "h": capture.h,
+                "screen_w": capture.screen_w,
+                "screen_h": capture.screen_h,
+            }
+            if event_id:
+                # ТЗ 4.5: the screenshot keeps the event id of its request.
+                header["event_id"] = event_id
+            await self.ws.send_json(header)
             await self.ws.send_bytes(capture.jpeg)
         log.info(
             "Screenshot sent (id=%s): %dx%d image of a %dx%d screen, %d bytes",
@@ -1716,6 +1824,7 @@ class JarvisClient:
         invalid, it defaults to a single frame exactly as before.
         """
         request_id = str(msg.get("id") or "")
+        event_id = str(msg.get("event_id") or "")[:100]
         try:
             burst = int(msg.get("burst") or 1)
         except (TypeError, ValueError):
@@ -1729,29 +1838,35 @@ class JarvisClient:
         )
         camera = self.camera
         if camera is None:
-            await self.ws.send_json(
-                {
-                    "type": MSG_CAMERA_ERROR,
-                    "id": request_id,
-                    "error": "this client has no camera",
-                }
-            )
+            payload = {
+                "type": MSG_CAMERA_ERROR,
+                "id": request_id,
+                "error": "this client has no camera",
+            }
+            if event_id:
+                payload["event_id"] = event_id
+            await self.ws.send_json(payload)
             return
         try:
-            await camera.serve_request(request_id, burst, full=full)
+            await camera.serve_request(request_id, burst, full=full, event_id=event_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the camera never breaks the client
             log.warning("Could not answer the camera request: %s", exc)
 
     async def _handle_camera_clip_request(self, msg: dict[str, Any]) -> None:
+        event_id = str(msg.get('event_id') or '')[:100]
         try:
             if self.camera is None:
-                await self.ws.send_json({'type': _protocol.MSG_CAMERA_CLIP_ERROR,
-                    'id': str(msg.get('id') or '')[:100], 'error': 'This client has no camera.'})
+                failure = {'type': _protocol.MSG_CAMERA_CLIP_ERROR,
+                           'id': str(msg.get('id') or '')[:100], 'error': 'This client has no camera.'}
+                if event_id:
+                    failure['event_id'] = event_id
+                await self.ws.send_json(failure)
                 return
             from client.camera_clips import serve_clip
-            await serve_clip(self.camera, msg.get('id'), msg.get('seconds', 5), msg.get('fps', 8))
+            await serve_clip(self.camera, msg.get('id'), msg.get('seconds', 5), msg.get('fps', 8),
+                             event_id=event_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1872,15 +1987,17 @@ class JarvisClient:
             if not reporting:
                 continue
             try:
-                await self.ws.send_json(
-                    {
-                        "type": MSG_ACTION_RESULT,
-                        "id": action_id,
-                        "ok": ok,
-                        "error": None if ok else (str(error) if error else "unknown error"),
-                        "output": output_text,
-                    }
-                )
+                result_payload: dict[str, Any] = {
+                    "type": MSG_ACTION_RESULT,
+                    "id": action_id,
+                    "ok": ok,
+                    "error": None if ok else (str(error) if error else "unknown error"),
+                    "output": output_text,
+                }
+                if self._live_turn_id:
+                    # ТЗ 4.5: the result belongs to the utterance that asked.
+                    result_payload["utterance_id"] = self._live_turn_id
+                await self.ws.send_json(result_payload)
             except WSDisconnected as exc:
                 # The server waits for these results (SPEC §4) and falls back to
                 # a timeout result, but a dead socket must not cancel the actions

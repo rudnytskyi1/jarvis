@@ -1,0 +1,12 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  {% if error %}<p class="note">{{ error }}</p>{% endif %}
+  <form method="post" action="/admin/login">
+    <label>Owner password
+      <input type="password" name="password" autocomplete="current-password" autofocus>
+    </label>
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="note">The password comes from the hub's environment. It is never stored in the
+    config file and never sent to Telegram.</p>
+{% endblock %}

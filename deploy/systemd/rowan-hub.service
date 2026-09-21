@@ -1,0 +1,22 @@
+# Хаб Rowan на Linux (ТЗ 4.9). Пути — под /opt/rowan; правьте под свой стенд.
+[Unit]
+Description=Rowan hub (brain: speech, identity, memory, devices)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rowan
+ExecStart=/opt/rowan/.venv/bin/python -m hub.main --config /opt/rowan/config.yaml
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Ключи API и пароль админки — из окружения, не из юнита: EnvironmentFile.
+EnvironmentFile=-/opt/rowan/.env
+User=rowan
+Group=rowan
+StandardOutput=append:/opt/rowan/data/logs/hub.log
+StandardError=append:/opt/rowan/data/logs/hub.log
+
+[Install]
+WantedBy=multi-user.target

@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from common import protocol as proto
+from common.ids import new_ulid
+from hub.camera_events import KIND_CLIP, record_event
+
+log = logging.getLogger("jarvis.server.app")
 
 
 class CameraClipReceiver:
@@ -17,11 +22,16 @@ class CameraClipReceiver:
             return 'Another clip is already being captured.'
         future = asyncio.get_running_loop().create_future()
         self._clip_future, self._clip_id = future, identifier
+        # ТЗ 4.5: a clip is a background camera event and owns an event id.
+        self._clip_event_id = new_ulid()
         try:
             await self.send_json({'type': proto.MSG_CAMERA_CLIP_REQUEST, 'id': identifier,
+                                  'event_id': self._clip_event_id,
                                   'seconds': seconds, 'fps': fps})
             return await asyncio.wait_for(future, timeout=seconds + 25)
         except TimeoutError:
+            record_event(self._clip_event_id, kind=KIND_CLIP, home_id=getattr(self, 'home_id', ''),
+                         source='camera_clip', frames=0, ok=False, detail='timeout')
             return 'Camera clip capture timed out.'
         finally:
             self._clip_future, self._clip_id = None, None
@@ -42,12 +52,24 @@ class CameraClipReceiver:
         valid = (header.get('format') == 'mp4' and type(header.get('bytes')) is int
                  and header['bytes'] == len(data) and 12 <= len(data) <= proto.CAMERA_CLIP_MAX_BYTES
                  and data[4:8] == b'ftyp')
+        event_id = str(header.get('event_id') or getattr(self, '_clip_event_id', '') or '')[:100]
+        if event_id:
+            record_event(event_id, kind=KIND_CLIP, home_id=getattr(self, 'home_id', ''),
+                         source='camera_clip', ok=valid,
+                         detail='' if valid else 'invalid clip payload')
+            log.info("Camera clip event %s received (%d bytes)", event_id, len(data),
+                     extra={'event_id': event_id})
         future.set_result(bytes(data) if valid else 'The camera returned an invalid video clip.')
 
     def _on_clip_error(self, payload):
         future = getattr(self, '_clip_future', None)
         if (future is not None and not future.done()
                 and payload.get('id') == getattr(self, '_clip_id', None)):
+            event_id = str(payload.get('event_id') or getattr(self, '_clip_event_id', '') or '')[:100]
+            if event_id:
+                record_event(event_id, kind=KIND_CLIP, home_id=getattr(self, 'home_id', ''),
+                             source='camera_clip', frames=0, ok=False,
+                             detail=str(payload.get('error') or 'capture failed')[:200])
             future.set_result('Camera clip capture failed.')
 
     def _close_camera_clip(self):

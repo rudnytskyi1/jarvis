@@ -24,6 +24,8 @@ client:
 
 test:
 	$(PY) -m pytest $(TESTS) -q
+	$(PY) -m ruff check .
+	$(PY) -m mypy common
 
 test-regress:
 	$(PY) -m pytest tests/regress -q

@@ -19,8 +19,32 @@ from hub import app as server_app  # noqa: E402
 log = logging.getLogger("jarvis.server.main")
 
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
-LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+#: ``%(utterance_id)s`` (ТЗ 4.5) is filled by :class:`UtteranceIdFilter`: the
+#: lines logged while a turn is being processed carry its id, everything else
+#: shows ``-``.
+LOG_FORMAT = "%(asctime)s %(levelname)-7s [%(utterance_id)s] %(name)s: %(message)s"
 LOG_DATE_FORMAT = "%H:%M:%S"
+
+
+class UtteranceIdFilter(logging.Filter):
+    """Give every log record an ``utterance_id`` field (ТЗ 4.5).
+
+    The hub stamps the id on the records it logs for a turn (``extra=...``);
+    records from everywhere else get ``-`` so one format string works for all
+    of them and a structured consumer still sees the same key on every line.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not getattr(record, "utterance_id", ""):
+            record.utterance_id = "-"
+        return True
+
+
+def _install_log_filter() -> None:
+    """Attach :class:`UtteranceIdFilter` to every root handler."""
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(item, UtteranceIdFilter) for item in handler.filters):
+            handler.addFilter(UtteranceIdFilter())
 #: The server runs in its own console window opened by start-jarvis-server.bat,
 #: so its scrollback is gone the moment that window is closed - and it is the
 #: only record of why a greeting did or did not fire, why a reply was slow, and
@@ -68,6 +92,7 @@ def _add_file_logging() -> None:
             LOG_FILE_PATH.unlink()  # crude rotation: start over past 5 MB
         handler = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
         handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+        handler.addFilter(UtteranceIdFilter())
         logging.getLogger().addHandler(handler)
     except Exception as exc:  # noqa: BLE001 - file logging is a convenience, not a dependency
         log.warning("File logging unavailable (%s) - console only", exc)
@@ -163,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         datefmt=LOG_DATE_FORMAT,
     )
     _add_file_logging()
+    _install_log_filter()
 
     config_path = Path(args.config)
     if not config_path.is_absolute():

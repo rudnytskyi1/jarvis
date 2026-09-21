@@ -121,6 +121,47 @@ server:
     face_timeout_s: 120
     background_timeout_s: 120
 
+  timeouts:                  # per-stage budgets: a slow stage degrades, never silence (ТЗ 4.5/15.1)
+    enabled: true             # false = only the GPU-queue timeouts above apply
+    stt_ms: 700               # конец речи (VAD) → финальный транскрипт
+    diarization_ms: 700       # то же окно для diarized-прохода; опоздал — ответ без diarization
+    speaker_ms: 700           # идентификация голоса (ReID); опоздала — ответ без имени
+    reply_ms: 20000           # предохранитель раунда модели: завис — отвечаем словами
+
+  streaming_reply:           # стриминговый ответ: первое предложение звучит сразу (ТЗ F-101)
+    enabled: true             # первое предложение уходит в синтез, пока пишется остальное
+    first_audio_budget_ms: 1200  # конец речи → первый звук ответа (таблица 15.1)
+
+  decider:                   # кто отвечает на какой вопрос и сколько ему на это дано (ТЗ 5.2)
+    timeout_ms: 400           # бюджет «транскрипт → начало генерации» из таблицы 15.1
+    cache_ttl_s: 60           # ТЗ 5.4: одинаковый вопрос решается один раз в минуту (0 = без кэша)
+    cache_max_entries: 256    # сколько ответов хранится
+    report_days: 7            # ТЗ 5.4: окно недельного отчёта калибровки в админке
+    # Провайдеры по типу решения, лучший первым. Тип, которого здесь нет,
+    # остаётся со встроенной цепочкой (сейчас — rules).
+    #   rules      — эвристики, всегда доступны, работают без GPU
+    #   local_llm  — локальная модель (нужен openai-совместимый сервер, F-402)
+    order:
+      route: [rules]          # fast_command или запрос к модели
+      model_level: [rules]    # local_fast или local_strong (F-401)
+      addressed: [rules]      # обращались ли к Rowan
+      hallucination: [rules]  # похож ли транскрипт на галлюцинацию Whisper
+      # С включённым vLLM порядок можно перевести на модель, например:
+      # route: [local_llm, rules]
+      # addressed: [local_llm, rules]
+
+  skills:                    # скиллы: манифест + skill.py в своей папке (ТЗ F-405)
+    dev_reload: false        # перечитывать скилл при изменении файла — только для разработки
+    interval_s: 2            # как часто проверять файлы, секунды
+
+  web_admin:                 # веб-админка владельца (ТЗ F-705)
+    enabled: false           # включать только там, где есть overlay-сеть
+    host: 127.0.0.1          # на стенде — адрес overlay-интерфейса
+    port: 8099
+    allowed_networks: [127.0.0.0/8, 100.64.0.0/10]  # Tailscale CGNAT + локально
+    password_env: ROWAN_ADMIN_PASSWORD               # пароль только из окружения (ТЗ 15.4)
+    session_minutes: 60
+
   tts:
     engine: silero
     language: en

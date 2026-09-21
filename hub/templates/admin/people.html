@@ -1,0 +1,15 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>People and membership</h2>
+  {% if people %}
+  <table>
+    <tr><th>Person</th><th>Name</th><th>Home</th><th>Role</th><th>Shared with the home</th></tr>
+    {% for person in people %}
+    <tr>
+      <td>{{ person.person_id }}</td><td>{{ person.name }}</td>
+      <td>{{ person.home_id or '—' }}</td><td>{{ person.role }}</td><td>{{ person.shares }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>Nobody is registered yet.</p>{% endif %}
+{% endblock %}

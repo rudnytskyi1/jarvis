@@ -1,79 +1,102 @@
-# План фазы 1 — многодомность и ядро
+# План фазы 2 — речь, идентичность и присутствие
 
-Фаза уже частично выполнена (см. `PROGRESS.md`). Этот план описывает оставшуюся
-часть: файлы, которые будут созданы/изменены, модели, таблицы, сообщения
-протокола и риски. План выполняется сразу, без ожидания подтверждения
-(раздел 1 ТЗ, пункт 2 отключён).
+Фаза 1 закрыта целиком (`PROGRESS.md`, критерии приёмки: две комнаты на одном
+хабе одновременно и изолированно, задержка между комнатами < 1,5 с, токены,
+сцена «кино» по голосу). Этот план описывает следующую фазу по разделу 16 ТЗ:
+файлы, модели, таблицы, сообщения протокола и риски. План выполняется сразу,
+без ожидания подтверждения (раздел 1 ТЗ, пункт 2 отключён).
 
-## Оставшиеся задачи
+## Содержание фазы (раздел 16 ТЗ)
 
-1. **P1-02..P1-04** — импорт унаследованных данных.
-   - Новый модуль `hub/legacy_migrate.py`.
-   - Подключение в `hub/main.py::_prepare_hub_database` после миграций и сида домов.
-   - Тест `tests/test_legacy_migrate.py`.
-2. **P1-05** — медиа и TTL.
-   - Новый модуль `hub/media.py`; конфиг `server.media` (`media_ttl_days`,
-     `clip_ttl_days`) в `common/config.py`.
-   - Тест `tests/test_media.py`.
-3. **P1-06** — sqlite-vec: сначала пробуем подключить расширение; если не
-   соберётся — фолбэк LanceDB (решение в `DECISIONS.md`).
-4. Далее строго по `PROGRESS.md`: горячая перезагрузка, backpressure, STT
-   батчинг, `utterance_id`/`event_id`, таймауты с деградацией, LocalLLMDecider,
-   провайдеры по конфигу, точки Decider, кэш, отчёт калибровки, hot reload
-   скиллов, устройства, адаптеры, ESP32, мастер добавления, сцены, админка,
-   аудит, автозапуск/OTA и приёмочные критерии.
+F-101–F-106, F-113, F-114, F-117 (речь и диалог); трекинг и ReID
+(F-201–F-208, F-210–F-213); присутствие (F-301–F-304); HUD v2 (F-708);
+многодомность в Telegram (F-701, F-702); деградация клиента без хаба (4.8).
+
+Критерии приёмки фазы: сценарии 1, 2, 4, 7 и 9 из раздела 2 ТЗ; бюджеты
+раздела 15.1; узнавание со спины после одного фронтального кадра — не хуже
+80 % на тестовом наборе (не меньше 20 треков).
+
+## Задачи
+
+Список задач — в `PROGRESS.md`, раздел «Фаза 2». Порядок обязателен:
+речь → идентичность → присутствие → интерфейсы → приёмочные критерии.
 
 ## Файлы
 
 | Действие | Файл |
 |---|---|
-| создать | `hub/legacy_migrate.py` |
-| создать | `hub/media.py` |
-| создать | `tests/test_legacy_migrate.py` |
-| создать | `tests/test_media.py` |
-| изменить | `hub/main.py` (запуск импорта legacy + медиа) |
-| изменить | `common/config.py` (секция `server.media`) |
-| изменить | `config.example.yaml` (шаблон `server.media`) |
+| создать | `hub/streaming_reply.py` (F-101: старт генерации на промежуточном транскрипте) |
+| создать | `hub/barge_in.py` (F-102: правило эхоподавления и окно остановки) |
+| создать | `hub/hotwords.py` (F-104: hotwords из БД, обновление по изменению) |
+| создать | `hub/noise_filter.py` (F-105: стоп-фразы, повторные n-граммы, знаки/секунду) |
+| создать | `hub/confirmations.py` (F-113: список опасных действий и ожидание «да») |
+| создать | `hub/tracking.py` (F-201: треки, re-association, `tracks` в протокол) |
+| создать | `hub/body_crops.py` (F-202: приём кропов, частота, смена ракурса) |
+| создать | `hub/reid.py` (F-203: OSNet 512-d, `body_embeddings`) |
+| создать | `hub/identity_fusion.py` (F-206–F-208: сигналы → person, гистерезис, admin-порог) |
+| создать | `hub/identity_lifecycle.py` (F-209–F-213: дневные сессии, регистрация гостя, дообучение, общий профиль, «забудь меня») |
+| создать | `hub/presence_state.py` (F-301–F-303: состояние дома, события, приветствия, камера) |
+| создать | `client/hud_v2.py` (F-708: индикаторы HUD) |
+| создать | `client/degraded.py` (4.8: локальный fallback и досылка событий) |
+| создать | `migrations/0004_preferred_language.py` (F-106) |
+| создать | `migrations/0005_identity_belief.py` (F-206) |
+| создать | `migrations/0006_tracking.py` (F-201/F-202/F-203: `tracks`, `body_crops`) |
+| создать | `migrations/0007_presence_events.py` (F-301) |
+| создать | `migrations/0008_notification_rules.py` (F-702) |
+| изменить | `common/protocol.py` (кадры `tracks`, `body_crop`, `sound_event`, `presence`, `identity_belief`, `hud`) |
+| изменить | `common/config.py` + `config.example.yaml` (секции `server.identity`, `server.presence`, `client.hud`, `client.degraded`) |
+| изменить | `hub/app.py` (`identity`, `presence`, `hotwords`, потоковые ответы) |
+| изменить | `hub/local_commands.py` (F-117: сцены, устройства, таймеры, «стоп/повтори/громче») |
 
-## Модели
+## Модели (Pydantic v2, `extra='forbid'`)
 
-- `MediaConfig(media_ttl_days=3, clip_ttl_days=7)` — Pydantic v2, `extra='forbid'`.
-- Legacy-импорт читает только уже описанные JSON/JSONL форматы; новые
-  Pydantic-модели не вводятся, потому что унаследованные файлы не
-  валидируются как строгие схемы (это данные, а не контракт).
+- `Track(id, conf, zone, bbox, ts)` — трек человека на клиенте (F-201).
+- `BodyCropHeader(track_id, w, h, reason, ts)` — кроп тела перед JPEG (F-202).
+- `IdentityBelief(track_id, person_id, p, sources, at)` — итог слияния (F-206).
+- `PresenceEvent(home_id, kind, person_id, track_id, at, zone)` — F-301.
+- `ConfirmationRequest(action, args, id, expires_at)` — F-113.
+- `HudState(listening, thinking, speaking, followup, hub, camera, transcript)` — F-708.
+- `DegradedState(offline_since, local_commands, pending_events)` — 4.8.
 
 ## Таблицы
 
-Используются существующие таблицы схемы `0001_init.py`: `persons`,
-`voice_embeddings`, `face_embeddings`, `memberships`, `memories`,
-`dialog_turns`, `media`, `homes`. Новые таблицы не создаются.
+Новые: `tracks` (живые треки дома), `body_crops` (кропы с `track_id` и TTL),
+`identity_belief` (track_id, person_id, p, sources_json), `presence_events`
+(вход/выход/зона), `notification_rules` (правило уведомления дома),
+`skill_state` (F-407, если понадобится скиллам фазы).
 
-## Сообщения протокола
+Используются существующие: `persons`, `memberships`, `voice_embeddings`,
+`face_embeddings`, `body_embeddings`, `media`, `rules`, `audit`, `decisions`.
 
-Для этих задач новых сообщений нет. Сообщение `config_update` появится в
-задаче P1-09.
+Миграции нумеруются `0004_…` и далее; `tests/test_migrations.py` хранит список
+применённых версий, поэтому каждое добавление обновляет и его.
+
+## Сообщения протокола (v2)
+
+Клиент → хаб: `tracks`, `body_crop` + JPEG, `hud_state`, `presence` (телефон),
+`local_fallback` (работа без хаба).
+Хаб → клиент: `identity_belief`, `hud` (расширение существующего), `presence`,
+`confirmation_request`, `degraded_state`.
+Протокол v1 продолжает работать до конца фазы 2: новые возможности включаются
+флагом конфига, старое поведение не заменяется.
 
 ## Риски
 
-- Импорт реальных `data/*` файлов в тестовые временные БД не должен происходить:
-  поэтому legacy-импорт вынесен из нумерованных миграций в отдельный вызов.
-- Идемпотентность важна: повторный запуск хаба не должен дублировать строки.
-- `sqlite-vec` может не собраться на этой машине; тогда включается LanceDB за
-  флагом/фолбэком.
+- **Нет живого железа.** YOLO/BoT-SORT, OSNet, insightface и WebRTC AEC в
+  песочнице недоступны: адаптеры и логика тестируются на подставных
+  детекторах, а замеры (80 % со спины, первый звук < 1,2 с) фиксируются как
+  переносимые на стенд команды, как в P1-24/P1-45.
+- **Приватность.** Кропы и кадры — самый чувствительный материал: TTL из
+  F-304, отсутствие отправки в облако, «забудь меня» — не косметика, а
+  критерий фазы.
+- **Ложная идентификация.** Гистерезис и admin-порог меняют поведение прав;
+  ошибка здесь дороже ошибки распознавания, поэтому пороги идут через
+  конфиг и покрываются тестами на границы.
+- **Ломать работающее нельзя.** Каждый шаг фазы заканчивается запускаемой
+  системой: `make test` зелёный, `python -c "import hub.app, client.main"` ok.
+- **Порядок.** Речь (F-10x) идёт до идентичности: без честного транскрипта и
+  follow-up окна трекинг и присутствие не дадут наблюдаемого эффекта.
 
-## Выполнено (обновляется по ходу фазы 1)
+## Выполнено (обновляется по ходу фазы 2)
 
-- **P1-06** — sqlite-vec собран и подключён: `hub/vendor/vec0.dll` 0.1.9,
-  `hub/vectors.py` создаёт `vec0`-таблицы на старте, фолбэк на LanceDB не нужен
-  (см. `DECISIONS.md`). Тесты: `tests/test_vectors.py` (24).
-- **P1-09** — горячая перезагрузка настроек дома без рестарта: `hub/config_reload.py`,
-  `hub/app.py::reload_room_configs`/`broadcast_config_update`, клиент хранит
-  `room_config_rev`; сообщение `config_update` (v2). Тесты: `tests/test_config_reload.py` (11).
-- **P1-14** — backpressure: буфер на сессию `hub/outbound.py`, фон отбрасывается
-  первым (реплики и PCM — никогда), метрики в `/health.outbound`.
-  Тесты: `tests/test_outbound.py` (7).
-- **P1-15** — STT батчинг 2–4 реплики: `hub/stt.py::SttBatcher` +
-  `SttEngine.transcribe_batch` (BatchedInferencePipeline), один слот GPU-очереди
-  на батч. Тесты: `tests/test_stt_batching.py` (8).
-
-Следующая задача по порядку `PROGRESS.md`: **P1-18** (`utterance_id`).
+- Пока пусто: фаза начата после закрытия приёмки фазы 1.
