@@ -28,15 +28,19 @@
 | Пункт | Статус | Доказательство |
 |---|---|---|
 | Схема БД и миграции (4.6) | готово | `migrations/0001_init.py` |
+| Векторы в sqlite-vec: подключение расширения и виртуальные таблицы (4.6) | готово | `hub/vectors.py`, `hub/vendor/vec0.dll` (0.1.9), `tests/test_vectors.py` — 24 passed; `make test` 2543 passed, 2 skipped |
 | Импорт унаследованных `people.json`, `memory.jsonl`, `dialogs/*.jsonl` в БД (4.6) | код и тесты готовы, коммит заблокирован песочницей (`git` не может писать `.git`) | `hub/legacy_migrate.py`, `hub/main.py`, `tests/test_legacy_migrate.py` |
 | Слой решений Decider: интерфейс, Rules-провайдер, цепочка с таймаутом, политики уверенности (раздел 5) | частично: нет LocalLLM и Jev; точки D-02–D-09 ещё не переведены | `hub/decider.py`, `tests/test_decider.py`, `tests/test_decision_log.py` |
 | Решения пишутся в таблицу `decisions` (5.3) | готово | `hub/decision_log.py`, `tests/test_decision_log.py` |
 | Очередь GPU: классы приоритета, fair share по домам, таймауты, оценка ожидания (4.5) | готово: подключена к STT/LLM/лицам/vision/SAM3 | `hub/gpu_queue.py`, `tests/test_gpu_queue.py`, `tests/test_gpu_queue_wiring.py` |
 | Auth клиентов по токену, привязка сессии к `home_id`, rate limit (4.3) | готово | `hub/auth.py`, `hub/gateway.py`, тесты |
 | Gateway: приём `hello`, реестр комнат, квоты на реплики и кадры (4.4) | готово | `hub/gateway.py`, `tests/test_gateway.py` |
+| Backpressure: буфер на сессию, фон отбрасывается первым, метрики (4.4) | готово в коде | `hub/outbound.py`, `server.outbound.queue_capacity`, `/health.outbound`, `tests/test_outbound.py` — 7 passed |
+| STT батчинг 2–4 реплики в один вызов (4.4, 15.1) | готово в коде, включён конфигом `server.stt.batch_size` (по умолчанию 4) | `hub/stt.py::SttBatcher`/`transcribe_batch`, `tests/test_stt_batching.py` — 8 passed |
 | Авторизация подключена к живому `hello`: v1 проходит без токена, v2 без токена закрывается 4401 (4.3) | готово | `hub/app.py::Connection._authorize`, `tests/test_hello_auth.py` |
 | Хаб-БД поднимается при старте: миграции + сид комнат, отказ не роняет сервер (4.6, 4.7) | готово | `hub/main.py::_prepare_hub_database` |
 | Дома из конфига: сид таблицы `homes`, `config_rev` (4.2, 4.7) | готово | `hub/homes.py`, `tests/test_homes.py` |
+| Горячая перезагрузка настроек дома + `config_update` клиенту (4.7) | готово в коде, вызов из хаба; форма владельца — P1-40 | `hub/config_reload.py`, `hub/app.py::reload_room_configs`, `tests/test_config_reload.py` — 11 passed |
 | vLLM-провайдер: OpenAI-совместимый API, tool calling, guided JSON (F-402) | готово в коде | `hub/llm.py` (`PROVIDER_VLLM`, `structured_json`), `tests/test_llm_vllm_provider.py` |
 | Роутер моделей: уровни `local_fast`/`local_strong`/`cloud_cheap`/`cloud_strong`, D-10 (F-401) | готово в коде, выключено конфигом (`models.enabled: false`) | `hub/model_router.py`, `tests/test_model_router.py` |
 | Перелив при перегрузке очереди (F-403) | готово в коде, включается `models.routing.cloud_fallback` | `hub/model_router.py`, `hub/gpu_queue.py::wait_estimate` |

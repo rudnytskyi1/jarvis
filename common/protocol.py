@@ -151,6 +151,20 @@ MSG_STATUS = "status"
 #: name clears it; a voice that matched nobody is simply not announced.
 MSG_SPEAKER = "speaker"
 MSG_ERROR = "error"
+#: v2: the room's settings changed on the hub (``config_update``, ТЗ 4.7).
+MSG_CONFIG_UPDATE = "config_update"
+
+#: Hub -> client frames of the background class (ТЗ 13): when a client cannot
+#: keep up with the send queue, these are dropped first. A reply's text and its
+#: PCM chunks are never in this set.
+BACKGROUND_SERVER_MESSAGE_TYPES = frozenset(
+    {"camera_state", "camera_frame", "device_state", "hud", "status", "speaker", "offline_hint"}
+)
+
+
+def is_background_server_frame(payload: Mapping[str, Any]) -> bool:
+    """True when a hub -> client frame may be dropped under backpressure."""
+    return str(payload.get("type", "")) in BACKGROUND_SERVER_MESSAGE_TYPES
 
 #: v1.7: optional ``say`` field - a caption the client shows on the HUD for the
 #: follow-up window that reply opens (voice enrollment progress), so the person
@@ -250,6 +264,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_STATUS,
         MSG_SPEAKER,
         MSG_ERROR,
+        MSG_CONFIG_UPDATE,
     }
 )
 
@@ -285,6 +300,9 @@ __all__ = [
     "MSG_IMAGE_SHOW",
     "MSG_STATUS",
     "MSG_SPEAKER",
+    "MSG_CONFIG_UPDATE",
+    "BACKGROUND_SERVER_MESSAGE_TYPES",
+    "is_background_server_frame",
     "SAY_STATUS_FIELD",
     "DEFAULT_STATUS_TTL_S",
     "MSG_ERROR",

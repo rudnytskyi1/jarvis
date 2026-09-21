@@ -70,6 +70,7 @@ __all__ = [
     "DEFAULT_LEVEL_NAMES",
     "TelegramConfig",
     "TTSConfig",
+    "MediaConfig",
     "ClientConfig",
     "WakewordConfig",
     "AudioConfig",
@@ -118,6 +119,10 @@ class STTConfig(_Strict):
     live_transcript: bool = True
     live_interval_s: float = Field(default=1.2, ge=.6, le=5)
     live_window_s: float = Field(default=12, ge=6, le=20)
+    #: ТЗ 4.4/15.1: utterances that arrive together are decoded in one
+    #: faster-whisper call (2-4 clips per batch). 1 switches batching off.
+    batch_size: int = Field(default=4, ge=1, le=4)
+    batch_window_ms: int = Field(default=40, ge=0, le=500)
 
     @field_validator("language", mode="after")
     @classmethod
@@ -343,6 +348,59 @@ class TrainingArchiveConfig(_Strict):
     min_free_gb: float = Field(default=5, ge=0)
 
 
+class MediaConfig(_Strict):
+    """Retention for room media stored under ``data/homes/<home_id>/media``.
+
+    Frames and crops are short-lived privacy-sensitive captures; clips may be
+    kept a little longer. Expired files are removed together with their row in
+    the ``media`` table. Embeddings and presence events are deliberately not
+    affected: those are controlled by the person's "forget me" request.
+    """
+
+    media_ttl_days: int = Field(default=3, ge=1)
+    clip_ttl_days: int = Field(default=7, ge=1)
+
+
+class VectorConfig(_Strict):
+    """sqlite-vec index for stored embeddings (``server.vectors``, ТЗ 4.6).
+
+    The metadata tables keep their float32 BLOB vectors; this section controls
+    the search index mirrored into sqlite-vec virtual tables. ``extension_path``
+    empty means auto-discovery (env var, the ``sqlite_vec`` package, then the
+    copy vendored in ``hub/vendor``). ``dimensions`` overrides the default
+    embedding size per kind and is normally left empty: the dimension is taken
+    from the stored rows once they exist.
+    """
+
+    enabled: bool = True
+    extension_path: str = ""
+    dimensions: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("dimensions")
+    @classmethod
+    def _known_kinds(cls, value: dict[str, int]) -> dict[str, int]:
+        allowed = {"voice", "face", "body", "memory", "objects"}
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unknown vector kind(s) {unknown}; expected any of {sorted(allowed)}")
+        for kind, dimension in value.items():
+            if not 0 < dimension <= 8192:
+                raise ValueError(f"vectors.dimensions.{kind} must be between 1 and 8192")
+        return value
+
+
+class OutboundConfig(_Strict):
+    """Per-session send buffer (``server.outbound``, ТЗ 4.4 and 13).
+
+    One slow room must not hold back the others: frames are written through a
+    bounded queue per connection, and background frames (camera state, HUD
+    captions, device state) are dropped before anything else once it fills.
+    Replies and their PCM are never dropped.
+    """
+
+    queue_capacity: int = Field(default=32, ge=1, le=1024)
+
+
 class GpuQueueConfig(_Strict):
     """The hub's single GPU queue (``server.gpu_queue``, ТЗ section 4.5).
 
@@ -513,6 +571,9 @@ class ServerConfig(_Strict):
     face: FaceConfig = Field(default_factory=FaceConfig)
     segment: SegmentConfig = Field(default_factory=SegmentConfig)
     gpu_queue: GpuQueueConfig = Field(default_factory=GpuQueueConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
+    vectors: VectorConfig = Field(default_factory=VectorConfig)
+    outbound: OutboundConfig = Field(default_factory=OutboundConfig)
 
 
 # ---------------------------------------------------------------------------

@@ -85,6 +85,8 @@ def _prepare_hub_database(cfg) -> None:
         applied = migrations_runner.migrate(conn)
         changed = sync_homes_from_config(conn, getattr(cfg, "homes", []) or [])
         legacy_counts = _import_legacy_data(conn)
+        media_counts = _cleanup_media(conn, cfg)
+        vector_dims = _prepare_vector_indexes(conn, cfg)
     finally:
         conn.close()
     if applied:
@@ -93,6 +95,10 @@ def _prepare_hub_database(cfg) -> None:
         log.info("Rooms refreshed from config: %s", changed)
     if legacy_counts:
         log.info("Legacy data imported into the hub database: %s", legacy_counts)
+    if media_counts and media_counts.get("expired_rows"):
+        log.info("Expired media cleaned up: %s", media_counts)
+    if vector_dims:
+        log.info("Vector indexes ready: %s", vector_dims)
 
 
 def _import_legacy_data(conn) -> dict:
@@ -103,6 +109,48 @@ def _import_legacy_data(conn) -> dict:
         return migrate_legacy(conn)
     except Exception as exc:  # noqa: BLE001 - legacy import must not stop the hub
         log.warning("Legacy data import skipped (%s); old files stay as backup", exc)
+        return {}
+
+
+def _cleanup_media(conn, cfg) -> dict:
+    """Remove expired room media rows and files at startup (ТЗ 4.6/F-304)."""
+    try:
+        from hub.media import MediaStore
+
+        media = getattr(cfg.server, "media", None)
+        store = MediaStore(
+            conn,
+            REPO_ROOT / "data",
+            media_ttl_days=getattr(media, "media_ttl_days", 3),
+            clip_ttl_days=getattr(media, "clip_ttl_days", 7),
+        )
+        return store.cleanup_expired()
+    except Exception as exc:  # noqa: BLE001 - retention cleanup must not stop the hub
+        log.warning("Media cleanup skipped (%s); expired rows stay until the next start", exc)
+        return {}
+
+
+def _prepare_vector_indexes(conn, cfg) -> dict:
+    """Create/refresh the sqlite-vec search indexes at startup (ТЗ 4.6).
+
+    Vector search is an index over data that stays in the ordinary tables, so a
+    machine without the extension only loses KNN search: the reason is logged
+    and startup continues.
+    """
+    vectors = getattr(getattr(cfg, "server", None), "vectors", None)
+    if not getattr(vectors, "enabled", True):
+        log.info("Vector indexes disabled by config (server.vectors.enabled: false)")
+        return {}
+    from hub.vectors import VectorExtensionUnavailable, ensure_indexes
+
+    try:
+        return ensure_indexes(
+            conn,
+            dimensions=getattr(vectors, "dimensions", None),
+            extension_path=getattr(vectors, "extension_path", "") or None,
+        )
+    except (VectorExtensionUnavailable, ValueError) as exc:
+        log.warning("Vector search unavailable (%s); embeddings stay in the metadata tables", exc)
         return {}
 
 

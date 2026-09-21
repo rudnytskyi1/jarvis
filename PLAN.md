@@ -60,3 +60,20 @@
 - Идемпотентность важна: повторный запуск хаба не должен дублировать строки.
 - `sqlite-vec` может не собраться на этой машине; тогда включается LanceDB за
   флагом/фолбэком.
+
+## Выполнено (обновляется по ходу фазы 1)
+
+- **P1-06** — sqlite-vec собран и подключён: `hub/vendor/vec0.dll` 0.1.9,
+  `hub/vectors.py` создаёт `vec0`-таблицы на старте, фолбэк на LanceDB не нужен
+  (см. `DECISIONS.md`). Тесты: `tests/test_vectors.py` (24).
+- **P1-09** — горячая перезагрузка настроек дома без рестарта: `hub/config_reload.py`,
+  `hub/app.py::reload_room_configs`/`broadcast_config_update`, клиент хранит
+  `room_config_rev`; сообщение `config_update` (v2). Тесты: `tests/test_config_reload.py` (11).
+- **P1-14** — backpressure: буфер на сессию `hub/outbound.py`, фон отбрасывается
+  первым (реплики и PCM — никогда), метрики в `/health.outbound`.
+  Тесты: `tests/test_outbound.py` (7).
+- **P1-15** — STT батчинг 2–4 реплики: `hub/stt.py::SttBatcher` +
+  `SttEngine.transcribe_batch` (BatchedInferencePipeline), один слот GPU-очереди
+  на батч. Тесты: `tests/test_stt_batching.py` (8).
+
+Следующая задача по порядку `PROGRESS.md`: **P1-18** (`utterance_id`).

@@ -21,12 +21,26 @@ server:
     path: data/training_archive
     min_free_gb: 5           # stop new writes at reserve; never delete retained material
 
+  media:                    # room media retention under data/homes/<home_id>/media (ТЗ 4.6/F-304)
+    media_ttl_days: 3       # frames and crops
+    clip_ttl_days: 7        # short clips
+
+  vectors:                  # sqlite-vec search index over the stored embeddings (ТЗ 4.6)
+    enabled: true
+    extension_path: ""      # "" = auto: ROWAN_SQLITE_VEC_PATH -> sqlite_vec package -> hub/vendor/vec0.dll
+    dimensions: {}          # optional per-kind override, e.g. {voice: 192, face: 512, memory: 384}
+
+  outbound:                 # one send buffer per client, so a slow room cannot hold back the others (ТЗ 4.4/13)
+    queue_capacity: 32      # background frames (camera state, HUD) are dropped first; replies/PCM never
+
   stt:
     model: large-v3          # faster-whisper
     device: cuda
     compute_type: float16    # int8_float16: same accuracy, ~1.9 GB less VRAM (use it on a shared GPU)
     language: null           # null = auto-detect within allowed_languages; "en" pins English
     allowed_languages: [en, ru, es]   # auto-detect whitelist; [] = any language
+    batch_size: 4            # ТЗ 4.4/15.1: utterances that arrive together are decoded in one call (2-4)
+    batch_window_ms: 40      # how long to wait for a second utterance before decoding alone
 
   diarization:               # local multi-speaker mode; docs/MULTI_SPEAKER.md
     enabled: false          # enable after downloading Community-1

@@ -88,6 +88,7 @@ from common.protocol import (
     MSG_ACTIONS,
     MSG_CAMERA_ERROR,
     MSG_CAMERA_REQUEST,
+    MSG_CONFIG_UPDATE,
     MSG_ERROR,
     MSG_HELLO,
     MSG_IMAGE_SHOW,
@@ -412,6 +413,9 @@ class JarvisClient:
         self._status_owns_hud = False
         #: Set when a proactive message finished playing: answer without wake word.
         self._proactive_listen_s = 0.0
+        #: Room settings from the hub's last ``config_update`` (ТЗ 4.7).
+        self.room_config_rev = 0
+        self.room_config: dict[str, Any] = {}
         #: Wake word spellings, lowercased - to spot our own name in reply text.
         wake_cfg = self.ccfg.wakeword
         self._wake_phrases = [
@@ -793,6 +797,8 @@ class JarvisClient:
             self._on_status_message(msg, in_conversation=False)
         elif mtype == MSG_SPEAKER:
             self._on_speaker_message(msg)
+        elif mtype == MSG_CONFIG_UPDATE:
+            self._apply_room_config(msg)
         else:
             log.warning("Unknown message type from the server: %r", mtype)
 
@@ -828,6 +834,30 @@ class JarvisClient:
             score = 0.0
         log.info("Recognised speaker: %s (%.2f)", name or "(nobody)", score)
         self.overlay.speaker(name)
+
+    def _apply_room_config(self, msg: dict[str, Any]) -> None:
+        """MSG_CONFIG_UPDATE: the hub reloaded this room's settings (ТЗ 4.7).
+
+        The client keeps the announced revision and patch, so room-scoped
+        settings (quiet hours, thresholds, rules) are known immediately without
+        a reconnect; the hub applies its own thresholds on the spot.
+        """
+        try:
+            revision = int(msg.get("config_rev") or 0)
+        except (TypeError, ValueError):
+            revision = 0
+        patch = msg.get("patch")
+        if not isinstance(patch, dict):
+            patch = {}
+        if revision and revision == self.room_config_rev and patch == self.room_config:
+            return
+        self.room_config_rev = revision
+        self.room_config = dict(patch)
+        log.info(
+            "Room settings updated by the hub (rev %d): %s",
+            revision,
+            ", ".join(sorted(self.room_config)) or "no fields",
+        )
 
     def _on_status_message(self, msg: dict[str, Any], in_conversation: bool) -> None:
         """MSG_STATUS: a caption for background work, e.g. face enrollment photos.
@@ -1277,6 +1307,9 @@ class JarvisClient:
                     continue
 
                 mtype = msg.get("type")
+                if mtype == MSG_CONFIG_UPDATE:
+                    self._apply_room_config(msg)
+                    continue
                 if mtype == MSG_TRANSCRIPT:
                     if msg.get('ignored'):
                         self.overlay.transcript({'ignored': True})

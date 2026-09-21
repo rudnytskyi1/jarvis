@@ -98,6 +98,7 @@ from hub.live_transcript import LiveTranscript, PreviewSTT
 from hub.llm import LlmClient, LlmResult, is_imperative_request
 from hub.local_commands import direct_command
 from hub.model_router import LevelPool, LevelUnavailable, ModelRouter
+from hub.outbound import OutboundBuffer
 from hub.presence_alerts import PresenceAlerts
 from hub.roleplay import PERSONAS, RoleplayModes, label_reply, roleplay_command
 from hub.room_questions import current_people_question, current_people_reply, inspect_current_people
@@ -689,6 +690,31 @@ def _hub_gateway():
 #: every job directly, exactly as it did before the queue existed.
 _gpu: GpuQueue | None = None
 _gpu_off = False
+#: One batcher for the whole hub: rooms that finish speaking together share a
+#: single faster-whisper batch and a single GPU-queue slot (ТЗ 4.4, 15.1).
+_stt_batcher: Any = None
+
+
+def _speech_batcher(engine: Any) -> Any:
+    """The hub-wide STT batcher, or ``None`` when the engine cannot batch."""
+    global _stt_batcher
+    if not callable(getattr(engine, "transcribe_batch", None)):
+        return None
+    if _stt_batcher is None:
+        from hub.stt import SttBatcher
+
+        stt_cfg = get_config().server.stt
+
+        async def runner(work: Any) -> Any:
+            return await run_on_gpu(PRIORITY_UTTERANCE, "", work, label="stt-batch")
+
+        _stt_batcher = SttBatcher(
+            engine,
+            batch_size=int(getattr(stt_cfg, "batch_size", 4)),
+            window_ms=int(getattr(stt_cfg, "batch_window_ms", 40)),
+            runner=runner,
+        )
+    return _stt_batcher
 
 
 def _gpu_queue() -> GpuQueue | None:
@@ -837,6 +863,91 @@ def _telegram_room(client_id=None):
 def _admin_runtime():
     return dict(memory=_memory, voices=_voices, llm=_llm, face=_face, stt=_stt,
                 vision=_vision, segment=_segment, image_generator=_image_generator)
+
+
+def _apply_config_in_place(target: Any, fresh: Any) -> None:
+    """Copy every validated field of ``fresh`` onto the live config object.
+
+    Connections captured ``cfg`` when they were created, so a hot reload
+    (ТЗ 4.7) has to update that same object; replacing the global would leave
+    every open room on the old thresholds until it reconnected.
+    """
+    for name in type(fresh).model_fields:
+        setattr(target, name, getattr(fresh, name))
+
+
+def _outbound_stats() -> dict[str, Any]:
+    """Aggregate send-buffer counters of the live sessions (ТЗ 4.4, 15.5)."""
+    queued = sent = dropped = 0
+    dropped_by_type: dict[str, int] = {}
+    for connection in list(_connections):
+        outbox = getattr(connection, "outbox", None)
+        if outbox is None:
+            continue
+        stats = outbox.stats()
+        queued += stats.queued
+        sent += stats.sent
+        dropped += stats.dropped
+        for label, number in stats.dropped_by_type.items():
+            dropped_by_type[label] = dropped_by_type.get(label, 0) + number
+    return {
+        "clients": len(_connections),
+        "queued": queued,
+        "sent": sent,
+        "dropped": dropped,
+        "dropped_by_type": dropped_by_type,
+    }
+
+
+async def broadcast_config_update(home_id: str, frame: dict[str, Any]) -> int:
+    """Send ``config_update`` to the live clients of one room; return how many."""
+    delivered = 0
+    for connection in list(_connections):
+        if connection.home_id != home_id or connection.ws.client_state is not WebSocketState.CONNECTED:
+            continue
+        try:
+            if await connection.queue_frame(frame):
+                delivered += 1
+        except Exception:  # noqa: BLE001 - one dead client must not stop the reload
+            log.debug("Could not send config_update to %s", connection.peer, exc_info=True)
+    return delivered
+
+
+async def reload_room_configs(config_path: str | Path | None = None) -> list[dict[str, Any]]:
+    """Admin API entry point: re-read config.yaml and update rooms live (ТЗ 4.7).
+
+    Returns the ``config_update`` frames that were sent, one per changed room.
+    A missing or invalid file raises ``ValueError`` and changes nothing: the
+    hub keeps running on the previous settings.
+    """
+    global _config
+    from hub import migrations_runner
+    from hub.config_reload import reload_home_settings
+
+    path = Path(config_path) if config_path is not None else (
+        Path(os.environ.get(CONFIG_ENV_VAR) or DEFAULT_CONFIG_PATH)
+    )
+    db_path = REPO_ROOT / "data" / "hub.db"
+
+    def _reload() -> tuple[Any, list]:
+        conn = migrations_runner.connect(str(db_path))
+        try:
+            migrations_runner.migrate(conn)
+            return reload_home_settings(conn, path)
+        finally:
+            conn.close()
+
+    fresh, changes = await asyncio.to_thread(_reload)
+    if changes:
+        if _config is None:
+            _config = fresh
+        else:
+            _apply_config_in_place(_config, fresh)
+        for change in changes:
+            await broadcast_config_update(change.home_id, change.frame())
+        log.info("Room settings reloaded from %s: %s", path,
+                 ", ".join(f"{change.home_id}@rev{change.config_rev}" for change in changes))
+    return [change.frame() for change in changes]
 
 
 def _workplaces():
@@ -1071,6 +1182,10 @@ async def health() -> dict[str, Any]:
         "face": bool(_face is not None and _face.available),
         # v1.5: SAM3 (find_object) is loaded, or enabled and not yet known broken.
         "sam": bool(_segment is not None and _segment.available),
+        # ТЗ 4.4/15.1: how well utterances are grouping into STT batches.
+        "stt_batching": _stt_batcher.stats() if _stt_batcher is not None else None,
+        # ТЗ 4.4: dropped background frames per live session (slow clients).
+        "outbound": _outbound_stats(),
     }
 
 
@@ -1082,6 +1197,14 @@ class Connection(CameraClipReceiver):
         #: Set once a v2 ``hello`` is verified; v1 connections keep it empty.
         self.home_id = ""
         self.cfg = cfg
+        #: One bounded send queue per session (ТЗ 4.4): a slow room cannot make
+        #: the hub wait on its socket, and background frames are what gets lost.
+        outbound = getattr(getattr(cfg, "server", None), "outbound", None)
+        self.outbox = OutboundBuffer(
+            self._write_outbound,
+            capacity=int(getattr(outbound, "queue_capacity", 32)),
+        )
+        self._outbox_task: asyncio.Task | None = None
         self.session: Session | None = None
         self.audio = bytearray()
         self.receiving = False
@@ -1224,6 +1347,38 @@ class Connection(CameraClipReceiver):
             raise WebSocketDisconnect(code=1006)
         await self.ws.send_text(json.dumps(payload, ensure_ascii=False))
 
+    async def send_bytes(self, data: bytes, *, background: bool = False) -> None:
+        """Send a binary frame; only fan-out frames go through the queue."""
+        if self.ws.client_state is not WebSocketState.CONNECTED:
+            raise WebSocketDisconnect(code=1006)
+        await self.ws.send_bytes(data)
+
+    async def queue_frame(self, payload: dict[str, Any], *, background: bool | None = None) -> bool:
+        """Fan-out one frame through this session's buffer (ТЗ 4.4).
+
+        Unlike :meth:`send_json`, this never waits for the socket: a room that
+        is not reading fast enough loses background frames instead of delaying
+        the rooms that are. Returns ``False`` when the frame was dropped.
+        """
+        if self.ws.client_state is not WebSocketState.CONNECTED:
+            return False
+        if background is None:
+            background = proto.is_background_server_frame(payload)
+        if self._outbox_task is None:
+            # Fan-out can start before (or without) the receive loop, so the
+            # writer is created lazily on the first queued frame.
+            self._outbox_task = asyncio.create_task(self.outbox.drain())
+        return await self.outbox.enqueue(
+            payload, background=background, label=str(payload.get("type") or "unknown")
+        )
+
+    async def _write_outbound(self, item: Any) -> None:
+        """The outbound writer: text frames are JSON, binary ones are raw."""
+        if isinstance(item, bytes):
+            await self.ws.send_bytes(item)
+        else:
+            await self.ws.send_text(json.dumps(item, ensure_ascii=False))
+
     async def send_error(self, message: str) -> None:
         log.warning("Error sent to client %s: %s", self.peer, message)
         try:
@@ -1234,17 +1389,25 @@ class Connection(CameraClipReceiver):
     # ------------------------------------------------------------------ receiving
 
     async def run(self) -> None:
-        while True:
-            message = await self.ws.receive()
-            if message.get("type") == "websocket.disconnect":
-                raise WebSocketDisconnect(code=message.get("code", 1000))
-            text = message.get("text")
-            if text is not None:
-                await self._on_text(text)
-                continue
-            data = message.get("bytes")
-            if data is not None:
-                self._on_binary(data)
+        if self._outbox_task is None:
+            self._outbox_task = asyncio.create_task(self.outbox.drain())
+        try:
+            while True:
+                message = await self.ws.receive()
+                if message.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect(code=message.get("code", 1000))
+                text = message.get("text")
+                if text is not None:
+                    await self._on_text(text)
+                    continue
+                data = message.get("bytes")
+                if data is not None:
+                    self._on_binary(data)
+        finally:
+            await self.outbox.aclose()
+            if self._outbox_task is not None:
+                self._outbox_task.cancel()
+                self._outbox_task = None
 
     async def _on_text(self, raw: str) -> None:
         try:
@@ -1432,6 +1595,28 @@ class Connection(CameraClipReceiver):
         )
         self._start_greeting_task()
         await self.send_json({"type": proto.MSG_READY})
+        await self._send_room_config()
+
+    async def _send_room_config(self) -> None:
+        """Tell the room its current settings revision (``config_update``, ТЗ 4.7)."""
+        if not self.home_id:
+            # v1 connections are not bound to a room row; nothing to announce.
+            return
+        try:
+            from hub.config_reload import current_room_frame
+
+            conn = _hub_conn
+            if conn is None:
+                _hub_gateway()
+                conn = _hub_conn
+            if conn is None:
+                return
+            frame = await asyncio.to_thread(current_room_frame, conn, self.home_id)
+        except Exception as exc:  # noqa: BLE001 - a missing room row is not fatal
+            log.debug("Could not send the room config to %s (%s)", self.peer, exc)
+            return
+        if frame is not None:
+            await self.send_json(frame)
 
     def _on_utterance_start(self, payload: dict[str, Any]) -> None:
         self._verify_wake = payload.get('verify_wake') is True
@@ -4267,7 +4452,7 @@ class Connection(CameraClipReceiver):
                     "ttl_s": float(ttl_s),
                 }
             )
-            await self.ws.send_bytes(jpeg)
+            await self.send_bytes(jpeg)
 
     async def _run_click_screen(self, args: dict[str, Any]) -> dict[str, Any]:
         """Locate a described element on the screen and click it (SPEC §5, tool 6).
@@ -4767,12 +4952,20 @@ class Connection(CameraClipReceiver):
                 text, language = attributed.text, attributed.language
                 self._transcript_segments = attributed.segments
             else:
-                text, language = await asyncio.wait_for(
-                    self._gpu(PRIORITY_UTTERANCE, "stt",
-                              lambda: asyncio.to_thread(engine.transcribe_pcm, pcm, self.sample_rate,
-                                                        self.cfg.server.stt.language)),
-                    timeout=STT_TIMEOUT_S,
-                )
+                batcher = _speech_batcher(engine)
+                if batcher is None:
+                    text, language = await asyncio.wait_for(
+                        self._gpu(PRIORITY_UTTERANCE, "stt",
+                                  lambda: asyncio.to_thread(engine.transcribe_pcm, pcm, self.sample_rate,
+                                                            self.cfg.server.stt.language)),
+                        timeout=STT_TIMEOUT_S,
+                    )
+                else:
+                    # The batch itself is one GPU-queue slot (see _speech_batcher).
+                    text, language = await asyncio.wait_for(
+                        batcher.transcribe(pcm, self.sample_rate, self.cfg.server.stt.language),
+                        timeout=STT_TIMEOUT_S,
+                    )
         except TimeoutError:
             log.error(
                 "Speech recognition exceeded %.0f s. The worker may still be running; "
@@ -5146,9 +5339,7 @@ class Connection(CameraClipReceiver):
                 log.exception("Speech synthesis failed for a sentence group")
                 continue
             for offset in range(0, len(pcm), TTS_CHUNK_BYTES):
-                if self.ws.client_state is not WebSocketState.CONNECTED:
-                    raise WebSocketDisconnect(code=1006)
-                await self.ws.send_bytes(pcm[offset : offset + TTS_CHUNK_BYTES])
+                await self.send_bytes(pcm[offset : offset + TTS_CHUNK_BYTES])
         await self.send_json({"type": proto.MSG_TTS_END, 'purpose': purpose})
         # v1.4: the greeting task waits out any audio the client is playing.
         self._last_audio_at = time.monotonic()

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline, WhisperModel
 
 from hub.diarization import Transcript, Word
 
@@ -186,7 +190,48 @@ class SttEngine:
             device=self.device,
             compute_type=self.compute_type,
         )
+        self._batched_pipeline: Any = None
         log.info("Whisper is loaded")
+
+    def batched_pipeline(self) -> Any:
+        """faster-whisper's batched decoder, or ``None`` when it is unusable.
+
+        Distilled checkpoints and a few quantisations cannot use the batched
+        pipeline; those keep the plain single-utterance path.
+        """
+        if self._batched_pipeline is None:
+            try:
+                self._batched_pipeline = BatchedInferencePipeline(model=self._model)
+            except Exception as exc:  # noqa: BLE001 - batching is an optimisation
+                log.info("Batched decoding is unavailable (%s); using single clips", exc)
+                self._batched_pipeline = False
+        return self._batched_pipeline or None
+
+    def transcribe_batch(
+        self,
+        clips: list[bytes],
+        sample_rate: int = WHISPER_SAMPLE_RATE,
+        language: Any = None,
+        *,
+        batch_size: int | None = None,
+    ) -> list[tuple[str, str]]:
+        """Transcribe 2-4 clips in one call, one ``(text, language)`` per clip.
+
+        All clips are decoded under a single call and a single GPU-queue slot
+        (ТЗ 4.4, 15.1); with the batched pipeline the decoder works on
+        ``batch_size`` windows at once instead of one at a time.
+        """
+        if not clips:
+            return []
+        width = int(batch_size or len(clips))
+        if width < 1:
+            raise ValueError("batch_size must be positive")
+        results: list[tuple[str, str]] = []
+        for pcm in clips:
+            transcript = self._transcribe(pcm, sample_rate, language, detailed=False,
+                                          batch_size=width if len(clips) > 1 else None)
+            results.append((transcript.text, transcript.language))
+        return results
 
     def transcribe_pcm(
         self,
@@ -206,7 +251,8 @@ class SttEngine:
         return self._transcribe(pcm, sample_rate, language, detailed=True, preview=True)
 
     def _transcribe(self, pcm_s16le_bytes: bytes, sample_rate: int,
-                    language: Any, *, detailed: bool, preview: bool = False) -> Transcript:
+                    language: Any, *, detailed: bool, preview: bool = False,
+                    batch_size: int | None = None) -> Transcript:
         requested = _clean_language(language)
         if requested is None and language is None:
             requested = self.default_language
@@ -237,7 +283,12 @@ class SttEngine:
             log_prob_threshold=LOG_PROB_THRESHOLD,
             compression_ratio_threshold=COMPRESSION_RATIO_THRESHOLD,
         )
-        segments, info = self._model.transcribe(audio, language=requested, **kwargs)
+        pipeline = self.batched_pipeline() if batch_size and not preview else None
+        if pipeline is not None:
+            kwargs["batch_size"] = max(1, int(batch_size))
+            segments, info = pipeline.transcribe(audio, language=requested, **kwargs)
+        else:
+            segments, info = self._model.transcribe(audio, language=requested, **kwargs)
 
         # Language detection ran on the encoder pass; segments are still a lazy
         # generator, so re-running with a forced language is cheap here.
@@ -259,7 +310,10 @@ class SttEngine:
                 detected_raw,
                 forced,
             )
-            segments, info = self._model.transcribe(audio, language=forced, **kwargs)
+            if pipeline is not None:
+                segments, info = pipeline.transcribe(audio, language=forced, **kwargs)
+            else:
+                segments, info = self._model.transcribe(audio, language=forced, **kwargs)
 
         # Materialize once: it is a lazy generator, and BUG 1's noise check
         # below needs to walk it before/independently of building the text.
@@ -290,3 +344,121 @@ class SttEngine:
             words = [Word(float(w.start), float(w.end), w.word)
                      for seg in segments for w in (getattr(seg, "words", None) or [])]
         return Transcript(text, detected, words)
+
+
+@dataclass
+class _BatchJob:
+    future: asyncio.Future
+    pcm: bytes
+    sample_rate: int
+    language: Any
+
+
+class SttBatcher:
+    """Group concurrent utterances into one faster-whisper batch (ТЗ 4.4, 15.1).
+
+    Several rooms can end an utterance at the same moment. Instead of one
+    queue slot and one model call each, the clips are collected for
+    ``window_ms`` (2-4 clips) and decoded together, which is what the GPU is
+    actually good at. ``runner`` decides where the blocking call runs: the hub
+    passes its GPU queue, so one batch occupies exactly one slot.
+    """
+
+    def __init__(
+        self,
+        engine: SttEngine,
+        *,
+        batch_size: int = 4,
+        window_ms: int = 40,
+        runner: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
+    ) -> None:
+        if not 1 <= batch_size <= 4:
+            raise ValueError("batch_size must be between 1 and 4")
+        if window_ms < 0:
+            raise ValueError("window_ms cannot be negative")
+        self.engine = engine
+        self.batch_size = batch_size
+        self.window_s = window_ms / 1000.0
+        self.runner = runner
+        self._queue: deque[_BatchJob] = deque()
+        self._task: asyncio.Task | None = None
+        self._wake = asyncio.Event()
+        self.batches = 0
+        self.clips = 0
+        self.max_batch = 0
+
+    async def transcribe(self, pcm: bytes, sample_rate: int, language: Any = None) -> tuple[str, str]:
+        """Queue one utterance and wait for its ``(text, language)``."""
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._queue.append(_BatchJob(future, pcm, int(sample_rate), language))
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._collect())
+        self._wake.set()
+        return await future
+
+    async def _collect(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+            while self._queue:
+                batch = [self._queue.popleft()]
+                deadline = loop.time() + self.window_s
+                while len(batch) < self.batch_size:
+                    if self._queue:
+                        batch.append(self._queue.popleft())
+                        continue
+                    if len(batch) == self.batch_size:
+                        break
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(remaining, 0.005))
+                await self._run_batch(batch)
+
+    async def _run_batch(self, batch: list[_BatchJob]) -> None:
+        clips = [job.pcm for job in batch]
+        language = batch[0].language
+        sample_rate = batch[0].sample_rate
+        work = lambda: self.engine.transcribe_batch(  # noqa: E731 - one call site
+            clips, sample_rate, language, batch_size=len(clips)
+        )
+        try:
+            if self.runner is not None:
+                results = await self.runner(work)
+            else:
+                results = await asyncio.to_thread(work)
+        except Exception as exc:  # noqa: BLE001 - every waiter sees the failure
+            for job in batch:
+                if not job.future.done():
+                    job.future.set_exception(exc)
+            return
+        self.batches += 1
+        self.clips += len(batch)
+        self.max_batch = max(self.max_batch, len(batch))
+        for job, result in zip(batch, results, strict=False):
+            if not job.future.done():
+                job.future.set_result(result)
+        for job in batch[len(results):]:
+            if not job.future.done():
+                job.future.set_exception(RuntimeError("speech recognition returned no result"))
+
+    async def aclose(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        self._queue.clear()
+
+    def stats(self) -> dict[str, int]:
+        return {"batches": self.batches, "clips": self.clips, "max_batch": self.max_batch}
+
+
+__all__ = [
+    "SttBatcher",
+    "SttEngine",
+    "Transcript",
+    "Word",
+    "is_probable_noise",
+    "pcm_to_float32",
+    "resample",
+]

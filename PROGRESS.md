@@ -33,14 +33,14 @@ vLLM-провайдер (F-402); Decider с Rules и LocalLLM (раздел 5); 
 ### Хранилище и сущности
 
 - [x] **P1-01 (4.6)** Схема БД хаба: `migrations/0001_init.py` (26 таблиц, FK, WAL), `hub/migrations_runner.py`, таблица `schema_version`. Проверено: `pytest tests/test_migrations.py -q` → 4 passed.
-- [ ] **P1-02 (4.6)** Миграция `data/people.json` → `persons` + `voice_embeddings`/`face_embeddings` скриптом, старый файл остаётся бэкапом.
-- [ ] **P1-03 (4.6)** Миграция `data/memory.jsonl` → `memories` (тип, область, TTL).
-- [ ] **P1-04 (4.6)** Миграция `data/dialogs/*.jsonl` → `dialog_turns`.
-- [ ] **P1-05 (4.6)** Медиа по правилу `data/homes/<home_id>/media/YYYY-MM-DD/` + TTL и удаление из `media`.
-- [ ] **P1-06 (4.6)** sqlite-vec: сборка/подключение и таблицы векторов (фолбэк — LanceDB, решение записать в `DECISIONS.md`).
+- [x] **P1-02 (4.6)** Миграция `data/people.json` → `persons` + `voice_embeddings`/`face_embeddings` скриптом, старый файл остаётся бэкапом. Проверено: `pytest tests/test_legacy_migrate.py -q` → 4 passed; `make test` → 2513 passed, 2 skipped.
+- [x] **P1-03 (4.6)** Миграция `data/memory.jsonl` → `memories` (тип, область, TTL). Проверено: `pytest tests/test_legacy_migrate.py -q` → 4 passed; `make test` → 2513 passed, 2 skipped.
+- [x] **P1-04 (4.6)** Миграция `data/dialogs/*.jsonl` → `dialog_turns`. Проверено: `pytest tests/test_legacy_migrate.py -q` → 4 passed; `make test` → 2513 passed, 2 skipped.
+- [x] **P1-05 (4.6)** Медиа по правилу `data/homes/<home_id>/media/YYYY-MM-DD/` + TTL и удаление из `media`. Проверено: `pytest tests/test_media.py tests/test_config.py tests/test_hub_config.py -q` → 26 passed; `make test` → 2519 passed, 2 skipped.
+- [x] **P1-06 (4.6)** sqlite-vec: сборка/подключение и таблицы векторов (фолбэк — LanceDB, решение записать в `DECISIONS.md`). Проверено: `pytest tests/test_vectors.py -q` → 24 passed; `make test` → 2543 passed, 2 skipped; `ruff check .` и `mypy common` чисто. `vec0.dll` 0.1.9 подключён из `hub/vendor/`, виртуальные таблицы `vec_voice_embeddings`, `vec_face_embeddings`, `vec_body_embeddings`, `vec_memories`, `vec_objects_index` создаются на старте хаба.
 - [x] **P1-07 (4.2)** Сущности `home`: таблица `homes`, сид из `homes:` конфига, `config_rev`. Проверено: `pytest tests/test_homes.py -q` → 4 passed.
 - [x] **P1-08 (4.2, 4.7)** Pydantic-конфиги хаба и клиента (`HomeConfig`, `GpuQueueConfig`, `ModelsConfig`, `homes:`, `models:`), шаблоны примеров. Проверено: `pytest tests/test_config.py tests/test_hub_config.py tests/test_client_config_v2.py -q` → 20 passed.
-- [ ] **P1-09 (4.7)** Горячая перезагрузка настроек дома без рестарта + сообщение `config_update` клиенту.
+- [x] **P1-09 (4.7)** Горячая перезагрузка настроек дома без рестарта + сообщение `config_update` клиенту. Проверено: `pytest tests/test_config_reload.py -q` → 11 passed; `make test` → 2554 passed, 2 skipped; `ruff check .` и `mypy common` чисто. `hub/config_reload.py` + `hub/app.py::reload_room_configs`/`broadcast_config_update`, клиент хранит `room_config_rev`/`room_config`.
 
 ### Сеть, auth, gateway
 
@@ -48,8 +48,8 @@ vLLM-провайдер (F-402); Decider с Rules и LocalLLM (раздел 5); 
 - [x] **P1-11 (4.3)** `hello`: сессия привязана к `home_id`, `home_id` из тела сообщения не принимается, неверный токен → закрытие 4401. Проверено: `pytest tests/test_hello_auth.py -q` → 3 passed.
 - [x] **P1-12 (4.3)** Rate-limit на клиента (реплики в минуту, кадры в секунду) из конфига. Проверено: `pytest tests/test_gateway.py -q` → 10 passed.
 - [x] **P1-13 (4.4)** Gateway: реестр комнат и клиентов, квоты, `rejection()`. Проверено: `pytest tests/test_gateway.py -q` → 10 passed.
-- [ ] **P1-14 (4.4)** Backpressure: медленный клиент не задерживает рассылку остальным (буфер на сессию + метрика отброшенного).
-- [ ] **P1-15 (4.4, 15.1)** STT батчингом 2–4 реплики: `faster-whisper` принимает батч, а не по одной.
+- [x] **P1-14 (4.4)** Backpressure: медленный клиент не задерживает рассылку остальным (буфер на сессию + метрика отброшенного). Проверено: `pytest tests/test_outbound.py -q` → 7 passed; `make test` → 2561 passed, 2 skipped; `ruff check .` и `mypy common` чисто. `hub/outbound.py` (буфер на сессию, фон отбрасывается первым, реплики/PCM — никогда), метрики в `/health` (`outbound`), конфиг `server.outbound.queue_capacity`.
+- [x] **P1-15 (4.4, 15.1)** STT батчингом 2–4 реплики: `faster-whisper` принимает батч, а не по одной. Проверено: `pytest tests/test_stt_batching.py -q` → 8 passed; `make test` → 2569 passed, 2 skipped; `ruff check .` и `mypy common` чисто. `hub/stt.py::SttBatcher` (окно `server.stt.batch_window_ms`, размер `server.stt.batch_size` 1–4) + `SttEngine.transcribe_batch` через `BatchedInferencePipeline`, один слот GPU-очереди на батч.
 
 ### Очередь GPU и трассировка
 
