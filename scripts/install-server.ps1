@@ -5,7 +5,7 @@
 .DESCRIPTION
     1. Finds the conda env `jarvis` (or creates it with Python 3.11; if conda is
        missing entirely, falls back to a plain venv in .venv at the repo root).
-    2. Installs the dependencies from server\requirements.txt.
+    2. Installs the dependencies from hub\requirements.txt.
     3. Creates config.yaml from config.example.yaml when it does not exist yet.
     4. Checks that Ollama is installed and prints the next steps.
 
@@ -141,7 +141,7 @@ function Resolve-Python {
 Write-Step "Jarvis: installing the server side (STT + LLM client + TTS)"
 Write-Host "Repository: $RepoRoot"
 
-$requirements = Join-Path $RepoRoot "server\requirements.txt"
+$requirements = Join-Path $RepoRoot "hub\requirements.txt"
 if (-not (Test-Path $requirements)) {
     throw "$requirements not found - the repository was not downloaded completely."
 }
@@ -152,7 +152,7 @@ Write-Step "Upgrading pip"
 & $python -m pip install --upgrade pip setuptools wheel
 if ($LASTEXITCODE -ne 0) { throw "pip install --upgrade pip failed with exit code $LASTEXITCODE" }
 
-Write-Step "Installing dependencies from server\requirements.txt"
+Write-Step "Installing dependencies from hub\requirements.txt"
 & $python -m pip install -r $requirements
 if ($LASTEXITCODE -ne 0) { throw "pip install -r $requirements failed with exit code $LASTEXITCODE" }
 

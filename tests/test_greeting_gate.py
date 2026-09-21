@@ -8,7 +8,7 @@ touches the unknown bucket) and never on a label that has already expired.
 """
 import time
 
-from server.app import LABEL_UNKNOWN, PresenceTracker
+from hub.app import LABEL_UNKNOWN, PresenceTracker
 
 
 def test_no_unknown_face_ever_seen_is_not_fresh():

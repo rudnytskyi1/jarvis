@@ -10,11 +10,12 @@ websockets           # WebSocket transport to the brain server
 numpy                # PCM helpers (beeps, resampling)
 pillow               # screenshots for look_at_screen (client/screen.py)
 pyyaml               # config.yaml
-pydantic             # config models (common/config.py)
+pydantic>=2,<3        # standalone client config models
 
 # --- actions & devices (W3) ---
 pycaw                # Windows master volume (IAudioEndpointVolume)
 comtypes             # COM plumbing used by pycaw
+psutil>=5.9          # app inventory and ordinary browser process identity
 bleak                # BLE for SwitchBot Bot
 flux_led             # Magic Home / Zengge Wi-Fi LED controllers
 tinytuya             # Tuya Wi-Fi bulbs / strips

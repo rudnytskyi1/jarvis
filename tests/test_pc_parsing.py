@@ -3,8 +3,8 @@ import pytest
 
 from client.actions.pc import (
     _CLOSING_HOTKEYS,
-    _is_console_alias,
     PC_COMMANDS,
+    _is_console_alias,
     parse_hotkey,
 )
 

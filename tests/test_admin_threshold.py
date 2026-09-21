@@ -1,5 +1,5 @@
 """High-confidence gate for the most dangerous tools (v1.6)."""
-from server.speaker import ROLE_ADMIN, ROLE_TRUSTED, check_permission
+from hub.speaker import ROLE_ADMIN, ROLE_TRUSTED, check_permission
 
 
 def test_run_command_needs_high_confidence_even_for_admin():

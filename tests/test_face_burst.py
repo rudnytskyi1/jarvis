@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from common.config import FaceConfig, load_config
-from server.face import FaceEngine, select_best_face
+from hub.face import FaceEngine, select_best_face
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

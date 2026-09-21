@@ -1,0 +1,38 @@
+{"id": "en-volume-set-30", "language": "en", "transcript": "volume 30", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 30}, "notes": "plain numeric volume"}
+{"id": "en-volume-set-phrase", "language": "en", "transcript": "set the volume to 45", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 45}, "notes": "phrasal form"}
+{"id": "en-volume-zero", "language": "en", "transcript": "volume 0", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 0}, "notes": "lower bound"}
+{"id": "en-volume-max", "language": "en", "transcript": "volume 100", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 100}, "notes": "upper bound"}
+{"id": "en-volume-out-of-range", "language": "en", "transcript": "volume 150", "expected_route": "llm", "expected_command": null, "notes": "out of range must not silently clamp"}
+{"id": "ru-volume-set-30", "language": "ru", "transcript": "громкость 30", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 30}, "notes": "russian numeric volume"}
+{"id": "ru-volume-set-phrase", "language": "ru", "transcript": "установи громкость на 40", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 40}, "notes": "russian phrasal form"}
+{"id": "en-mute", "language": "en", "transcript": "mute", "expected_route": "fast_command", "expected_command": {"command": "mute"}, "notes": "exact match"}
+{"id": "ru-mute", "language": "ru", "transcript": "выключи звук", "expected_route": "fast_command", "expected_command": {"command": "mute"}, "notes": "exact match"}
+{"id": "en-unmute", "language": "en", "transcript": "unmute", "expected_route": "fast_command", "expected_command": {"command": "unmute"}, "notes": "exact match"}
+{"id": "ru-unmute", "language": "ru", "transcript": "включи звук", "expected_route": "fast_command", "expected_command": {"command": "unmute"}, "notes": "exact match"}
+{"id": "en-next-track", "language": "en", "transcript": "next track", "expected_route": "fast_command", "expected_command": {"command": "media_next"}, "notes": "media key"}
+{"id": "ru-next-track", "language": "ru", "transcript": "следующий трек", "expected_route": "fast_command", "expected_command": {"command": "media_next"}, "notes": "media key"}
+{"id": "en-previous-track", "language": "en", "transcript": "previous track", "expected_route": "fast_command", "expected_command": {"command": "media_prev"}, "notes": "media key"}
+{"id": "ru-previous-track", "language": "ru", "transcript": "предыдущий трек", "expected_route": "fast_command", "expected_command": {"command": "media_prev"}, "notes": "media key"}
+{"id": "en-volume-up", "language": "en", "transcript": "volume up", "expected_route": "fast_command", "expected_command": {"command": "volume_up"}, "notes": "exact match, not the numeric form"}
+{"id": "ru-volume-up", "language": "ru", "transcript": "громче", "expected_route": "fast_command", "expected_command": {"command": "volume_up"}, "notes": "exact match"}
+{"id": "en-volume-down", "language": "en", "transcript": "volume down", "expected_route": "fast_command", "expected_command": {"command": "volume_down"}, "notes": "exact match"}
+{"id": "ru-volume-down", "language": "ru", "transcript": "тише", "expected_route": "fast_command", "expected_command": {"command": "volume_down"}, "notes": "exact match"}
+{"id": "en-open-chrome", "language": "en", "transcript": "open chrome", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "chrome"}, "notes": "allow-listed app"}
+{"id": "en-open-spotify-mixed-case", "language": "en", "transcript": "Open Spotify", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "spotify"}, "notes": "case is folded before matching"}
+{"id": "en-open-calculator", "language": "en", "transcript": "open calculator", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "calculator"}, "notes": "allow-listed app"}
+{"id": "en-open-notepad", "language": "en", "transcript": "open notepad", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "notepad"}, "notes": "allow-listed app"}
+{"id": "en-open-firefox", "language": "en", "transcript": "open firefox", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "firefox"}, "notes": "allow-listed app"}
+{"id": "ru-open-steam", "language": "ru", "transcript": "открой steam", "expected_route": "fast_command", "expected_command": {"command": "open_app", "value": "steam"}, "notes": "russian verb with an english app name"}
+{"id": "en-wake-word-stripped", "language": "en", "transcript": "rowan volume 25", "expected_route": "fast_command", "expected_command": {"command": "volume_set", "value": 25}, "notes": "the wake word is stripped before routing"}
+{"id": "en-pause-is-not-a-shortcut", "language": "en", "transcript": "pause", "expected_route": "llm", "expected_command": null, "notes": "a toggle cannot promise a paused state"}
+{"id": "en-weather-question", "language": "en", "transcript": "what is the weather", "expected_route": "llm", "expected_command": null, "notes": "ordinary question"}
+{"id": "ru-weather-question", "language": "ru", "transcript": "какая погода", "expected_route": "llm", "expected_command": null, "notes": "ordinary question"}
+{"id": "ru-turn-on-light", "language": "ru", "transcript": "включи свет", "expected_route": "llm", "expected_command": null, "notes": "device action, needs the tool loop"}
+{"id": "ru-set-timer", "language": "ru", "transcript": "поставь таймер на 20 минут", "expected_route": "llm", "expected_command": null, "notes": "scheduler work, not a shortcut"}
+{"id": "en-volume-without-number", "language": "en", "transcript": "volume", "expected_route": "llm", "expected_command": null, "notes": "ambiguous without a value"}
+{"id": "ru-volume-without-number", "language": "ru", "transcript": "громкость", "expected_route": "llm", "expected_command": null, "notes": "ambiguous without a value"}
+{"id": "en-open-unknown-app", "language": "en", "transcript": "open telegram", "expected_route": "llm", "expected_command": null, "notes": "not on the shortcut allow-list"}
+{"id": "ru-open-unknown-app", "language": "ru", "transcript": "открой телеграм", "expected_route": "llm", "expected_command": null, "notes": "not on the shortcut allow-list"}
+{"id": "ru-relative-volume-with-percent", "language": "ru", "transcript": "громче на 20 процентов", "expected_route": "llm", "expected_command": null, "notes": "relative change is not an absolute shortcut"}
+{"id": "en-play-music", "language": "en", "transcript": "play music", "expected_route": "llm", "expected_command": null, "notes": "needs the media tool"}
+{"id": "es-unmute", "language": "es", "transcript": "activa el sonido", "expected_route": "banter", "expected_command": null, "notes": "no spanish shortcut exists yet; needs an audio fixture"}

@@ -4,7 +4,7 @@ import json
 import numpy as np
 import pytest
 
-from server.speaker import (
+from hub.speaker import (
     ENROLL_MIN_SAMPLES,
     FACE_KEY,
     LEGACY_VOICES_FILENAME,
@@ -47,19 +47,19 @@ PCM = b"\x00\x01" * 16000  # 1 s of fake s16le
         (ROLE_UNKNOWN, "set_light", {}, True),
         (ROLE_UNKNOWN, "enroll_voice", {}, True),
         (ROLE_USER, "remember", {}, False),
-        (ROLE_ADMIN, "remember", {}, True),
+        (ROLE_ADMIN, "remember", {"scope": "global"}, True),
         # v1.4: the camera tools join the existing tiers.
         (ROLE_TRUSTED, "look_at_camera", {}, True),
         (ROLE_ADMIN, "look_at_camera", {}, True),
-        (ROLE_USER, "look_at_camera", {}, False),
-        (ROLE_UNKNOWN, "look_at_camera", {}, False),
+        (ROLE_USER, "look_at_camera", {}, True),
+        (ROLE_UNKNOWN, "look_at_camera", {}, True),
         (ROLE_UNKNOWN, "enroll_face", {}, True),
         (ROLE_USER, "enroll_face", {}, True),
         # v1.5: find_object joins the trusted tier, same as look_at_camera.
         (ROLE_TRUSTED, "find_object", {}, True),
         (ROLE_ADMIN, "find_object", {}, True),
-        (ROLE_USER, "find_object", {}, False),
-        (ROLE_UNKNOWN, "find_object", {}, False),
+        (ROLE_USER, "find_object", {}, True),
+        (ROLE_UNKNOWN, "find_object", {}, True),
     ],
 )
 def test_permission_matrix(role, tool, args, allowed):
@@ -158,11 +158,11 @@ def test_add_face_embedding_creates_people_like_enroll(tmp_path):
     role, status = reg.add_face_embedding("Anton", face)
     assert role == ROLE_ADMIN  # first person ever = the owner
     assert "1" in status
-    role, _ = reg.add_face_embedding("Guest", face[::-1])
+    role, _ = reg.add_face_embedding("Casey", face[::-1])
     assert role == ROLE_USER
 
     profiles = reg.face_profiles()
-    assert set(profiles) == {"Anton", "Guest"}
+    assert set(profiles) == {"Anton", "Casey"}
     assert len(profiles["Anton"][0]) == 512
 
     with pytest.raises(ValueError):
@@ -174,7 +174,7 @@ def test_add_face_embedding_creates_people_like_enroll(tmp_path):
     reg.add_face_embedding("Anton", face * 0.5)
     reloaded = VoiceRegistry(data_dir=tmp_path)
     assert len(reloaded.face_profiles()["Anton"]) == 2
-    assert reloaded.people() == {"Anton": ROLE_ADMIN, "Guest": ROLE_USER}
+    assert reloaded.people() == {"Anton": ROLE_ADMIN, "Casey": ROLE_USER}
 
 
 def test_face_and_voice_profiles_share_one_person(tmp_path):
@@ -296,14 +296,14 @@ def test_estimate_speech_seconds():
 
 
 def test_enrollment_complete_requires_both_gates():
-    assert ENROLL_MIN_SAMPLES == 3
-    assert MIN_ENROLL_SPEECH_S == 10.0
+    assert ENROLL_MIN_SAMPLES == 6
+    assert MIN_ENROLL_SPEECH_S == 20.0
     # Enough samples, not enough speech.
-    assert not enrollment_complete(samples=3, total_speech_s=5.0)
+    assert not enrollment_complete(samples=6, total_speech_s=15.0)
     # Enough speech, not enough samples.
-    assert not enrollment_complete(samples=2, total_speech_s=12.0)
+    assert not enrollment_complete(samples=5, total_speech_s=40.0)
     # Neither gate met.
     assert not enrollment_complete(samples=1, total_speech_s=1.0)
     # Exactly both gates, and comfortably past both.
-    assert enrollment_complete(samples=3, total_speech_s=10.0)
-    assert enrollment_complete(samples=5, total_speech_s=20.0)
+    assert enrollment_complete(samples=6, total_speech_s=20.0)
+    assert enrollment_complete(samples=8, total_speech_s=30.0)

@@ -1,0 +1,5 @@
+# RTX 5090 environment: do not let optional installs replace CUDA with CPU torch.
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+ruamel.yaml==0.18.10
+protobuf==6.33.2

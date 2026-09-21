@@ -1,7 +1,7 @@
 """server/storage.py: dialog log and memory on a temp directory."""
 import json
 
-from server.storage import DialogLog, Memory
+from hub.storage import DialogLog, Memory
 
 
 def test_dialog_append_creates_dated_file(tmp_path):

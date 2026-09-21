@@ -16,7 +16,9 @@ import asyncio
 import collections
 import logging
 import queue
-from typing import Deque, Optional, Union
+import threading
+import time
+from typing import Union
 
 import numpy as np
 import sounddevice as sd
@@ -79,7 +81,7 @@ class RingBuffer:
     """Fixed-length ring of audio frames used for the pre-roll (SPEC §7 step 3)."""
 
     def __init__(self, max_frames: int) -> None:
-        self._frames: Deque[bytes] = collections.deque(maxlen=max(0, int(max_frames)))
+        self._frames: collections.deque[bytes] = collections.deque(maxlen=max(0, int(max_frames)))
 
     def push(self, frame: bytes) -> None:
         self._frames.append(frame)
@@ -103,21 +105,45 @@ class AudioInput:
         sample_rate: int = 16000,
         frame_ms: int = FRAME_MS,
         max_queue_frames: int = 600,
+        processor=None,
     ) -> None:
         self.device = device
         self.sample_rate = int(sample_rate)
         self.frame_ms = int(frame_ms)
         self.blocksize = frame_samples(self.sample_rate, self.frame_ms)
         self.frame_bytes = self.blocksize * SAMPLE_WIDTH
-        self._queue: "queue.Queue[bytes]" = queue.Queue(maxsize=max(10, int(max_queue_frames)))
-        self._stream: Optional[sd.RawInputStream] = None
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=max(10, int(max_queue_frames)))
+        self._stream: sd.RawInputStream | None = None
         self._dropped = 0
+        self._processor = processor
+        self._raw_queue = queue.Queue(maxsize=8)
+        self._worker = None
+        self._worker_stop = threading.Event()
+        self._generation = 0
 
     # -- PortAudio thread ------------------------------------------------
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
         if status:
             log.debug("Microphone: stream status %s", status)
         data = bytes(indata)
+        if self._worker is not None:
+            from .audio_processing import capture_time
+            item = (data, capture_time(time_info, frames, self.sample_rate), self._generation)
+            try:
+                self._raw_queue.put_nowait(item)
+            except queue.Full:
+                try:
+                    self._raw_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._raw_queue.put_nowait(item)
+                except queue.Full:
+                    pass
+            return
+        self._put_frame(data)
+
+    def _put_frame(self, data: bytes) -> None:
         try:
             self._queue.put_nowait(data)
         except queue.Full:
@@ -137,6 +163,15 @@ class AudioInput:
     def start(self) -> None:
         if self._stream is not None:
             return
+        if self._processor is not None:
+            try:
+                self._processor.start()
+                self._worker_stop.clear()
+                self._worker = threading.Thread(target=self._process_frames, name='jarvis-audio-dsp', daemon=True)
+                self._worker.start()
+            except Exception as exc:
+                log.warning('Audio processing unavailable; using original microphone: %s', exc)
+                self._processor.close()
         self._stream = sd.RawInputStream(
             samplerate=self.sample_rate,
             blocksize=self.blocksize,
@@ -156,6 +191,12 @@ class AudioInput:
 
     def stop(self) -> None:
         stream, self._stream = self._stream, None
+        self._worker_stop.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2)
+            self._worker = None
+        if self._processor is not None:
+            self._processor.close()
         if stream is None:
             return
         try:
@@ -171,31 +212,44 @@ class AudioInput:
         self.stop()
         self.clear()
 
+    def _process_frames(self):
+        while not self._worker_stop.is_set():
+            try:
+                data, started, generation = self._raw_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            # Never replay stale commands after a temporary processing stall.
+            if time.monotonic() - started < 0.5:
+                processed = self._processor.process(data, started)
+                if generation == self._generation and not self._worker_stop.is_set():
+                    self._put_frame(processed)
+
     @property
     def running(self) -> bool:
         return self._stream is not None
 
     def clear(self) -> None:
         """Drop everything captured so far (echo of our own playback, etc.)."""
+        self._generation += 1
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 return
 
-    def read_frame_nowait(self) -> Optional[bytes]:
+    def read_frame_nowait(self) -> bytes | None:
         try:
             return self._queue.get_nowait()
         except queue.Empty:
             return None
 
-    def _get_blocking(self, timeout: float) -> Optional[bytes]:
+    def _get_blocking(self, timeout: float) -> bytes | None:
         try:
             return self._queue.get(True, timeout)
         except queue.Empty:
             return None
 
-    async def read_frame(self, timeout: float = 0.5) -> Optional[bytes]:
+    async def read_frame(self, timeout: float = 0.5) -> bytes | None:
         """Await one captured frame; ``None`` if nothing arrived within ``timeout``."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._get_blocking, float(timeout))
@@ -207,11 +261,11 @@ class AudioOutput:
     def __init__(self, device: DeviceSpec = None, default_sample_rate: int = 16000) -> None:
         self.device = device
         self.default_sample_rate = int(default_sample_rate)
-        self._stream: Optional[sd.RawOutputStream] = None
-        self._declared_rate: Optional[int] = None   # rate of the PCM we are handed
-        self._device_rate: Optional[int] = None     # rate the device actually runs at
-        self._queue: "asyncio.Queue[bytes]" = asyncio.Queue()
-        self._writer: Optional[asyncio.Task] = None
+        self._stream: sd.RawOutputStream | None = None
+        self._declared_rate: int | None = None   # rate of the PCM we are handed
+        self._device_rate: int | None = None     # rate the device actually runs at
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._writer: asyncio.Task | None = None
         self._tail = b""
 
     # -- stream management ----------------------------------------------
@@ -258,7 +312,7 @@ class AudioOutput:
         self._ensure_writer()
         log.debug("Audio output open: %d Hz (device at %d Hz)", samplerate, device_rate)
 
-    def _device_default_rate(self) -> Optional[float]:
+    def _device_default_rate(self) -> float | None:
         try:
             info = sd.query_devices(self.device, "output")
             return float(info["default_samplerate"])

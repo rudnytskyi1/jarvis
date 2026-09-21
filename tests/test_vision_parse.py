@@ -1,7 +1,7 @@
 """parse_point: the grounding reply must survive every reply shape."""
 import pytest
 
-from server.vision import parse_point
+from hub.vision import parse_point
 
 
 @pytest.mark.parametrize(

@@ -10,7 +10,7 @@ turning a typed query into a Google search.
 """
 import pytest
 
-from server.vision import LOCATE_PROMPT_TEMPLATE, to_normalized
+from hub.vision import LOCATE_PROMPT_TEMPLATE, to_normalized
 
 
 def test_a_real_answer_lands_on_the_search_box():

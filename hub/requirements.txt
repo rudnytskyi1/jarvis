@@ -1,0 +1,48 @@
+# Jarvis brain server (RTX 5090 PC) — pip install -r server/requirements.txt
+# Versions are deliberately unpinned: torch and faster-whisper are already
+# installed in the conda env "jarvis".
+
+# WebSocket / HTTP
+fastapi
+uvicorn[standard]
+websockets
+
+# STT
+faster-whisper
+
+# LLM: Ollama native /api/chat (httpx) and the OpenAI-compatible provider
+httpx
+openai
+
+# TTS: Silero via torch.hub (torch/torchaudio are already in the env; hubconf needs omegaconf)
+torch
+torchaudio
+omegaconf
+num2words  # spells numbers/times out in words - Silero cannot pronounce digits
+
+# Speaker recognition (SPEC v1.7): ECAPA-TDNN voice embeddings for who-is-talking.
+# Install these three with --no-deps: a plain install lets pip "resolve" torch
+# and replace the CUDA build with a CPU one, which has already killed Whisper
+# twice on this machine.
+#   pip install --no-deps speechbrain hyperpyyaml sentencepiece "ruamel.yaml==0.18.10"
+# ruamel.yaml 0.19 breaks hyperpyyaml 1.2.3 ("'Loader' object has no attribute
+# 'max_depth'"), hence the pin.
+speechbrain
+hyperpyyaml
+sentencepiece
+ruamel.yaml==0.18.10
+
+# Face recognition and presence (SPEC v1.4): insightface buffalo_l (512-d
+# ArcFace embeddings) running on onnxruntime. The model pack downloads itself
+# on the first camera frame.
+insightface
+# GPU inference for insightface. If the gpu wheel is unavailable for this
+# Python/CUDA combination, install the CPU wheel instead: pip install
+# onnxruntime — server/face.py falls back to the CPU provider by itself.
+onnxruntime-gpu
+
+# Shared
+numpy
+pyyaml
+pydantic
+Pillow  # verified Nano Banana image decoding and local previews

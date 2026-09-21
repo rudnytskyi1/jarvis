@@ -6,7 +6,7 @@ them" about the owner whose face had just matched at 0.85. So its answer never
 travels alone: the room camera's own detector says what is really there, and
 the face matcher is the only thing that can put a name to anybody.
 """
-from server.app import LABEL_UNKNOWN, Connection, PresenceTracker
+from hub.app import LABEL_UNKNOWN, Connection, PresenceTracker
 
 
 def _conn(camera_state=None) -> Connection:

@@ -6,7 +6,6 @@ as mic audio, answers ``actions`` and ``screenshot_request`` like the real
 client would, and asserts on the replies.
 """
 import asyncio
-import base64
 import io
 import json
 import sys

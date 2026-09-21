@@ -6,8 +6,8 @@ Personal facts are read back only while that person is speaking; room facts
 live in the system prompt, where they must stay byte-identical between turns
 so the model's prompt cache survives.
 """
-from server.app import _mentions_the_speaker
-from server.storage import Memory
+from hub.app import _mentions_the_speaker
+from hub.storage import Memory
 
 
 def _memory(tmp_path) -> Memory:

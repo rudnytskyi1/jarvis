@@ -8,9 +8,9 @@
 #   python voice_id.py enroll Дима   - записать 10 сек и сохранить голос Димы
 #   python voice_id.py who           - записать 4 сек и определить, кто говорит
 #   python voice_id.py list          - показать, кто в базе
-import time
-import sys
 import json
+import sys
+import time
 from pathlib import Path
 
 import numpy as np

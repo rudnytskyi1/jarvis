@@ -7,7 +7,7 @@ badly-angled) person is seen as both a named face in one frame and an
 unmatched face in another - reconcile() is what stops that from being
 reported as "you and a stranger" while the owner is alone.
 """
-from server.app import LABEL_UNKNOWN, PresenceTracker
+from hub.app import LABEL_UNKNOWN, PresenceTracker
 
 
 def test_reconcile_drops_unknown_seen_in_a_later_worse_angle_burst():

@@ -1,5 +1,5 @@
-﻿"""server/tools.py: the tool schemas and the client/server execution matrix."""
-from server.tools import (
+"""server/tools.py: the tool schemas and the client/server execution matrix."""
+from hub.tools import (
     CLIENT_TOOLS,
     MOUSE_CLICK_TOOL,
     SERVER_TOOLS,
@@ -15,8 +15,21 @@ def tool_names():
     return {t["function"]["name"] for t in TOOLS}
 
 
+def test_browser_controls_existing_profile_and_atomic_search_contract():
+    tool = next(t['function'] for t in TOOLS if t['function']['name'] == 'browser_control')
+    props = tool['parameters']['properties']
+    assert props['submit']['type'] == 'boolean'
+    assert props['browser']['type'] == props['window_ref']['type'] == 'string'
+    assert tool['parameters']['required'] == ['command']  # Enter may use the focused field.
+    assert 'ordinary' in tool['description']
+    assert 'Uses a separate persistent profile' not in tool['description']
+
+
 def test_fifteen_tools_exposed():
     assert tool_names() == {
+        "inspect_photo",
+        "browser_control",
+        "recall_conversation",
         "set_light",
         "set_switch",
         "pc_control",
@@ -31,6 +44,10 @@ def test_fifteen_tools_exposed():
         "find_object",
         "rename_person",
         "show_photo",
+        "save_photo",
+        "generate_image",
+        "telegram_send",
+        "set_wallpaper",
         "list_people",
     }
 
@@ -42,6 +59,8 @@ def test_mouse_click_is_internal_only():
 
 def test_matrix_split():
     assert SERVER_TOOLS == {
+        "inspect_photo",
+        "recall_conversation",
         "look_at_screen",
         "click_screen",
         "remember",
@@ -52,9 +71,13 @@ def test_matrix_split():
         "find_object",
         "rename_person",
         "show_photo",
+        "save_photo",
+        "generate_image",
+        "telegram_send",
+        "set_wallpaper",
         "list_people",
     }
-    assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command"}
+    assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command", "browser_control"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")
     # v1.4: the camera tools run on the server, like the screen ones.
     assert not is_client_tool("look_at_camera") and not is_client_tool("enroll_face")

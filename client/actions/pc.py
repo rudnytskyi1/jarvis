@@ -28,9 +28,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from ctypes import wintypes
-from typing import Any, Iterator, Mapping, NamedTuple, Sequence
+from typing import Any, NamedTuple
 
 from .apps import (
     AppEntry,
@@ -1397,7 +1398,7 @@ class PCController:
             named = ", ".join(titles[:MAX_REPORTED_WINDOWS])
             return PCResult(f"minimized {len(titles)} console window(s): {named}")
 
-        entry = await self._resolve_app(value)
+        entry = await self._resolve_window_app(value)
         titles = await asyncio.to_thread(
             _sync_minimize_app, entry.process_name(), entry.name
         )
@@ -1417,7 +1418,7 @@ class PCController:
             raise PCActionError(
                 "refusing to focus the console - it hosts the Jarvis client itself"
             )
-        entry = await self._resolve_app(value)
+        entry = await self._resolve_window_app(value)
         title = await asyncio.to_thread(
             _sync_focus_app, entry.process_name(), entry.name
         )
@@ -1433,7 +1434,7 @@ class PCController:
 
         if _is_console_alias(value):
             raise PCActionError("refusing to maximize the console hosting the client")
-        entry = await self._resolve_app(value)
+        entry = await self._resolve_window_app(value)
         title = await asyncio.to_thread(
             _sync_maximize_app, entry.process_name(), entry.name
         )
@@ -1525,6 +1526,21 @@ class PCController:
         await asyncio.to_thread(_sync_scroll, notches)
         log.info("pc_control: scrolled %s", label)
         return PCResult(f"scrolled {label}")
+
+    async def _resolve_window_app(self, value: Any) -> AppEntry:
+        """Window operations resolve the running browser, not Start-menu aliases."""
+        from .app_control import BROWSERS, GENERIC_BROWSER, visible_apps
+        from .apps import SOURCE_CONFIG
+        if str(value or '').strip().casefold() not in GENERIC_BROWSER:
+            return await self._resolve_app(value)
+        browsers = [row for row in await asyncio.to_thread(visible_apps) if row['image'] in BROWSERS]
+        if not browsers:
+            raise PCActionError('No browser window is open. Ask which browser to open first.')
+        if len(browsers) > 1:
+            choices = ', '.join(row['name'] for row in browsers)
+            raise PCActionError(f'Multiple browsers are open: {choices}. Ask which browser to use.')
+        # Only used for window operations. Never launch a process from this row.
+        return AppEntry(name=browsers[0]['name'], target=browsers[0]['image'], source=SOURCE_CONFIG)
 
     async def _resolve_app(self, value: Any) -> AppEntry:
         """Resolve an app name through the index, or raise with close matches."""

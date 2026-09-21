@@ -1,5 +1,6 @@
 # --- local settings and data ---
 config.yaml
+config.openai.yaml
 models/
 data/
 *.log
@@ -36,3 +37,15 @@ desktop.ini
 # --- third-party checkouts (SAM3 copy from Downloads) ---
 third_party/
 config.yaml.bak-*
+config*.yaml.*-backup-*
+
+# --- phase 0: hub database, migrations scratch and regression artefacts ---
+data/hub.db
+data/hub.db-wal
+data/hub.db-shm
+.pytest_tmp/
+.ptmp_*/
+dist/
+
+# --- локальные архивы кода (бекапы перед крупными изменениями) ---
+*.zip

@@ -1,5 +1,6 @@
 from RealtimeSTT import AudioToTextRecorder
 
+
 def on_partial(text):
     # промежуточный текст, обновляется пока говоришь
     print(f"\r… {text}          ", end="", flush=True)

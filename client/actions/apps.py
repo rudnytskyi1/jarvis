@@ -40,8 +40,9 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -379,6 +380,10 @@ class AppIndex:
         """Display names of everything in the index."""
 
         return [entry.name for entry in self._entries.values()]
+
+    @property
+    def entries(self):
+        return list(self._entries.values())
 
     @property
     def loaded(self) -> bool:

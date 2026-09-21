@@ -14,13 +14,13 @@ Public API (SPEC section 6)::
     cfg.server.llm.think            # False (Qwen3 reasoning off for fast replies)
     cfg.server.llm.vision_model     # "qwen3-vl:8b" (look_at_screen)
     cfg.server.llm.max_tool_rounds  # 4
-    cfg.server.speaker.threshold    # 0.28 (ECAPA voice matching, v1.7.1)
+    cfg.server.speaker.threshold    # 0.40 cosine, not a probability
     cfg.server.face.threshold       # 0.45 (face matching + presence, v1.4)
     cfg.server.face.{burst_size, enroll_bursts}  # v1.4 burst: 3, 3 (multi-frame camera pulls)
     cfg.server.segment.{enabled, checkpoint, confidence}  # v1.5: SAM3 find_object
     cfg.server.tts.speaker          # "en_0"
     cfg.client.server_url           # "ws://192.168.1.100:8765/ws"
-    cfg.client.wakeword.phrases     # ["rowan", "roan", "rowen"]
+    cfg.client.wakeword.phrases     # ["rowan ai"] unless variants are configured
     cfg.client.audio.input_device   # int | str | None
     cfg.client.vad.silence_ms       # 800
     cfg.client.camera.fps           # 5 (room camera -> YOLO presence, v1.4)
@@ -35,20 +35,40 @@ key with a wrong type) raises a ``ValueError`` whose message names the key.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+from common.client_config import (
+    AudioConfig,
+    CameraConfig,
+    ClientConfig,
+    DeviceConfig,
+    OverlayConfig,
+    RecordingConfig,
+    VADConfig,
+    WakewordConfig,
+)
+from common.openai_models import OPENAI_TEXT_RATES
 
 __all__ = [
     "Config",
     "ServerConfig",
     "STTConfig",
+    "DiarizationConfig",
     "LLMConfig",
     "SpeakerConfig",
     "FaceConfig",
     "SegmentConfig",
+    "GpuQueueConfig",
+    "ModelsConfig",
+    "ModelLevelConfig",
+    "ModelRoutingConfig",
+    "DEFAULT_LEVEL_NAMES",
+    "TelegramConfig",
     "TTSConfig",
     "ClientConfig",
     "WakewordConfig",
@@ -89,32 +109,58 @@ class STTConfig(_Strict):
     device: str = "cuda"
     compute_type: str = "float16"
     #: ``None``/empty -> language auto-detection.
-    language: Optional[str] = None
+    language: str | None = None
     #: Whitelist for auto-detection (the languages actually spoken in the room);
     #: empty list = any of Whisper's 99 languages. Ignored when ``language`` is set.
     allowed_languages: list[str] = Field(default_factory=lambda: ["en", "ru", "es"])
+    #: Spelling hints only; never include conversation history or command text.
+    hotwords: list[str] = Field(default_factory=lambda: ["Rowan"], max_length=32)
+    live_transcript: bool = True
+    live_interval_s: float = Field(default=1.2, ge=.6, le=5)
+    live_window_s: float = Field(default=12, ge=6, le=20)
 
     @field_validator("language", mode="after")
     @classmethod
-    def _empty_language_is_none(cls, value: Optional[str]) -> Optional[str]:
+    def _empty_language_is_none(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             return None
         return value
 
 
+class DiarizationConfig(_Strict):
+    """Local multi-speaker processing, enabled after model setup."""
+
+    enabled: bool = False
+    model_path: str = "models/speaker-diarization-community-1"
+    reject_mixed_speech: bool = True
+    device: Literal["cuda", "cpu"] = "cuda"
+    timeout_s: float = Field(default=45, ge=5, le=120)
+    min_identity_s: float = Field(default=1.5, ge=.8, le=10)
+
+
 class LLMConfig(_Strict):
     """LLM endpoint settings (``server.llm``).
 
-    Two backends are supported (SPEC section 3): ``"ollama_native"`` talks to
-    Ollama's own ``/api/chat`` (the only way to switch Qwen3 reasoning off) and
-    ``"openai"`` uses the OpenAI-compatible ``/v1`` surface.
+    Four backends are supported (SPEC section 3): ``"ollama_native"`` talks to
+    Ollama's own ``/api/chat`` (the only way to switch Qwen3 reasoning off),
+    ``"openai"`` uses the OpenAI-compatible ``/v1`` surface, ``"vllm"`` is the
+    same surface on a vLLM server (with schema-validated JSON, ТЗ F-402), and
+    ``"openai_responses"`` is the official text-only API with persistent local
+    budget accounting.
     """
 
-    #: "ollama_native" (default) | "openai".
+    #: "ollama_native" (default) | "openai" | "vllm" | "openai_responses".
     provider: str = "ollama_native"
     base_url: str = "http://127.0.0.1:11434/v1"
     model: str = "qwen3:30b"
     api_key: str = "ollama"
+    #: Budgeted official API reads the key only from this environment variable.
+    api_key_env: str = "OPENAI_API_KEY"
+    monthly_budget_usd: float = Field(default=18.0, gt=0, le=20)
+    max_input_bytes: int = Field(default=64000, ge=4096, le=128000)
+    #: None preserves the legacy Ollama URL. Required separately for cloud chat.
+    vision_base_url: str | None = None
+    prompt_file: str | None = None
     #: Qwen3 reasoning; False keeps voice replies fast (ollama_native only).
     think: bool = False
     #: Vision model used by the look_at_screen tool (8B fits in VRAM next to
@@ -129,7 +175,7 @@ class LLMConfig(_Strict):
     #: rarely used, and that memory is what SAM3 needs.
     vision_keep_alive: str = "10m"
     #: How many last user/assistant exchanges are kept in the session history.
-    history_turns: int = Field(default=12, ge=0)
+    history_turns: int = Field(default=25, ge=0)
     #: How long Ollama keeps the chat model loaded after a request
     #: (a duration string like "4h", or "-1" for forever; ollama_native only).
     #: Ollama's own default of 5 m makes the first command after a quiet spell
@@ -145,14 +191,51 @@ class LLMConfig(_Strict):
     #: actually did everything requested/promised and finishes anything missing.
     #: Runs only when a state-changing tool ran, so plain chat stays fast.
     verify_actions: bool = True
+    #: Extra request fields for OpenAI-compatible servers (vLLM reads
+    #: ``chat_template_kwargs`` and, on older builds, ``guided_json`` here).
+    extra_body: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("provider", mode="after")
     @classmethod
     def _known_provider(cls, value: str) -> str:
         provider = (value or "").strip().lower()
-        if provider not in {"ollama_native", "openai"}:
-            raise ValueError('must be "ollama_native" or "openai"')
+        if provider not in {"ollama_native", "openai", "openai_responses", "vllm"}:
+            raise ValueError('must be "ollama_native", "openai", "openai_responses", or "vllm"')
         return provider
+
+    @model_validator(mode="after")
+    def _cloud_contract(self) -> LLMConfig:
+        if self.provider == "openai_responses":
+            if self.model not in OPENAI_TEXT_RATES:
+                raise ValueError("openai_responses requires a model with reviewed pricing: " + ', '.join(OPENAI_TEXT_RATES))
+            if self.max_tokens > 2048:
+                raise ValueError("openai_responses max_tokens must not exceed 2048")
+            if not self.api_key_env.strip():
+                raise ValueError("api_key_env cannot be empty")
+        return self
+
+
+class ImageGenerationConfig(_Strict):
+    """On-demand Google Nano Banana 2; shares the LLM's monthly allowance."""
+
+    enabled: bool = False
+    model: Literal['gemini-3.1-flash-image'] = 'gemini-3.1-flash-image'
+    api_key_env: str = Field(default='GEMINI_API_KEY', min_length=1, pattern=r'^\w+$')
+    image_size: Literal['1K'] = '1K'
+    timeout_s: float = Field(default=120, ge=15, le=180)
+
+
+class TelegramConfig(_Strict):
+    """One group plus an optional account allowed to control Rowan; env token."""
+
+    enabled: bool = False
+    chat_id: int | None = Field(default=None, lt=0, gt=-(2 ** 63))
+    control_user_id: int | None = Field(default=None, strict=True, gt=0, lt=2 ** 63)
+    api_key_env: str = Field(default='TELEGRAM_BOT_TOKEN', min_length=1,
+                             pattern=r'^[A-Za-z_][A-Za-z0-9_]*$')
+    timeout_s: float = Field(default=30, ge=5, le=120)
+    respond_to_mentions: bool = False
+    poll_timeout_s: int = Field(default=25, ge=1, le=50)
 
 
 class SpeakerConfig(_Strict):
@@ -162,15 +245,15 @@ class SpeakerConfig(_Strict):
     #: Cosine-similarity threshold for a voice to match an enrolled profile.
     #: v1.7: on the ECAPA scale (equal error rate measured near 0.44); the old
     #: resemblyzer values do not transfer.
-    threshold: float = Field(default=0.28, gt=0.0, le=1.0)
+    threshold: float = Field(default=0.40, gt=0.0, le=1.0)
     #: v1.7: with two or more voices enrolled, the best match must lead the
     #: runner-up by this much, or the speaker is reported as unknown.
-    margin: float = Field(default=0.10, ge=0.0, le=1.0)
+    margin: float = Field(default=0.15, ge=0.0, le=1.0)
     #: Higher bar for the most dangerous tools (run_command, set_role): the
     #: speaker must match this closely, not just the normal threshold, before
     #: those are allowed even to an admin profile. Guards against a lookalike
     #: voice slipping past the (lower) identification threshold.
-    admin_threshold: float = Field(default=0.42, gt=0.0, le=1.0)
+    admin_threshold: float = Field(default=0.65, gt=0.0, le=1.0)
     #: Utterances shorter than this are not identified (too little voice).
     min_speech_s: float = Field(default=0.8, ge=0.0)
 
@@ -184,8 +267,14 @@ class FaceConfig(_Strict):
     """
 
     enabled: bool = True
+    #: Disable proactive speech while keeping detection/tracking/appearance active.
+    greetings_enabled: bool = True
     #: Cosine-similarity threshold for a face to match an enrolled profile.
     threshold: float = Field(default=0.45, gt=0.0, le=1.0)
+    #: Archive vetted portrait/body samples of enrolled people without expiry.
+    appearance_enabled: bool = True
+    #: Compare faces with curated auto-collected samples as well as enrollment.
+    adaptive_recognition: bool = True
     #: Somebody is forgotten this long after the camera last saw them.
     presence_ttl_s: float = Field(default=30.0, gt=0.0)
     #: v1.7: greet with a fixed script instead of a model round. Going through
@@ -193,7 +282,7 @@ class FaceConfig(_Strict):
     #: too late for somebody standing in front of the camera. True restores it.
     greeting_llm: bool = False
     #: An unknown face present for this long triggers the proactive greeting.
-    greet_after_s: float = Field(default=10.0, ge=0.0)
+    greet_after_s: float = Field(default=0.35, ge=0.0)
     #: v1.7: at most one greeting of the SAME STRANGER per this window
     #: (0 = no cooldown). Per person, not per room.
     greeting_cooldown_s: float = Field(default=300.0, ge=0.0)
@@ -242,6 +331,165 @@ class TTSConfig(_Strict):
     model_id: str = "v3_en"
     speaker: str = "en_0"
     sample_rate: int = Field(default=48000, ge=8000)
+    kokoro_model_path: str = 'models/kokoro/kokoro-v1.0.onnx'
+    kokoro_voices_path: str = 'models/kokoro/voices-v1.0.bin'
+
+
+class TrainingArchiveConfig(_Strict):
+    """Permanent labeled source material for manual dataset preparation."""
+
+    enabled: bool = False
+    path: str = 'data/training_archive'
+    min_free_gb: float = Field(default=5, ge=0)
+
+
+class GpuQueueConfig(_Strict):
+    """The hub's single GPU queue (``server.gpu_queue``, ТЗ section 4.5).
+
+    Every heavy job (STT, the LLM round, face embeddings, SAM3, the vision
+    model) goes through one priority queue instead of hitting the card
+    directly: classes are ordered utterance → face burst → background camera →
+    nightly consolidation, and no single room may hold more than
+    ``fair_share`` of the running slots while another room is waiting.
+
+    The timeouts are safety nets, not UX limits: they only fire when a job
+    waits behind a stuck worker for minutes, and hitting one is reported as a
+    timeout the same way a missed STT deadline is.
+    """
+
+    #: A hub that cannot run the queue (or an operator debugging the pipeline)
+    #: sets this to false; every call site then runs its job directly.
+    enabled: bool = True
+    #: How many GPU jobs may run at the same time across all rooms. The card
+    #: itself serializes the big models, so this stays low on purpose.
+    max_concurrent: int = Field(default=2, ge=1, le=16)
+    fair_share: float = Field(default=0.5, gt=0.0, le=1.0)
+    max_waiting: int = Field(default=256, ge=1, le=4096)
+    utterance_timeout_s: float = Field(default=300.0, gt=1, le=3600)
+    face_timeout_s: float = Field(default=120.0, gt=1, le=3600)
+    background_timeout_s: float = Field(default=120.0, gt=1, le=3600)
+
+
+class ModelLevelConfig(_Strict):
+    """One model level (``models.levels.<name>``, ТЗ F-401).
+
+    A level is an endpoint plus the settings a chat round needs. Levels are
+    named after their role: ``local_fast`` and ``local_strong`` run on the
+    hub's own GPU, ``cloud_cheap`` and ``cloud_strong`` are budgeted API
+    levels used only when the owner allows them.
+    """
+
+    provider: Literal["vllm", "ollama_native", "openai", "openai_responses"] = "vllm"
+    base_url: str = "http://127.0.0.1:8000/v1"
+    #: Empty means "this level is not provisioned yet" - the router skips it.
+    model: str = ""
+    api_key: str = "vllm"
+    #: Cloud levels keep their key in the environment, never in the config.
+    api_key_env: str = "OPENAI_API_KEY"
+    temperature: float = Field(default=0.6, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=1024, ge=1, le=32768)
+    think: bool = False
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def ready(self) -> bool:
+        """True when the level names a model, i.e. it can actually be used."""
+        return bool(self.model.strip())
+
+
+class ModelRoutingConfig(_Strict):
+    """How one utterance picks a level (``models.routing``, ТЗ F-401/F-403)."""
+
+    #: Utterances at most this long may use ``local_fast``.
+    short_chars: int = Field(default=120, ge=1, le=2000)
+    #: Utterances at least this long, or carrying a reasoning/code marker,
+    #: need the strong level.
+    strong_chars: int = Field(default=240, ge=1, le=8000)
+    #: F-403: a class-0 job predicted to wait longer than this overflows.
+    overflow_wait_s: float = Field(default=1.5, gt=0.0, le=60.0)
+    overflow_level: str = "cloud_cheap"
+    #: Off by default: the hub keeps everything local unless the owner opts
+    #: into spending the API allowance on overflow.
+    cloud_fallback: bool = False
+    #: F-404: an image may go to a cloud vision model. Off by default.
+    cloud_vision: bool = False
+
+
+DEFAULT_LEVEL_NAMES = ("local_fast", "local_strong", "cloud_cheap", "cloud_strong")
+
+
+class ModelsConfig(_Strict):
+    """Model levels and routing (``models``, ТЗ section 9.1).
+
+    Off by default: an existing single-model hub keeps using
+    ``server.llm`` exactly as before until levels are provisioned and this
+    section is switched on.
+    """
+
+    enabled: bool = False
+    levels: dict[str, ModelLevelConfig] = Field(default_factory=dict)
+    routing: ModelRoutingConfig = Field(default_factory=ModelRoutingConfig)
+
+    @model_validator(mode="after")
+    def _fill_and_check_levels(self) -> ModelsConfig:
+        unknown = sorted(set(self.levels) - set(DEFAULT_LEVEL_NAMES))
+        if unknown:
+            raise ValueError(
+                "unknown model level(s): " + ", ".join(unknown)
+                + " (expected " + ", ".join(DEFAULT_LEVEL_NAMES) + ")"
+            )
+        for name in DEFAULT_LEVEL_NAMES:
+            self.levels.setdefault(name, ModelLevelConfig())
+        if self.enabled and self.routing.overflow_level not in self.levels:
+            raise ValueError(f"routing.overflow_level is not a configured level: "
+                             f"{self.routing.overflow_level!r}")
+        if self.routing.overflow_level in {"local_fast", "local_strong"}:
+            raise ValueError("routing.overflow_level must name a cloud level")
+        return self
+
+
+class QuietHoursConfig(_Strict):
+    """Quiet hours of one room, ``HH:MM`` in the room's own time zone."""
+
+    start: str = ""
+    end: str = ""
+
+    @field_validator("start", "end")
+    @classmethod
+    def _clock(cls, value: str) -> str:
+        if value and not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+            raise ValueError("quiet hours must use HH:MM")
+        return value
+
+    @model_validator(mode="after")
+    def _both_or_neither(self) -> QuietHoursConfig:
+        if bool(self.start) != bool(self.end):
+            raise ValueError("set both quiet-hour boundaries or leave both empty")
+        if self.start and self.start == self.end:
+            raise ValueError("quiet-hour start and end must differ")
+        return self
+
+
+class HomeConfig(_Strict):
+    """One room (``home``) served by the hub (ТЗ section 4.2)."""
+
+    home_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    name: str = Field(min_length=1, max_length=80)
+    tz: str = "America/Chicago"
+    quiet_hours: QuietHoursConfig = Field(default_factory=QuietHoursConfig)
+    owner_person_id: str = Field(default="", max_length=100)
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("tz")
+    @classmethod
+    def _valid_timezone(cls, value: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"tz must be a valid IANA time zone, got {value!r}") from None
+        return value
 
 
 class ServerConfig(_Strict):
@@ -249,168 +497,22 @@ class ServerConfig(_Strict):
 
     host: str = "0.0.0.0"
     port: int = Field(default=8765, ge=1, le=65535)
+    #: False temporarily grants every speaker access to all tools, including guests.
+    #: Voice recognition still selects personal history; no stored roles are changed.
+    permissions_enabled: bool = True
+    audio_recording: RecordingConfig = Field(default_factory=RecordingConfig)
+    camera_request_recording: RecordingConfig = Field(default_factory=RecordingConfig)
+    training_archive: TrainingArchiveConfig = Field(default_factory=TrainingArchiveConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
+    diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     face: FaceConfig = Field(default_factory=FaceConfig)
     segment: SegmentConfig = Field(default_factory=SegmentConfig)
-
-
-# ---------------------------------------------------------------------------
-# client section
-# ---------------------------------------------------------------------------
-
-
-class WakewordConfig(_Strict):
-    """Vosk wake-word settings (``client.wakeword``)."""
-
-    word: str = "rowan"
-    #: Recognition variants; empty list is normalised to ``[word]``.
-    phrases: List[str] = Field(default_factory=list)
-    vosk_model: str = "models/vosk-model-small-en-us-0.15"
-
-    @model_validator(mode="after")
-    def _default_phrases(self) -> "WakewordConfig":
-        phrases = [p.strip() for p in self.phrases if isinstance(p, str) and p.strip()]
-        if not phrases:
-            phrases = [self.word.strip()]
-        self.phrases = phrases
-        return self
-
-
-class AudioConfig(_Strict):
-    """sounddevice settings (``client.audio``).
-
-    ``input_device``/``output_device`` are either a device index (int), a
-    substring of the device name (str) or ``None`` for the system default.
-    """
-
-    input_device: Union[int, str, None] = None
-    output_device: Union[int, str, None] = None
-    sample_rate: int = Field(default=16000, ge=8000)
-
-
-class VADConfig(_Strict):
-    """webrtcvad settings (``client.vad``)."""
-
-    aggressiveness: int = Field(default=2, ge=0, le=3)
-    silence_ms: int = Field(default=800, ge=0)
-    max_utterance_s: float = Field(default=15.0, gt=0.0)
-    pre_roll_ms: int = Field(default=300, ge=0)
-    #: Minimum voiced audio for a recording to count as an utterance; anything
-    #: shorter is a noise blip - discarded without contacting the server.
-    min_speech_ms: int = Field(default=250, ge=0)
-
-
-class CameraConfig(_Strict):
-    """Room camera settings (``client.camera``, SPEC v1.4).
-
-    The client runs YOLO on the capture and reports STATE (how many people,
-    which objects), plus one JPEG every ``face_check_interval_s`` while
-    somebody is visible so the server can recognise faces. Missing camera
-    dependencies must never break the voice pipeline.
-    """
-
-    enabled: bool = True
-    #: OpenCV capture device index.
-    index: int = Field(default=0, ge=0)
-    #: How many frames per second are pushed through YOLO.
-    fps: int = Field(default=5, ge=1)
-    #: Ultralytics model file (downloaded automatically on first run).
-    model: str = "yolo11n.pt"
-    #: One frame is sent to the server this often while a person is visible.
-    face_check_interval_s: float = Field(default=5.0, gt=0.0)
-
-
-class OverlayConfig(_Strict):
-    """Sci-fi HUD overlay on the TV (``client.overlay``).
-
-    A transparent, always-on-top, click-through Tkinter window showing an
-    animated orb that reacts to the assistant's state. Entirely optional: a
-    missing display or Tk simply disables it, never touching the voice client.
-    """
-
-    enabled: bool = True
-    position: str = "bottom_right"
-    idle_hidden: bool = False
-    scale: float = Field(default=1.0, gt=0.0, le=4.0)
-
-
-class DeviceConfig(BaseModel):
-    """One controllable device from ``client.devices``.
-
-    ``name``/``type``/``area``/``description`` are first-class fields; every
-    other key of the YAML mapping (``host``, ``dev_id``, ``local_key``,
-    ``version``, ``mac``, ``mode``, ...) is collected into :attr:`params` and is
-    also kept as an attribute of the model.
-    """
-
-    model_config = ConfigDict(extra="allow", protected_namespaces=())
-
-    name: str
-    #: "magichome" | "tuya" | "switchbot_bot"
-    type: str
-    area: Optional[str] = None
-    description: Optional[str] = None
-    #: Type-specific fields taken from the same YAML mapping.
-    params: Dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _collect_params(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        first_class = {"name", "type", "area", "description", "params"}
-        explicit = data.get("params")
-        params: Dict[str, Any] = dict(explicit) if isinstance(explicit, dict) else {}
-        for key, value in data.items():
-            if key not in first_class:
-                params[str(key)] = value
-        merged = dict(data)
-        merged["params"] = params
-        return merged
-
-
-class ClientConfig(_Strict):
-    """Everything the room PC reads (``client``)."""
-
-    #: WebSocket URL of the brain PC, e.g. ``ws://192.168.1.100:8765/ws``.
-    server_url: str
-    client_id: str = "livingroom"
-    wakeword: WakewordConfig = Field(default_factory=WakewordConfig)
-    audio: AudioConfig = Field(default_factory=AudioConfig)
-    vad: VADConfig = Field(default_factory=VADConfig)
-    #: Room camera: YOLO presence state + face frames for the server (v1.4).
-    camera: CameraConfig = Field(default_factory=CameraConfig)
-    #: Sci-fi HUD overlay on the TV.
-    overlay: OverlayConfig = Field(default_factory=OverlayConfig)
-    #: Seconds to keep listening after a reply without the wake word (0 = off).
-    followup_window_s: float = Field(default=6.0, ge=0.0)
-    #: Soft repeating blips while the server is still working on a reply
-    #: (vision, tool rounds) so silence never looks like a hang.
-    thinking_sounds: bool = True
-    #: Friendly app name -> executable path / command; OVERRIDES on top of the
-    #: client's installed-app index. Empty by default.
-    apps: Dict[str, str] = Field(default_factory=dict)
-    #: Physical devices; empty by default (none are installed yet).
-    devices: List[DeviceConfig] = Field(default_factory=list)
-
-    @field_validator("apps", mode="after")
-    @classmethod
-    def _expand_app_paths(cls, value: Dict[str, str]) -> Dict[str, str]:
-        # Allow %USERNAME%-style environment variables in the example config.
-        return {name: os.path.expandvars(path) for name, path in value.items()}
-
-    @model_validator(mode="after")
-    def _unique_device_names(self) -> "ClientConfig":
-        seen: set = set()
-        for device in self.devices:
-            key = device.name.strip().lower()
-            if key in seen:
-                raise ValueError(f"duplicate device name: {device.name!r}")
-            seen.add(key)
-        return self
+    gpu_queue: GpuQueueConfig = Field(default_factory=GpuQueueConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +529,21 @@ class Config(_Strict):
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     client: ClientConfig = Field(default_factory=_default_client)
+    #: Rooms served by this hub (ТЗ section 4.2). Empty keeps the classic
+    #: single-room behaviour, so an existing config.yaml keeps working.
+    homes: list[HomeConfig] = Field(default_factory=list)
+    #: Model levels and the router that picks one (ТЗ section 9.1). Disabled
+    #: by default: until then every round uses ``server.llm``.
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
+
+    @model_validator(mode="after")
+    def _unique_homes(self) -> Config:
+        seen: set[str] = set()
+        for home in self.homes:
+            if home.home_id in seen:
+                raise ValueError(f"duplicate home_id: {home.home_id!r}")
+            seen.add(home.home_id)
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -453,7 +570,7 @@ def _format_validation_error(exc: ValidationError, source: str) -> str:
     return "\n".join(lines)
 
 
-def load_config(path: Union[str, os.PathLike, None] = None) -> Config:
+def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     """Load, validate and return the config.
 
     :param path: path to the YAML file; ``None`` means ``config.yaml`` in the

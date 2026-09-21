@@ -1,5 +1,5 @@
 """server/llm.py helpers: URL derivation, argument parsing, reply cleanup."""
-from server.llm import (
+from hub.llm import (
     _arguments_to_dict,
     clean_reply,
     native_base_url,

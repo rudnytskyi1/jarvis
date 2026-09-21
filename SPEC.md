@@ -3,6 +3,192 @@
 This document is the **contract**. All modules must match it exactly: message types,
 config keys, module APIs, file ownership. If code and spec disagree, the spec wins.
 
+## Persistent appearance and image references amendment (2026-09-20)
+
+This amendment replaces the old 24-crop/day gallery retention and indefinite
+body-track identity assumptions.
+
+- `server.face.appearance_enabled` and `server.face.adaptive_recognition` default
+  to `true`. `server/appearance.py` stores an indexed archive under
+  `data/appearance/` using SQLite and UUID-named JPEG files. Accepted face and
+  unambiguous body photographs are retained without automatic deletion. Active
+  selection limits never remove archived files.
+- Automatic admission requires a manual face-anchor match >=0.60, runner-up
+  margin >=0.12, detector confidence >=0.80, minimum face side 64 pixels, and
+  sufficient sharpness. Three consistent observations spanning >=1 second are
+  required; captures are spaced >=60 seconds and redundant views are skipped.
+  Explicitly confirmed face enrollment may save a quality-checked sample
+  immediately. Ambiguous body ownership suppresses body capture. Neither track
+  continuity nor learned vectors alone authorize new identity samples.
+- Matching may use at most 12 diverse archived vectors per enrolled person in
+  addition to manual samples. Every adaptive vector is revalidated against the
+  current manual anchors; the recognition network itself is not retrained.
+  Voice embeddings, roles and personal conversation histories are unchanged.
+- A continuously observed body may retain its last confirmed identity for at
+  most six seconds through a weak/turned face. This is a tracking hint, not a
+  fresh recognition or enrollment. Contradictory clear faces, duplicate identity
+  matches, ambiguous body binding, track replacement/jumps and expiry clear the
+  carried identity. Camera receipt timestamps prevent delayed inference from
+  reviving an older occupant. Clothing alone never assigns permanent identity.
+- `generate_image.reference_people` is an optional array of at most two
+  explicitly requested current face-profile names. Each supplies up to two
+  selected references, at most four named images total, alongside the optional
+  primary scene image. References are labeled by person and face/body kind.
+  `source:none` permits a new composition with named identity references.
+- `AppearanceGallery.references(name, limit=2, profiles=None)` optionally
+  revalidates sample embeddings against current manual anchors. Image generation
+  and `list_people` supply current anchors; an empty mapping accepts no people.
+  At least one readable face reference is mandatory. Voice-only enrollment,
+  missing images or conflicting/changed face anchors cause a clear failure before
+  the paid provider call. A renamed/reused label never bypasses this validation.
+  `list_people` reports availability of usable image references.
+- Only explicitly selected images and the artwork prompt are uploaded for a
+  generation request. Archived appearance does not prove current presence,
+  position or clothing. Generated images never enter the face gallery. Renames
+  and explicitly confirmed merges preserve photographs and historical labels.
+  Existing provider handling, shared spending cap and one-attempt limit remain.
+
+## Room reliability amendment (2026-09-20)
+
+- Image generation separates `prompt` (artwork only) from `target: display|
+  wallpaper` (default display). Wallpaper target transfers original pixels to
+  the room PC with internal `set_wallpaper_file {image_base64}`, stores them in
+  LocalAppData/Jarvis/wallpapers, calls Unicode Windows APIs and verifies the
+  configured path. Public `set_wallpaper {source:generated|camera|screen,
+  fresh?:false}` installs an existing image without regeneration. It needs the
+  same trusted role as other PC/photo actions when role checks are enabled;
+  the deployed open-access profile remains open to everyone.
+- Generation results expose an opaque `image_id`, `storage:brain`, `shown`, and
+  `saved_on_client` instead of a brain path. Wallpaper success requires both
+  `applied:true` and `verified:true`. The completion check rejects unverified
+  image/save/open/wallpaper claims, allows one corrective tool round and then
+  supplies a factual failure reply. Repair cannot start another paid generation.
+  Failed generation cannot silently apply/show/save an older result that turn.
+- With role checks disabled, a newly displayed anonymous image remains usable
+  on that room connection for five minutes when the next voice is recognized;
+  it takes precedence over an older personal image. Named users' image archives
+  remain isolated. Enabling permissions disables this anonymous fallback.
+- `utterance_start.verify_wake` is an optional boolean. The room client sets it
+  for a normal wake-word recording, but not continuation or interruption turns.
+  After STT the server checks for a supported Rowan spelling in the first six
+  spoken words (contractions count as one), or after a bounded prefix made only
+  of short interjections. Quoted mentions do not confirm a wake. Repeated directly
+  addressed silence commands tolerate interjections, but not negation or reported
+  commands. Enrollment/name/face selection and silence commands keep their existing
+  handling. An unconfirmed wake sends `transcript {ignored:true,...}` followed by
+  `tts_end`, with no LLM, spoken reply or personal-history entry. Request audio
+  and diagnostic logs remain archived. The overlay removes the live transcript.
+  Older clients omitting this field keep their existing behavior.
+- Replacing an unknown person's camera track ID cannot bypass the unknown
+  greeting cooldown. An increase in the number of unknown people can still
+  trigger a greeting; existing quiet-room and conversation gates apply.
+- Generic browser focus/maximize/minimize uses visible browser processes. One
+  candidate is selected automatically; multiple candidates require a choice.
+  These operations do not resolve the literal word "browser" via Start-menu
+  entries or launch a new application.
+- The deployed room settings use VAD aggressiveness 2, 1100 ms silence,
+  25 s maximum request and 1500 ms pre-roll. YOLO uses `camera.fps: 0` (no
+  inference rate cap), with actual throughput reported in camera diagnostics.
+- While microphone DSP is active, the client logs raw and processed RMS/peak
+  levels every 1000 frames (30 s). The diagnostic retains counters only, not
+  ambient audio, and does not alter wake sensitivity or speaker identity.
+
+## Room requests amendment (2026-09-18)
+
+This amendment supersedes older permission, memory, app-closing and TTS rules.
+
+- Live `look_at_camera` and `find_object(source=camera)` are available to every
+  role, including unknown. Screen access, file saving and PC actions still use
+  their existing role gate. SAM3 detects requested objects; local Qwen vision
+  describes food and the room. Neither is an identity or authorization source.
+- ECAPA defaults: recognition 0.40, runner-up margin 0.15, privileged actions
+  0.65. These are initial thresholds, not calibrated probabilities or protection
+  against replay. Existing voice/face enrollment requires the matching owner at
+  the higher threshold; voice samples are checked again on every enrollment turn.
+  Recovery command: `Rowan, update my voice`. Low-confidence refusals mention it.
+- `remember` defaults to the recognized speaker's personal memory. Only admin
+  can write global memory, with the higher voice threshold. Nobody can write to
+  a different person's personal memory. Records retain timestamp, author,
+  optional stable `key` and `value`. Global keyed preferences override personal
+  preferences deterministically; the prompt also gives global prose priority.
+  Effective memory is refreshed every turn, including across connections.
+- `server.llm.history_turns` defaults to 25 complete exchanges per recognized
+  person. Each request is archived before execution and its answer before TTS;
+  interrupted requests retain a status marker. Older exchanges remain in SQLite.
+  `recall_conversation(query,since?,until?,limit?)` searches the entire current
+  person's archive, including Unicode, returning timestamps and author. Unknown
+  voices never inherit someone else's history. Dates are local ISO dates/times.
+- `pc_control(open_app/close_app)` is resolved server-side against the room
+  client's real inventory. New internal action `app_action` accepts
+  `{operation:inspect,action:open|close,name}` or `{operation:execute,target_id}`.
+  Open lists installed apps, close lists visible windows grouped by executable.
+  Multiple apps require a per-person choice expiring in 180 s; a single match
+  executes immediately. Global then personal `apps.browser` applies to opening,
+  never to closing several browsers. Each completed browser action offers to
+  remember the choice. The client checks the actual launched window and uses
+  WM_CLOSE with pid revalidation; unsaved-work dialogs are never force-dismissed.
+- New public server tool `save_photo(source,fresh?,filename?,open?)` captures or
+  reuses a frame. The internal client action `save_photo_file` carries
+  `jpeg_base64,filename,open`, saves to the Windows Desktop with a unique name,
+  and reports `saved,path,opened,error`. Image data is omitted from logs. Screen
+  capture continues to require an overlay-hide acknowledgement.
+- Local TTS optionally uses `server.tts.engine=kokoro`, speaker `am_michael`,
+  language `en`: American English male, CPU ONNX, 24 kHz resampled to the wire
+  rate. Additional §6 keys: `kokoro_model_path` defaults to
+  `models/kokoro/kokoro-v1.0.onnx`; `kokoro_voices_path` defaults to
+  `models/kokoro/voices-v1.0.bin`. Install `server/requirements-tts.txt` and run
+  `scripts/setup_kokoro.py`. Silero remains supported for existing installations.
+  The deployed OpenAI profile uses Kokoro; no paid speech API is involved.
+- Multi-speaker behavior is unchanged: word timestamps are attributed using
+  diarized spans, and only the uniquely addressed turn is used. Overlapping
+  speech is not source-separated and prompts clarification without execution.
+
+## Personal room experience amendment (2026-09-17)
+
+This amendment supersedes older enrollment, shared-history, interruption and
+camera-cadence descriptions below. Full behavior is specified in
+`docs/ROOM_EXPERIENCE.md`.
+
+- §3: `server/conversations.py` persists person-scoped exchanges in SQLite.
+  Each turn resets the connection's rolling context and loads only the recognized
+  speaker's recent history. Unknown speakers have no persistent shared history.
+- §4 client messages: `interrupt_request` asks for cancellation confirmation;
+  `utterance_start.interrupt_id` identifies a confirmation recording. It cannot
+  cancel another task. Work continues while a confirmation is pending.
+- §4 quiet stop: `dismiss {id}` stops the current turn, control prompts, voice/
+  face registration and greetings; `dismissed {id}` acknowledges that all old
+  producers have stopped. There is no TTS or follow-up recording. The client
+  mutes locally before sending, drops stale speech/actions until acknowledgement
+  and a fresh wake word, and the server suppresses greetings until a new turn.
+  Local finalized English/Russian silence commands are checked only during work
+  or playback. Normal wake words retain the cancellation-confirmation behavior.
+- §4 server messages: `chat {person, messages:[{id,ts,question,answer}], question,
+  selection_active}` replaces the display's personal history. `notice {text,id}`
+  is a spoken status/confirmation. `tts_start` and `tts_end` optionally carry
+  `purpose: reply|notice|cancelled`; a notice end does not finish the active task.
+  `say.enrollment_sentence` carries the reading prompt and enables the client's
+  temporary 4-second silence / 45-second maximum registration recorder.
+- §4 camera: both camera state and aligned presence-frame headers may contain
+  `tracks:[{id,box:[x1,y1,x2,y2]}]` (normalized coordinates, <=24 tracks).
+  Track IDs are namespaced to the camera process. State heartbeats are sent at
+  most every 0.4 seconds; presence uses one aligned frame, not a delayed burst.
+  On-demand enrollment bursts remain supported.
+- §4 binary streams: all server audio and image header/binary sequences share a
+  lock. Capture waits for an acknowledged overlay hide and suppresses visibility
+  changes until the screenshot is finished. Failed hide means no screenshot.
+- §5: `recall_conversation {query}` returns only the current recognized speaker's
+  archive; unknown speakers cannot read it. Every tool schema accepts optional
+  `purpose`, a public status removed before action dispatch.
+- §6 defaults: `server.face.greet_after_s = 0.35` (0 still disables greetings),
+  `client.camera.face_check_interval_s = 0.5`. The deployed room profile uses
+  `client.camera.fps = 8`; the general fps default remains 5. Quiet-room gates
+  and per-visit greeting suppression still apply.
+- §9: new modules `server/enrollment.py`, `server/face_registration.py`, and
+  `server/room_state.py` own deterministic registration and scene tracking;
+  `client/room-tracker.yaml` configures local BoT-SORT with appearance matching.
+  `client/overlay_web/chat.html` is the dark, centered chat view. Appearance
+  snapshots are bounded and never confer roles or identity for tool permissions.
+
 ## 1. Overview
 
 Two Windows 11 PCs on the same LAN in a student dorm:
@@ -253,6 +439,21 @@ All code imports `common/` with repo root on `sys.path` (entry points run as
   compute_type=cfg.stt.compute_type)`. `transcribe_pcm(pcm_s16le_bytes, sample_rate,
   language) -> (text, detected_language)`. Convert int16 bytes → float32 numpy / 32768.
   If `language` is null/empty use auto-detect. Use `vad_filter=True`.
+  `transcribe_detailed(...) -> Transcript` additionally returns word timestamps
+  for local speaker attribution; the legacy tuple API remains unchanged.
+- `server/diarization.py` — optional local Community-1 pipeline, loaded once at
+  startup from `server.diarization.model_path`. Regular overlapping speaker
+  tracks are preserved. Non-overlapping turns are decoded as separate Whisper
+  crops; ECAPA matches clean intervals per cluster. A unique wake-addressed turn
+  reaches the existing permission gate; other turns remain in local transcripts.
+  A wake-only turn may bridge up to 3 s to the same speaker's next turn, with no
+  intervening voice. In configured wake-word-only mode, an empty first ASR fragment
+  of at most 1.25 s may be ignored if there is exactly one diarized voice and a
+  later transcribed turn; recognized text and missing later fragments are never
+  discarded this way. Overlap/uncertain attribution asks for clarification without
+  tools or cloud inference; mixed recordings are excluded from voice enrollment.
+  Enabled-but-unavailable is an error, never a fallback to mixed voice identity.
+  See `docs/MULTI_SPEAKER.md` for setup, measured limitations and validation.
 - `server/llm.py` — two providers, selected by `cfg.llm.provider`:
   - `"ollama_native"` (default): POST `{base}/api/chat` (base = `cfg.llm.base_url`
     with a trailing `/v1` stripped) via `httpx`, `stream: false`,
@@ -312,6 +513,7 @@ JSON text frames for control, binary frames for audio. Constants in
 `common/protocol.py` (`MSG_HELLO = "hello"` etc. — one constant per type below).
 
 Client → Server:
+0. `{"type": "room_speech"}` — optional local idle VAD heartbeat (at most once per second while speech is detected). No audio or transcript follows. Defer proactive greetings for five seconds after the latest heartbeat. Shares the camera/audio wire lock; update both peers together.
 1. `{"type": "hello", "client_id": str, "devices": [{"name": str, "type": str, "area": str|null, "description": str|null}]}` — sent once after connect. `devices` built from client config (§6); empty list is normal.
 2. `{"type": "utterance_start", "sr": 16000, "format": "pcm_s16le", "channels": 1}`
 3. binary frames: raw PCM s16le mono 16 kHz chunks
@@ -322,6 +524,13 @@ Client → Server:
 Server → Client:
 1. `{"type": "ready"}` — reply to `hello`.
 2. `{"type": "transcript", "text": str, "language": str}` — after STT.
+   Local diarization optionally adds `segments: [{start, end, speaker_id, speaker,
+   text, uncertain}]` and `clarification: str`. Times are seconds from the start
+   of the utterance; anonymous IDs are scoped to that utterance. `text` contains
+   only the selected addressed turn. Overlap events have null `speaker_id`, empty
+   text and `uncertain: true`. An ambiguous recording sends a scripted `say` and
+   TTS after the transcript, without LLM/tools/enrollment. Segments also appear in
+   the local dialog log. Other speakers' text is never injected as commands.
 3. `{"type": "actions", "items": [{"id": str, "tool": str, "args": {…}}]}` — client executes in order and sends one `action_result` per item. `id` unique per action within the utterance (`"a1"`, `"a2"`, …). May be sent multiple times per utterance (one per tool round).
 4. `{"type": "screenshot_request", "id": str}` — client captures the screen (client/screen.py) and replies per C→S #6.
 5. `{"type": "say", "text": str}` — the reply text.
@@ -403,6 +612,30 @@ tools only for devices in the system prompt's list (may be empty).
 
 ## 6. Config
 
+Permanent training source archive: `cfg.server.training_archive.enabled` defaults
+to `false`, `path` to `data/training_archive`, and `min_free_gb` to `5`. When enabled,
+all processed requests (including rejected/cancelled turns), accepted enrollment
+source samples and processed camera observations are retained by local date and
+person, with detected unknown faces under `unknown/face-<permanent-id>` and
+observations without faces under plain `unknown`. There is no automatic retention
+deletion. `server/face_identity.py` persists dataset clusters locally using existing
+buffalo_l embeddings (cosine >=0.62, margin >=0.08, detection score >=0.80).
+Frame assignment is one-to-one; ambiguous/weak faces get isolated provisional
+IDs and cannot update established templates. IDs survive dates and restarts.
+`face_identities/profiles/<id>/profile.json` and `events.jsonl` group profile data
+and image references across dates. Backfill links existing face events without
+rewriting media or canonical event JSON. No face cluster grants roles, changes
+voice identities, personal memory, or automatic greetings. Raw observations do
+not automatically become trusted recognition vectors.
+Passive face-profile capture admits no more than 50 observations per rolling
+60 seconds for a face ID or its camera track. Storage admission time and an
+atomic SQLite transaction enforce this across dates, cameras and restarts.
+Unreliable untracked faces share a conservative camera fallback allowance.
+Active voice/Telegram requests and enrollment bypass this passive cap, while
+recognition still runs between saved samples. Original-frame recording remains
+separate; microphone streaming temporarily reserves the wire, with local YOLO
+recording continuing. No lifetime count limit or automatic deletion is added.
+
 Single `config.yaml` at repo root (copy of `config.example.yaml`). `common/config.py` API:
 
 ```python
@@ -412,22 +645,47 @@ cfg.server.host              # "0.0.0.0"
 cfg.server.port              # 8765
 cfg.server.stt.{model, device, compute_type, language}          # language: str | None
 cfg.server.stt.allowed_languages                                # ["en","ru","es"]: auto-detect whitelist, [] = all
+cfg.server.diarization.enabled                                  # false until local model setup
+cfg.server.diarization.model_path                               # "models/speaker-diarization-community-1", relative to repo
+cfg.server.diarization.device                                   # "cuda" | "cpu", default cuda
+cfg.server.diarization.timeout_s                                # 45, range 5..120
+cfg.server.diarization.min_identity_s                           # 1.5, range 0.8..10: minimum clean sample for ECAPA
 cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns}
-cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # v1.1: "ollama_native"|"openai", bool, str, int
+cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # "ollama_native"|"openai"|"openai_responses", bool, str, int
+cfg.server.llm.api_key_env           # "OPENAI_API_KEY": environment-only key for openai_responses
+cfg.server.llm.monthly_budget_usd    # 18.0, >0 and <=20; local UTC-month SQLite accounting
+cfg.server.llm.max_input_bytes      # 64000, 4096..128000; text request limit before sending
+cfg.server.llm.vision_base_url      # null: legacy uses base_url; cloud defaults vision to local Ollama
+cfg.server.llm.prompt_file          # null: prompts/system.md; cloud profile uses prompts/cloud.md
+cfg.server.llm.verify_actions       # true for legacy; false in budgeted cloud profile
 cfg.server.llm.vision_keep_alive   # v1.7: "10m" - the VISION model's own keep_alive; it holds
                                    # ~8.4 GB resident and SAM3 needs that memory
 cfg.server.llm.{keep_alive, num_ctx}                            # v1.1.1: "4h" (Ollama keep_alive), 16384 (requested context; v1.7 - the
                                                                 #   system prompt + tool schemas alone are ~7.6k tokens)
+cfg.server.telegram.enabled                                    # false: fixed-group Telegram transport
+cfg.server.telegram.chat_id                                    # null: configured negative group ID; no tool-selected recipients
+cfg.server.telegram.control_user_id                            # null: strict positive int sender ID; only this account can use tools in group/own DM
+cfg.server.telegram.api_key_env                                # "TELEGRAM_BOT_TOKEN": environment-only bot token
+cfg.server.telegram.timeout_s                                  # 30, range 5..120
+cfg.server.telegram.respond_to_mentions                        # false: answer new explicit mentions in the configured group
+cfg.server.telegram.poll_timeout_s                             # 25, range 1..50
 cfg.server.tts.{engine, language, model_id, speaker, sample_rate}   # English default: language "en", model_id "v3_en", speaker "en_0"
-cfg.server.speaker.{enabled, threshold, min_speech_s}           # v1.3: true, 0.28 cosine (v1.7.1 ECAPA on the real mic), 0.8 s minimum audio
-cfg.server.speaker.{margin, admin_threshold}                    # v1.7.1: 0.10 lead over the runner-up, 0.42 for run_command/set_role
+cfg.server.speaker.{enabled, threshold, min_speech_s}           # true, 0.40 cosine, 0.8 s minimum audio
+cfg.server.speaker.{margin, admin_threshold}                    # 0.15 lead over runner-up, 0.65 for privileged operations
 cfg.server.face.greeting_llm                                     # v1.7: false - greet from a script, not a model round
+cfg.server.face.greetings_enabled                               # true: false silences proactive greetings while tracking stays active
 cfg.client.server_url        # "ws://192.168.x.x:8765/ws"
 cfg.client.client_id
+cfg.client.workplace_name    # friendly Telegram label, max 80 chars; empty -> client_id
+cfg.client.camera.name       # friendly camera label, 1..80 chars; one camera per client
+cfg.client.camera.model      # local YOLO weights (default yolo11n.pt)
+cfg.client.camera.fps        # 0 = no software cap; fresh capture frames only
 cfg.client.wakeword.{word, phrases, vosk_model}                 # phrases: list[str]
+                                                              # default word: "rowan ai"; room aliases include "rowan a i" and "rowanai"
 cfg.client.audio.{input_device, output_device, sample_rate}     # devices: int|str|None
 cfg.client.vad.{aggressiveness, silence_ms, max_utterance_s, pre_roll_ms, min_speech_ms}
-cfg.client.followup_window_s # float, 0 = off
+cfg.client.attention_mode    # "wake_word" (default) | "window" (explicit legacy opt-in)
+cfg.client.followup_window_s # float 0..30, default 0; used only in window mode
 cfg.client.thinking_sounds   # bool, true: soft blips while a reply takes > ~1.5 s
 cfg.client.apps              # dict[str, str] friendly name -> exe path/command (OVERRIDES on top of the app index; may be empty)
 cfg.client.devices           # list[DeviceConfig]; [] is the current default (no physical devices yet)
@@ -441,6 +699,26 @@ Missing optional keys get the defaults shown in `config.example.yaml`; missing
 required keys → clear startup error naming the key.
 
 `config.example.yaml` is already written — treat its keys/defaults as normative.
+
+Budgeted profile (`scripts/configure_openai.py`, output `config.openai.yaml`):
+`openai_responses` calls the official `/v1/responses` endpoint, text only,
+`gpt-5.4-mini`, reasoning `none`, standard service tier, `store=false`, no
+automatic HTTP retries. Credentials never come from YAML. The model is restricted
+to the reviewed price table; max output is <=2048 tokens (profile uses 600).
+Each tool round reserves estimated input + maximum output cost transactionally
+in `data/api_usage.sqlite3` before sending. Actual usage settles the reservation;
+timeouts, missing usage, and crashes retain it. No new requests if insufficient
+allowance or accounting is unavailable. This ledger covers Jarvis only; other
+applications using the same API project are outside its accounting. Input-byte
+estimates are conservative estimates, not an exact billing guarantee.
+
+Exact local PC shortcuts go through `Connection._execute_tool` and its usual
+permission gate, report the real result, and skip LLM generation/self-check.
+TTS sends one start/end pair per answer and synthesizes sentence groups between
+audio sends. In wake_word mode, neither `say.listen_s`, enrollment nor proactive
+greetings may open an unattended follow-up window: every new utterance needs a
+wake word. Old clients need updating for this behavior. Window mode remains
+available only as an explicit opt-in.
 
 ## 7. Client core (W2)
 
@@ -463,6 +741,14 @@ required keys → clear startup error naming the key.
   grammar mode; model dir from `cfg.client.wakeword.vosk_model`. Feed 30 ms blocks;
   detection = any configured phrase appears in a final or partial result; after
   detection reset recognizer. `phrases` defaults to `[word]` if empty.
+  The default address is Rowan AI. Explicit configured phrases replace legacy
+  short-name activation; confidence must cover all words in a multiword phrase.
+  Only after local confirmation, the server may recover logged Whisper
+  substitutions Roman AI/Ruin AI (also A I) at the beginning of the request.
+  This does not add local wake aliases or alter the original transcript. The AI
+  suffix stays mandatory for Rowan AI configuration; legacy bare Rowan config
+  alone permits the recorded Roman substitution. Noise and non-address mentions
+  still cannot supply this recovery.
 - `client/vad.py` — `webrtcvad.Vad(cfg.aggressiveness)` on 30 ms frames; utterance
   ends once the trailing `silence_ms` window is ≥90% non-speech frames (sporadic
   false positives from a noisy mic must not reset the tail) or at `max_utterance_s`; returns
@@ -566,3 +852,246 @@ Deps (client/requirements.txt): `vosk`, `sounddevice`, `webrtcvad-wheels`
   messages, script output, docs. (v1.1: any remaining Russian text in code,
   scripts, .bat files, yaml comments or README must be translated.)
 - Graceful Ctrl+C on both sides.
+# Room interaction update: local audio, browser and network camera
+
+This amendment extends §§5–6 without changing WebSocket framing. The client
+still sends 16 kHz, mono, signed 16-bit, 30 ms audio frames.
+
+`client.audio.echo_cancellation` and `noise_suppression` default to `false`;
+`noise_suppression_level` defaults to `1` (0–3). Optional
+`client/requirements-audio.txt` enables WebRTC AEC3 and noise reduction. A
+bounded worker preprocesses the microphone before all consumers (wake, VAD,
+speaker enrollment/recognition, STT). WASAPI captures the selected playback
+endpoint as the echo reference; frames are matched by capture timestamps,
+not TTS queue order. No automatic gain boost and no continuous audio files.
+Missing reference disables AEC with a log warning; DSP failure preserves raw
+microphone operation. External TV audio not rendered by this PC is not a known
+reference. Physical room cancellation and double-talk must be checked in situ.
+
+New client tool `browser_control` requires trusted/admin, like other computer
+interaction. Commands: `navigate`, `read`, `click`, `fill`, `press`, `back`,
+`scroll`; optional `url`, `ref`, `text`, `key`, `direction`, `submit`, `browser`,
+`window_ref`, and common `purpose`. The production client controls an existing
+ordinary Chrome/Edge window via Windows UI Automation and checked window-local
+keyboard actions. It never starts a separate profile or debugging browser.
+`browser` selects a reported app name; `window_ref` selects a reported opaque
+window choice. Ambiguous applications require selection; stale refs fail before
+mutation. `fill` with `submit=true` fills and submits the same input; `press`
+without a ref acts on the focused control only in the verified browser window.
+Successful explicit browser/window selection returns the shared optional
+`remember_offer`; a subsequent user request saves `apps.browser` through the
+existing personal/global memory permissions, without automatic saving.
+It returns bounded visible page text and element references, excluding password
+values and the Rowan HUD. `purpose` updates chat progress; page content remains
+untrusted. Closing/cancelling the controller releases only its own automation
+work, preserving the user's browser. The legacy Playwright implementation in
+`client/actions/browser.py` is retained for explicit isolated test fixtures and
+is not instantiated by the production dispatcher.
+
+Exact stale/missing-reference and changed-element failures get one recovery
+instruction per user turn and at most two extra tool rounds beyond the normal
+cap. A separate page read must precede a retry; reading alone does not confirm
+the failed action succeeded. Timeouts and access errors do not trigger this
+reserve, and the existing cloud budget still governs every completion.
+
+`client.camera.stream_url` defaults to `null`; an RTSP(S) URL overrides the USB
+`index`. USB `width`/`height` default to 1920/1080 and may request up to 7680/4320;
+RTSP retains the camera's stream resolution. Network open/read timeouts are
+4/2.5 seconds; connection failures retry every 2 seconds, clearing stale frames
+after disconnect. One configured camera is supported. The URL stays in local
+configuration and is not included in protocol messages or application errors.
+
+## Standalone client distribution
+
+The public client is exported with `scripts/export_client.py` from an explicit
+runtime allowlist and templates under `distribution/client/`. No server code,
+provider configuration, active YAML, credentials, recordings, profiles or Git
+history are included. The build checks credential patterns, local Python
+dependency closure and the ZIP's actual contents, and writes a SHA-256 manifest.
+
+`common/client_config.py` owns the client models and shared `RecordingConfig`;
+`common/config.py` reexports them to preserve the server API. Client startup
+uses `load_client_config`, accepts legacy combined YAML, and discards its
+server section without importing brain/provider modules. Configuration errors
+do not echo submitted values.
+
+The standalone Windows installer uses Python 3.11/3.12 and a local `.venv`.
+`client.setup` collects the server address, microphone and optional camera,
+generates a unique installation ID, preserves existing settings, and downloads
+only the Vosk wake model. Cloud API keys remain server-side. Public defaults
+disable local frame recording; the existing room configuration is unchanged.
+This change does not introduce public server exposure or invitation/auth tokens.
+
+## Camera image-edit targeting
+
+`look_at_camera` includes `faces_in_frame`, `face_positions_available`,
+`frame_id` and the normalized coordinate convention. Face names and boxes come
+from matching the exact requested photo. Recent presence labels cannot assign
+positions in that photo. Duplicate matches to the same profile are marked
+ambiguous. For one uniquely matched requested target, unknown bystanders alone
+do not require clarification. Full-resolution camera pulls update the cached
+photo, allowing `generate_image source=camera fresh=false` to edit exactly the
+inspected image. Provider restrictions and the one-attempt limit are unchanged.
+
+## Literal image prompt and clarification contract
+
+The current accepted final STT transcript is authoritative for the image's visual
+wording. `server/image_prompt.py` only removes narrow leading wake/capture phrases
+and unambiguous trailing PC/delivery instructions. Wallpaper installation,
+saving/opening and Telegram delivery remain separate actions. It preserves
+negations, captions, actual wallpaper/Telegram artwork and later visual details;
+ambiguous wording is retained. The assistant must not invent style, emoji,
+objects or substitutions, including changing recognized "head" to "hat".
+
+The outbound image prompt is logged as actually submitted. Provider canvas
+geometry follows the primary scene's aspect ratio, never face/body
+reference crops. Explicit numeric or worded output-format requests take
+precedence without rewriting the prompt. The desktop viewer fits images with
+uniform scaling and padding, raises the newest image in its own window, and
+releases its topmost window before opening a saved file in Windows Photos.
+Additional provider
+text is limited to validated technical identity metadata: matched scene name,
+normalized face box/requester flag and requested reference-image name/kind.
+Metadata must not introduce creative prose. A pending literal image request is
+eligible for a short clarification only after an assistant clarification
+question, for the same recognized person, within 180 seconds. It must not be
+inherited by an anonymous or different speaker or replayed after unrelated work.
+Showing/installing/sending an existing result never implies a new generation.
+
+Wallpaper installation additionally requires `wallpaper_change_requested` to
+confirm a positive instruction in the current accepted user transcript. Earlier
+requests, pending creative wording, saved preferences and LLM tool arguments
+cannot supply this authorization. Negations, quoted/discussed commands and edits
+to an image's own background do not authorize a Windows change. A generated
+image defaults to display-only without that instruction, and the common native
+application path enforces the same condition for direct installation tools.
+
+## Fixed-group Telegram transport
+
+`server.telegram` contains `enabled:false`, `chat_id:null`, `control_user_id:null`,
+`api_key_env:TELEGRAM_BOT_TOKEN`, `timeout_s:30`,
+`respond_to_mentions:false` and `poll_timeout_s:25`. `chat_id` accepts one negative
+numeric group ID. The optional positive strict integer `control_user_id` is an
+account ID, independently checked by router and tool executor. Send methods accept
+only a guarded `private_reply_to_user_id` matching that configured account;
+model arguments cannot choose arbitrary destinations. The encrypted
+brain-side token is loaded through `set-telegram-key.bat` and the normal server
+launcher. Credentials never enter YAML or the room client.
+
+`server.telegram.TelegramProvider` exposes async `send_text`, `send_image`,
+`check_connection`, `get_me`, `get_updates`, `get_webhook_info`, `download_photo`
+and `close`; `ready` describes configuration readiness only. `check_connection`
+uses only `getMe` and `getChat`. Send results contain `ok`, `chat_id`,
+`message_id` and `kind`; an acknowledged matching group/message is required for
+success. `TelegramError` exposes a sanitized message, optional numeric `code`
+and `retry_after`, and an `uncertain` flag. Network/API URLs containing tokens
+are not logged, redirected, or returned. The HTTPS transport performs no send
+retries, including after rate limits or a failed photo upload.
+
+Text/captions use no parse mode and are bounded to 4096/1024 UTF-16 code units.
+Image bytes are validated as static PNG/JPEG/WebP. Suitable PNG/JPEGs use a photo
+upload (<=10 MB, width+height<=10000, aspect ratio<=20); other supported pictures
+use a document upload up to 50 MB. This selection precedes network activity and
+preserves supplied bytes. Oversized text is rejected rather than split. Optional
+`reply_to_message_id` uses a reply within the selected authorized group/DM route.
+
+Mention mode answers mentions and replies to a message whose sender ID matches
+this bot, only in the configured group. It uses one persistent group conversation
+with attributed authors/timestamps and the latest 25 exchanges. Older per-sender
+Telegram rows are included chronologically without rewriting or deletion. Up to
+25 delivered background group messages can supply context without triggering a
+reply; all context is bounded by the input budget. Telegram stays separate from
+room identities. Other participants get text/image chat without room tools;
+only the configured controller gets `TelegramController`'s isolated Connection
+facade and existing tool executor. Controller private messages use a separate
+durable history and media owner. Full sender ID and private chat ID must both
+match; forwarded messages and bot senders cannot authorize actions. Room commands
+use unique action IDs and existing receive futures, without replacing room voice
+identity or history. An explicit room reservation prevents competing voice
+actions; unavailable room transport does not disable brain-only chat/images.
+Within that authenticated Telegram route, a direct request to take a room photo
+or send/show an image can select the current conversation implicitly. It need
+not include the word Telegram. This allowance is bound to the current literal
+message and does not authorize quoted, revoked, historical, or third-party
+requests; room voice sends still require their existing explicit destination.
+Current-room identity questions capture a new camera frame before replying.
+Names come only from face matching on that frame; fresh YOLO tracks supply
+visible bodies, including people whose faces cannot be identified. Neither old
+presence entries nor conversation history may supply current identities.
+Requested frames briefly wait for the existing YOLO worker and attach the tracks
+of the exact image being encoded, independently for each burst frame. If no new
+processed frame arrives within 0.5 seconds, capture falls back to a fresh image
+with `tracks:null`; a face-only count is then explicitly a lower bound.
+The direct spoken identity question uses this local result without a language
+or vision-model call; Telegram supplies it as a current tool observation.
+Camera failure is reported as unavailable, never as an empty room.
+Startup backlog is acknowledged
+without replies; claimed work is never
+automatically replayed. Existing webhooks are detected but not deleted. Photo
+downloads use provider-issued paths on the fixed Telegram endpoint with an 8 MB
+default bound and no token-bearing URL in model context. The transport's update
+methods are never invoked by a connection health check.
+
+`server.face.greetings_enabled` defaults to `true`; setting it to `false`
+suppresses proactive greetings while face matching, room tracking and appearance
+collection continue normally.
+
+## Telegram owner panel and multi-workplace release (2026-09-20)
+
+This amendment extends the earlier controller-only contract: `/tools` belongs
+only to `server.telegram.control_user_id` in its DM or configured group. The
+owner can grant explicit Telegram users `chat/images/camera/pc/memory/profiles`
+capabilities. These checks remain active even when room voice permissions are
+disabled. Other group members default to chat/images; DM requires explicit
+access. Owner cannot be removed or demoted. Inline callbacks bind actor, chat,
+message and panel generation; input is a reply to a distinct bot prompt.
+
+`TelegramAdminState` persists permissions/settings/audit in SQLite; runtime
+authorization and route reads use snapshots published after committed writes.
+`AdminBackend` validates non-secret settings against `Config`; marked live keys
+update engines, other keys apply at the next server start. Client settings are
+read-only here and remain local YAML. Personal memory opened from the group is
+shown in owner DM. Active profile deletion/reset preserves recording archives.
+
+HELLO adds optional `workplace_name`, `camera_name`, and capability `camera_clip`.
+No camera URL/index or cloud key enters this metadata. Each unique `client_id`
+is a workplace with one camera. The owner selects it per Telegram chat. If
+several are online without a selection, no automatic camera is chosen. An
+offline selected workplace never falls back to a different room.
+
+`camera_clip_request` server->client JSON carries `id`, `seconds` (3..10),
+`fps` (5..10). Client replies with `camera_clip` JSON (`id`, `format:"mp4"`,
+`bytes`, `w`, `h`, `seconds`, `fps`) immediately followed by one binary MP4
+under the common send lock. Maximum 20,000,000 bytes; server WS limit is 24MB.
+Failure uses `camera_clip_error` JSON. Even stale clip headers consume the next
+binary frame as a clip, never audio. Recording runs off-loop using fresh existing
+capture frames, at most 100 frames and 960px long side; no second YOLO inference.
+
+Presence rules default disabled. Explicit owner enable allows entry alerts for
+any YOLO person, unknown face or named fresh face match, scoped to a workplace
+or all workplaces. Quiet hours, stability, absence and cooldown are enforced.
+Destination is owner DM or configured group. Durable claims prevent replay;
+ambiguous delivery failures are not automatically retried. Video is silent and
+starts after the event (no pre-roll); photo/clip always uses the observed room.
+
+`inspect_photo(query,target?)` is server-only, scoped to a current/replied
+Telegram attachment. `target` invokes SAM3, otherwise saved face matching and
+vision description. Annotation bytes do not enter LLM context. An uploaded
+photo never establishes current room presence. Nano Banana uses the exact
+attachment as reference. Captionless photo follow-ups retain a durable,
+chat/sender/question-message-bound association.
+
+The public client is generated by `scripts/export_client.py` from one explicit
+source allowlist. Runtime bytes match the private development client and the
+room deployment; SHA256 hashes are in `release-manifest.json`. No brain code,
+keys, recordings, profiles, local configs or private Git history are published.
+`scripts/publish_client.py --push` updates the approved GitHub repository with a
+regular fast-forward. End-user `update-client.bat` preserves local data/config.
+See `docs/TELEGRAM_ADMIN.md` and `docs/CLIENT_DISTRIBUTION.md` for setup and limits.
+
+The owner panel uses English built-in text and readable status/profile/permission/
+notification cards rather than serialized JSON. Stored names and memory content
+are not translated. `/tools` shows connected computer names and a count; Computers
+and cameras lists all known clients, online first, seven per page. Refresh reads
+current connections; offline rows cannot take photos. Status reports all connected
+workplaces correctly even when no single room can be selected automatically.

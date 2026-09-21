@@ -309,7 +309,7 @@ class TestPublicApiMarshalsValidatedPayloads:
         hud = self._hud_with_fake_bridge()
         hud.set_status("x" * 200)
         (call,) = hud._bridge.status_changed.calls
-        assert len(call[0]) <= 60
+        assert len(call[0]) <= 180
 
     def test_click_at_emits_clamped_floats(self):
         hud = self._hud_with_fake_bridge()

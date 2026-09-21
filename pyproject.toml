@@ -1,0 +1,54 @@
+# Tooling configuration for the Rowan repository (ТЗ phase 0).
+# The project is not packaged: the hub and the room client run from the source
+# tree in the shared conda environment `jarvis`.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["third_party", "data", "models", "dist", ".venv", "migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501 (line length) is handled by the formatter, not the linter; UP038 is a
+# style preference that conflicts with the isinstance() calls used for strict
+# runtime type checks in the protocol models.
+ignore = [
+    "E501",   # line length is a formatter concern
+    "E402",   # the client bootstraps sys.path before importing the package
+    "B905",   # zip() without strict= is deliberate where lengths are already checked
+    "E731",   # a few local lambdas read better than named defs
+    "UP007",  # Union[...] is required inside Annotated[] discriminated unions
+    "UP031",  # printf-style formatting in log messages is intentional
+    "UP042",  # StrEnum migration would churn the wire-format enums
+    "B017",   # pytest.raises(Exception) is used to pin strict-pydantic failures
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__ files are re-export surfaces: an apparently unused import is
+# usually part of the public API of that package.
+"**/__init__.py" = ["F401", "F403"]
+# Test helpers and fixtures deliberately import things for their side effects.
+"tests/**" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_configs = true
+files = ["common"]
+exclude = ["^third_party/", "^data/", "^models/", "^dist/"]
+
+# The protocol module is the contract every other layer depends on: it is the
+# one file the spec requires to be type-checked strictly from phase 0.
+[[tool.mypy.overrides]]
+module = ["common.protocol"]
+strict = true
+
+# The whole shared contract is strict (ТЗ section 15.6). The legacy modules in
+# common/ were annotated in phase 0 so this can stay on.
+[[tool.mypy.overrides]]
+module = ["common.*"]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["data", "models", "third_party", "dist", ".venv", "__pycache__", ".pytest_cache"]

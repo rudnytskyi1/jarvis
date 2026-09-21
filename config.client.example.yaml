@@ -1,0 +1,30 @@
+# Rowan room-client configuration (ТЗ section 4.7).
+#
+# Copy to config.yaml on a room PC. The client reads only the `client` section;
+# every key of the single-room template config.example.yaml remains valid.
+
+client:
+  # --- hub identity (phase 0) ---
+  home_id: livingroom
+  client_id: livingroom-pc
+  kind: room_pc                 # room_pc | phone | sensor_node
+  hub_url: wss://hub.internal/ws
+  server_url: wss://hub.internal/ws   # legacy alias, used when hub_url is unset
+  token_env: ROWAN_CLIENT_TOKEN # the token itself is never written to YAML
+  caps: [mic, speaker, camera, screen, hud, actions]
+
+  # --- room behaviour ---
+  workplace_name: "Living room"
+  wakeword:
+    phrases: [rowan ai, rowan a i, roan ai]
+  audio:
+    sample_rate: 16000
+  vad:
+    silence_ms: 700
+  camera:
+    enabled: true
+    name: "Main camera"
+    index: 0
+  overlay:
+    enabled: true
+    position: bottom_right

@@ -1,7 +1,7 @@
 """Guards that catch an action only talked about, never actually done."""
 import pytest
 
-from server.llm import announces_undone_action, claims_completed_action
+from hub.llm import announces_undone_action, claims_completed_action
 
 
 @pytest.mark.parametrize(

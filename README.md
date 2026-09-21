@@ -1,9 +1,63 @@
 # Jarvis — a voice assistant for a dorm room
 
-A local voice assistant running on two PCs. Nothing goes to the cloud: speech
-recognition, the language model and voice synthesis all run at home.
+**Telegram owner panel:** [permissions, memory, profiles, cameras and alerts](docs/TELEGRAM_ADMIN.md).
+Use `/tools` in the owner's DM or configured group. Incoming photos support
+SAM3 analysis and Nano Banana editing. Telegram runs entirely on the server.
 
-You say: **"rowan, what's on my screen?"** → the room PC takes a screenshot, a
+**Public client package:** [standalone setup and safe export](docs/CLIENT_DISTRIBUTION.md).
+Run `python scripts/export_client.py` to build a separate client folder/ZIP
+without brain code, API keys, personal settings, recordings or Git history.
+
+**Budgeted OpenAI mode:** see [setup and addressing behavior](docs/OPENAI_SETUP.md).
+It keeps speech, cameras and device execution local, uses a text-only API with
+a persistent $18/month allowance, and requires the wake word for every turn.
+The original local-model configuration below remains available.
+
+**Nano Banana 2:** [image creation, photo editing and Gemini key setup](docs/IMAGE_GENERATION.md).
+Requested image edits send the selected photo to Google and share the same $18 allowance.
+
+**Multiple speakers:** [local diarization setup and limitations](docs/MULTI_SPEAKER.md).
+Community-1 labels turns locally and selects the addressed speaker where possible.
+The active room profile attempts requests despite overlap; strict rejection is
+optional. Voice enrollment still requires a clean single-speaker recording.
+
+**Personal room experience:** [guided voice/face registration, personal chat,
+tracking, screenshots and interruption confirmation](docs/ROOM_EXPERIENCE.md).
+
+A voice assistant running on two PCs. Speech recognition, camera processing and
+voice synthesis run locally. The optional OpenAI profile sends text requests,
+the current person's recent history and tool results to the configured OpenAI
+model (GPT-5.6 Luna in the active room profile).
+
+The room profile uses local **Kokoro Michael**, an American English male voice.
+Rowan's fixed personality is cheeky, uses uncensored profanity in casual chat,
+and swears back during invited banter. Casual profanity is aimed at the situation;
+personal roasts need an invitation.
+Invited comebacks rotate their comic approach and avoid recent wording. On that
+path, past requests are quoted references and recent answers are an avoidance
+list, not assistant examples to copy. The full personal history is retained for
+ordinary questions and tasks.
+Past replies and saved tone preferences do not redefine it: history supplies
+facts and task context, not a persistent mood. Ordinary requests still get useful
+answers, and explicit stop-speaking commands take priority over banter.
+An explicit **"Rowan AI, answer as Putin"** or **"Rowan AI, act like Genghis Khan"**
+starts a five-minute fictional parody for the recognized speaker. Say
+**"Rowan AI, stop roleplay"** or **"Роуан, обычный режим"** to end it early.
+The mode survives subsequent questions, keeps the usual Michael voice, and labels
+generated answers "Parody:". It changes delivery, not tool permissions or factual
+accuracy. It is temporary, is not saved as global memory, and ends on reconnect.
+Recognized speakers have separate modes; unidentified guests on one connection
+share a temporary guest mode. Racial abuse and threats against people are excluded.
+Say **"Rowan AI, update my voice"** to add voice samples after confirming your
+identity. Overlapping voices still require a repeat; diarization does not
+separate simultaneous speech into clean audio tracks.
+
+Browser choices use actual installed apps/open windows, with personal or admin
+global preferences. The current speaker gets 25 recent exchanges plus permanent
+memory; earlier messages remain searchable with timestamps. Global preferences
+override personal ones. Live camera questions are available to guests too.
+
+You say: **"rowan ai, what's on my screen?"** → the room PC takes a screenshot, a
 vision model looks at it, and Jarvis answers out loud in English.
 
 ```
@@ -277,8 +331,8 @@ client:
   client_id: livingroom
 
   wakeword:
-    word: rowan
-    phrases: [rowan, roan, rowen]          # spellings Vosk actually hears
+    word: rowan ai
+    phrases: [rowan ai, rowan a i, roan ai, roan a i, rowen ai, rowen a i, rowanai]
     vosk_model: models/vosk-model-small-en-us-0.15   # path relative to the repo root
 
   audio:
@@ -650,7 +704,7 @@ jarvis/
 - The model directory must contain the `am`, `conf` and `graph` subfolders. If it
   contains a single nested folder, the archive unpacked one level deeper — move
   it or re-download: `scripts\download-models.ps1 -Force`.
-- Add your own pronunciations to `phrases` (e.g. `[rowan, roan, rowen, rovan]`).
+- Add your own pronunciations to `phrases` (e.g. `[rowan ai, rowan a i, roan a i]`).
   All phrases must be written in **Latin letters** — the model is English.
 - Triggers too often → drop the shortest variants, raise `vad.aggressiveness`.
 

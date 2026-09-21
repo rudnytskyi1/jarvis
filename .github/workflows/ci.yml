@@ -1,0 +1,37 @@
+name: ci
+
+# Phase 0 CI: static checks plus the parts of the suite that do not need the
+# hub's CUDA stack. The full `pytest tests` run (2284 tests) needs the conda
+# environment `jarvis` with torch / faster-whisper / insightface and is run on
+# the hub machine; see docs/TZ_STATUS.md for the exact command.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: python -m pip install --upgrade pip ruff mypy
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy (strict protocol, common package)
+        run: mypy common
+
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest pydantic pyyaml numpy
+      - name: Utterance regression harness
+        run: python -m pytest tests/regress -q

@@ -26,8 +26,9 @@ import os
 import queue
 import threading
 import time
+import weakref
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TTL_S = 60.0
 #: Title of the OpenCV window (also used to find its HWND for the
 #: borderless/topmost styling below).
-WINDOW_NAME = "Jarvis - detections"
+WINDOW_NAME = f"Jarvis - detections [{os.getpid()}]"
 #: Fallback when cv2 is unavailable (SPEC v1.6).
 FALLBACK_IMAGE_PATH = REPO_ROOT / "data" / "last_detections.jpg"
 #: How often the viewer thread wakes to pump the window and check the ttl.
@@ -58,12 +59,16 @@ _SWP_NOSIZE = 0x0001
 _SWP_FRAMECHANGED = 0x0020
 _SWP_SHOWWINDOW = 0x0040
 _SWP_NOACTIVATE = 0x0010
+_SW_RESTORE = 9
+_viewers = weakref.WeakSet()
+_viewers_lock = threading.Lock()
 
 __all__ = [
     "DEFAULT_TTL_S",
     "WINDOW_NAME",
     "FALLBACK_IMAGE_PATH",
     "ImageViewer",
+    "dismiss_for_external_photo",
 ]
 
 
@@ -85,6 +90,43 @@ _STOP = object()
 _HIDE = object()
 
 
+class _HideRequest:
+    def __init__(self):
+        self.completed = threading.Event()
+
+
+def dismiss_for_external_photo() -> None:
+    """Release Rowan's topmost photo before opening a saved photo in Windows."""
+    with _viewers_lock:
+        viewers = list(_viewers)
+    for viewer in viewers:
+        viewer.hide(wait=True)
+
+
+def _window_api():
+    """Declare pointer-sized HWND arguments before locating/updating windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.GetWindowLongW.restype = wintypes.LONG
+    user32.SetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
+    user32.SetWindowLongW.restype = wintypes.LONG
+    user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT)
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = (wintypes.HWND,)
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    return user32
+
+
 def _screen_size() -> tuple[int, int]:
     """Desktop resolution (falls back to 1920x1080 when ctypes is unavailable)."""
     try:
@@ -97,17 +139,26 @@ def _screen_size() -> tuple[int, int]:
 
 
 def _fit_to_screen(cv2: Any, frame: Any) -> Any:
-    """Scale ``frame`` down so the whole picture fits on the screen."""
+    """Fit proportionally inside a screen-sized canvas, preserving every edge.
+
+    Fullscreen HighGUI backends may stretch their input to the window. Providing
+    a canvas with the screen's dimensions keeps that final scale uniform even
+    for narrow portrait photos. The decoded/source image is never modified.
+    """
     try:
         height, width = int(frame.shape[0]), int(frame.shape[1])
         screen_w, screen_h = _screen_size()
         if width <= 0 or height <= 0 or screen_w <= 0 or screen_h <= 0:
             return frame
         scale = min(screen_w / float(width), screen_h / float(height))
-        if scale >= 1.0:
-            return frame
-        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+        new_size = (min(screen_w, max(1, round(width * scale))),
+                    min(screen_h, max(1, round(height * scale))))
+        fitted = frame if new_size == (width, height) else cv2.resize(
+            frame, new_size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        horizontal, vertical = screen_w - new_size[0], screen_h - new_size[1]
+        return cv2.copyMakeBorder(fitted, vertical // 2, vertical - vertical // 2,
+                                 horizontal // 2, horizontal - horizontal // 2,
+                                 cv2.BORDER_CONSTANT, value=(0, 0, 0))
     except Exception:  # noqa: BLE001 - showing the original beats showing nothing
         log.debug("Could not fit the photo to the screen", exc_info=True)
         return frame
@@ -123,15 +174,15 @@ def _make_borderless_topmost(window_name: str) -> None:
     is actually shown.
     """
     try:
-        import ctypes
-
-        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32 = _window_api()
         hwnd = user32.FindWindowW(None, window_name)
         if not hwnd:
             return
         style = user32.GetWindowLongW(hwnd, _GWL_STYLE)
         style &= ~(_WS_CAPTION | _WS_THICKFRAME | _WS_SYSMENU | _WS_MINIMIZEBOX | _WS_MAXIMIZEBOX)
         user32.SetWindowLongW(hwnd, _GWL_STYLE, style)
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, _SW_RESTORE)
         user32.SetWindowPos(
             hwnd,
             _HWND_TOPMOST,
@@ -141,6 +192,9 @@ def _make_borderless_topmost(window_name: str) -> None:
             0,
             _SWP_NOMOVE | _SWP_NOSIZE | _SWP_FRAMECHANGED | _SWP_SHOWWINDOW,
         )
+        # A newly requested image should surface now. Subsequent keep-alive
+        # calls never activate the window or take keyboard focus repeatedly.
+        user32.SetForegroundWindow(hwnd)
     except Exception:  # noqa: BLE001 - cosmetic only
         log.debug("Could not make the detections window borderless/topmost", exc_info=True)
 
@@ -156,9 +210,7 @@ def _keep_on_top(window_name: str) -> None:
     keyboard away from whatever he is actually typing into.
     """
     try:
-        import ctypes
-
-        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        user32 = _window_api()
         hwnd = user32.FindWindowW(None, window_name)
         if not hwnd:
             return
@@ -187,9 +239,11 @@ class ImageViewer:
     def __init__(self) -> None:
         self._cv2: Any = None
         self._cv2_checked = False
-        self._queue: "queue.Queue[Any]" = queue.Queue()
-        self._thread: Optional[threading.Thread] = None
+        self._queue: queue.Queue[Any] = queue.Queue()
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        with _viewers_lock:
+            _viewers.add(self)
 
     # ------------------------------------------------------------------
     # cv2 (lazy, like client/camera.py)
@@ -236,10 +290,17 @@ class ImageViewer:
         except Exception:  # noqa: BLE001 - never break the caller
             log.exception("Could not queue the detections photo for display")
 
-    def hide(self) -> None:
+    def hide(self, *, wait=False) -> None:
         """Close the photo window but keep the viewer alive (voice dismissal)."""
         try:
-            self._queue.put_nowait(_HIDE)
+            thread = self._thread
+            if wait and thread is not None and thread.is_alive():
+                request = _HideRequest()
+                self._queue.put_nowait(request)
+                if thread is not threading.current_thread():
+                    request.completed.wait(JOIN_TIMEOUT_S)
+            else:
+                self._queue.put_nowait(_HIDE)
         except Exception:  # pragma: no cover - unbounded queue cannot fail
             pass
 
@@ -295,7 +356,7 @@ class ImageViewer:
     def _run(self) -> None:
         """The window/message-pump loop — the ONLY thread that touches cv2's UI."""
         cv2 = self._cv2
-        shown_deadline: Optional[float] = None
+        shown_deadline: float | None = None
         try:
             while True:
                 timeout = POLL_S if shown_deadline is not None else None
@@ -304,15 +365,25 @@ class ImageViewer:
                 except queue.Empty:
                     item = None
 
+                # If decoding/UI work fell behind, only the newest requested
+                # photo should surface. Hide/stop requests retain their order.
+                while isinstance(item, _ShowRequest):
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+
                 if item is _STOP:
                     break
-                if item is _HIDE:
+                if item is _HIDE or isinstance(item, _HideRequest):
                     try:
                         cv2.destroyWindow(WINDOW_NAME)
                         cv2.waitKey(1)
                     except Exception:  # pragma: no cover - no window open
                         pass
                     shown_deadline = None
+                    if isinstance(item, _HideRequest):
+                        item.completed.set()
                     continue
                 if isinstance(item, _ShowRequest):
                     frame = self._decode(cv2, item.jpeg)

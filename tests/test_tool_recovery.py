@@ -5,10 +5,9 @@ millard-qwen4 is the best tool-caller of the models available (8/10 vs 3/10 and
 Hermes template tags instead of a structured call. Rather than burn a retry
 round each time, the text is parsed back into a real call.
 """
-import pytest
 
-from server.llm import recover_tool_calls
-from server.tools import TOOL_NAMES
+from hub.llm import recover_tool_calls
+from hub.tools import TOOL_NAMES
 
 
 def names(calls):

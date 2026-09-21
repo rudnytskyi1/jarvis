@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 from PIL import Image, ImageDraw  # noqa: E402
 
 from common.config import SegmentConfig  # noqa: E402
-from server.segment import Sam3Engine  # noqa: E402
+from hub.segment import Sam3Engine  # noqa: E402
 
 
 def _make_test_jpeg() -> bytes:

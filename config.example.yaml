@@ -4,6 +4,22 @@
 server:
   host: 0.0.0.0
   port: 8765
+  permissions_enabled: true # false temporarily opens all tools to everyone, including unknown voices
+  audio_recording:
+    enabled: false           # enable to save all request WAVs locally before recognition
+    retention_days: 0        # 0 = never auto-delete by age
+    max_gb: 0                # 0 = no archive size limit
+    min_free_gb: 5           # stop new writes at this free-space reserve; never delete old files
+  camera_request_recording:
+    enabled: false           # save camera frames requested during conversations, even with no people
+    retention_days: 0
+    max_gb: 0
+    min_free_gb: 5
+
+  training_archive:
+    enabled: false           # permanent per-date/per-person audio, transcripts, face and YOLO body crops
+    path: data/training_archive
+    min_free_gb: 5           # stop new writes at reserve; never delete retained material
 
   stt:
     model: large-v3          # faster-whisper
@@ -12,33 +28,65 @@ server:
     language: null           # null = auto-detect within allowed_languages; "en" pins English
     allowed_languages: [en, ru, es]   # auto-detect whitelist; [] = any language
 
+  diarization:               # local multi-speaker mode; docs/MULTI_SPEAKER.md
+    enabled: false          # enable after downloading Community-1
+    reject_mixed_speech: true # false: attempt ordinary requests despite background voices; enrollment stays strict
+    model_path: models/speaker-diarization-community-1
+    device: cuda
+    timeout_s: 45
+    min_identity_s: 1.5      # minimum clean voice sample for a known identity
+
+  image_generation:          # optional Nano Banana 2; docs/IMAGE_GENERATION.md
+    enabled: false
+    model: gemini-3.1-flash-image
+    api_key_env: GEMINI_API_KEY # saved separately on the brain PC, never in YAML
+    image_size: 1K
+    timeout_s: 120
+
+  telegram:                  # fixed-group messages/photos and optional @mentions; docs/TELEGRAM.md
+    enabled: false
+    chat_id: null             # fixed negative group ID; tools cannot choose another destination
+    control_user_id: null     # ONLY this numeric sender gets tools in the group and their private DM
+    api_key_env: TELEGRAM_BOT_TOKEN # secret is saved on the brain PC, never in YAML
+    timeout_s: 30
+    respond_to_mentions: false # optional replies to new @bot mentions in this same group
+    poll_timeout_s: 25
+
   llm:
     provider: ollama_native  # ollama_native (recommended: can disable thinking) | openai
     base_url: http://127.0.0.1:11434/v1   # /v1 is stripped automatically for ollama_native
     model: millard-qwen4:latest           # Qwen3.6-35B-A3B multimodal; tool calling + vision verified
     api_key: ollama
+    api_key_env: OPENAI_API_KEY  # openai_responses only; never put the real key in YAML
+    monthly_budget_usd: 18.0    # app allowance, <=20; persisted in data/api_usage.sqlite3
+    max_input_bytes: 64000      # cap cloud context before sending
+    vision_base_url: null      # separate Ollama URL when chat uses OpenAI
+    prompt_file: null          # cloud profile uses prompts/cloud.md
     think: false             # disable Qwen3 reasoning for fast voice replies
     vision_model: qwen2.5vl:7b        # fast NON-thinking vision model (coexists with the chat model)
     temperature: 0.3         # low keeps tool use disciplined (no claimed-but-not-done actions)
     max_tokens: 1024
     max_tool_rounds: 10      # tool-call rounds per utterance (a computer-use chain needs ~8)
-    history_turns: 12        # how many recent exchanges to keep
+    history_turns: 25        # latest exchanges for this person; older ones remain searchable
     keep_alive: 4h           # keep the CHAT model in VRAM (Ollama unloads after 5 m otherwise)
     vision_keep_alive: 10m   # the vision model holds ~8.4 GB; give it back when idle
     num_ctx: 16384           # system prompt + tool schemas alone are ~7.6k tokens; 8192 overflows
 
   speaker:                   # who is talking (ECAPA voice profiles, data/people.json)
     enabled: true
-    threshold: 0.28          # ECAPA on the REAL mic: same-speaker sits ~0.2-0.45 (0.40 rejected the owner)
-    margin: 0.10             # with 2+ voices the winner must lead the runner-up by this
-    admin_threshold: 0.42    # run_command / set_role need this much confidence
+    threshold: 0.40          # conservative starting threshold; cosine score is not probability
+    margin: 0.15             # winner must lead the runner-up by this
+    admin_threshold: 0.65    # privileged actions and updating existing voice samples
     min_speech_s: 0.8        # shorter utterances are left unidentified
 
   face:                      # face recognition + presence (v1.4, insightface)
     enabled: true
+    greetings_enabled: true   # false silences proactive greetings; tracking and appearance stay active
+    appearance_enabled: true # retain validated face/body references locally; no automatic deletion
+    adaptive_recognition: true # use up to 12 validated appearance vectors per enrolled person
     threshold: 0.45          # cosine similarity for a face to match a profile
     presence_ttl_s: 30       # forget someone this long after last seeing them
-    greet_after_s: 10        # greet an unknown face after this many seconds
+    greet_after_s: 0.35      # short stabilization before greeting an unknown face
     greeting_llm: false      # false = instant scripted greeting; true = ask the model (3-5 s slower)
     greeting_cooldown_s: 300       # greet the SAME stranger again after this long
     greeting_cooldown_known_s: 900 # greet the same KNOWN person again after this long
@@ -50,12 +98,55 @@ server:
     checkpoint: third_party/sam3/server/model/sam3.pt   # resolved relative to the repo root
     confidence: 0.5           # SAM3 match threshold
 
+  gpu_queue:                 # one priority queue for every heavy job (ТЗ 4.5)
+    enabled: true             # false runs each job directly, for debugging
+    max_concurrent: 2         # GPU jobs in flight across all rooms
+    fair_share: 0.5           # cap for one room while another is waiting
+    max_waiting: 256          # queued jobs before new ones are refused
+    utterance_timeout_s: 300  # safety net: does the job never start/finish?
+    face_timeout_s: 120
+    background_timeout_s: 120
+
   tts:
     engine: silero
     language: en
     model_id: v3_en
     speaker: en_0            # en_0 .. en_117 (v3_en voices)
+    kokoro_model_path: models/kokoro/kokoro-v1.0.onnx # engine=kokoro, speaker=am_michael for American male
+    kokoro_voices_path: models/kokoro/voices-v1.0.bin
     sample_rate: 48000
+
+# Model levels and the router that picks one (ТЗ F-401..F-403).
+# OFF by default: while `enabled` is false every round uses `server.llm`
+# above, exactly as before. An empty `model` means the level is not
+# provisioned yet and the router skips it.
+models:
+  enabled: false
+  levels:
+    local_fast:                # small local model for commands and short replies
+      provider: vllm
+      base_url: http://127.0.0.1:8000/v1
+      model: ""                # e.g. Qwen3-4B
+      max_tokens: 512
+    local_strong:              # the strong local model (Qwen 35B-A3B under vLLM)
+      provider: vllm
+      base_url: http://127.0.0.1:8000/v1
+      model: ""
+    cloud_cheap:               # used only for the overflow of F-403
+      provider: openai_responses
+      model: gpt-5.4-mini
+      api_key_env: OPENAI_API_KEY
+    cloud_strong:
+      provider: openai_responses
+      model: gpt-5.4
+      api_key_env: OPENAI_API_KEY
+  routing:
+    short_chars: 120           # at most this long may use local_fast
+    strong_chars: 240          # from this length the strong level is used
+    overflow_wait_s: 1.5       # F-403: class-0 predicted wait before overflow
+    overflow_level: cloud_cheap
+    cloud_fallback: false      # true = the owner allows spending on overflow
+    cloud_vision: false        # F-404: send hard images to a cloud vision model
 
 client:
   # Via ngrok (works from any network, including dorm Wi-Fi with client isolation):
@@ -63,16 +154,20 @@ client:
   # Direct LAN (faster, if the PCs can see each other):
   # server_url: ws://192.168.1.100:8765/ws   # IP of the 5090 PC
   client_id: livingroom
+  workplace_name: Living room # Friendly name displayed in Telegram
 
   wakeword:
-    word: rowan
-    phrases: [rowan, roan, rowen]          # spellings Vosk actually hears
+    word: rowan ai
+    phrases: [rowan ai, rowan a i, roan ai, roan a i, rowen ai, rowen a i, rowanai]
     vosk_model: models/vosk-model-small-en-us-0.15
 
   audio:
     input_device: null       # null = default mic; or an index (3) or name part ("Yeti")
     output_device: null
     sample_rate: 16000       # do not change: Whisper/VAD/Vosk run at 16 kHz
+    echo_cancellation: false # install client/requirements-audio.txt; Windows WASAPI reference
+    noise_suppression: false # local WebRTC noise reduction before wake word, STT and voice ID
+    noise_suppression_level: 1 # 0..3; avoid aggressive filtering for voice profiles
 
   vad:
     aggressiveness: 3        # 0..3, higher = cuts silence/noise harder (3 recommended for webcam mics)
@@ -81,15 +176,26 @@ client:
     pre_roll_ms: 300         # audio from BEFORE the trigger included in the recording
     min_speech_ms: 250       # shorter voiced bursts are noise blips - dropped, listening continues
 
-  followup_window_s: 6       # after a reply, listen N more seconds without wake word (0 = off)
+  attention_mode: wake_word # every turn needs Rowan; window explicitly opts into old behavior
+  followup_window_s: 0       # used only in attention_mode: window (maximum 30 s)
   thinking_sounds: true      # soft blips when a reply takes longer than ~1.5 s (vision, tool chains)
 
   camera:                    # room camera -> YOLO presence + face frames (v1.4)
+    name: Main camera        # Friendly label; one camera per client
     enabled: true
     index: 0                 # OpenCV device index
-    fps: 8                   # YOLO processing rate
+    stream_url: null         # optional rtsp://camera-account:password@camera-ip:554/stream
+    width: 1920              # USB capture request; use 3840 x 2160 for a 4K webcam
+    height: 1080             # RTSP uses the resolution configured in the camera itself
+    fps: 0                   # 0 = no software FPS cap; fresh frames only
+    half: true               # CUDA FP16 inference
+    frame_recording:
+      enabled: false         # native-size JPEG of every YOLO-processed frame with a person
+      retention_days: 0      # keep until manually deleted
+      max_gb: 0
+      min_free_gb: 5
     model: yolo11x.pt        # ultralytics model (auto-downloaded on first run)
-    face_check_interval_s: 5 # push one frame this often while someone is visible
+    face_check_interval_s: 0.5 # one aligned face/tracking frame while someone is visible
 
   overlay:                 # sci-fi HUD on the TV (Tkinter, transparent, click-through)
     enabled: true

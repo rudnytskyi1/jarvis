@@ -1,0 +1,28 @@
+# Rowan hub configuration (multi-room, ТЗ section 4.7).
+#
+# Copy this next to `config.example.yaml` on the hub (RTX 5090 PC) and merge
+# them into one config.yaml: every key of the single-room template is still
+# valid, this file only adds the `homes:` section.
+#
+# The client section is optional on the hub; the hub reads `server` and `homes`.
+
+homes:
+  - home_id: livingroom
+    name: "Living room"
+    tz: America/Chicago
+    owner_person_id: anton
+    quiet_hours:
+      start: "23:00"
+      end: "08:00"
+    settings:
+      cloud_vision: false
+
+  - home_id: dorm-max
+    name: "Max's room"
+    tz: America/Chicago
+    owner_person_id: max
+    # Leave quiet_hours empty (or omit it) when the room has none.
+    quiet_hours:
+      start: ""
+      end: ""
+    settings: {}

@@ -9,11 +9,8 @@ preferring a cached frame so "show me the photo you described" stays the same
 moment it described.
 """
 import asyncio
-from types import SimpleNamespace
 
-import pytest
-
-from server.app import SOURCE_CAMERA, SOURCE_SCREEN, Connection
+from hub.app import SOURCE_CAMERA, Connection
 
 
 class _Frame:

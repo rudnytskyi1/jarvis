@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from ..devices.base import (
     STATE_OFF,
@@ -39,7 +40,9 @@ from ..devices.base import (
     parse_state,
     parse_switch_action,
 )
+from .app_control import AppController
 from .apps import AppError
+from .browser_desktop import DesktopBrowserController
 from .pc import PCActionError, PCController, PCResult
 
 log = logging.getLogger(__name__)
@@ -51,6 +54,10 @@ TOOL_PC_CONTROL = "pc_control"
 TOOL_RUN_COMMAND = "run_command"
 #: v1.2: produced server-side by ``click_screen``, not called by the LLM directly.
 TOOL_MOUSE_CLICK = "mouse_click"
+TOOL_BROWSER = "browser_control"
+TOOL_APP_ACTION = 'app_action'
+TOOL_SAVE_PHOTO = 'save_photo_file'
+TOOL_SET_WALLPAPER = 'set_wallpaper_file'
 TOOLS = frozenset(
     {
         TOOL_SET_LIGHT,
@@ -58,6 +65,10 @@ TOOLS = frozenset(
         TOOL_PC_CONTROL,
         TOOL_RUN_COMMAND,
         TOOL_MOUSE_CLICK,
+        TOOL_BROWSER,
+        TOOL_APP_ACTION,
+        TOOL_SAVE_PHOTO,
+        TOOL_SET_WALLPAPER,
     }
 )
 
@@ -87,6 +98,8 @@ class Dispatcher:
         self.cfg = cfg_client
         self.registry = registry
         self.pc = PCController(self._apps_of(cfg_client))
+        self.browser = DesktopBrowserController()
+        self.applications = AppController(self.pc.apps)
 
     # -- construction helpers ----------------------------------------------
 
@@ -133,7 +146,7 @@ class Dispatcher:
                 return False, f"malformed args in action {action_id}: {raw_args!r}", None
             args: dict[str, Any] = dict(raw_args)
 
-            log.info("action %s: %s %s", action_id, tool or "?", args)
+            log.info("action %s: %s %s", action_id, tool or "?", {k: '<image omitted>' if k in {'jpeg_base64', 'image_base64'} else v for k, v in args.items()})
 
             output: str | None = None
             if tool == TOOL_SET_LIGHT:
@@ -154,6 +167,25 @@ class Dispatcher:
                     self._mouse_click(args), timeout=PC_TIMEOUT_S
                 )
                 detail, output = result.detail, result.output
+            elif tool == TOOL_BROWSER:
+                output = await asyncio.wait_for(self.browser.execute(args), timeout=28)
+                detail = 'Browser action complete'
+            elif tool == TOOL_APP_ACTION:
+                import json
+                result = await asyncio.wait_for(self.applications.execute(args), timeout=20)
+                output, detail = json.dumps(result), 'Application inventory/action completed'
+            elif tool == TOOL_SAVE_PHOTO:
+                import json
+
+                from .photos import save_photo
+                result = await asyncio.wait_for(asyncio.to_thread(save_photo, args), timeout=20)
+                output, detail = json.dumps(result), 'Photo saved'
+            elif tool == TOOL_SET_WALLPAPER:
+                import json
+
+                from .wallpaper import set_wallpaper
+                result = await asyncio.wait_for(asyncio.to_thread(set_wallpaper, args), timeout=20)
+                output, detail = json.dumps(result), 'Desktop wallpaper applied and verified'
             elif tool == TOOL_RUN_COMMAND:
                 ok, error, output = await asyncio.wait_for(
                     self._run_command(args), timeout=RUN_COMMAND_TIMEOUT_S
@@ -173,7 +205,7 @@ class Dispatcher:
 
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             message = f"action {action_id} ({tool}) timed out"
             log.error(message)
             return False, message, None

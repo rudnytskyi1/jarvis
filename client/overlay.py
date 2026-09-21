@@ -72,7 +72,7 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ DEFAULT_CHROMA = "#010101"
 # --- timing / lifecycle tuning ---------------------------------------------------
 START_TIMEOUT_S = 5.0
 JOIN_TIMEOUT_S = 2.0
-STATUS_MAX_CHARS = 60
+STATUS_MAX_CHARS = 180
 #: Mirrors the HTML/CSS timings in hud.html - used to know when a one-shot
 #: effect (click ring / flash bloom) has finished playing, purely so the
 #: idle-hidden decision below can reconsider hiding the native window.
@@ -118,7 +118,7 @@ SHOT_DURATION_S = 0.7
 HIDE_DELAY_S = 0.55
 
 #: The actual page shown in the WebView (client/overlay_web/hud.html).
-HUD_HTML_PATH = Path(__file__).resolve().parent / "overlay_web" / "hud.html"
+HUD_HTML_PATH = Path(__file__).resolve().parent / "overlay_web" / "chat.html"
 
 __all__ = [
     "STATE_IDLE",
@@ -219,7 +219,7 @@ def _clamp01(value: Any) -> float:
     return number
 
 
-def norm_to_px(x_norm: Any, y_norm: Any, width: int, height: int) -> Tuple[int, int]:
+def norm_to_px(x_norm: Any, y_norm: Any, width: int, height: int) -> tuple[int, int]:
     """Map normalized ``(0..1, 0..1)`` screen coordinates to clamped pixel ints.
 
     Out-of-range values are clamped rather than rejected (a slightly
@@ -284,7 +284,7 @@ class OverlayHUD:
         self.chroma = str(_attr(cfg, "chroma", DEFAULT_CHROMA) or DEFAULT_CHROMA)
 
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._ready_event = threading.Event()
         self._warned = False
 
@@ -308,6 +308,8 @@ class OverlayHUD:
         self._flash_until = 0.0
         self._click_until = 0.0
         self._mapped = False
+        self._capture_suspended = False
+        self._chat = {"person": "", "messages": [], "question": ""}
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -440,6 +442,50 @@ class OverlayHUD:
             return
         self._post(lambda bridge: bridge.flash_requested.emit(normalized))
 
+    def chat(self, payload: dict) -> None:
+        self._post(lambda bridge: bridge.chat_changed.emit(json.dumps(payload)))
+
+    def chat_reply(self, text: str, sentence: str = "") -> None:
+        self._post(lambda bridge: bridge.reply_changed.emit(json.dumps({"text": text, "sentence": sentence})))
+
+    def transcript(self, payload: dict) -> None:
+        self._post(lambda bridge: bridge.transcript_changed.emit(json.dumps(payload)))
+
+    def photo(self, jpeg: bytes) -> None:
+        import base64
+        self._post(lambda bridge: bridge.photo_changed.emit('data:image/jpeg;base64,' + base64.b64encode(jpeg).decode('ascii')))
+
+    def confirm_voice(self, name, callback):
+        """Physical confirmation on the room display, outside the chat/LLM tools."""
+        if not self.enabled or self._bridge is None:
+            callback(False)
+            return
+        cancelled = threading.Event()
+        self._voice_confirm_cancel = cancelled
+        self._post(lambda bridge: bridge.voice_confirmation.emit((name, callback, cancelled)))
+
+    def cancel_voice_confirmation(self):
+        cancelled = getattr(self, '_voice_confirm_cancel', None)
+        if cancelled:
+            cancelled.set()
+        self._post(lambda bridge: bridge.voice_confirmation_cancel.emit())
+
+    def suspend_capture(self, timeout: float = 2.0) -> bool:
+        """Wait until Qt actually hides; fail closed if the UI thread is stuck."""
+        cancelled = getattr(self, '_voice_confirm_cancel', None)
+        if cancelled and not cancelled.is_set():
+            return False
+        if not self.enabled:
+            return True
+        if self._bridge is None:
+            return False
+        done = threading.Event()
+        self._post(lambda bridge: bridge.capture_requested.emit(done))
+        return done.wait(timeout)
+
+    def resume_capture(self) -> None:
+        self._post(lambda bridge: bridge.capture_finished.emit())
+
     def hide_now(self) -> None:
         """Take the window off screen immediately, skipping the fade-out delay.
 
@@ -489,7 +535,7 @@ class OverlayHUD:
         finally:
             self._teardown_qt()
 
-    def _create_qt_objects(self) -> Tuple[Any, Any, Any]:
+    def _create_qt_objects(self) -> tuple[Any, Any, Any]:
         """Import PySide6 and build the QApplication + transparent WebView + bridge.
 
         Only ever called from :meth:`_run_ui` on the dedicated Qt thread,
@@ -504,8 +550,8 @@ class OverlayHUD:
         # created (a documented Qt/PySide6 requirement), so this import
         # happens before QApplication(...) below, not just before it is used.
         from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-        from PySide6.QtWidgets import QApplication
         from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtWidgets import QApplication, QMessageBox
 
         owner = self
 
@@ -527,6 +573,14 @@ class OverlayHUD:
             speaker_changed = Signal(str)
             hide_now_requested = Signal()
             stop_requested = Signal()
+            chat_changed = Signal(str)
+            reply_changed = Signal(str)
+            transcript_changed = Signal(str)
+            photo_changed = Signal(str)
+            capture_requested = Signal(object)
+            capture_finished = Signal()
+            voice_confirmation = Signal(object)
+            voice_confirmation_cancel = Signal()
 
             def __init__(self) -> None:
                 super().__init__()
@@ -539,6 +593,63 @@ class OverlayHUD:
                 self.speaker_changed.connect(self._on_speaker)
                 self.hide_now_requested.connect(self._on_hide_now)
                 self.stop_requested.connect(self._on_stop)
+                self.chat_changed.connect(self._on_chat)
+                self.reply_changed.connect(self._on_reply)
+                self.transcript_changed.connect(self._on_transcript)
+                self.photo_changed.connect(self._on_photo)
+                self.capture_requested.connect(self._on_capture)
+                self.capture_finished.connect(self._on_capture_finished)
+                self.voice_confirmation.connect(self._on_voice_confirmation)
+                self.voice_confirmation_cancel.connect(self._cancel_voice_confirmation)
+                self._voice_box = None
+
+            def _cancel_voice_confirmation(self):
+                if self._voice_box is not None:
+                    self._voice_box.reject()
+
+            def _on_voice_confirmation(self, request):
+                name, callback, cancelled = request
+                self._cancel_voice_confirmation()
+                if cancelled.is_set():
+                    callback(False)
+                    return
+                box = QMessageBox()
+                self._voice_box = box
+                rename = name if isinstance(name, dict) else None
+                box.setWindowTitle('Rowan - confirm name change' if rename else 'Rowan - confirm voice update')
+                box.setWindowFlags(Qt.Dialog | Qt.WindowStaysOnTopHint)
+                box.setTextFormat(Qt.PlainText)
+                box.setText(f"Change {rename['old_name']} to {rename['new_name']}?" if rename else f'Update the saved voice for {name}?')
+                box.setInformativeText((
+                    'This combines two existing profiles, including their voices, faces, permissions and private history. '
+                    'Choose Save only if both names belong to the same person.' if rename.get('merge') else
+                    'Choose Save only if this corrects the name of the same person. Their voice, face, memories and history will be kept.'
+                ) if rename else (
+                    f'Only choose Save if {name} just read all the sentences.\n\n'
+                    'The recording did not match the old profile confidently. '
+                    'Saving will link this voice to that person\'s conversations and permissions.'))
+                box.setStandardButtons(QMessageBox.Save | QMessageBox.Cancel)
+                box.setDefaultButton(QMessageBox.Cancel)
+                box.setEscapeButton(QMessageBox.Cancel)
+                box.setStyleSheet('QWidget { background: #18181b; color: #fafafa; font-size: 16px; } '
+                                  'QPushButton { padding: 10px 24px; border: 1px solid #52525b; border-radius: 6px; }')
+                def finished(_result):
+                    approved = not cancelled.is_set() and box.standardButton(box.clickedButton()) == QMessageBox.Save
+                    cancelled.set()
+                    self._voice_box = None
+                    callback(approved)
+                    box.deleteLater()
+                box.finished.connect(finished)
+                timer = QTimer(box)
+                timer.setSingleShot(True)
+                timer.timeout.connect(box.reject)
+                timer.start(45000)
+                box.open()
+                try:
+                    import ctypes
+                    ctypes.windll.user32.SetWindowDisplayAffinity(ctypes.c_void_p(int(box.winId())), 0x11)
+                except (AttributeError, OSError):
+                    pass  # Captures also fail closed while this dialog is open.
 
             # -- helpers (Qt thread only) --
             def _run_js(self, script: str) -> None:
@@ -583,7 +694,7 @@ class OverlayHUD:
                     self._hide()
 
             def _show(self) -> None:
-                if owner._mapped or owner._view is None:
+                if owner._capture_suspended or owner._mapped or owner._view is None:
                     return
                 try:
                     owner._view.show()
@@ -603,6 +714,29 @@ class OverlayHUD:
                 owner._mapped = False
 
             # -- slots --
+            def _on_chat(self, payload: str) -> None:
+                owner._chat = json.loads(payload)
+                self._run_js(f"window.hudChat && window.hudChat({payload});")
+
+            def _on_reply(self, payload: str) -> None:
+                self._run_js(f"window.hudReply && window.hudReply({payload});")
+
+            def _on_transcript(self, payload: str) -> None:
+                self._run_js(f"window.hudTranscript && window.hudTranscript({payload});")
+
+            def _on_photo(self, url: str) -> None:
+                self._run_js(f"window.hudImage && window.hudImage({json.dumps(url)});")
+
+            def _on_capture(self, done) -> None:
+                owner._capture_suspended = True
+                self._hide()
+                if owner._view is not None and not owner._view.isVisible():
+                    done.set()
+
+            def _on_capture_finished(self) -> None:
+                owner._capture_suspended = False
+                self._reconsider_visibility()
+
             def _on_state(self, state: str) -> None:
                 owner._state = state
                 self._sync_state()
@@ -656,6 +790,7 @@ class OverlayHUD:
                 self._hide()
 
             def _on_stop(self) -> None:
+                self._cancel_voice_confirmation()
                 try:
                     if owner._view is not None:
                         owner._view.close()
@@ -685,6 +820,13 @@ class OverlayHUD:
         url.setQuery(f"scale={self.scale}")
         view.load(url)
         view.hide()
+
+        # Defense in depth: hide/ack is still mandatory on every capture.
+        try:
+            import ctypes
+            ctypes.windll.user32.SetWindowDisplayAffinity(ctypes.c_void_p(int(view.winId())), 0x11)
+        except (AttributeError, OSError):
+            log.debug("Native capture exclusion unavailable; acknowledged hide remains active")
 
         bridge = _Bridge()
         return app, view, bridge

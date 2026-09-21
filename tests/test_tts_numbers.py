@@ -1,7 +1,7 @@
 """spell_numbers: Silero cannot say digits, so everything must become words."""
 import pytest
 
-from server.tts import sanitize_text, spell_numbers
+from hub.tts import sanitize_text, spell_numbers
 
 
 @pytest.mark.parametrize(

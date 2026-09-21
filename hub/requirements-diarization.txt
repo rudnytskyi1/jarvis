@@ -1,0 +1,2 @@
+# Optional multi-speaker pipeline; retain this machine's CUDA torch builds.
+pyannote.audio>=4.0,<5

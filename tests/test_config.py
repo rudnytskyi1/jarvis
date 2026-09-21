@@ -37,7 +37,7 @@ def test_tts_is_english(cfg):
 
 def test_client_invariants(cfg):
     c = cfg.client
-    assert c.wakeword.word == "rowan"
+    assert c.wakeword.word == "rowan ai"
     assert c.wakeword.phrases, "at least one spelling for Vosk"
     assert c.vad.min_speech_ms > 0
     assert c.vad.aggressiveness == 3

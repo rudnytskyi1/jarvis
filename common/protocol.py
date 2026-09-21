@@ -29,11 +29,18 @@ Client -> Server
   whose own ``burst`` field says how many frames were asked for. On capture failure:
   ``{"type": MSG_CAMERA_ERROR, "id": str, "error": str}`` with no binary frame (ends
   the whole burst, however many pairs already went out).
+* Optional ``camera_clip`` hello capability: ``{type: MSG_CAMERA_CLIP, id,
+  format: "mp4", bytes, w, h, seconds, fps}`` followed by one silent MP4 binary
+  frame of at most CAMERA_CLIP_MAX_BYTES, or ``{type: MSG_CAMERA_CLIP_ERROR,
+  id, error}`` with no binary. Header and MP4 share the client's wire lock.
 
 Server -> Client
 ----------------
 * ``{"type": MSG_READY}``
 * ``{"type": MSG_TRANSCRIPT, "text": str, "language": str}``
+  -- optional ``segments`` contains attributed turns with ``start``, ``end``,
+  ``speaker_id``, ``speaker``, ``text``, ``uncertain``; optional ``clarification``
+  explains why no addressed command was selected (see SPEC section 4).
 * ``{"type": MSG_ACTIONS, "items": [{"id": str, "tool": str, "args": {...}}]}``
   -- may be sent several times per utterance (one per tool round).
 * ``{"type": MSG_SCREENSHOT_REQUEST, "id": str}``
@@ -44,6 +51,9 @@ Server -> Client
   (see the seq/of note above). ``full`` (v1.6, optional, default false) skips
   the usual downscale for THIS pull only -- used by ``find_object`` so the
   object detector sees the frame at native camera resolution.
+* ``{type: MSG_CAMERA_CLIP_REQUEST, id, seconds: 3..10, fps: 5..10}`` is sent
+  only when the client advertises ``camera_clip``. Recording uses existing
+  camera capture frames; it does not open another camera or run extra YOLO.
 * ``{"type": MSG_SAY, "text": str, "listen_s": float, "status": str}`` --
   ``listen_s`` and ``status`` are optional. v1.7: ``status`` is a caption the
   client shows on the HUD for the follow-up window this reply opens (voice
@@ -85,11 +95,22 @@ is likewise always followed by exactly one binary frame.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Mapping
+from enum import Enum
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
 # --- client -> server -------------------------------------------------------
 MSG_HELLO = "hello"
+#: Idle local VAD heartbeat, no audio/transcript: defer unsolicited greetings.
+MSG_ROOM_SPEECH = "room_speech"
 MSG_UTTERANCE_START = "utterance_start"
 MSG_UTTERANCE_END = "utterance_end"
 MSG_ACTION_RESULT = "action_result"
+#: Reply to a physical confirmation on the room PC; never an LLM tool result.
+MSG_VOICE_CONFIRMATION_RESULT = "voice_confirmation_result"
 #: v1.1: header announcing the single binary frame with the JPEG screenshot.
 MSG_SCREENSHOT = "screenshot"
 #: v1.1: the client could not capture the screen; no binary frame follows.
@@ -100,15 +121,21 @@ MSG_CAMERA_STATE = "camera_state"
 MSG_CAMERA_FRAME = "camera_frame"
 #: v1.4: the client could not grab a camera frame; no binary frame follows.
 MSG_CAMERA_ERROR = "camera_error"
+MSG_CAMERA_CLIP = "camera_clip"
+MSG_CAMERA_CLIP_ERROR = "camera_clip_error"
 
 # --- server -> client -------------------------------------------------------
 MSG_READY = "ready"
 MSG_TRANSCRIPT = "transcript"
+#: Provisional caption during recording; never authorizes actions or history access.
+MSG_TRANSCRIPT_PARTIAL = "transcript_partial"
 MSG_ACTIONS = "actions"
+MSG_VOICE_CONFIRMATION = "voice_confirmation"
 #: v1.1: ask the client for a screenshot of the room PC's screen.
 MSG_SCREENSHOT_REQUEST = "screenshot_request"
 #: v1.4: ask the client for one frame of the room camera.
 MSG_CAMERA_REQUEST = "camera_request"
+MSG_CAMERA_CLIP_REQUEST = "camera_clip_request"
 MSG_SAY = "say"
 MSG_TTS_START = "tts_start"
 MSG_TTS_END = "tts_end"
@@ -166,6 +193,10 @@ CAMERA_BURST_DEFAULT = 1
 #: cannot turn one request into an unbounded stream of frames.
 CAMERA_BURST_MAX = 5
 
+# Optional hello capability. A clip is one MP4 binary frame, never PCM audio.
+CAP_CAMERA_CLIP = "camera_clip"
+CAMERA_CLIP_MAX_BYTES = 20_000_000
+
 #: Error message the server sends when STT produced nothing (false wake-word).
 ERR_EMPTY_TRANSCRIPT = "empty transcript"
 
@@ -176,25 +207,42 @@ ERR_CLIENT_TIMEOUT = "client timeout"
 CLIENT_MESSAGE_TYPES = frozenset(
     {
         MSG_HELLO,
+        MSG_ROOM_SPEECH,
         MSG_UTTERANCE_START,
         MSG_UTTERANCE_END,
         MSG_ACTION_RESULT,
+        MSG_VOICE_CONFIRMATION_RESULT,
         MSG_SCREENSHOT,
         MSG_SCREENSHOT_ERROR,
         MSG_CAMERA_STATE,
         MSG_CAMERA_FRAME,
         MSG_CAMERA_ERROR,
+        MSG_CAMERA_CLIP,
+        MSG_CAMERA_CLIP_ERROR,
     }
 )
 
 #: Every message type a server may send.
+MSG_CHAT = "chat"
+MSG_INTERRUPT_REQUEST = "interrupt_request"
+MSG_NOTICE = "notice"
+MSG_DISMISS = "dismiss"
+MSG_DISMISSED = "dismissed"
+CLIENT_MESSAGE_TYPES = CLIENT_MESSAGE_TYPES | {MSG_INTERRUPT_REQUEST, MSG_DISMISS}
+
 SERVER_MESSAGE_TYPES = frozenset(
     {
         MSG_READY,
+        MSG_CHAT,
+        MSG_NOTICE,
+        MSG_DISMISSED,
         MSG_TRANSCRIPT,
+        MSG_TRANSCRIPT_PARTIAL,
+        MSG_VOICE_CONFIRMATION,
         MSG_ACTIONS,
         MSG_SCREENSHOT_REQUEST,
         MSG_CAMERA_REQUEST,
+        MSG_CAMERA_CLIP_REQUEST,
         MSG_SAY,
         MSG_TTS_START,
         MSG_TTS_END,
@@ -206,7 +254,13 @@ SERVER_MESSAGE_TYPES = frozenset(
 )
 
 __all__ = [
+    "MSG_DISMISS",
+    "MSG_DISMISSED",
+    "MSG_CHAT",
+    "MSG_NOTICE",
+    "MSG_INTERRUPT_REQUEST",
     "MSG_HELLO",
+    "MSG_ROOM_SPEECH",
     "MSG_UTTERANCE_START",
     "MSG_UTTERANCE_END",
     "MSG_ACTION_RESULT",
@@ -215,6 +269,11 @@ __all__ = [
     "MSG_CAMERA_STATE",
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_ERROR",
+    "MSG_CAMERA_CLIP",
+    "MSG_CAMERA_CLIP_ERROR",
+    "MSG_CAMERA_CLIP_REQUEST",
+    "CAP_CAMERA_CLIP",
+    "CAMERA_CLIP_MAX_BYTES",
     "MSG_READY",
     "MSG_TRANSCRIPT",
     "MSG_ACTIONS",
@@ -244,3 +303,342 @@ __all__ = [
     "CLIENT_MESSAGE_TYPES",
     "SERVER_MESSAGE_TYPES",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Protocol v2 (ТЗ section 13)
+# ---------------------------------------------------------------------------
+# Every v2 text frame carries the same envelope: type, proto (=2), ts (ms),
+# home_id, client_id, seq, plus an optional utterance_id / event_id. The models
+# are strict (extra="forbid") and are collected into a discriminated union on
+# `type`, so an unknown frame is reported as a protocol error instead of being
+# guessed at. Binary frames keep the v1 rule: a binary payload always follows
+# the header that announced it, in the same session, with nothing in between.
+
+#: Current protocol version written into ``hello_ok``.
+PROTOCOL_VERSION = 2
+#: Frames without a ``proto`` field are v1 and stay accepted until phase 2 ends.
+LEGACY_PROTOCOL_VERSION = 1
+
+
+class ProtocolError(ValueError):
+    """A frame could not be parsed; the caller answers with an ``error`` frame."""
+
+
+class ClientKind(str, Enum):
+    ROOM_PC = "room_pc"
+    PHONE = "phone"
+    SENSOR_NODE = "sensor_node"
+
+
+class Role(str, Enum):
+    ADMIN = "admin"
+    TRUSTED = "trusted"
+    USER = "user"
+    GUEST = "guest"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+class Envelope(BaseModel):
+    """Fields every v2 text frame carries (ТЗ section 13)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proto: Literal[2] = 2
+    ts: int = Field(default_factory=_now_ms, ge=0)
+    home_id: str = Field(default="", max_length=100)
+    client_id: str = Field(default="", max_length=100)
+    seq: int = Field(default=0, ge=0)
+    utterance_id: str | None = Field(default=None, max_length=100)
+    event_id: str | None = Field(default=None, max_length=100)
+
+
+class Track(BaseModel):
+    """One person track reported by a client (F-201)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    track_id: str = Field(min_length=1, max_length=100)
+    bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    conf: float = Field(default=0.0, ge=0.0, le=1.0)
+    zone: str = Field(default="", max_length=100)
+    since: float = 0.0
+
+
+class ActionItem(BaseModel):
+    """One tool call the client must execute."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=100)
+    kind: str = Field(min_length=1, max_length=100)
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+# --- client -> server -------------------------------------------------------
+
+
+class Hello(Envelope):
+    type: Literal["hello"] = "hello"
+    token: str = Field(default="", max_length=200)
+    kind: ClientKind = ClientKind.ROOM_PC
+    caps: list[str] = Field(default_factory=list)
+    version: str = Field(default="", max_length=50)
+    hw: str = Field(default="", max_length=200)
+
+
+class UtteranceStart(Envelope):
+    type: Literal["utterance_start"] = "utterance_start"
+    sample_rate: int = Field(default=MIC_SAMPLE_RATE, gt=0)
+    channels: int = Field(default=AUDIO_CHANNELS, gt=0)
+    pre_roll_ms: int = Field(default=0, ge=0)
+
+
+class UtteranceEnd(Envelope):
+    type: Literal["utterance_end"] = "utterance_end"
+
+
+class ActionResult(Envelope):
+    type: Literal["action_result"] = "action_result"
+    action_id: str = Field(min_length=1, max_length=100)
+    ok: bool
+    detail: str = Field(default="", max_length=2000)
+
+
+class Tracks(Envelope):
+    type: Literal["tracks"] = "tracks"
+    tracks: list[Track] = Field(default_factory=list)
+
+
+class BodyCropHeader(Envelope):
+    type: Literal["body_crop"] = "body_crop"
+    track_id: str = Field(min_length=1, max_length=100)
+    kind: Literal["body", "face"] = "body"
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+
+
+class FaceBurstHeader(Envelope):
+    type: Literal["face_burst"] = "face_burst"
+    track_id: str = Field(default="", max_length=100)
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+
+
+class ScreenshotHeader(Envelope):
+    type: Literal["screenshot"] = "screenshot"
+    format: Literal["jpeg"] = "jpeg"
+
+
+class CameraFrameHeader(Envelope):
+    type: Literal["camera_frame"] = "camera_frame"
+    reason: Literal["presence", "request"] = "request"
+    index: int = Field(default=1, ge=1)
+    of: int = Field(default=1, ge=1)
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+
+
+class CameraClipHeader(Envelope):
+    type: Literal["camera_clip"] = "camera_clip"
+    format: Literal["mp4"] = "mp4"
+    bytes: int = Field(default=0, ge=0)
+    w: int = Field(default=0, ge=0)
+    h: int = Field(default=0, ge=0)
+    seconds: float = Field(default=0.0, ge=0.0)
+    fps: int = Field(default=0, ge=0)
+
+
+class SoundEvent(Envelope):
+    type: Literal["sound_event"] = "sound_event"
+    label: str = Field(min_length=1, max_length=100)
+    conf: float = Field(default=0.0, ge=0.0, le=1.0)
+    at_ms: int = Field(default=0, ge=0)
+
+
+class DeviceState(Envelope):
+    type: Literal["device_state"] = "device_state"
+    device_id: str = Field(min_length=1, max_length=100)
+    capability: str = Field(min_length=1, max_length=100)
+    value: Any = None
+
+
+class BargeIn(Envelope):
+    type: Literal["barge_in"] = "barge_in"
+    say_id: str = Field(default="", max_length=100)
+    at_ms: int = Field(default=0, ge=0)
+
+
+class Ping(Envelope):
+    type: Literal["ping"] = "ping"
+
+
+class Pong(Envelope):
+    type: Literal["pong"] = "pong"
+
+
+# --- server -> client -------------------------------------------------------
+
+
+class HelloOk(Envelope):
+    type: Literal["hello_ok"] = "hello_ok"
+    session_id: str = Field(min_length=1, max_length=100)
+    server_version: str = Field(default="", max_length=50)
+    config_rev: int = Field(default=1, ge=0)
+
+
+class HelloErr(Envelope):
+    type: Literal["hello_err"] = "hello_err"
+    code: int = 4401
+    message: str = Field(default="", max_length=500)
+
+
+class Transcript(Envelope):
+    type: Literal["transcript"] = "transcript"
+    text: str = ""
+    partial: bool = False
+    language: str = Field(default="", max_length=20)
+    speaker: str = Field(default="", max_length=100)
+
+
+class Actions(Envelope):
+    type: Literal["actions"] = "actions"
+    actions: list[ActionItem] = Field(default_factory=list)
+
+
+class Say(Envelope):
+    type: Literal["say"] = "say"
+    say_id: str = Field(default="", max_length=100)
+    text: str = ""
+    voice: str = Field(default="", max_length=100)
+    volume: float | None = Field(default=None, ge=0.0, le=1.0)
+    interruptible: bool = True
+
+
+class TtsStart(Envelope):
+    type: Literal["tts_start"] = "tts_start"
+    say_id: str = Field(default="", max_length=100)
+    sample_rate: int = Field(default=48000, gt=0)
+    format: Literal["pcm_s16le"] = "pcm_s16le"
+    channels: int = Field(default=1, gt=0)
+
+
+class TtsEnd(Envelope):
+    type: Literal["tts_end"] = "tts_end"
+    say_id: str = Field(default="", max_length=100)
+
+
+class ListenFollowup(Envelope):
+    type: Literal["listen_followup"] = "listen_followup"
+    window_ms: int = Field(default=0, ge=0)
+
+
+class Identity(Envelope):
+    type: Literal["identity"] = "identity"
+    track_id: str = Field(min_length=1, max_length=100)
+    person_id: str | None = Field(default=None, max_length=100)
+    name: str | None = Field(default=None, max_length=120)
+    p: float = Field(default=0.0, ge=0.0, le=1.0)
+    role: Role = Role.USER
+
+
+class CameraRequest(Envelope):
+    type: Literal["camera_request"] = "camera_request"
+    kind: Literal["frame", "clip"] = "frame"
+    zone: str = Field(default="", max_length=100)
+    burst: int = Field(default=CAMERA_BURST_DEFAULT, ge=1, le=CAMERA_BURST_MAX)
+    full: bool = False
+    clip_seconds: int = Field(default=0, ge=0, le=10)
+
+
+class ScreenshotRequest(Envelope):
+    type: Literal["screenshot_request"] = "screenshot_request"
+
+
+class CameraClipRequest(Envelope):
+    type: Literal["camera_clip_request"] = "camera_clip_request"
+    seconds: int = Field(default=5, ge=3, le=10)
+    fps: int = Field(default=8, ge=5, le=10)
+
+
+class DeviceSet(Envelope):
+    type: Literal["device_set"] = "device_set"
+    device_id: str = Field(min_length=1, max_length=100)
+    capability: str = Field(min_length=1, max_length=100)
+    value: Any = None
+    action_id: str = Field(default="", max_length=100)
+
+
+class Hud(Envelope):
+    type: Literal["hud"] = "hud"
+    kind: Literal["state", "card", "overlay"] = "state"
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConfigUpdate(Envelope):
+    type: Literal["config_update"] = "config_update"
+    config_rev: int = Field(default=1, ge=0)
+    patch: dict[str, Any] = Field(default_factory=dict)
+
+
+class OfflineHint(Envelope):
+    type: Literal["offline_hint"] = "offline_hint"
+    reason: str = Field(default="", max_length=200)
+    eta_s: float = Field(default=0.0, ge=0.0)
+
+
+class Intercom(Envelope):
+    type: Literal["intercom"] = "intercom"
+    from_person: str = Field(default="", max_length=120)
+    text: str = ""
+    audio: str | None = Field(default=None, max_length=500)
+
+
+class ErrorMessage(Envelope):
+    type: Literal["error"] = "error"
+    code: int = 0
+    message: str = Field(default="", max_length=500)
+    ref_seq: int | None = Field(default=None, ge=0)
+
+
+ClientMessage = Annotated[
+    Hello | UtteranceStart | UtteranceEnd | ActionResult | Tracks | BodyCropHeader | FaceBurstHeader | ScreenshotHeader | CameraFrameHeader | CameraClipHeader | SoundEvent | DeviceState | BargeIn | Ping | Pong,
+    Field(discriminator="type"),
+]
+ServerMessage = Annotated[
+    HelloOk | HelloErr | Transcript | Actions | Say | TtsStart | TtsEnd | ListenFollowup | Identity | CameraRequest | ScreenshotRequest | CameraClipRequest | DeviceSet | Hud | ConfigUpdate | OfflineHint | Intercom | ErrorMessage,
+    Field(discriminator="type"),
+]
+
+_CLIENT_ADAPTER: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
+_SERVER_ADAPTER: TypeAdapter[ServerMessage] = TypeAdapter(ServerMessage)
+
+
+def protocol_version(raw: Mapping[str, Any]) -> int:
+    """The frame's protocol version; frames without ``proto`` are v1."""
+    value = raw.get("proto", LEGACY_PROTOCOL_VERSION)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return LEGACY_PROTOCOL_VERSION
+    return value
+
+
+def parse_message(raw: Mapping[str, Any], *, direction: str = "client") -> BaseModel | None:
+    """Parse a v2 frame; return ``None`` for a v1 frame (caller keeps v1 path).
+
+    Raises :class:`ProtocolError` for an unknown or malformed v2 frame. The
+    caller reports it as an ``error`` frame and keeps the connection open.
+    """
+    if not isinstance(raw, Mapping):
+        raise ProtocolError("A control frame must be a JSON object.")
+    if protocol_version(raw) < PROTOCOL_VERSION:
+        return None
+    if direction not in {"client", "server"}:
+        raise ProtocolError(f"Unknown direction {direction!r}.")
+    adapter = _CLIENT_ADAPTER if direction == "client" else _SERVER_ADAPTER
+    try:
+        return adapter.validate_python(dict(raw))
+    except ValidationError as exc:
+        raise ProtocolError(str(exc)) from None

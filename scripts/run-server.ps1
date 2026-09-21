@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Finds the Python of the `jarvis` environment (conda or .venv) and runs
-    `python -m server.main --config <config.yaml>` with the working directory set
+    `python -m hub.main --config <config.yaml>` with the working directory set
     to the repo root, so that the common/ package is importable on both sides.
     Ctrl+C stops the server gracefully.
 
@@ -86,15 +86,15 @@ $python = Resolve-Python
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
-Write-Host "Jarvis server: $python -m server.main --config $Config" -ForegroundColor Cyan
+Write-Host "Jarvis server: $python -m hub.main --config $Config" -ForegroundColor Cyan
 
 Push-Location $RepoRoot
 try {
     if ($ExtraArgs -and $ExtraArgs.Count -gt 0) {
-        & $python -m server.main --config $Config @ExtraArgs
+        & $python -m hub.main --config $Config @ExtraArgs
     }
     else {
-        & $python -m server.main --config $Config
+        & $python -m hub.main --config $Config
     }
     $code = $LASTEXITCODE
 }

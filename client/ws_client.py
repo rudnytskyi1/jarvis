@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Dict, Optional, Union
+from collections.abc import Callable
+from typing import Any, Union
 
 try:  # websockets >= 13 (new asyncio implementation)
     from websockets.asyncio.client import connect as ws_connect
@@ -46,7 +47,7 @@ RECV_TIMEOUT_S = 420.0
 #: connection, which makes the pending ``recv`` raise.
 WAIT_FOREVER = 0.0
 
-Message = Union[Dict[str, Any], bytes]
+Message = Union[dict[str, Any], bytes]
 
 
 class WSDisconnected(Exception):
@@ -59,11 +60,11 @@ class WSClient:
     def __init__(
         self,
         url: str,
-        hello: Dict[str, Any],
+        hello: dict[str, Any],
         reconnect_delay: float = RECONNECT_DELAY_S,
         ready_timeout: float = READY_TIMEOUT_S,
         recv_timeout: float = RECV_TIMEOUT_S,
-        should_stop: Optional[Callable[[], bool]] = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.url = str(url)
         self.hello = dict(hello)
@@ -124,7 +125,7 @@ class WSClient:
                     close_timeout=3,
                     max_size=None,
                 )
-            except (OSError, WebSocketException, asyncio.TimeoutError, TimeoutError) as exc:
+            except (OSError, WebSocketException, TimeoutError) as exc:
                 if not self._announced_failure:
                     log.warning(
                         "No connection to the server %s (%s). Retrying every %.0f s...",
@@ -140,7 +141,7 @@ class WSClient:
             try:
                 await self.send_json(self.hello)
                 await self._await_ready()
-            except (WSDisconnected, asyncio.TimeoutError, TimeoutError) as exc:
+            except (WSDisconnected, TimeoutError) as exc:
                 log.warning("Handshake with the server failed: %s", exc)
                 self._drop()
                 await self._sleep(self.reconnect_delay)
@@ -176,7 +177,7 @@ class WSClient:
             waited += step
 
     # -- I/O -------------------------------------------------------------
-    async def send_json(self, payload: Dict[str, Any]) -> None:
+    async def send_json(self, payload: dict[str, Any]) -> None:
         conn = self._conn
         if conn is None:
             raise WSDisconnected("no connection")
@@ -199,7 +200,7 @@ class WSClient:
             self._drop()
             raise WSDisconnected(f"send failed: {exc}") from exc
 
-    async def recv(self, timeout: Optional[float] = None) -> Message:
+    async def recv(self, timeout: float | None = None) -> Message:
         """Next server message: parsed dict for text frames, bytes for binary.
 
         ``timeout`` is seconds, ``None`` means :data:`RECV_TIMEOUT_S` and
@@ -215,7 +216,7 @@ class WSClient:
                     raw = await conn.recv()
                 else:
                     raw = await asyncio.wait_for(conn.recv(), timeout=wait)
-            except (asyncio.TimeoutError, TimeoutError) as exc:
+            except TimeoutError as exc:
                 self._drop()
                 raise WSDisconnected("the server is not responding") from exc
             except (ConnectionClosed, WebSocketException, OSError, RuntimeError) as exc:

@@ -12,11 +12,12 @@ import json
 import numpy as np
 import pytest
 
-from server.speaker import (
+from hub.speaker import (
     PEOPLE_FILENAME,
     ROLE_UNKNOWN,
     VOICE_KEY,
     VOICE_MODEL_ID,
+    DuplicateVoice,
     VoiceMismatch,
     VoiceRegistry,
 )
@@ -161,11 +162,21 @@ def test_a_consistent_second_sample_is_accepted(tmp_path):
     assert status.startswith("sample 2 stored")
 
 
-def test_a_first_sample_that_already_matches_somebody_else_is_flagged(tmp_path):
+def test_duplicate_voice_is_not_written_under_a_second_name(tmp_path):
     reg = registry(tmp_path, [(1, 0, 0), (1, 0.05, 0)])
     reg.enroll("Anton", PCM, 16000)
-    _, status = reg.enroll("Drew", PCM, 16000)
-    assert "sounds a lot like Anton" in status
+    with pytest.raises(DuplicateVoice) as caught:
+        reg.enroll("Drew", PCM, 16000)
+    assert caught.value.person == 'Anton'
+    assert reg.voice_profiles() == {'Anton': 1}
+    assert VoiceRegistry(data_dir=tmp_path, save_audio=False).voice_profiles() == {'Anton': 1}
+
+
+def test_name_case_does_not_create_a_competing_voice_profile(tmp_path):
+    reg = registry(tmp_path, [(1, 0, 0), (1, .05, 0)])
+    reg.enroll('Anton', PCM, 16000)
+    reg.enroll('anton', PCM, 16000)
+    assert reg.voice_profiles() == {'Anton': 2}
 
 
 def test_a_genuinely_new_voice_is_not_flagged(tmp_path):

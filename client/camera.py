@@ -5,8 +5,8 @@ video:
 
 * an OpenCV capture thread keeps the newest frame of ``cfg.client.camera.index``
   in memory (draining the driver buffer so the frame is always fresh),
-* a second thread runs Ultralytics YOLO (``cfg.client.camera.model``) over that
-  frame ``cfg.client.camera.fps`` times per second and counts the labels it sees
+* a second thread runs Ultralytics YOLO (``cfg.client.camera.model``) over fresh
+  frames, capped by ``cfg.client.camera.fps`` (0 means no software limit), and counts the labels it sees
   with a confidence of at least :data:`CONF_THRESHOLD`,
 * whenever the picture changes it sends ``camera_state`` (debounced, at least
   :data:`STATE_DEBOUNCE_S` apart),
@@ -49,11 +49,14 @@ is held (the user is talking — the server is not looking at faces anyway).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
-from collections.abc import Mapping
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
 
 from common.protocol import (
     CAMERA_BURST_MAX,
@@ -88,7 +91,7 @@ STATE_DEBOUNCE_S = 2.0
 CONF_THRESHOLD = 0.5
 #: Clamp for ``cfg.client.camera.fps``.
 MIN_FPS = 0.2
-MAX_FPS = 30.0
+MAX_FPS = 240.0
 #: A frame older than this is not worth sending to the server any more.
 STALE_FRAME_S = 10.0
 #: How many consecutive failed ``VideoCapture.read()`` calls mean the device is
@@ -106,7 +109,7 @@ BURST_FRAME_INTERVAL_S = 0.25
 #: of a burst (a stalled camera must not hang the whole request).
 FRESH_FRAME_WAIT_S = 0.5
 
-SendJson = Callable[[Dict[str, Any]], Awaitable[None]]
+SendJson = Callable[[dict[str, Any]], Awaitable[None]]
 SendBytes = Callable[[bytes], Awaitable[None]]
 
 __all__ = [
@@ -167,30 +170,51 @@ class CameraService:
     """
 
     def __init__(self, cfg_camera: Any = None) -> None:
+        import uuid
+        self._track_epoch = uuid.uuid4().hex[:10]
+        self._tracks = []
+        self._last_tracks_at = 0.0
         self._enabled = bool(_attr(cfg_camera, "enabled", False))
         self.index = _as_int(_attr(cfg_camera, "index", 0), 0)
-        self.fps = min(MAX_FPS, max(MIN_FPS, _as_float(_attr(cfg_camera, "fps", 5), 5.0)))
+        self.stream_url = str(_attr(cfg_camera, 'stream_url', '') or '').strip()
+        self.width = _as_int(_attr(cfg_camera, 'width', CAPTURE_WIDTH), CAPTURE_WIDTH)
+        self.height = _as_int(_attr(cfg_camera, 'height', CAPTURE_HEIGHT), CAPTURE_HEIGHT)
+        requested_fps = _as_float(_attr(cfg_camera, 'fps', 5), 5.)
+        self.fps = 0. if requested_fps == 0 else min(MAX_FPS, max(MIN_FPS, requested_fps))
+        self.half = bool(_attr(cfg_camera, 'half', True))
+        self._recording_cfg = _attr(cfg_camera, 'frame_recording')
+        self._frame_recorder = None
+        self._archive_error = ''
+        self._captured_count = self._inferred_count = 0
+        self._metrics_at = time.monotonic()
+        self._metrics_captured = self._metrics_inferred = 0
+        self._presence_pending = threading.Event()
         self.model_name = str(_attr(cfg_camera, "model", "yolo11n.pt") or "yolo11n.pt")
         self.face_check_interval_s = max(
-            0.5, _as_float(_attr(cfg_camera, "face_check_interval_s", 5.0), 5.0)
+            0.5, _as_float(_attr(cfg_camera, "face_check_interval_s", 0.5), 0.5)
         )
 
         # --- wiring to the event loop ---
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._send_json: Optional[SendJson] = None
-        self._send_bytes: Optional[SendBytes] = None
-        self._send_lock: Optional[asyncio.Lock] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._send_json: SendJson | None = None
+        self._send_bytes: SendBytes | None = None
+        self._send_lock: asyncio.Lock | None = None
 
         # --- threads ---
         self._stop_event = threading.Event()
         self._capture_ready = threading.Event()
-        self._capture_thread: Optional[threading.Thread] = None
-        self._infer_thread: Optional[threading.Thread] = None
+        self._new_frame = threading.Event()
+        self._capture_thread: threading.Thread | None = None
+        self._infer_thread: threading.Thread | None = None
 
         # --- latest frame ---
         self._frame_lock = threading.Lock()
+        self._clip_lock = threading.Lock()
         self._frame: Any = None
         self._frame_ts = 0.0
+        # One complete inference result, tied to the exact captured image.
+        # Requests must never combine the latest capture with older tracks.
+        self._detected_frame = None
         self._cv2: Any = None
 
         # --- reporting state ---
@@ -198,7 +222,7 @@ class CameraService:
         self._detect_errors = 0
         self._send_errors = 0
         self._frame_seq = 0
-        self._sent_state: Optional[Tuple[int, Tuple[Tuple[str, int], ...]]] = None
+        self._sent_state: tuple[int, tuple[tuple[str, int], ...]] | None = None
         self._sent_state_at = 0.0
         self._last_presence_push = 0.0
 
@@ -238,7 +262,7 @@ class CameraService:
         loop: asyncio.AbstractEventLoop,
         send_json: SendJson,
         send_bytes: SendBytes,
-        send_lock: Optional[asyncio.Lock] = None,
+        send_lock: asyncio.Lock | None = None,
     ) -> bool:
         """Start the capture and detection threads.
 
@@ -290,6 +314,7 @@ class CameraService:
         """Stop both threads and release the device (safe to call twice)."""
         self._stop_event.set()
         self._capture_ready.set()
+        self._new_frame.set()
         for thread in (self._infer_thread, self._capture_thread):
             if thread is None or not thread.is_alive():
                 continue
@@ -300,9 +325,13 @@ class CameraService:
             log.info("Camera service stopped")
         self._capture_thread = None
         self._infer_thread = None
+        if self._frame_recorder is not None:
+            self._frame_recorder.close()
+            self._frame_recorder = None
         with self._frame_lock:
             self._frame = None
             self._frame_ts = 0.0
+            self._detected_frame = None
 
     # ------------------------------------------------------------------
     # lazy imports
@@ -340,16 +369,38 @@ class CameraService:
         the negotiated size is logged so a blurry frame is obvious in the log.
         """
         try:
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
             height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             log.info("Camera %d capturing at %dx%d", self.index, width, height)
+            if hasattr(cv2, 'CAP_PROP_FPS'):
+                log.info('Camera negotiated capture rate: %.1f FPS', capture.get(cv2.CAP_PROP_FPS) or 0)
         except Exception as exc:  # noqa: BLE001 - resolution is best-effort
             log.debug("Could not set the capture resolution: %s", exc)
 
     def _open_capture(self, cv2: Any) -> Any:
         """Open ``cfg.camera.index``, retrying with DirectShow on Windows."""
+        if self.stream_url:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(self.stream_url)
+            if parsed.scheme not in ('rtsp', 'rtsps') or not parsed.hostname:
+                raise CameraUnavailable('camera.stream_url must be an RTSP URL')
+            # FFmpeg reads native resolution. Timeouts bound reconnect/shutdown;
+            # the capture thread continuously drains the stream to limit delay.
+            try:
+                capture = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG, [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2500,
+                ])
+            except Exception:
+                raise CameraUnavailable('Could not open the RTSP camera stream') from None
+            if capture is not None and capture.isOpened():
+                log.info('Network camera connected (RTSP, native resolution)')
+                return capture
+            if capture is not None:
+                capture.release()
+            raise CameraUnavailable('RTSP camera unavailable; check its local address and camera account')
         capture = cv2.VideoCapture(self.index)
         if capture is not None and capture.isOpened():
             self._request_resolution(cv2, capture)
@@ -379,14 +430,26 @@ class CameraService:
 
     def _capture_loop(self) -> None:
         capture = None
+        cv2 = None
         try:
             try:
                 cv2 = self._import_cv2()
                 capture = self._open_capture(cv2)
                 self._cv2 = cv2
             except CameraUnavailable as exc:
-                self._fail(str(exc))
-                return
+                if not self.stream_url or cv2 is None:
+                    self._fail(str(exc))
+                    return
+                log.warning('Network camera unavailable; waiting for it to reconnect')
+                while not self._stop_event.wait(2):
+                    try:
+                        capture = self._open_capture(cv2)
+                        self._cv2 = cv2
+                        break
+                    except CameraUnavailable:
+                        continue
+                if self._stop_event.is_set():
+                    return
             except Exception as exc:  # noqa: BLE001 - never let a driver kill the client
                 self._fail(f"could not start the camera: {exc}")
                 return
@@ -403,7 +466,22 @@ class CameraService:
                     log.debug("Camera read error: %s", exc)
                 if not ok or frame is None:
                     failures += 1
-                    if failures >= MAX_READ_FAILURES:
+                    if failures >= (1 if self.stream_url else MAX_READ_FAILURES):
+                        if self.stream_url:
+                            capture.release()
+                            with self._frame_lock:
+                                self._frame = None
+                                self._frame_ts = 0.0
+                                self._detected_frame = None
+                            log.warning('Network camera disconnected; retrying in 2 seconds')
+                            while not self._stop_event.wait(2):
+                                try:
+                                    capture = self._open_capture(cv2)
+                                    failures = 0
+                                    break
+                                except CameraUnavailable:
+                                    continue
+                            continue
                         self._fail("the camera stopped delivering frames")
                         return
                     self._stop_event.wait(0.2)
@@ -412,10 +490,9 @@ class CameraService:
                 with self._frame_lock:
                     self._frame = frame
                     self._frame_ts = time.monotonic()
-                # The driver queue must stay drained (otherwise every frame we
-                # look at is seconds old), so this loop runs at camera speed and
-                # only yields the GIL for a moment.
-                time.sleep(0.005)
+                    self._captured_count += 1
+                # read() waits for the device; extra sleeps reduce capture FPS.
+                self._new_frame.set()
         finally:
             self._capture_ready.set()
             if capture is not None:
@@ -424,7 +501,7 @@ class CameraService:
                 except Exception as exc:  # pragma: no cover - teardown
                     log.debug("Error while releasing the camera: %s", exc)
 
-    def _latest_frame(self) -> Tuple[Any, float]:
+    def _latest_frame(self) -> tuple[Any, float]:
         """The newest captured frame and its age in seconds (``None``, ``inf``)."""
         with self._frame_lock:
             frame = self._frame
@@ -433,7 +510,7 @@ class CameraService:
             return None, float("inf")
         return frame, max(0.0, time.monotonic() - ts)
 
-    def _latest_frame_ts(self) -> Tuple[Any, float]:
+    def _latest_frame_ts(self) -> tuple[Any, float]:
         """The newest captured frame and its OWN monotonic timestamp (not age).
 
         Used by :meth:`_await_fresh_frame` to tell burst frames apart: an age
@@ -443,7 +520,7 @@ class CameraService:
         with self._frame_lock:
             return self._frame, self._frame_ts
 
-    def _await_fresh_frame(self, newer_than: float) -> Tuple[Any, float]:
+    def _await_fresh_frame(self, newer_than: float) -> tuple[Any, float]:
         """Block briefly for a capture-thread frame newer than ``newer_than``.
 
         One slot of a burst must never resend the same JPEG twice: the capture
@@ -465,7 +542,33 @@ class CameraService:
                 return None, 0.0
             time.sleep(0.02)
 
-    def _capture_burst_sync(self, count: int, full: bool = False) -> list:
+    def _cache_detection(self, frame: Any, captured_at: float) -> None:
+        """Publish a same-frame snapshot from the sole YOLO worker."""
+        with self._frame_lock:
+            self._detected_frame = (frame, captured_at, deepcopy(self._tracks))
+
+    def _await_detected_frame(self, newer_than: float) -> tuple:
+        """Wait briefly for normal inference; never run extra YOLO work.
+
+        Runs in the request's worker thread. If inference is unavailable or
+        slower than the request budget, the caller can still send a fresh
+        capture with unknown tracks instead of borrowing stale detections.
+        """
+        deadline = time.monotonic() + FRESH_FRAME_WAIT_S
+        while not self._stop_event.is_set():
+            with self._frame_lock:
+                detected = self._detected_frame
+            if detected is not None:
+                frame, captured_at, tracks = detected
+                if captured_at > newer_than and time.monotonic() - captured_at <= STALE_FRAME_S:
+                    return frame, captured_at, tracks
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._stop_event.wait(min(.02, remaining))
+        return None, 0.0, None
+
+    def _capture_burst_sync(self, count: int, full: bool = False, include_tracks: bool = False) -> list:
         """Capture up to ``count`` fresh frames ~250 ms apart, JPEG-encoded.
 
         Synchronous by design: called either via ``asyncio.to_thread`` (a
@@ -479,14 +582,22 @@ class CameraService:
         :param full: v1.6 -- skip the usual :data:`MAX_SIDE_PX` downscale for
             every frame of this burst (``find_object`` wants native
             resolution); ``False`` (the default) is the pre-v1.6 behaviour.
-        :returns: ``[(jpeg_bytes, width, height), …]``, shortest at ``[]``.
+        :param include_tracks: prefer a newly captured frame processed by the
+            normal inference worker, with tracks from that exact image.
+        :returns: ``[(jpeg_bytes, width, height), …]``, shortest at ``[]``;
+            ``include_tracks`` adds a fourth item (tracks or ``None``).
         """
         pairs: list = []
-        newer_than = -1.0
+        newer_than = time.monotonic() if include_tracks else -1.0
         for seq in range(1, max(1, count) + 1):
             if seq > 1:
                 time.sleep(BURST_FRAME_INTERVAL_S)
-            frame, ts = self._await_fresh_frame(newer_than)
+            tracks = None
+            frame, ts = None, 0.0
+            if include_tracks:
+                frame, ts, tracks = self._await_detected_frame(newer_than)
+            if frame is None:
+                frame, ts = self._await_fresh_frame(newer_than)
             if frame is None:
                 break
             newer_than = ts
@@ -495,7 +606,8 @@ class CameraService:
             except Exception as exc:  # noqa: BLE001 - encoding must not kill the caller
                 log.debug("Could not encode burst frame %d/%d: %s", seq, count, exc)
                 break
-            pairs.append((jpeg, width, height))
+            pair = (jpeg, width, height)
+            pairs.append((*pair, tracks) if include_tracks else pair)
         return pairs
 
     # ------------------------------------------------------------------
@@ -514,12 +626,27 @@ class CameraService:
         except Exception as exc:  # noqa: BLE001 - weights download / CUDA errors
             self._fail(f"the YOLO model {self.model_name!r} could not be loaded: {exc}")
             return
-        log.info("YOLO model %s loaded - watching the room", self.model_name)
+        log.info('YOLO model %s loaded, CUDA FP16=%s, FPS limit=%s',
+                 self.model_name, self.half, self.fps or 'unlimited')
+        if _attr(self._recording_cfg, 'enabled', False):
+            try:
+                from client.frame_recording import FrameRecorder
+                self._frame_recorder = FrameRecorder(self._recording_cfg, self._cv2)
+            except Exception as exc:
+                self._archive_error = type(exc).__name__
+                log.exception('Camera recording could not start')
 
-        interval = 1.0 / self.fps
+        interval = 1.0 / self.fps if self.fps else 0.
+        last_frame_ts = 0.
         while not self._stop_event.is_set():
             started = time.monotonic()
-            frame, age = self._latest_frame()
+            self._new_frame.clear()
+            frame, frame_ts = self._latest_frame_ts()
+            if frame is None or frame_ts <= last_frame_ts:
+                self._new_frame.wait(.1)
+                continue
+            last_frame_ts = frame_ts
+            age = started - frame_ts
             if frame is not None and age <= STALE_FRAME_S:
                 try:
                     persons, objects = self._detect(model, frame)
@@ -534,23 +661,36 @@ class CameraService:
                         return
                 else:
                     self._detect_errors = 0
+                    self._inferred_count += 1
+                    self._cache_detection(frame, frame_ts)
                     self._publish_state(persons, objects)
                     if persons >= 1:
-                        self._maybe_push_presence()
+                        if self._frame_recorder is not None:
+                            self._frame_recorder.submit(frame, time.time() - (time.monotonic() - frame_ts),
+                                {'persons': persons, 'tracks': list(self._tracks), 'objects': objects,
+                                 'camera_id': 'network' if self.stream_url else f'usb:{self.index}',
+                                 'model': self.model_name}, stop_event=self._stop_event)
+                        self._maybe_push_presence(frame)
+                    self._report_performance()
             remaining = interval - (time.monotonic() - started)
             if remaining > 0:
                 self._stop_event.wait(remaining)
 
-    def _detect(self, model: Any, frame: Any) -> Tuple[int, Dict[str, int]]:
+    def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int]]:
         """Count people and objects in one frame by YOLO class name."""
-        results = model.predict(
+        from pathlib import Path
+        results = model.track(
             source=frame,
+            persist=True,
+            tracker=str(Path(__file__).with_name('room-tracker.yaml')),
             conf=CONF_THRESHOLD,
             verbose=False,
             device=0,
             imgsz=640,
+            half=self.half,
         )
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
+        tracks = []
         for result in results or []:
             names = getattr(result, "names", None) or {}
             boxes = getattr(result, "boxes", None)
@@ -564,19 +704,48 @@ class CameraService:
             conf_list = (
                 confidences.tolist() if hasattr(confidences, "tolist") else list(confidences)
             )
-            for class_id, confidence in zip(class_list, conf_list):
+            ids = boxes.id.tolist() if getattr(boxes, 'id', None) is not None else []
+            positions = boxes.xyxyn.tolist() if getattr(boxes, 'xyxyn', None) is not None else []
+            for box_index, (class_id, confidence) in enumerate(zip(class_list, conf_list)):
                 if float(confidence) < CONF_THRESHOLD:
                     continue
                 index = int(class_id)
                 label = str(names.get(index, index) if isinstance(names, dict) else index)
                 counts[label] = counts.get(label, 0) + 1
+                if label == 'person' and box_index < len(ids):
+                    tracks.append({'id': f'{self._track_epoch}:{int(ids[box_index])}',
+                                   'box': [max(0., min(1., float(v))) for v in positions[box_index]]})
+        self._tracks = tracks
         persons = counts.pop("person", 0)
         return int(persons), counts
+
+    def _report_performance(self):
+        now = time.monotonic()
+        elapsed = now - self._metrics_at
+        if elapsed < 5:
+            return
+        stats = {'ts': time.time(), 'model': self.model_name, 'half': self.half,
+                 'fps_limit': self.fps,
+                 'capture_fps': round((self._captured_count - self._metrics_captured) / elapsed, 2),
+                 'yolo_fps': round((self._inferred_count - self._metrics_inferred) / elapsed, 2),
+                 'captured_frames': self._captured_count, 'processed_frames': self._inferred_count,
+                 'recording': self._frame_recorder.stats() if self._frame_recorder else None,
+                 'archive_error': self._archive_error}
+        self._metrics_at, self._metrics_captured, self._metrics_inferred = now, self._captured_count, self._inferred_count
+        log.info('Camera performance: %s', stats)
+        try:
+            path = Path(__file__).resolve().parents[1] / 'data/camera-performance.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pending = path.with_suffix('.pending')
+            pending.write_text(json.dumps(stats), encoding='utf-8')
+            pending.replace(path)
+        except OSError:
+            log.debug('Could not save camera performance counters', exc_info=True)
 
     # ------------------------------------------------------------------
     # camera_state (SPEC v1.4)
     # ------------------------------------------------------------------
-    def _publish_state(self, persons: int, objects: Dict[str, int]) -> None:
+    def _publish_state(self, persons: int, objects: dict[str, int]) -> None:
         """Send ``camera_state`` when the picture changed, at most every 2 s.
 
         YOLO flickers object counts (a bottle drifting between 1 and 2 across
@@ -590,19 +759,22 @@ class CameraService:
         # debounce window. Counts still ride along in the payload when a real
         # change (new/removed label, person count) is announced.
         key = (int(persons), tuple(sorted(objects.keys())))
-        if key == self._sent_state:
-            return
         now = time.monotonic()
-        if now - self._sent_state_at < STATE_DEBOUNCE_S:
+        heartbeat = now - self._last_tracks_at >= .4
+        if key == self._sent_state and not heartbeat:
+            return
+        if now - self._sent_state_at < STATE_DEBOUNCE_S and not heartbeat:
             # Too soon after the last report: the state is recomputed every tick,
             # so the change is simply announced by one of the next ones. Short
             # flickers (a misdetected chair) never reach the server at all.
             return
         self._sent_state = key
         self._sent_state_at = now
+        self._last_tracks_at = now
         payload = {
             "type": MSG_CAMERA_STATE,
             "persons": int(persons),
+            "tracks": list(self._tracks),
             "objects": {label: int(count) for label, count in sorted(objects.items())},
         }
         # Person-count changes are worth a console line; object-label churn
@@ -617,7 +789,7 @@ class CameraService:
         )
         self._submit(self._send_state(payload))
 
-    async def _send_state(self, payload: Dict[str, Any]) -> None:
+    async def _send_state(self, payload: dict[str, Any]) -> None:
         send_json = self._send_json
         if send_json is None:
             return
@@ -631,15 +803,14 @@ class CameraService:
     # ------------------------------------------------------------------
     # camera_frame (SPEC v1.4)
     # ------------------------------------------------------------------
-    def _maybe_push_presence(self) -> None:
+    def _maybe_push_presence(self, frame=None) -> None:
         """Push a :data:`FACE_BURST`-frame burst while somebody is visible (v1.4 burst).
 
-        Runs on the YOLO worker thread, so the whole burst is captured here
-        synchronously (a few hundred ms of sleeps on a background thread costs
-        nothing) and only the actual SEND is handed to the event loop.
+        JPEG encoding runs off the YOLO thread. At most one presence update is
+        pending; its track boxes are captured together with its source frame.
         """
         now = time.monotonic()
-        if now - self._last_presence_push < self.face_check_interval_s:
+        if self._presence_pending.is_set() or now - self._last_presence_push < self.face_check_interval_s:
             return
         lock = self._send_lock
         if lock is not None and lock.locked():
@@ -650,24 +821,29 @@ class CameraService:
             log.debug("Skipping a presence burst - the socket is busy")
             return
         self._last_presence_push = now
+        self._frame_seq += 1
+        frame_id = f'p{self._frame_seq}'
+        self._presence_pending.set()
+        if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks))) is None:
+            self._presence_pending.clear()
+
+    async def _encode_and_push_presence(self, frame, frame_id, tracks):
         try:
             # full=True: face recognition needs a CRISP face. The old 1280px /
             # quality-80 presence frame made the owner's own face score around
             # the match threshold; a native-resolution frame fixes that at the
             # source instead of lowering the bar.
-            pairs = self._capture_burst_sync(FACE_BURST, full=True)
+            pairs = ([await asyncio.to_thread(self._encode, frame, full=True)] if frame is not None
+                     else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
+            if pairs:
+                await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True, tracks=tracks)
         except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the thread
             log.debug("Could not capture the presence burst: %s", exc)
             return
-        if not pairs:
-            return
-        self._frame_seq += 1
-        frame_id = f"p{self._frame_seq}"
-        self._submit(
-            self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True)
-        )
+        finally:
+            self._presence_pending.clear()
 
-    def _encode(self, frame: Any, full: bool = False) -> Tuple[bytes, int, int]:
+    def _encode(self, frame: Any, full: bool = False) -> tuple[bytes, int, int]:
         """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80.
 
         :param full: v1.6 -- skip the downscale entirely for this frame
@@ -699,6 +875,7 @@ class CameraService:
         reason: str,
         pairs: list,
         skip_if_busy: bool = False,
+        tracks=None,
     ) -> None:
         """Send ``pairs`` as that many ``camera_frame`` header+binary pairs.
 
@@ -722,15 +899,19 @@ class CameraService:
         )
         try:
             if lock is None:
-                for seq, (jpeg, width, height) in enumerate(pairs, start=1):
+                for seq, pair in enumerate(pairs, start=1):
+                    jpeg, width, height = pair[:3]
+                    frame_tracks = pair[3] if len(pair) > 3 else tracks
                     await self._send_pair(
-                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height
+                        send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height, frame_tracks
                     )
             else:
                 async with lock:
-                    for seq, (jpeg, width, height) in enumerate(pairs, start=1):
+                    for seq, pair in enumerate(pairs, start=1):
+                        jpeg, width, height = pair[:3]
+                        frame_tracks = pair[3] if len(pair) > 3 else tracks
                         await self._send_pair(
-                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height
+                            send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height, frame_tracks
                         )
         except asyncio.CancelledError:
             raise
@@ -748,6 +929,7 @@ class CameraService:
         jpeg: bytes,
         width: int,
         height: int,
+        tracks=None,
     ) -> None:
         """Send one ``camera_frame`` header plus its single binary frame."""
         header = {
@@ -759,6 +941,7 @@ class CameraService:
             "h": int(height),
             "seq": int(seq),
             "of": int(total),
+            "tracks": tracks,
         }
         log.debug(
             "Sending camera frame %s (%s) %d/%d: %dx%d, %d bytes",
@@ -802,6 +985,8 @@ class CameraService:
         ``request_id`` -- all under one hold of the wire lock -- each header
         carrying ``seq``/``of``. ``burst=1`` (the default, and every pre-burst
         caller) behaves exactly as the single-frame request always did.
+        Each frame carries its own YOLO tracks when normal inference delivers
+        a fresh result in time; otherwise tracks are unknown (``None``).
 
         :param full: v1.6 -- honor the request's ``"full": true`` (skip the
             usual downscale for every frame of this pull; ``find_object``
@@ -820,7 +1005,7 @@ class CameraService:
         count = max(1, min(_as_int(burst, 1), CAMERA_BURST_MAX))
 
         try:
-            pairs = await asyncio.to_thread(self._capture_burst_sync, count, full)
+            pairs = await asyncio.to_thread(self._capture_burst_sync, count, full, include_tracks=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - capture/encoding must not kill the client
@@ -847,7 +1032,7 @@ class CameraService:
     # ------------------------------------------------------------------
     # thread -> event loop
     # ------------------------------------------------------------------
-    def _submit(self, coro: Awaitable[None]) -> None:
+    def _submit(self, coro: Awaitable[None]) -> Any:
         """Run a coroutine on the client's loop from a worker thread."""
         loop = self._loop
         if loop is None or loop.is_closed() or self._stop_event.is_set():
@@ -864,6 +1049,7 @@ class CameraService:
                 close()
             return
         future.add_done_callback(self._drain_future)
+        return future
 
     @staticmethod
     def _drain_future(future: Any) -> None:

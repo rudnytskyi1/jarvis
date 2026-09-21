@@ -9,7 +9,7 @@ network, no event loop surprises - same ``asyncio.run`` pattern
 import asyncio
 from types import SimpleNamespace
 
-from server.llm import (
+from hub.llm import (
     FORCE_LOOK_MESSAGE,
     VISION_TOOLS,
     LlmClient,
@@ -17,7 +17,6 @@ from server.llm import (
     ToolCall,
     contains_sight_claim,
 )
-
 
 # --------------------------------------------------------------------- contains_sight_claim
 
@@ -162,3 +161,10 @@ def test_no_retry_when_no_rounds_remain():
 def test_force_look_message_mentions_the_right_tools():
     assert "look_at_camera" in FORCE_LOOK_MESSAGE
     assert "look_at_screen" in FORCE_LOOK_MESSAGE
+
+
+def test_generated_photo_confirmation_does_not_trigger_a_screenshot():
+    calls = [ToolCall(id='1', name='generate_image', arguments={'source': 'none', 'prompt': 'A green square'})]
+    result = run_generate_with_script([('', calls), ("It's up on the screen now.", [])])
+    assert result.text == "It's up on the screen now."
+    assert result.rounds == 2

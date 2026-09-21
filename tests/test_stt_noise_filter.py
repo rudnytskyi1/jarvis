@@ -6,7 +6,7 @@ Pure-python: fake ``Segment``-like objects (``SimpleNamespace`` with the same
 """
 from types import SimpleNamespace
 
-from server.stt import (
+from hub.stt import (
     COMPRESSION_RATIO_THRESHOLD,
     LOG_PROB_THRESHOLD,
     LOGPROB_MIN,
@@ -40,6 +40,20 @@ def test_single_segment_with_high_no_speech_prob_is_dropped():
     # speech there at all.
     segments = [seg("thank you", avg_logprob=-0.3, no_speech_prob=0.9)]
     assert is_probable_noise(segments)
+
+
+def test_confident_real_sentence_survives_false_high_no_speech_score():
+    assert not is_probable_noise([seg(
+        'Rowan please help me find information open applications and answer questions throughout the day',
+        avg_logprob=-.35, no_speech_prob=.79)])
+
+
+def test_long_uncertain_high_no_speech_still_rejected():
+    assert is_probable_noise([seg('I broke my hair today', avg_logprob=-.77, no_speech_prob=.77)])
+
+
+def test_confident_sentence_cannot_hide_uncertain_negation_segment():
+    assert is_probable_noise([seg('Rowan close the browser please', -.2, .79), seg('do not', -.8, .9)])
 
 
 def test_one_bad_segment_among_good_ones_is_dropped_by_the_max_check():
@@ -92,7 +106,7 @@ def test_transcribe_pcm_passes_the_tuned_thresholds_to_whisper():
     """Fake the model to inspect the kwargs, without loading a real one."""
     import numpy as np
 
-    from server.stt import SttEngine
+    from hub.stt import SttEngine
 
     engine = SttEngine.__new__(SttEngine)  # skip __init__: no real WhisperModel load
 
@@ -107,6 +121,7 @@ def test_transcribe_pcm_passes_the_tuned_thresholds_to_whisper():
     engine._model = _FakeModel()
     engine.allowed_languages = []
     engine.default_language = None
+    engine.hotwords = 'Rowan'
 
     text, language = engine.transcribe_pcm(
         (np.array([1000, -1000] * 8000, dtype="<i2")).tobytes(), sample_rate=16000
@@ -119,13 +134,14 @@ def test_transcribe_pcm_passes_the_tuned_thresholds_to_whisper():
     assert captured["compression_ratio_threshold"] == COMPRESSION_RATIO_THRESHOLD
     assert captured["vad_filter"] is True
     assert captured["condition_on_previous_text"] is False
+    assert captured['hotwords'] == 'Rowan'
 
 
 def test_transcribe_pcm_drops_a_noisy_transcript_end_to_end():
     """Same fake-model wiring, but the segments look like a hallucination."""
     import numpy as np
 
-    from server.stt import SttEngine
+    from hub.stt import SttEngine
 
     engine = SttEngine.__new__(SttEngine)
 
@@ -145,3 +161,20 @@ def test_transcribe_pcm_drops_a_noisy_transcript_end_to_end():
     # SPEC: the whole transcript is dropped - app.py's empty-transcript path.
     assert text == ""
     assert language == "en"
+
+
+def test_detailed_transcript_has_original_word_timestamps():
+    from hub.stt import SttEngine
+    engine = SttEngine.__new__(SttEngine)
+    engine.allowed_languages = []
+    engine.default_language = None
+    segment = seg("hello there")
+    segment.words = [SimpleNamespace(start=.5, end=.8, word=" hello"),
+                     SimpleNamespace(start=.8, end=1., word=" there")]
+    def transcribe(audio, language=None, **kwargs):
+        assert kwargs["word_timestamps"] is True
+        return [segment], SimpleNamespace(language="en")
+    engine._model = SimpleNamespace(transcribe=transcribe)
+    result = engine.transcribe_detailed(b"\0" * 32000)
+    assert result.text == "hello there"
+    assert [(w.start, w.end, w.text) for w in result.words] == [(.5, .8, " hello"), (.8, 1., " there")]

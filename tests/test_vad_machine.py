@@ -1,8 +1,6 @@
 """VadRecorder state machine with a mocked webrtcvad classifier."""
 import asyncio
 
-import pytest
-
 from client.vad import VadRecorder
 
 FRAME = b"\x00" * 960  # 30 ms @ 16 kHz s16le

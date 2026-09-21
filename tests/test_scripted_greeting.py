@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from server.app import (
+from hub.app import (
     LABEL_UNKNOWN,
     SCRIPTED_GREETING_KNOWN,
     SCRIPTED_GREETING_UNKNOWN,

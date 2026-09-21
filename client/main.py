@@ -52,16 +52,37 @@ import logging
 import math
 import signal
 import sys
-from collections.abc import Mapping
+import time
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from client.actions.dispatcher import Dispatcher
+from client.attention import followup_seconds
+from client.audio import (
+    BEEP_FREQ_HZ,
+    BEEP_MS,
+    ERROR_BEEP_FREQ_HZ,
+    ERROR_BEEP_MS,
+    FRAME_MS,
+    SAMPLE_WIDTH,
+    AudioInput,
+    AudioOutput,
+    RingBuffer,
+    frame_bytes,
+)
+from client.devices.registry import build_registry
+from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
+from client.vad import VadRecorder
+from client.voice_controls import ConfirmedWakeDetector, SilenceDetector
+from client.wakeword import WakeWordDetector
+from client.ws_client import WAIT_FOREVER, WSClient, WSDisconnected
 from common import protocol as _protocol
-from common.config import load_config
+from common.client_config import load_client_config as load_config
 from common.protocol import (
     MSG_ACTION_RESULT,
     MSG_ACTIONS,
@@ -83,32 +104,14 @@ from common.protocol import (
     MSG_UTTERANCE_END,
     MSG_UTTERANCE_START,
 )
-
-from client.actions.dispatcher import Dispatcher
-from client.audio import (
-    BEEP_FREQ_HZ,
-    BEEP_MS,
-    ERROR_BEEP_FREQ_HZ,
-    ERROR_BEEP_MS,
-    FRAME_MS,
-    SAMPLE_WIDTH,
-    AudioInput,
-    AudioOutput,
-    RingBuffer,
-    frame_bytes,
-)
-from client.devices.registry import build_registry
-from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
-from client.vad import VadRecorder
-from client.wakeword import WakeWordDetector
-from client.ws_client import WAIT_FOREVER, WSClient, WSDisconnected
+from common.voice_commands import mentions_silence_command
 
 log = logging.getLogger("client")
 
 #: The camera stack (OpenCV + Ultralytics) is optional and lives behind lazy
 #: imports, but even importing this thin module must not be able to stop the
 #: voice client — a broken checkout simply means "no camera on this machine".
-_CAMERA_IMPORT_ERROR: Optional[str] = None
+_CAMERA_IMPORT_ERROR: str | None = None
 try:
     from client.camera import CameraService
 except Exception as _camera_exc:  # noqa: BLE001 - pragma: no cover
@@ -118,7 +121,7 @@ except Exception as _camera_exc:  # noqa: BLE001 - pragma: no cover
 #: v1.6: the detections-photo viewer only lazily touches cv2 (inside its own
 #: methods), but the import is still guarded the same way as the camera
 #: stack — a broken checkout must never be able to stop the voice client.
-_VIEWER_IMPORT_ERROR: Optional[str] = None
+_VIEWER_IMPORT_ERROR: str | None = None
 try:
     from client.viewer import ImageViewer
 except Exception as _viewer_exc:  # noqa: BLE001 - pragma: no cover
@@ -127,7 +130,7 @@ except Exception as _viewer_exc:  # noqa: BLE001 - pragma: no cover
 
 #: The sci-fi HUD overlay (Tkinter). Optional and self-disabling; a missing
 #: display or tk never touches the voice client.
-_OVERLAY_IMPORT_ERROR: Optional[str] = None
+_OVERLAY_IMPORT_ERROR: str | None = None
 try:
     from client.overlay import OverlayHUD
 except Exception as _overlay_exc:  # noqa: BLE001 - pragma: no cover
@@ -183,6 +186,7 @@ RESULT_ERROR = "error"
 #: The user said the wake word while the reply was playing: playback was cut
 #: and the client goes straight back to listening.
 RESULT_BARGE_IN = "barge_in"
+RESULT_DISMISSED = "dismissed"
 
 #: Routing modes of the reader task (v1.4). The conversation loop owns the flag.
 #: ``idle`` — proactive audio is played and camera/screen requests answered;
@@ -212,6 +216,12 @@ class _NoOverlay:
 
     enabled = False
 
+    def suspend_capture(self, timeout=2.0):
+        return True
+
+    def confirm_voice(self, name, callback):
+        callback(False)
+
     def __getattr__(self, _name: str):  # pragma: no cover - trivial
         def _noop(*_a, **_k):
             return None
@@ -220,6 +230,10 @@ class _NoOverlay:
 
 class _Stopping(Exception):
     """Internal: Ctrl+C was pressed, unwind the audio loops."""
+
+
+class _Dismissed(Exception):
+    """The user requested silence, with no follow-up recording."""
 
 
 class _BargedIn(Exception):
@@ -241,14 +255,14 @@ def _attr(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-def _opt_str(value: Any) -> Optional[str]:
+def _opt_str(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
 
 
-def clip_output(value: Any) -> Optional[str]:
+def clip_output(value: Any) -> str | None:
     """Normalise the dispatcher's ``output`` for ``action_result`` (SPEC §4).
 
     ``None``/empty stays ``None``; anything longer than :data:`MAX_OUTPUT_CHARS`
@@ -265,9 +279,9 @@ def clip_output(value: Any) -> Optional[str]:
     return text
 
 
-def build_hello(cfg_client: Any) -> Dict[str, Any]:
+def build_hello(cfg_client: Any) -> dict[str, Any]:
     """Build the ``hello`` payload from the client config (SPEC §4.1)."""
-    devices: List[Dict[str, Any]] = []
+    devices: list[dict[str, Any]] = []
     for dev in (_attr(cfg_client, "devices") or []):
         name = _opt_str(_attr(dev, "name"))
         if not name:
@@ -283,6 +297,9 @@ def build_hello(cfg_client: Any) -> Dict[str, Any]:
     return {
         "type": MSG_HELLO,
         "client_id": str(_attr(cfg_client, "client_id") or "client"),
+        "workplace_name": str(_attr(cfg_client, 'workplace_name') or _attr(cfg_client, 'client_id') or 'client'),
+        "camera_name": str(_attr(_attr(cfg_client, 'camera'), 'name') or 'Основная камера'),
+        "capabilities": ["voice_confirmation", "live_transcript", _protocol.CAP_CAMERA_CLIP],
         "devices": devices,
     }
 
@@ -310,10 +327,20 @@ class JarvisClient:
         self.sample_rate = int(audio_cfg.sample_rate)
         self.frame_ms = FRAME_MS
         self.frame_bytes = frame_bytes(self.sample_rate, self.frame_ms)
+        processor = None
+        if getattr(audio_cfg, 'echo_cancellation', False) or getattr(audio_cfg, 'noise_suppression', False):
+            from client.audio_processing import AudioPreprocessor
+            processor = AudioPreprocessor(
+                self.sample_rate, echo_cancellation=getattr(audio_cfg, 'echo_cancellation', False),
+                noise_suppression=getattr(audio_cfg, 'noise_suppression', False),
+                ns_level=getattr(audio_cfg, 'noise_suppression_level', 1),
+                output_device=audio_cfg.output_device,
+            )
         self.audio_in = AudioInput(
             device=audio_cfg.input_device,
             sample_rate=self.sample_rate,
             frame_ms=self.frame_ms,
+            processor=processor,
         )
         self.audio_out = AudioOutput(
             device=audio_cfg.output_device,
@@ -330,15 +357,34 @@ class JarvisClient:
             frame_ms=self.frame_ms,
             pre_roll_ms=pre_roll_ms,
             min_speech_ms=int(getattr(vad_cfg, "min_speech_ms", 250)),
+            energy_endpoint=True,
         )
-        self.preroll = RingBuffer(int(math.ceil(pre_roll_ms / float(self.frame_ms))))
+        self.preroll = RingBuffer(int(math.ceil(max(2200, pre_roll_ms) / float(self.frame_ms))))
 
         self.followup_window_s = float(_attr(self.ccfg, "followup_window_s") or 0.0)
+        self.attention_mode = str(_attr(self.ccfg, "attention_mode") or "wake_word")
+        self._last_room_speech_notice = 0.0
         raw_thinking = _attr(self.ccfg, "thinking_sounds")
         self.thinking_sounds = True if raw_thinking is None else bool(raw_thinking)
-        self._thinking_task: Optional[asyncio.Task] = None
-        self._barge_task: Optional[asyncio.Task] = None
+        self._thinking_task: asyncio.Task | None = None
+        self._barge_task: asyncio.Task | None = None
         self._barged = False
+        self._interrupt_id = ''
+        self._notice_tts = False
+        self._enrollment_until = 0.0
+        self._live_turn_id = ''
+        self._recording_live = False
+        self._selection_until = 0.0
+        self._quiet_turn = False
+        self._dismiss_task = None
+        self._dismiss_id = ''
+        self._dismiss_ack = asyncio.Event()
+        self.silence = None
+        self._wake_muted = False
+        self._silence_muted = False
+        self.enrollment_vad = VadRecorder(aggressiveness=int(vad_cfg.aggressiveness), silence_ms=4000,
+                                          max_utterance_s=45, sample_rate=self.sample_rate,
+                                          pre_roll_ms=pre_roll_ms, min_speech_ms=250)
 
         self.registry = build_registry(self.ccfg)
         self.dispatcher = Dispatcher(self.ccfg, self.registry)
@@ -348,9 +394,9 @@ class JarvisClient:
             should_stop=lambda: self._stopping,
         )
 
-        self.wake: Optional[WakeWordDetector] = None
+        self.wake: ConfirmedWakeDetector | None = None
         self._started = False
-        self._action_task: Optional[asyncio.Task] = None
+        self._action_task: asyncio.Task | None = None
         self._tts_active = False
         self._tts_bytes = 0
         self._last_say = ""
@@ -376,9 +422,10 @@ class JarvisClient:
 
         # -- v1.4: one reader task owns the socket -----------------------
         #: Messages belonging to the utterance in flight (text and binary).
-        self._inbox: "asyncio.Queue[Any]" = asyncio.Queue()
+        self._inbox: asyncio.Queue[Any] = asyncio.Queue()
         self._mode = MODE_IDLE
-        self._reader_task: Optional[asyncio.Task] = None
+        self._reader_task: asyncio.Task | None = None
+        self._camera_clip_task: asyncio.Task | None = None
         #: Held around every header+binary pair we send, and for the whole
         #: duration of a streamed utterance: the server routes incoming binary
         #: frames by the header that announced them, so a camera JPEG must never
@@ -390,10 +437,10 @@ class JarvisClient:
         self._idle_tts_bytes = 0
         self._idle_interrupted = False     # the wake word cut the greeting
         self._idle_playing = False         # audio still queued for the speaker
-        self._idle_drain_task: Optional[asyncio.Task] = None
+        self._idle_drain_task: asyncio.Task | None = None
 
         camera_cfg = _attr(self.ccfg, "camera")
-        self.camera: Optional[Any] = None
+        self.camera: Any | None = None
         if CameraService is None:
             log.debug("Camera support is not importable: %s", _CAMERA_IMPORT_ERROR)
         elif camera_cfg is None:
@@ -402,7 +449,7 @@ class JarvisClient:
             self.camera = CameraService(camera_cfg)
 
         # -- v1.6: detections photo (find_object's image_show) -------------
-        self.viewer: Optional[Any] = ImageViewer() if ImageViewer is not None else None
+        self.viewer: Any | None = ImageViewer() if ImageViewer is not None else None
         if self.viewer is None:
             log.debug("The detections viewer is not importable: %s", _VIEWER_IMPORT_ERROR)
 
@@ -413,7 +460,7 @@ class JarvisClient:
             log.debug("The overlay HUD is not importable: %s", _OVERLAY_IMPORT_ERROR)
             self.overlay = _NoOverlay()
         #: The image_show header awaiting its single binary JPEG frame.
-        self._pending_image_show: Optional[Dict[str, Any]] = None
+        self._pending_image_show: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # setup / teardown
@@ -437,13 +484,18 @@ class JarvisClient:
         if not phrases:
             phrases = [str(wake_cfg.word)]
         model_path = resolve_path(wake_cfg.vosk_model)
-        self.wake = await asyncio.to_thread(
+        wake = await asyncio.to_thread(
             WakeWordDetector, model_path, phrases, self.sample_rate
         )
+        self.silence = await asyncio.to_thread(
+            SilenceDetector, wake, REPO_ROOT / 'models' / 'vosk-model-small-ru-0.22'
+        )
+        self.wake = await asyncio.to_thread(ConfirmedWakeDetector, wake)
 
     async def _shutdown(self) -> None:
         self._stopping = True
         await self._stop_reader()
+        await self._cancel_task(self._dismiss_task, 'silence acknowledgement')
         await self._cancel_task(self._idle_drain_task, "proactive playback")
         self._idle_drain_task = None
         camera = self.camera
@@ -472,6 +524,10 @@ class JarvisClient:
             except Exception as exc:  # pragma: no cover - teardown
                 log.debug("Error while finishing actions: %s", exc)
         try:
+            await self.dispatcher.browser.close()
+        except Exception as exc:
+            log.debug('Error closing the Rowan browser: %s', exc)
+        try:
             self.audio_in.close()
         except Exception as exc:  # pragma: no cover - teardown
             log.debug("Error while closing the microphone: %s", exc)
@@ -487,7 +543,7 @@ class JarvisClient:
             log.info("Client stopped")
 
     @staticmethod
-    async def _cancel_task(task: Optional[asyncio.Task], what: str) -> None:
+    async def _cancel_task(task: asyncio.Task | None, what: str) -> None:
         """Cancel a helper task and swallow whatever it ends with."""
         if task is None or task.done():
             return
@@ -582,8 +638,11 @@ class JarvisClient:
         log.debug("The socket reader task is running")
 
     async def _stop_reader(self) -> None:
+        self._recording_live = False
         task, self._reader_task = self._reader_task, None
         await self._cancel_task(task, "socket reader")
+        clip, self._camera_clip_task = getattr(self, '_camera_clip_task', None), None
+        await self._cancel_task(clip, 'camera clip')
         self._idle_stream_active = False
         self._idle_tts_active = False
         # v1.6: an image_show header with no binary yet must not survive a
@@ -631,6 +690,27 @@ class JarvisClient:
 
     async def _route_message(self, msg: Any) -> None:
         """Send one server message where it belongs (see the module docstring)."""
+        if isinstance(msg, dict) and msg.get('type') == _protocol.MSG_CAMERA_CLIP_REQUEST:
+            # A 3–10 s recording must never occupy the sole socket reader.
+            task = getattr(self, '_camera_clip_task', None)
+            if task is not None and not task.done():
+                await self.ws.send_json({'type': _protocol.MSG_CAMERA_CLIP_ERROR,
+                    'id': str(msg.get('id') or '')[:100], 'error': 'A camera clip is already in progress.'})
+            else:
+                self._camera_clip_task = asyncio.create_task(self._handle_camera_clip_request(msg))
+            return
+        if isinstance(msg, dict) and msg.get('type') == _protocol.MSG_DISMISSED:
+            request_id = str(msg.get('id') or '')
+            if not request_id or request_id == self._dismiss_id:
+                self._silence_locally()
+                self._dismiss_ack.set()
+            return
+        if getattr(self, '_quiet_turn', False):
+            # Camera presence may continue; no stale speech, action or overlay
+            # update is allowed to revive a dismissed conversation.
+            if isinstance(msg, dict) and msg.get('type') == MSG_CAMERA_REQUEST:
+                await self._handle_camera_request(msg)
+            return
         if isinstance(msg, bytes):
             if self._pending_image_show is not None:
                 # v1.6: the JPEG announced by an image_show header, in EITHER
@@ -645,6 +725,11 @@ class JarvisClient:
             return
 
         mtype = msg.get("type")
+        if mtype == _protocol.MSG_TRANSCRIPT_PARTIAL:
+            if (getattr(self, '_recording_live', False)
+                    and msg.get('utterance_id') == self._live_turn_id):
+                self.overlay.transcript(msg)
+            return
         if mtype == MSG_IMAGE_SHOW:
             # v1.6: handled directly here, in both idle and conversation mode -
             # the header just announces the ONE binary frame that follows it.
@@ -679,9 +764,14 @@ class JarvisClient:
             return
         await self._handle_idle_message(mtype, msg)
 
-    async def _handle_idle_message(self, mtype: Any, msg: Dict[str, Any]) -> None:
+    async def _handle_idle_message(self, mtype: Any, msg: dict[str, Any]) -> None:
         """Handle a message that arrived between utterances (SPEC v1.4)."""
-        if mtype == MSG_SAY:
+        if mtype == _protocol.MSG_NOTICE:
+            self._interrupt_id = str(msg.get('id') or '')
+            self._show_status(str(msg.get('text') or ''), 45)
+        elif mtype == _protocol.MSG_CHAT:
+            self.overlay.chat(msg)
+        elif mtype == MSG_SAY:
             self._last_say = str(msg.get("text") or "").strip()
             log.info("Unprompted message: %s", self._last_say or "(empty)")
         elif mtype == MSG_TTS_START:
@@ -725,7 +815,7 @@ class JarvisClient:
             if self._mode == MODE_IDLE:
                 self.overlay.set_state("idle")
 
-    def _on_speaker_message(self, msg: Dict[str, Any]) -> None:
+    def _on_speaker_message(self, msg: dict[str, Any]) -> None:
         """MSG_SPEAKER: put the recognised person's name in the middle of the TV.
 
         Cleared when the turn ends, so a name is only ever on screen while it
@@ -739,7 +829,7 @@ class JarvisClient:
         log.info("Recognised speaker: %s (%.2f)", name or "(nobody)", score)
         self.overlay.speaker(name)
 
-    def _on_status_message(self, msg: Dict[str, Any], in_conversation: bool) -> None:
+    def _on_status_message(self, msg: dict[str, Any], in_conversation: bool) -> None:
         """MSG_STATUS: a caption for background work, e.g. face enrollment photos.
 
         Between turns the HUD is normally dark, so a caption alone would float
@@ -764,7 +854,7 @@ class JarvisClient:
 
     # -- proactive playback (greetings): only ever while idle ----------------
 
-    async def _on_idle_tts_start(self, msg: Dict[str, Any]) -> None:
+    async def _on_idle_tts_start(self, msg: dict[str, Any]) -> None:
         sample_rate = int(msg.get("sr") or self.sample_rate)
         fmt = str(msg.get("format") or PCM_FORMAT)
         channels = int(msg.get("channels") or CHANNELS)
@@ -785,6 +875,9 @@ class JarvisClient:
             self._idle_tts_active = False
             return
         self._idle_tts_active = True
+        if getattr(self, '_quiet_turn', False):
+            self._idle_tts_active = self._idle_stream_active = False
+            return
         self._idle_playing = True
         self.overlay.set_state("speaking")
         log.info("Playing an unprompted message (%d Hz)", sample_rate)
@@ -824,7 +917,7 @@ class JarvisClient:
                 interrupted = self._idle_interrupted
                 self._idle_playing = False
                 self._idle_interrupted = False
-                if not interrupted and self._idle_tts_bytes:
+                if not interrupted and self._idle_tts_bytes and self.attention_mode == "window":
                     # The greeting asked a question: give the person a window to
                     # simply answer instead of demanding the wake word first.
                     self._proactive_listen_s = PROACTIVE_LISTEN_S
@@ -874,21 +967,23 @@ class JarvisClient:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(getattr(self.ws, "recv_timeout", 420.0))
         while True:
+            if getattr(self, '_quiet_turn', False):
+                raise _Dismissed()
             try:
                 item = await asyncio.wait_for(self._inbox.get(), timeout=INBOX_POLL_S)
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 if self._stopping:
-                    raise _Stopping()
+                    raise _Stopping() from None
                 if self._barged:
                     # Checked HERE, inside the wait, not between messages: a
                     # server that is wedged never sends another message, and
                     # the owner is standing in the room repeating the name.
-                    raise _BargedIn()
+                    raise _BargedIn() from None
                 if not self._reader_alive() and self._inbox.empty():
-                    raise WSDisconnected("the connection was lost while waiting for the reply")
+                    raise WSDisconnected("the connection was lost while waiting for the reply") from None
                 if loop.time() >= deadline:
                     self.ws.drop()
-                    raise WSDisconnected("the server is not responding")
+                    raise WSDisconnected("the server is not responding") from None
                 continue
             if item is LINK_DOWN:
                 raise WSDisconnected("the connection was lost while waiting for the reply")
@@ -904,9 +999,10 @@ class JarvisClient:
         self.preroll.clear()
         await self._beep(BEEP_FREQ_HZ, BEEP_MS)
         pre_roll += self._drain_beep_window()
-        lead_in: Optional[float] = proactive if proactive > 0 else None
+        lead_in: float | None = proactive if proactive > 0 else None
+        verify_wake = proactive <= 0 and self.attention_mode == 'wake_word'
         while not self._stopping:
-            result = await self._handle_utterance(pre_roll, lead_in)
+            result = await self._handle_utterance(pre_roll, lead_in, verify_wake=verify_wake)
             if result == RESULT_BARGE_IN:
                 # The wake word cut the turn short: drop whatever the abandoned
                 # reply left in the inbox, acknowledge, and listen for the new
@@ -924,17 +1020,19 @@ class JarvisClient:
                 await self._beep(BEEP_FREQ_HZ, BEEP_MS)
                 pre_roll = self._drain_beep_window()
                 lead_in = None
+                verify_wake = False
                 continue
             # SPEC §4: the server may ask for a longer follow-up window via
             # say.listen_s (voice enrollment needs room to keep talking).
             hint = self._listen_hint_s
             self._listen_hint_s = 0.0
-            window = max(self.followup_window_s, hint)
+            window = followup_seconds(self.attention_mode, self.followup_window_s, hint)
             if result != RESULT_OK or window <= 0:
                 self.overlay.set_state("idle")
                 return
             pre_roll = b""
             lead_in = window
+            verify_wake = False
             await asyncio.sleep(FOLLOWUP_ECHO_GUARD_S)
             self.audio_in.clear()
             self.overlay.set_state("listening")
@@ -951,7 +1049,7 @@ class JarvisClient:
         our own tone at the very end. Keep the former, drop the latter — feeding
         the beep to the VAD would make every false trigger look like speech.
         """
-        frames: List[bytes] = []
+        frames: list[bytes] = []
         while True:
             frame = self.audio_in.read_frame_nowait()
             if frame is None:
@@ -973,6 +1071,9 @@ class JarvisClient:
         self.preroll.clear()
         self.audio_in.clear()
         self.wake.reset()
+        if self.silence:
+            self.silence.reset()
+        silence_active = False
         while not self._stopping:
             if not self.ws.connected or not self._reader_alive():
                 log.info("No connection to the server - reconnecting...")
@@ -981,6 +1082,8 @@ class JarvisClient:
                 self.preroll.clear()
                 self.wake.reset()
                 log.info("Waiting for the wake word '%s'...", word)
+            if self.attention_mode != "window":
+                self._proactive_listen_s = 0.0
             if self._proactive_listen_s > 0:
                 log.info("Answer window after a proactive message - no wake word needed")
                 self.overlay.set_state("listening")
@@ -990,6 +1093,26 @@ class JarvisClient:
             if not frame:
                 continue
             self.preroll.push(frame)
+            active = self._idle_playing and not self._quiet_turn
+            if self.silence:
+                if active != silence_active:
+                    self.silence.reset()
+                    silence_active = active
+                if active and not mentions_silence_command(self._last_say) and self.silence.accept_frame(frame):
+                    self._request_silence()
+                    await self._finish_dismissal()
+                    self.preroll.clear()
+                    self.wake.reset()
+                    continue
+            # Only an activity bit leaves the idle client, never ambient audio.
+            # Do not stall wake detection behind a camera burst's wire lock.
+            now = time.monotonic()
+            if (not self._idle_playing and self.vad.is_speech(frame)
+                    and now - self._last_room_speech_notice >= 1.0
+                    and not self._wire_lock.locked()):
+                self._last_room_speech_notice = now
+                async with self._wire_lock:
+                    await self.ws.send_json({"type": _protocol.MSG_ROOM_SPEECH})
             if self.wake.accept_frame(frame):
                 if (
                     self._idle_playing
@@ -1001,6 +1124,13 @@ class JarvisClient:
                     self.wake.reset()
                     continue
                 log.info("Wake word detected")
+                await self._finish_dismissal()
+                if self._quiet_turn:
+                    self._idle_stream_active = False
+                    self._pending_image_show = None
+                    self._clear_inbox()
+                self._quiet_turn = False
+                self._dismiss_id = ''
                 self.overlay.flash("wake")
                 self.overlay.set_state("listening")
                 # While idle this loop is also the barge-in watcher: an
@@ -1014,7 +1144,7 @@ class JarvisClient:
     # ------------------------------------------------------------------
     # one utterance
     # ------------------------------------------------------------------
-    async def _read_frame(self) -> Optional[bytes]:
+    async def _read_frame(self) -> bytes | None:
         if self._stopping:
             raise _Stopping()
         frame = await self.audio_in.read_frame(timeout=0.5)
@@ -1031,7 +1161,7 @@ class JarvisClient:
                 yield piece
 
     async def _handle_utterance(
-        self, pre_roll: bytes, lead_in_s: Optional[float]
+        self, pre_roll: bytes, lead_in_s: float | None, *, verify_wake: bool = False
     ) -> str:
         sent_start = False
         holding_wire = False
@@ -1047,9 +1177,14 @@ class JarvisClient:
                 # ...and from this exact point on every incoming message belongs
                 # to this utterance, not to an unprompted greeting.
                 self._enter_conversation()
+                import uuid
+                self._live_turn_id = uuid.uuid4().hex
+                self._recording_live = True
                 await self.ws.send_json(
                     {
                         "type": MSG_UTTERANCE_START,
+                        "utterance_id": self._live_turn_id,
+                        "verify_wake": verify_wake,
                         "sr": self.sample_rate,
                         "format": PCM_FORMAT,
                         "channels": CHANNELS,
@@ -1062,7 +1197,8 @@ class JarvisClient:
 
         try:
             try:
-                audio = await self.vad.record(
+                recorder = self.enrollment_vad if time.monotonic() < self._enrollment_until else self.vad
+                audio = await recorder.record(
                     self._read_frame,
                     pre_roll=pre_roll,
                     lead_in_s=lead_in_s,
@@ -1081,6 +1217,7 @@ class JarvisClient:
                     len(audio) / float(self.sample_rate * SAMPLE_WIDTH),
                 )
             finally:
+                self._recording_live = False
                 # Released before waiting for the reply: the reply's rounds may
                 # need the wire themselves (screenshot), and the camera should
                 # get its turn again while the server thinks.
@@ -1104,15 +1241,32 @@ class JarvisClient:
         self._tts_active = False
         self._tts_bytes = 0
         self._barged = False
+        self._interrupt_id = ''
+        self._wake_muted = self._silence_muted = False
         result = RESULT_OK
+        notice_playback_task = None
+
+        async def resume_after_notice():
+            # Keep consuming tool requests while the spoken question plays.
+            # Only wake detection waits, to avoid hearing our own "Rowan".
+            await self.audio_out.drain()
+            if getattr(self, '_quiet_turn', False):
+                return
+            self._notice_tts = False
+            self._wake_muted = self._silence_muted = False
+            if not self._tts_active:
+                self.overlay.set_state('thinking')
+                self._start_barge_watch()
+
         self._start_thinking()
-        # The wake word can interrupt the WHOLE turn, not only the spoken
-        # reply: while the server grinds through a long tool chain, saying
-        # "rowan" abandons this turn and records a new command (the server
-        # cancels the old task when the new utterance arrives).
+        # The wake word requests confirmation while this receiver continues
+        # executing the original task's actions and playing its response.
         self._start_barge_watch()
         try:
             while True:
+                if getattr(self, '_quiet_turn', False):
+                    result = RESULT_DISMISSED
+                    break
                 if self._barged:
                     log.info("Turn interrupted by the wake word - abandoning the reply")
                     result = RESULT_BARGE_IN
@@ -1124,18 +1278,41 @@ class JarvisClient:
 
                 mtype = msg.get("type")
                 if mtype == MSG_TRANSCRIPT:
+                    if msg.get('ignored'):
+                        self.overlay.transcript({'ignored': True})
+                        log.info('False wake discarded; returning to standby')
+                        continue
                     text = str(msg.get("text") or "").strip()
                     language = str(msg.get("language") or "?")
                     log.info("Recognised [%s]: %s", language, text or "(empty)")
+                    self.overlay.transcript({'text': text, 'provisional': False})
+                    for segment in msg.get("segments") or []:
+                        log.info("  %s [%.2f-%.2f]: %s", segment.get("speaker", "Unknown"),
+                                 segment.get("start", 0), segment.get("end", 0),
+                                 segment.get("text") or "[overlapping / unclear speech]")
+                elif mtype == _protocol.MSG_NOTICE:
+                    self._interrupt_id = str(msg.get('id') or '')
+                    self._silence_muted = mentions_silence_command(msg.get('text') or '')
+                    self._show_status(str(msg.get('text') or ''), 45)
+                elif mtype == _protocol.MSG_CHAT:
+                    self._selection_until = time.monotonic() + 90 if msg.get('selection_active') else 0.0
+                    self.overlay.chat(msg)
                 elif mtype == MSG_ACTIONS:
                     await self._start_actions(msg.get("items") or [])
+                elif mtype == _protocol.MSG_VOICE_CONFIRMATION:
+                    await self._handle_voice_confirmation(msg)
                 elif mtype == MSG_SCREENSHOT_REQUEST:
                     await self._handle_screenshot_request(msg)
                 elif mtype == MSG_SAY:
                     await self._stop_thinking()
                     self._last_say = str(msg.get("text") or "").strip()
+                    self._silence_muted = mentions_silence_command(self._last_say)
+                    self.overlay.chat_reply(self._last_say, str(msg.get("enrollment_sentence") or ""))
+                    self._enrollment_until = time.monotonic() + 180 if msg.get('enrollment_sentence') else 0.0
                     try:
-                        self._listen_hint_s = float(msg.get("listen_s") or 0.0)
+                        self._listen_hint_s = followup_seconds(
+                            self.attention_mode, 0, float(msg.get("listen_s") or 0.0)
+                        )
                     except (TypeError, ValueError):
                         self._listen_hint_s = 0.0
                     self._say_status = str(
@@ -1143,19 +1320,29 @@ class JarvisClient:
                     ).strip()
                     log.info("Reply: %s", self._last_say or "(empty)")
                 elif mtype == MSG_TTS_START:
+                    self._notice_tts = msg.get('purpose') == 'notice'
                     await self._stop_thinking()
                     self.overlay.set_state("speaking")
                     await self._on_tts_start(msg)
-                    if self._says_wake_word(self._last_say):
+                    if self._notice_tts or self._says_wake_word(self._last_say):
                         # Rowan is about to SAY its own name: the mic would hear
                         # it from the speakers and barge in on itself. Stop the
                         # watcher for this one playback.
                         log.info("Reply contains the wake word - barge-in off for it")
-                        await self._stop_barge_watch()
+                        self._wake_muted = True
                 elif mtype == MSG_TTS_END:
+                    if msg.get('purpose') == 'notice':
+                        self._tts_active = False
+                        if notice_playback_task is not None:
+                            notice_playback_task.cancel()
+                        notice_playback_task = asyncio.create_task(resume_after_notice())
+                        continue
                     self._tts_active = False
-                    await self._stop_barge_watch()
                     await self.audio_out.drain()
+                    await self._stop_barge_watch()
+                    if getattr(self, '_quiet_turn', False):
+                        result = RESULT_DISMISSED
+                        break
                     self.overlay.set_state(
                         "listening" if self._listen_hint_s else "idle"
                     )
@@ -1163,7 +1350,9 @@ class JarvisClient:
                     # answers; otherwise the working caption is cleared.
                     self._show_status(
                         self._say_status,
-                        max(self._listen_hint_s, _protocol.DEFAULT_STATUS_TTL_S)
+                        max(self._listen_hint_s, _protocol.DEFAULT_STATUS_TTL_S,
+                            self._enrollment_until - time.monotonic(),
+                            self._selection_until - time.monotonic())
                         if self._say_status
                         else 0.0,
                     )
@@ -1190,6 +1379,8 @@ class JarvisClient:
                     self._on_speaker_message(msg)
                 else:
                     log.warning("Unknown message type from the server: %r", mtype)
+        except _Dismissed:
+            result = RESULT_DISMISSED
         except _BargedIn:
             log.info(
                 "Turn interrupted by the wake word while waiting on the server "
@@ -1199,8 +1390,15 @@ class JarvisClient:
             self.audio_out.cancel_pending()
             result = RESULT_BARGE_IN
         finally:
+            if notice_playback_task is not None:
+                notice_playback_task.cancel()
+                try:
+                    await notice_playback_task
+                except asyncio.CancelledError:
+                    pass
             await self._stop_thinking()
             await self._stop_barge_watch()
+            await self._finish_dismissal()
             await self._await_actions()
             # The name belongs to the turn that is now over.
             self.overlay.speaker("")
@@ -1219,17 +1417,94 @@ class JarvisClient:
             return
         self.audio_in.clear()  # drop stale audio buffered while the server thought
         self.wake.reset()
+        silence = getattr(self, 'silence', None)
+        if silence:
+            silence.reset()
+        preroll = RingBuffer(int(math.ceil(2200 / float(self.frame_ms))))
         while True:
             frame = await self.audio_in.read_frame(timeout=0.5)
             if not frame:
                 continue
-            if self.wake.accept_frame(frame):
-                log.info("Wake word during playback - interrupting the reply")
-                self._barged = True
-                dropped = self.audio_out.cancel_pending()
-                log.debug("Dropped %d queued playback chunk(s)", dropped)
-                self.wake.reset()
+            preroll.push(frame)
+            if silence and not self._silence_muted and silence.accept_frame(frame):
+                self._request_silence()
                 return
+            if getattr(self, '_wake_muted', False):
+                continue
+            if self.wake.accept_frame(frame):
+                log.info("Wake word during work - requesting cancellation confirmation")
+                self.wake.reset()
+                if self._interrupt_id:
+                    token = self._interrupt_id
+                    audio = await self.vad.record(self._read_frame, pre_roll=preroll.snapshot(), lead_in_s=5)
+                    if audio:
+                        async with self._wire_lock:
+                            await self.ws.send_json({'type': MSG_UTTERANCE_START, 'sr': self.sample_rate,
+                                                     'format': PCM_FORMAT, 'channels': CHANNELS, 'interrupt_id': token})
+                            try:
+                                for piece in self._split_frames(audio):
+                                    await self.ws.send_bytes(piece)
+                            finally:
+                                await self.ws.send_json({'type': MSG_UTTERANCE_END})
+                else:
+                    await self.ws.send_json({'type': _protocol.MSG_INTERRUPT_REQUEST})
+                preroll.clear()
+
+    def _clear_inbox(self):
+        while not self._inbox.empty():
+            try:
+                self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _silence_locally(self):
+        self._recording_live = False
+        self._quiet_turn = True
+        self._interrupt_id = ''
+        self._listen_hint_s = self._proactive_listen_s = 0.0
+        self._enrollment_until = self._selection_until = 0.0
+        self._idle_interrupted = True
+        self._idle_playing = self._idle_stream_active = self._idle_tts_active = False
+        self._tts_active = False
+        self._pending_image_show = None
+        self.overlay.cancel_voice_confirmation()
+        self.audio_out.cancel_pending()
+        if self._action_task is not None:
+            self._action_task.cancel()
+            self._action_task = None
+        self.overlay.typing(False)
+        self.overlay.scan_screen(False)
+        self.overlay.speaker('')
+        self._show_status('', 0)
+        self.overlay.chat({})
+        self.overlay.set_state('idle')
+        self._clear_inbox()
+
+    def _request_silence(self):
+        if self._quiet_turn:
+            return
+        import uuid
+        self._silence_locally()
+        self._dismiss_id = uuid.uuid4().hex
+        self._dismiss_ack.clear()
+        # A separate task survives cancellation of the microphone watcher.
+        self._dismiss_task = asyncio.create_task(self._send_dismissal(self._dismiss_id))
+
+    async def _send_dismissal(self, request_id):
+        try:
+            async with self._wire_lock:
+                await self.ws.send_json({'type': _protocol.MSG_DISMISS, 'id': request_id})
+            await asyncio.wait_for(self._dismiss_ack.wait(), timeout=5)
+        except (TimeoutError, WSDisconnected):
+            # A disconnected server cancels that connection's remaining work.
+            self.ws.drop()
+        log.info('Dismissed silently; waiting for the wake word')
+
+    async def _finish_dismissal(self):
+        task = getattr(self, '_dismiss_task', None)
+        if task is not None:
+            await asyncio.shield(task)
+            self._dismiss_task = None
 
     def _start_barge_watch(self) -> None:
         if self._barge_task is None:
@@ -1256,6 +1531,8 @@ class JarvisClient:
         await asyncio.sleep(THINKING_DELAY_S)
         while True:
             for freq in THINKING_BLIP_FREQS_HZ:
+                if getattr(self, '_quiet_turn', False):
+                    return
                 await self._beep(freq, THINKING_BLIP_MS, volume=THINKING_VOLUME)
             await asyncio.sleep(THINKING_INTERVAL_S)
 
@@ -1278,7 +1555,7 @@ class JarvisClient:
         except Exception as exc:  # noqa: BLE001 - a sound must never break the loop
             log.debug("Thinking-sound task ended with: %s", exc)
 
-    async def _on_tts_start(self, msg: Dict[str, Any]) -> None:
+    async def _on_tts_start(self, msg: dict[str, Any]) -> None:
         sample_rate = int(msg.get("sr") or self.sample_rate)
         fmt = str(msg.get("format") or PCM_FORMAT)
         channels = int(msg.get("channels") or CHANNELS)
@@ -1317,7 +1594,7 @@ class JarvisClient:
     # ------------------------------------------------------------------
     # screen vision (SPEC §4 S->C #4, §7)
     # ------------------------------------------------------------------
-    async def _handle_screenshot_request(self, msg: Dict[str, Any]) -> None:
+    async def _handle_screenshot_request(self, msg: dict[str, Any]) -> None:
         """Answer ``screenshot_request``: a header plus exactly ONE binary frame.
 
         The header carries both sizes (SPEC §4, C->S #6): ``w``/``h`` of the
@@ -1338,9 +1615,10 @@ class JarvisClient:
         # window before the screen is grabbed.
         self.overlay.scan_screen(False)
         self.overlay.set_status("")
-        self.overlay.hide_now()
-        await asyncio.sleep(OVERLAY_SETTLE_S)
         try:
+            if not await asyncio.to_thread(self.overlay.suspend_capture):
+                raise RuntimeError("Overlay did not acknowledge hiding; screenshot cancelled")
+            await asyncio.sleep(OVERLAY_SETTLE_S)
             capture: Capture = await asyncio.to_thread(capture_jpeg)
         except asyncio.CancelledError:
             self.overlay.set_status("")
@@ -1353,7 +1631,11 @@ class JarvisClient:
                 {"type": MSG_SCREENSHOT_ERROR, "id": request_id, "error": error}
             )
             return
+        finally:
+            self.overlay.resume_capture()
 
+        if getattr(self, '_quiet_turn', False):
+            return
         # Captured: shutter, then the glow returns in the bottom-right corner
         # and sweeps while the server's vision model reads the frame.
         self.overlay.flash("shot")
@@ -1390,7 +1672,7 @@ class JarvisClient:
     # ------------------------------------------------------------------
     # room camera (SPEC v1.4, S->C camera_request)
     # ------------------------------------------------------------------
-    async def _handle_camera_request(self, msg: Dict[str, Any]) -> None:
+    async def _handle_camera_request(self, msg: dict[str, Any]) -> None:
         """Answer ``camera_request`` with the newest camera frame, in any mode.
 
         :mod:`client.camera` owns the reply, including ``camera_error`` when it
@@ -1429,6 +1711,19 @@ class JarvisClient:
         except Exception as exc:  # noqa: BLE001 - the camera never breaks the client
             log.warning("Could not answer the camera request: %s", exc)
 
+    async def _handle_camera_clip_request(self, msg: dict[str, Any]) -> None:
+        try:
+            if self.camera is None:
+                await self.ws.send_json({'type': _protocol.MSG_CAMERA_CLIP_ERROR,
+                    'id': str(msg.get('id') or '')[:100], 'error': 'This client has no camera.'})
+                return
+            from client.camera_clips import serve_clip
+            await serve_clip(self.camera, msg.get('id'), msg.get('seconds', 5), msg.get('fps', 8))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning('Could not answer the camera clip request (%s)', type(exc).__name__)
+
     # ------------------------------------------------------------------
     # detections photo (SPEC v1.6, S->C image_show)
     # ------------------------------------------------------------------
@@ -1444,6 +1739,9 @@ class JarvisClient:
         header = self._pending_image_show or {}
         self._pending_image_show = None
         title = str(header.get("title") or "Jarvis")
+        if title.startswith('Which person are you?'):
+            self.overlay.photo(data)
+            return
         try:
             ttl_s = float(header.get("ttl_s") or 0.0)
         except (TypeError, ValueError):
@@ -1461,25 +1759,59 @@ class JarvisClient:
     # actions (executed by W3's dispatcher)
     # ------------------------------------------------------------------
     async def _start_actions(self, items: Any) -> None:
+        if getattr(self, '_quiet_turn', False):
+            return
         if not isinstance(items, list) or not items:
             log.debug("No actions in this batch")
             return
         await self._await_actions()
+        if getattr(self, '_quiet_turn', False):
+            return
         log.info("Received %d action(s)", len(items))
         self._action_task = asyncio.get_running_loop().create_task(
             self._execute_actions(list(items)), name="jarvis-actions"
         )
 
-    async def _execute_actions(self, items: List[Any]) -> None:
+    async def _handle_voice_confirmation(self, msg):
+        # No automated input may click the confirmation. Finish previous input
+        # before showing it; this receiver processes no action batches meanwhile.
+        await self._await_actions()
+        if getattr(self, '_quiet_turn', False):
+            return
+        future = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        def resolve(approved):
+            if not future.done():
+                future.set_result(approved is True)
+        def callback(approved):
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(resolve, approved)
+        approved = False
+        try:
+            details = ({'old_name': str(msg.get('old_name') or '')[:100],
+                        'new_name': str(msg.get('new_name') or '')[:100], 'merge': msg.get('merge') is True}
+                       if msg.get('kind') == 'rename' else str(msg.get('name') or '')[:100])
+            self.overlay.confirm_voice(details, callback)
+            approved = await asyncio.wait_for(future, 46)
+        except TimeoutError:
+            pass
+        finally:
+            self.overlay.cancel_voice_confirmation()
+        await self.ws.send_json({'type': _protocol.MSG_VOICE_CONFIRMATION_RESULT,
+                                 'id': msg.get('id'), 'approved': approved})
+
+    async def _execute_actions(self, items: list[Any]) -> None:
         reporting = True
         for item in items:
+            if getattr(self, '_quiet_turn', False):
+                break
             if not isinstance(item, dict):
                 log.warning("Skipping a malformed action: %r", item)
                 continue
             action_id = str(item.get("id") or "")
             tool = str(item.get("tool") or "")
             args = item.get("args") or {}
-            log.info("Executing %s (%s): %s", action_id or "?", tool, args)
+            log.info("Executing %s (%s): %s", action_id or "?", tool, {k: '<image omitted>' if k == 'jpeg_base64' else v for k, v in args.items()})
             # HUD: animate the mouse targeting for a click and the typing pulse.
             command = str(args.get("command") or "").strip().lower()
             typing = tool == "pc_control" and command == "type_text"
@@ -1534,12 +1866,15 @@ class JarvisClient:
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=ACTION_TIMEOUT_S)
             self._action_task = None
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             log.warning(
                 "Actions are taking longer than %.0f s - continuing, will wait later",
                 ACTION_TIMEOUT_S,
             )
         except asyncio.CancelledError:
+            if getattr(self, '_quiet_turn', False):
+                self._action_task = None
+                return
             raise
         except Exception as exc:  # pragma: no cover - dispatcher must not raise
             self._action_task = None
@@ -1549,7 +1884,7 @@ class JarvisClient:
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="client.main",
         description="Jarvis room client: wake word, VAD, streaming to the brain server",
@@ -1599,7 +1934,7 @@ def setup_logging(level: str) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     setup_logging(args.log_level)
 

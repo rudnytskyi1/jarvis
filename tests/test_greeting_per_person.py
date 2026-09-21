@@ -13,7 +13,7 @@ WebSocket, a camera, a face engine or a model.
 import time
 from types import SimpleNamespace
 
-from server.app import LABEL_UNKNOWN, Connection, PresenceTracker
+from hub.app import LABEL_UNKNOWN, Connection, PresenceTracker
 
 GREET_AFTER_S = 10.0
 UNKNOWN_GAP_S = 300.0  # 5 minutes away

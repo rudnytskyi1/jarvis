@@ -10,7 +10,8 @@ caption bookkeeping on the client, without a socket or a HUD.
 import asyncio
 
 from common import protocol as proto
-from server.app import Connection
+from hub import speaker as speaker_mod
+from hub.app import Connection
 
 
 def test_status_message_is_a_known_server_message():
@@ -21,14 +22,18 @@ def test_status_message_is_a_known_server_message():
 def test_caption_counts_seconds_while_more_speech_is_needed():
     text = Connection._enroll_status_text({"name": "Drew", "samples": 1, "total_speech_s": 4.0})
     assert "Drew" in text
-    assert "1 of 3" in text
-    assert "6 s more" in text
+    # The sample target and the speech budget live in server.speaker; the caption
+    # must report whatever those constants currently are instead of a stale copy.
+    assert f"1 of {speaker_mod.ENROLL_MIN_SAMPLES}" in text
+    assert f"{speaker_mod.MIN_ENROLL_SPEECH_S - 4.0:.0f} s more" in text
     assert "keep talking" in text
 
 
 def test_caption_asks_for_one_sentence_once_the_seconds_are_there():
-    text = Connection._enroll_status_text({"name": "Drew", "samples": 2, "total_speech_s": 12.0})
-    assert "2 of 3" in text
+    text = Connection._enroll_status_text(
+        {"name": "Drew", "samples": 2, "total_speech_s": speaker_mod.MIN_ENROLL_SPEECH_S}
+    )
+    assert f"2 of {speaker_mod.ENROLL_MIN_SAMPLES}" in text
     assert "one more sentence" in text
 
 
