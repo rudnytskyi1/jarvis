@@ -5,7 +5,7 @@
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = ["third_party", "data", "models", "dist", ".venv", "migrations"]
+extend-exclude = ["third_party", "data", "models", "dist", ".venv", "migrations", ".tmp", "testtmp", "ptroot"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

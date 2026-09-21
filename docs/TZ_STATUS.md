@@ -28,6 +28,7 @@
 | Пункт | Статус | Доказательство |
 |---|---|---|
 | Схема БД и миграции (4.6) | готово | `migrations/0001_init.py` |
+| Импорт унаследованных `people.json`, `memory.jsonl`, `dialogs/*.jsonl` в БД (4.6) | код и тесты готовы, коммит заблокирован песочницей (`git` не может писать `.git`) | `hub/legacy_migrate.py`, `hub/main.py`, `tests/test_legacy_migrate.py` |
 | Слой решений Decider: интерфейс, Rules-провайдер, цепочка с таймаутом, политики уверенности (раздел 5) | частично: нет LocalLLM и Jev; точки D-02–D-09 ещё не переведены | `hub/decider.py`, `tests/test_decider.py`, `tests/test_decision_log.py` |
 | Решения пишутся в таблицу `decisions` (5.3) | готово | `hub/decision_log.py`, `tests/test_decision_log.py` |
 | Очередь GPU: классы приоритета, fair share по домам, таймауты, оценка ожидания (4.5) | готово: подключена к STT/LLM/лицам/vision/SAM3 | `hub/gpu_queue.py`, `tests/test_gpu_queue.py`, `tests/test_gpu_queue_wiring.py` |

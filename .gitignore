@@ -49,3 +49,11 @@ dist/
 
 # --- локальные архивы кода (бекапы перед крупными изменениями) ---
 *.zip
+
+# --- scratch directories created by test runs inside the sandbox ---
+.tmp/
+testtmp/
+ptroot/
+
+loop.log
+.pytest_tmp/

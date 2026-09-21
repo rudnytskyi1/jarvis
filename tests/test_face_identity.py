@@ -35,6 +35,17 @@ def concurrent_assignment(arguments):
     return assign(store, frame=f'concurrent-{number}')[0]
 
 
+def _spawn_processes_unavailable() -> bool:
+    """Named pipes can be blocked by the sandbox (Windows spawn uses them)."""
+    try:
+        left, right = multiprocessing.get_context("spawn").Pipe(duplex=False)
+        left.close()
+        right.close()
+        return False
+    except (PermissionError, OSError):
+        return True
+
+
 def test_one_face_keeps_id_across_angle_restart_and_date(tmp_path):
     store = FaceIdentityStore(tmp_path)
     first = assign(store, [face(np.array([1., 0., 0.]))])[0]
@@ -281,6 +292,10 @@ def test_parallel_store_instances_do_not_fork_one_person_or_lose_counts(tmp_path
     assert profile(FaceIdentityStore(tmp_path), results[0])['observation_count'] == 12
 
 
+@pytest.mark.skipif(
+    _spawn_processes_unavailable(),
+    reason="sandbox blocks Windows named pipes required by process pools",
+)
 def test_parallel_processes_use_sqlite_serialization(tmp_path):
     arguments = [(str(tmp_path), index) for index in range(6)]
     with ProcessPoolExecutor(max_workers=3, mp_context=multiprocessing.get_context('spawn')) as pool:

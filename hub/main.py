@@ -84,12 +84,26 @@ def _prepare_hub_database(cfg) -> None:
     try:
         applied = migrations_runner.migrate(conn)
         changed = sync_homes_from_config(conn, getattr(cfg, "homes", []) or [])
+        legacy_counts = _import_legacy_data(conn)
     finally:
         conn.close()
     if applied:
         log.info("Hub database migrated: %s", applied)
     if changed:
         log.info("Rooms refreshed from config: %s", changed)
+    if legacy_counts:
+        log.info("Legacy data imported into the hub database: %s", legacy_counts)
+
+
+def _import_legacy_data(conn) -> dict:
+    """Copy the single-room stores into the hub database once (ТЗ 4.6)."""
+    try:
+        from hub.legacy_migrate import migrate_legacy
+
+        return migrate_legacy(conn)
+    except Exception as exc:  # noqa: BLE001 - legacy import must not stop the hub
+        log.warning("Legacy data import skipped (%s); old files stay as backup", exc)
+        return {}
 
 
 def main(argv: list[str] | None = None) -> int:

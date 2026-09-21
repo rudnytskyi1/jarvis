@@ -67,7 +67,9 @@ class DecisionLog:
         if decision_type:
             sql += " WHERE type=?"
             params.append(decision_type)
-        sql += " ORDER BY at DESC LIMIT ?"
+        # A tie on ``at`` (two decisions in the same clock tick) is broken by
+        # insertion order, so "newest first" stays deterministic.
+        sql += " ORDER BY at DESC, rowid DESC LIMIT ?"
         params.append(int(limit))
         rows = self._conn.execute(sql, params).fetchall()
         return [
