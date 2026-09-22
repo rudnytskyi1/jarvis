@@ -15,6 +15,27 @@ function Initialize-JarvisDpapi {
     return [bool]('System.Security.Cryptography.ProtectedData' -as [type])
 }
 
+# The folder that holds the encrypted keys. Launchers normally inherit a valid
+# ``LOCALAPPDATA``, but a window opened by a tool that replaced or dropped it
+# would look in the wrong place, find nothing, and ask for a key that IS saved
+# (the read cannot tell "no key yet" from "wrong folder"). The user profile is
+# therefore checked as well, and the caller can print the folder it settled on.
+function Get-JarvisKeyDirectory {
+    $candidates = @()
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Jarvis') }
+    if ($env:USERPROFILE) { $candidates += (Join-Path $env:USERPROFILE 'AppData\Local\Jarvis') }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    foreach ($candidate in $candidates) { return $candidate }
+    return 'Jarvis'
+}
+
+function Get-JarvisKeyPath {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    return (Join-Path (Get-JarvisKeyDirectory) $Name)
+}
+
 function Read-JarvisApiKey {
     param([Parameter(Mandatory=$true)][string]$Path)
     if (-not [IO.File]::Exists($Path)) { return $null }

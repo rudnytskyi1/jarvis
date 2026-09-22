@@ -13,7 +13,7 @@ $jarvisPreviousKey = $env:OPENAI_API_KEY
 $jarvisPreviousGeminiKey = $env:GEMINI_API_KEY
 $jarvisPreviousTelegramToken = $env:TELEGRAM_BOT_TOKEN
 . (Join-Path $PSScriptRoot 'openai-key-store.ps1')
-$jarvisKeyPath = Join-Path $env:LOCALAPPDATA 'Jarvis\openai-api-key.dpapi'
+$jarvisKeyPath = Get-JarvisKeyPath 'openai-api-key.dpapi'
 $jarvisSecureKey = $null
 $jarvisGeminiSecureKey = $null
 $jarvisTelegramSecureKey = $null
@@ -21,6 +21,7 @@ try {
     if ($ReplaceKey -or -not $env:OPENAI_API_KEY) {
         if (-not $ReplaceKey) { $jarvisSecureKey = Read-JarvisApiKey -Path $jarvisKeyPath }
         if ($null -eq $jarvisSecureKey) {
+            Write-Host "No saved OpenAI key at $jarvisKeyPath - entering one now." -ForegroundColor Yellow
             $jarvisSecureKey = Read-Host 'OpenAI API key (hidden; saved encrypted for future starts)' -AsSecureString
             if ($jarvisSecureKey.Length -eq 0) { throw 'API key is empty.' }
             try {
@@ -39,7 +40,7 @@ try {
     if (-not $env:OPENAI_API_KEY) { throw 'API key is empty.' }
     # Optional provider: never prompt or prevent ordinary chat if unconfigured.
     if (-not $env:GEMINI_API_KEY) {
-        $jarvisGeminiSecureKey = Read-JarvisApiKey -Path (Join-Path $env:LOCALAPPDATA 'Jarvis\gemini-api-key.dpapi')
+        $jarvisGeminiSecureKey = Read-JarvisApiKey -Path (Get-JarvisKeyPath 'gemini-api-key.dpapi')
         if ($null -ne $jarvisGeminiSecureKey) {
             $jarvisGeminiCredential = [System.Management.Automation.PSCredential]::new('jarvis', $jarvisGeminiSecureKey)
             $env:GEMINI_API_KEY = $jarvisGeminiCredential.GetNetworkCredential().Password
@@ -48,7 +49,7 @@ try {
         }
     }
     if (-not $env:TELEGRAM_BOT_TOKEN) {
-        $jarvisTelegramSecureKey = Read-JarvisApiKey -Path (Join-Path $env:LOCALAPPDATA 'Jarvis\telegram-bot-token.dpapi')
+        $jarvisTelegramSecureKey = Read-JarvisApiKey -Path (Get-JarvisKeyPath 'telegram-bot-token.dpapi')
         if ($null -ne $jarvisTelegramSecureKey) {
             $jarvisTelegramCredential = [System.Management.Automation.PSCredential]::new('jarvis', $jarvisTelegramSecureKey)
             $env:TELEGRAM_BOT_TOKEN = $jarvisTelegramCredential.GetNetworkCredential().Password
