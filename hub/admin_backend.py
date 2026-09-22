@@ -47,7 +47,11 @@ class AdminBackend:
 
     async def call(self, action, payload, actor_id):
         scope = self.get_scope(actor_id)
-        if scope is None and not self.access.is_owner(actor_id):
+        # ``None`` scope means the whole hub, and that is exactly what a hub
+        # admin gets: the owner and the accounts named in
+        # ``server.telegram.admin_user_ids`` (ТЗ F-701). Refusing everyone but
+        # the owner here was what left the named admins with an empty panel.
+        if scope is None and not self.access.is_hub_admin(actor_id):
             return {'ok': False, 'error': 'Only the owner can access this panel.'}
         if scope is not None and not scope:
             # Аккаунт без домов: панель открыта, но показывать нечего.

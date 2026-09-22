@@ -74,6 +74,7 @@ from hub import (
     forget_me,
     guest_registration,
     memories,
+    memory_admin,
     memory_search,
     profile_names,
     room_state,
@@ -373,12 +374,17 @@ STATE_CHANGING_TOOLS = frozenset(
         "set_role",
         "rename_person",
         "remember",
+        "forget_fact",
     }
 )
 #: v1.4 burst: gap between the background bursts of a staged face enrollment
 #: ("2-3 s apart" per SPEC); at the default 3 background bursts this totals
 #: the ~9 s SPEC describes.
 ENROLL_FACE_INTERVAL_S = 3.0
+
+#: ТЗ F-418: the two memory calls whose question and cancellation are worded
+#: by the hub in the speaker's own language (``hub/memory_admin.py``).
+_MEMORY_TOOLS: frozenset[str] = frozenset({"remember", "forget_fact"})
 
 #: SPEC §4: the error sent when STT produced nothing (shared with the client).
 ERROR_EMPTY_TRANSCRIPT = proto.ERR_EMPTY_TRANSCRIPT
@@ -4807,6 +4813,18 @@ class Connection(CameraClipReceiver):
         if self._approved_call and self._approved_call == confirmation_key(name, args):
             # The "yes" was for exactly this call, so run it now.
             return ""
+        # ТЗ F-418: the two memory calls that change stored data can be made to
+        # wait for the same spoken "yes" (``server.memory.confirm_*``). The
+        # explicit requests of :meth:`_memory_turn` ask regardless of these
+        # flags - they are what the "yes" is FOR; the flags cover the model's
+        # own tool calls.
+        memory = getattr(self.cfg.server, 'memory', None)
+        if name == 'remember' and bool(getattr(memory, 'confirm_remember', False)):
+            fact = " ".join(str(args.get('fact') or '').split())[:200]
+            return f"remember «{fact}»"
+        if name == 'forget_fact' and bool(getattr(memory, 'confirm_forget', True)):
+            detail = " ".join(str(args.get('text') or args.get('query') or '').split())[:200]
+            return f"forget «{detail}» and it cannot be restored"
         return dangerous_call(name, args, tools=settings.tools,
                               pc_commands=settings.pc_commands)
 
@@ -5034,16 +5052,22 @@ class Connection(CameraClipReceiver):
         self._pending_confirmation = None
         if pending.expired():
             self._audit_confirmation(pending, 'denied', 'the window ran out')
+            expired_line = ("That confirmation expired, so nothing was done."
+                            if pending.tool not in _MEMORY_TOOLS
+                            else memory_admin.expired(self._memory_language(language)))
             await self._speak_confirmation(
-                voice, "That confirmation expired, so nothing was done.",
+                voice, expired_line,
                 session=session, started_at=started_at, language=language, stt_ms=stt_ms,
                 text=text, note='confirmation_expired', ok=False, t_start=t_start,
             )
             return True
         if verdict is False:
             self._audit_confirmation(pending, 'denied', 'the room said no')
+            cancel_line = ("Cancelled. I did not touch anything."
+                           if pending.tool not in _MEMORY_TOOLS
+                           else memory_admin.cancelled(self._memory_language(language)))
             await self._speak_confirmation(
-                voice, "Cancelled. I did not touch anything.",
+                voice, cancel_line,
                 session=session, started_at=started_at, language=language, stt_ms=stt_ms,
                 text=text, note='confirmation_cancelled', ok=False, t_start=t_start,
             )
@@ -5055,6 +5079,16 @@ class Connection(CameraClipReceiver):
         finally:
             self._approved_call = ""
         answer = outcome.get('reply') if isinstance(outcome, dict) else ''
+        if not answer and pending.tool in _MEMORY_TOOLS and outcome.get('ok'):
+            # ТЗ F-418: the hub says what it kept or dropped, in the speaker's
+            # own language - the same rule the question followed.
+            lang = self._memory_language(language)
+            if pending.tool == 'remember':
+                answer = memory_admin.remembered_answer(
+                    str(pending.arguments.get('fact') or ''), lang)
+            else:
+                answer = memory_admin.forgotten_answer(
+                    str(pending.arguments.get('text') or ''), lang)
         if not answer:
             if outcome.get('ok'):
                 detail = pending.description.strip()
@@ -5265,6 +5299,7 @@ class Connection(CameraClipReceiver):
             "look_at_camera": "Checking the room", "find_object": "Looking for the requested object",
             "run_command": "Running a command on this PC", "pc_control": "Controlling the PC",
             "remember": "Saving your note", "enroll_face": "Preparing face registration",
+            "forget_fact": "Forgetting one note", "list_memory": "Reading what I know",
         }
         if name in descriptions:
             detail = str(args.get("target") or args.get("command") or "") if name != "run_command" else ""
@@ -5298,6 +5333,10 @@ class Connection(CameraClipReceiver):
             return await self._run_click_screen(args)
         if name == "remember":
             return await self._run_remember(args)
+        if name == "forget_fact":
+            return await self._run_forget_fact(args)
+        if name == "list_memory":
+            return await self._run_list_memory(args)
         if name == "show_photo":
             return await self._run_show_photo(args)
         if name == "enroll_voice":
@@ -5901,6 +5940,63 @@ class Connection(CameraClipReceiver):
         except Exception:  # noqa: BLE001 - a silent room still has the HUD
             log.exception("Could not speak a guest-flow line")
             await self._send_status(text, ttl_s=15)
+
+    # --- ТЗ F-418: obvious memory requests ------------------------------------
+
+    async def _memory_turn(self, text: str, language: str = "") -> str | None:
+        """«запомни, что …», «забудь, что …», «что ты обо мне знаешь?» (F-418).
+
+        The three requests are recognised by the hub itself, not by the model,
+        so a deletion never rests on a paraphrase and a fact is never invented
+        into an answer. The two calls that change stored data go through the
+        spoken "yes" of F-113: this method opens the question and the next
+        utterance either answers it (``Connection._resolve_confirmation``) or
+        cancels it. The read-only question is answered at once.
+        """
+        settings = self._memory_settings()
+        if settings is None or not bool(getattr(settings, 'management_enabled', True)):
+            return None
+        request = memory_admin.parse(text)
+        if request is None:
+            return None
+        lang = self._memory_language(language)
+        if request.action == 'knowledge':
+            outcome = await self._run_list_memory({})
+            return str(outcome.get('reply') or outcome.get('error') or
+                       memory_admin.knowledge_answer([], lang))
+        owner = self._memory_profile('')
+        if request.action == 'remember':
+            if not owner:
+                return ("I can save personal notes only for the person whose voice "
+                        "I recognize right now. Say Rowan AI, my name is, and your name.")
+            args = {'fact': request.text, 'about': request.about or 'me'}
+            window = float(getattr(self.cfg.server.confirmations, 'window_s', 8.0) or 8.0)
+            await self._request_confirmation(
+                'remember', args, f"remember «{request.text}»")
+            # The room hears the hub's own, localised question instead of the
+            # generic English line of ``Confirmation.question``.
+            self._confirmation_opened = None
+            log.info("Explicit «запомни» from %s waits for its yes: %r",
+                     owner, request.text, extra={'utterance_id': self.utterance_id})
+            return memory_admin.remember_question(request.text, lang, window_s=window)
+        candidates = self._memory_candidates(owner)
+        selection = memory_admin.select(candidates, request.text)
+        if selection.ambiguous:
+            log.info("«Забудь» matched several facts; asking instead of guessing",
+                     extra={'utterance_id': self.utterance_id})
+            return memory_admin.ambiguous_question(selection.alternatives, lang)
+        if selection.candidate is None:
+            log.info("«Забудь» matched no stored fact: %r", request.text,
+                     extra={'utterance_id': self.utterance_id})
+            return memory_admin.nothing_found(lang)
+        args = {'text': selection.candidate.text, 'query': request.text, 'about': ''}
+        window = float(getattr(self.cfg.server.confirmations, 'window_s', 8.0) or 8.0)
+        await self._request_confirmation(
+            'forget_fact', args, f"forget «{selection.candidate.text}»")
+        self._confirmation_opened = None
+        log.info("«Забудь» from %s waits for its yes: %r", owner, selection.candidate.text,
+                 extra={'utterance_id': self.utterance_id})
+        return memory_admin.forget_question(selection.candidate.text, lang, window_s=window)
 
     # --- ТЗ F-213: «забудь меня» ---------------------------------------------
 
@@ -8957,6 +9053,147 @@ class Connection(CameraClipReceiver):
             return None
         return encoded[0] if encoded else None
 
+    # ------------------------------------------- ТЗ F-418: memory management
+
+    def _memory_settings(self) -> Any:
+        """The ``server.memory`` section, or ``None`` on a very old config."""
+        return getattr(getattr(self.cfg, 'server', None), 'memory', None)
+
+    def _memory_language(self, language: Any = "") -> str:
+        """The language an answer about memory is spoken in."""
+        speaker = (language or getattr(self, '_reply_language', '')
+                   or getattr(self, '_speaker_language', '') or '')
+        return memory_admin.language_of(speaker)
+
+    def _visible_memory_facts(self) -> list[memories.MemoryFact]:
+        """The ``memories`` rows this speaker may see (ТЗ F-415).
+
+        Read on the event-loop thread: the hub's SQLite connection belongs to
+        it (``DECISIONS.md`` P1-44).
+        """
+        conn = _hub_conn
+        if conn is None:
+            return []
+        try:
+            rows = memories.MemoryIndex(conn).active()
+        except Exception as exc:  # noqa: BLE001 - a missing table is not a crash
+            log.warning("Could not read the memories table (%s)", exc)
+            return []
+        person = self._memory_profile('')
+        home = str(getattr(self, 'home_id', '') or '')
+        member = not self._home_guest()
+        return [fact for fact in rows
+                if memory_search.visible(fact, person=person, home_id=home, member=member)]
+
+    def _file_memory_rows(self, owner: str) -> list[dict[str, Any]]:
+        """The file store's live records this speaker may see (F-415)."""
+        if _memory is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        if owner:
+            rows.extend(_memory.admin_entries(owner))
+        if not self._home_guest():
+            # Facts of the room itself live under the empty person (F-415).
+            rows.extend(_memory.admin_entries(''))
+        return rows
+
+    def _memory_candidates(self, owner: str) -> list[memory_admin.Candidate]:
+        """One pool of facts from both stores, deduplicated by text."""
+        candidates = memory_admin.candidates_from_facts(self._visible_memory_facts())
+        for row in memory_admin.candidates_from_file(
+                self._file_memory_rows(owner), owner=owner,
+                home_id=str(getattr(self, 'home_id', '') or '')):
+            if any(existing.text.casefold() == row.text.casefold() for existing in candidates):
+                continue
+            candidates.append(row)
+        return candidates
+
+    async def _run_list_memory(self, args: dict[str, Any]) -> dict[str, Any]:
+        """«что ты обо мне знаешь?» - read back, changing nothing (F-418)."""
+        settings = self._memory_settings()
+        if settings is None or not bool(getattr(settings, 'management_enabled', True)):
+            return {'ok': False, 'error': 'Explicit memory management is disabled.'}
+        owner = self._memory_profile(args.get('about', ''))
+        limit = int(getattr(settings, 'knowledge_max_facts', memory_admin.KNOWLEDGE_LIMIT))
+        candidates = self._memory_candidates(owner)
+        # ``_memory_candidates`` already applies the F-415 rule to both stores,
+        # so a guest only sees their own facts and the hub's.
+        texts = [item.text for item in candidates]
+        return {
+            'ok': True,
+            'person': owner or 'the room',
+            'facts': texts[:limit],
+            'reply': memory_admin.knowledge_answer(texts, self._memory_language(), limit=limit),
+        }
+
+    async def _run_forget_fact(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Forget ONE stored fact (ТЗ F-418), after the "yes" of F-113."""
+        settings = self._memory_settings()
+        if settings is None or not bool(getattr(settings, 'management_enabled', True)):
+            return {'ok': False, 'error': 'Explicit memory management is disabled.'}
+        target = ' '.join(str(args.get('text') or args.get('query') or '').split())
+        if not target:
+            return {'ok': False, 'error': 'Which fact should I forget?'}
+        owner = self._memory_profile(args.get('about', ''))
+        candidates = self._memory_candidates(owner)
+        chosen = next((item for item in candidates
+                       if item.text.casefold() == target.casefold()), None)
+        if chosen is None:
+            selection = memory_admin.select(candidates, str(args.get('query') or target))
+            if selection.ambiguous:
+                return {'ok': False, 'ambiguous': True, 'options': [
+                    item.text for item in selection.alternatives],
+                    'error': memory_admin.ambiguous_question(
+                        selection.alternatives, self._memory_language())}
+            chosen = selection.candidate
+        if chosen is None:
+            return {'ok': False, 'error': memory_admin.nothing_found(self._memory_language())}
+        if chosen.scope == str(memories.Scope.HOME) and self._speaker_role != speaker_mod.ROLE_ADMIN:
+            return {'ok': False, 'error': 'Only an admin can forget a fact about the room.'}
+        if chosen.scope == str(memories.Scope.PERSON) and owner and chosen.owner.casefold() != owner.casefold():
+            return {'ok': False, 'error': 'I can only forget a fact that belongs to you.'}
+        # The two stores keep the same sentence: the row of ``memories`` and
+        # the file record are twins (P3-15), and a fact is not forgotten while
+        # either of them still answers questions. Deletion is by TEXT here, so
+        # the pair goes together even when the chosen candidate came from just
+        # one of the two stores.
+        deleted = 0
+        if _hub_conn is not None:
+            try:
+                index = memories.MemoryIndex(_hub_conn)
+                for fact in index.active():
+                    if (fact.text.casefold() == chosen.text.casefold()
+                            and str(fact.scope) == chosen.scope
+                            and fact.owner_id.casefold() == chosen.owner.casefold()):
+                        deleted += int(index.delete(fact.memory_id))
+            except Exception as exc:  # noqa: BLE001 - the file store is the twin
+                log.warning("Could not delete the memory row %r (%s)", chosen.text, exc)
+        if _memory is not None:
+            person = '' if chosen.scope == str(memories.Scope.HOME) else chosen.owner
+            try:
+                for row in _memory.admin_entries(person):
+                    if str(row.get('fact') or '').casefold() == chosen.text.casefold():
+                        _memory.change_entry(str(row.get('id') or ''), person, delete=True)
+                        deleted += 1
+            except Exception as exc:  # noqa: BLE001 - the row may already be gone
+                log.warning("Could not delete the file fact %r (%s)", chosen.text, exc)
+        audit = _audit_log()
+        if audit is not None:
+            try:
+                audit.record(action='memory.forget', actor=self._known_speaker_name(),
+                             target=chosen.memory_id or chosen.file_id, home_id=self.home_id,
+                             result='ok' if deleted else 'missing',
+                             detail={'text': chosen.text, 'scope': chosen.scope,
+                                     'deleted_rows': deleted})
+            except Exception:  # noqa: BLE001 - the answer is not lost to a broken audit table
+                log.warning('Could not audit the forgotten fact', exc_info=True)
+        if not deleted:
+            return {'ok': False, 'error': memory_admin.nothing_found(self._memory_language())}
+        log.info("Forgot one fact (%s/%s): %r", chosen.scope, chosen.kind, chosen.text,
+                 extra={'utterance_id': self.utterance_id})
+        return {'ok': True, 'forgotten': chosen.text, 'deleted_rows': deleted,
+                'reply': memory_admin.forgotten_answer(chosen.text, self._memory_language())}
+
     async def _memory_block(self, text: str, *, home_id: str | None = None) -> str:
         """The retrieved facts for this utterance, as one prompt block (P3-16).
 
@@ -9781,6 +10018,10 @@ class Connection(CameraClipReceiver):
             scripted = await self._share_identity_turn(text)
         if scripted is None:
             scripted = await self._forget_turn(text, language)
+        # ТЗ F-418: «запомни, что …» / «забудь, что …» / «что ты обо мне
+        # знаешь?» — the hub's own memory tools, not a model paraphrase.
+        if scripted is None:
+            scripted = await self._memory_turn(text, language)
         # ТЗ F-215: «почему ты решил, что это Макс?» is answered from the hub's
         # own belief (F-206), never from the model's imagination.
         if scripted is None:

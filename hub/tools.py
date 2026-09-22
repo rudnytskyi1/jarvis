@@ -309,6 +309,64 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "forget_fact",
+            "description": (
+                "Forget ONE stored fact or preference. Use it only when somebody "
+                "explicitly asks to forget something they told you ('forget that I "
+                "drink coffee'). The hub finds the fact by its words, asks for a "
+                "spoken yes (F-113) and deletes exactly one row; 'forget me' is a "
+                "different, irreversible request. Never invent a fact to delete."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The words of the request that identify the fact, e.g. "
+                            "'I drink coffee'. The hub matches them against stored facts."
+                        ),
+                    },
+                    "about": {
+                        "type": "string",
+                        "description": (
+                            "Whose fact it is; 'me' (the default) is whoever is "
+                            "speaking right now. Only the recognized speaker's own "
+                            "facts can be forgotten."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memory",
+            "description": (
+                "Read back what the hub remembers about the current speaker. Use it "
+                "for questions like 'what do you know about me?'. It changes nothing "
+                "and is answered from the stored facts, so never guess a fact."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "about": {
+                        "type": "string",
+                        "description": (
+                            "Whose facts to read; 'me' (the default) is the recognized "
+                            "speaker. A guest can only read their own facts."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "show_photo",
             "description": (
                 "Put a picture up on the room screen. Use it for EVERY request to "
@@ -702,6 +760,8 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "look_at_screen",
         "click_screen",
         "remember",
+        "forget_fact",
+        "list_memory",
         "enroll_voice",
         "set_role",
         "look_at_camera",

@@ -521,6 +521,20 @@ class MemoryConfig(_Strict):
     bm25_k1: float = Field(default=1.5, ge=0.0, le=10.0)
     bm25_b: float = Field(default=0.75, ge=0.0, le=1.0)
     embed_on_remember: bool = True
+    #: ТЗ F-418: «запомни, что …», «забудь, что …», «что ты обо мне знаешь?».
+    #: The three explicit memory requests are answered by the hub itself (the
+    #: parser is `hub/memory_admin.py`), and the two that change stored data go
+    #: through the spoken "yes" of F-113.
+    management_enabled: bool = True
+    #: A remembered fact from the explicit request always waits for its "yes";
+    #: these two flags decide whether the MODEL's own tool call waits too.
+    #: Off for ``remember`` because the tool has saved facts without a question
+    #: since phase 1 (ТЗ section 1: a working behaviour is not swapped in the
+    #: same step); on for ``forget_fact``, which is new and deletes data.
+    confirm_remember: bool = False
+    confirm_forget: bool = True
+    #: How many facts one «что ты обо мне знаешь?» answer names.
+    knowledge_max_facts: int = Field(default=10, ge=1, le=64)
     #: ТЗ 9.4 (F-414, P3-17): read dialogues from ``dialog_turns`` instead of
     #: the archive store. Off by default, because a working hub is not swapped
     #: in the same step (ТЗ section 1); the flag turns the table into the source

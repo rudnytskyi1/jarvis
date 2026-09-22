@@ -39,10 +39,18 @@ class HomeOwners:
     # --- reading ------------------------------------------------------------
 
     def scope(self, user_id: Any) -> frozenset[str] | None:
-        """Homes this account may see; ``None`` means the whole hub."""
+        """Homes this account may see; ``None`` means the whole hub.
+
+        A hub admin — the owner and the accounts named in
+        ``server.telegram.admin_user_ids`` (ТЗ F-701) — sees every home. They are
+        deliberately not home owners, so asking the grant table about them
+        answers "no homes", and a panel that read that literally showed them
+        nothing at all. The answer has to come from the access store's own
+        notion of a hub admin.
+        """
         if self.access is None:
             return None
-        if self.access.is_owner(user_id):
+        if self.access.is_hub_admin(user_id):
             return None
         return self.access.homes_of(user_id)
 
@@ -50,7 +58,7 @@ class HomeOwners:
         """ТЗ F-701: the hub admin, or an account that owns at least one home."""
         if self.access is None:
             return False
-        if self.access.is_owner(user_id):
+        if self.access.is_hub_admin(user_id):
             return True
         return self.access.is_home_owner(user_id)
 

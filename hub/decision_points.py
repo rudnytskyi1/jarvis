@@ -55,8 +55,9 @@ UNTRUSTED_TEXT_SOURCES = frozenset(SOURCES)
 GUARDED_TOOLS = frozenset(
     {"pc_control", "run_command", "click_screen", "set_light", "set_switch",
      "device_set", "type_text", "browser", "remember", "show_photo",
-     "save_photo", "generate_image", "set_wallpaper", "telegram_send",
-     "enroll_voice", "enroll_face", "set_role", "rename_person"}
+    "save_photo", "generate_image", "set_wallpaper", "telegram_send",
+    "enroll_voice", "enroll_face", "set_role", "rename_person",
+    "forget_fact"}
 )
 
 #: Phrases that only appear when somebody is trying to give the assistant new

@@ -189,6 +189,7 @@ _TRUSTED_TOOLS = frozenset(
         # Who holds admin is security-relevant: a stranger must not be able to
         # enumerate the room's people and find out whom to imitate.
         "list_people",
+        "forget_fact",
     }
 )
 #: Tools that need admin.
