@@ -37,11 +37,19 @@ _CAPTURE_PREFIX_RU = re.compile(
     r'(?:\s+(?:меня|нас|с\s+камеры))?\s*(?:,\s*(?:и\s+)?|(?:и|затем)\s+)', re.I)
 
 _REFERENT = r'(?:it|this|that|(?:this|that|the)\s+(?:picture|photo|image|screenshot|result))'
-_BACKGROUND = r'(?:(?:my|the|a|your)\s+)?(?:desktop\s+(?:background|wallpaper)|background(?:\s+(?:picture|image))?|wallpaper)'
+_POSSESSIVE = r'(?:my|our|your|his|her|their|the|a|this|that)'
+_BACKGROUND = (r'(?:(?:' + _POSSESSIVE + r')\s+)?'
+               r'(?:desktop\s+(?:background|wallpaper)|background(?:\s+(?:picture|image))?|wallpaper)')
 _ON_PC = r'(?:\s+(?:on|for)\s+(?:(?:this|the|my|your)\s+)?(?:computer|pc|desktop))?'
 _EN_WALLPAPER = (
-    r'(?:(?:set|put|use|apply)\s+' + _REFERENT + r'\s+(?:as\s+|for\s+)' + _BACKGROUND
+    r'(?:(?:set|put|use|apply|install|switch)\s+' + _REFERENT + r'\s+(?:as\s+|for\s+)' + _BACKGROUND
     + r'|make\s+' + _REFERENT + r'\s+(?:as\s+)?' + _BACKGROUND + r')' + _ON_PC)
+# "Change my desktop background to this picture" installs an existing result
+# just as much as the referent-first wording above, but with the nouns first.
+_EN_WALLPAPER_TO = (
+    r'(?:change|set|switch|put|use|install)\s+(?:(?:' + _POSSESSIVE + r')\s+)?'
+    r'(?:desktop\s+(?:background|wallpaper)|background(?:\s+(?:picture|image))?|wallpaper)\s+'
+    r'(?:to|into)\s+' + _REFERENT + _ON_PC)
 _EN_SAVE_OPEN = (
     r'(?:save|open|download)\s+' + _REFERENT
     + r'(?:\s+(?:on|to|in|with)\s+(?:(?:this|the|my|your)\s+)?'
@@ -65,10 +73,10 @@ _RU_SEND = (
 _CONNECTOR = r'(?:and(?:\s+also)?|then|also|а\s+потом|а\s+затем|и(?:\s+потом)?|затем)'
 _SEPARATOR = r'(?:\s*[,;]\s*(?:' + _CONNECTOR + r'\s+)?|\s+' + _CONNECTOR + r'\s+)'
 _WORKFLOW_SUFFIX = re.compile(
-    _SEPARATOR + r'(?:' + _EN_WALLPAPER + r'|' + _EN_SAVE_OPEN + r'|' + _EN_SEND + r'|'
+    _SEPARATOR + r'(?:' + _EN_WALLPAPER + r'|' + _EN_WALLPAPER_TO + r'|' + _EN_SAVE_OPEN + r'|' + _EN_SEND + r'|'
     + _RU_WALLPAPER + r'|' + _RU_SAVE_OPEN + r'|' + _RU_SEND + r')'
     + r'(?:\s*,?\s*(?:please|пожалуйста))?\s*[.!?]*\s*$', re.I)
-_PURE_WORKFLOW = re.compile(r'^(?:' + _EN_WALLPAPER + r'|' + _EN_SAVE_OPEN + r'|' + _EN_SEND + r'|'
+_PURE_WORKFLOW = re.compile(r'^(?:' + _EN_WALLPAPER + r'|' + _EN_WALLPAPER_TO + r'|' + _EN_SAVE_OPEN + r'|' + _EN_SEND + r'|'
                             + _RU_WALLPAPER + r'|' + _RU_SAVE_OPEN + r'|' + _RU_SEND + r')[.!?\s]*$', re.I)
 _CAPTION_INTRO = re.compile(
     r'\b(?:words|text|caption|phrase|message|says|saying|reads|reading|'
@@ -204,7 +212,7 @@ def is_image_clarification(text: str) -> bool:
 
 
 _EN_DIRECT_WALLPAPER = (
-    r'(?:change|set|replace|update)\s+(?:(?:my|the|this|your)\s+)?'
+    r'(?:change|set|replace|update|install|switch)\s+(?:(?:' + _POSSESSIVE + r')\s+)?'
     r'(?:desktop\s+(?:background|wallpaper)|wallpaper)\b')
 _EN_EXISTING_BACKGROUND = (
     r'(?:make|set)\s+(?:the|my)\s+background(?:\s+picture)?\s*[,;]\s*'
@@ -217,7 +225,7 @@ _RU_PICTURE_WALLPAPER = (
     r'(?:(?:это|эту|мою|эту\s+же)\s+)?(?:фото|картинку|изображение|фотографию)\s+'
     r'(?:(?:как|на|в\s+качестве)\s+)?(?:фон(?:ом)?(?:\s+рабочего\s+стола)?|обои|обоями)\b')
 _WALLPAPER_CHANGE = re.compile(
-    r'\b(?:' + '|'.join((_EN_WALLPAPER, _EN_DIRECT_WALLPAPER, _EN_EXISTING_BACKGROUND,
+    r'\b(?:' + '|'.join((_EN_WALLPAPER, _EN_WALLPAPER_TO, _EN_DIRECT_WALLPAPER, _EN_EXISTING_BACKGROUND,
                          _RU_WALLPAPER, _RU_DIRECT_WALLPAPER, _RU_PICTURE_WALLPAPER)) + r')', re.I)
 _NEGATED_WORKFLOW = re.compile(
     r'\b(?:not|never|without|no|cannot|cant|dont|didnt|can[’\x27]t|don[’\x27]t|didn[’\x27]t|'

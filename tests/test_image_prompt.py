@@ -141,6 +141,16 @@ def test_explicit_telegram_artwork_survives_separate_delivery_instruction():
     'Поставь картинку фоном рабочего стола.',
     'Do not change my face. Set it as wallpaper.',
     'Draw the caption "A great day" and set it as my wallpaper.',
+    'Rowan AI, can you make this picture our background picture?',
+    'make this our background picture',
+    'make this picture our wallpaper',
+    'use this picture as our background',
+    'put this photo as the desktop background',
+    'make it my wallpaper',
+    'install this as my wallpaper',
+    'change my desktop background to this picture',
+    'switch my wallpaper to that photo',
+    'set our background picture to the photo you just made',
 ])
 def test_wallpaper_needs_positive_current_action(text):
     assert wallpaper_change_requested(text)
@@ -172,6 +182,11 @@ def test_wallpaper_needs_positive_current_action(text):
     'Draw the text: set it as my wallpaper.',
     'Tell me whether to set it as wallpaper.',
     'Set it as wallpaper, but do not set it as wallpaper actually.',
+    'Why did you make this picture our background picture?',
+    'Do not make this picture our background picture.',
+    'Say "make this picture our background picture".',
+    'Explain how to change my desktop background to this picture.',
+    'You set our background to this picture.',
     'Роуэн, не ставь это фото фоном рабочего стола.',
     'Я не просил поставить это фото фоном рабочего стола.',
     'Почему ты установил это фото как обои?',
