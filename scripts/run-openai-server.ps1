@@ -13,6 +13,13 @@ $jarvisPreviousKey = $env:OPENAI_API_KEY
 $jarvisPreviousGeminiKey = $env:GEMINI_API_KEY
 $jarvisPreviousTelegramToken = $env:TELEGRAM_BOT_TOKEN
 . (Join-Path $PSScriptRoot 'openai-key-store.ps1')
+$jarvisRepoRoot = Split-Path -Parent $PSScriptRoot
+# Keys may also live in a git-ignored ``.env`` next to the config: the file is
+# read first, and anything already set in the environment keeps priority.
+$jarvisFromDotEnv = Import-JarvisDotEnv -Path (Join-Path $jarvisRepoRoot '.env')
+if ($jarvisFromDotEnv.Count -gt 0) {
+    Write-Host ('Loaded from .env: ' + ($jarvisFromDotEnv -join ', ')) -ForegroundColor Green
+}
 $jarvisKeyPath = Get-JarvisKeyPath 'openai-api-key.dpapi'
 $jarvisSecureKey = $null
 $jarvisGeminiSecureKey = $null

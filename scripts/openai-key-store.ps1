@@ -36,6 +36,32 @@ function Get-JarvisKeyPath {
     return (Join-Path (Get-JarvisKeyDirectory) $Name)
 }
 
+# Optional plain-text fallback: ``.env`` in the repository root (git-ignored).
+# Windows DPAPI stays the preferred store, but an operator who would rather keep
+# the keys in a file can put ``OPENAI_API_KEY=...`` there and the launcher uses
+# it as-is. A value that is already in the environment wins, so an explicit
+# ``set OPENAI_API_KEY=...`` in the calling window still overrides the file.
+function Import-JarvisDotEnv {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not [IO.File]::Exists($Path)) { return @() }
+    $imported = @()
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        $text = $line.Trim()
+        if (-not $text -or $text.StartsWith('#')) { continue }
+        $split = $text.IndexOf('=')
+        if ($split -lt 1) { continue }
+        $name = $text.Substring(0, $split).Trim()
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { continue }
+        $value = $text.Substring($split + 1).Trim().Trim('"').Trim("'")
+        if (-not $value) { continue }
+        if (-not [Environment]::GetEnvironmentVariable($name)) {
+            Set-Item -Path "env:$name" -Value $value
+            $imported += $name
+        }
+    }
+    return $imported
+}
+
 function Read-JarvisApiKey {
     param([Parameter(Mandatory=$true)][string]$Path)
     if (-not [IO.File]::Exists($Path)) { return $null }

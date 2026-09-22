@@ -1,6 +1,8 @@
 # --- local settings and data ---
 config.yaml
 config.openai.yaml
+.env
+.env.*
 models/
 data/
 *.log
