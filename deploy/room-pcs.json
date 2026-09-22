@@ -1,0 +1,22 @@
+[
+  {
+    "name": "AntonDorm",
+    "kind": "copy",
+    "host": "100.126.102.69",
+    "user": "anton",
+    "key": "C:\\Users\\Anton\\Desktop\\jarvis\\ssh_pc_with_jarvis\\id_ed25519_jarvis",
+    "root": "C:\\Users\\Anton\\Desktop\\jarvis",
+    "task": "JarvisRoomClient",
+    "note": "Копия проекта без .git: код обновляется файлами (см. docs/ROOM_CLIENT_UPDATES.md)."
+  },
+  {
+    "name": "buro",
+    "kind": "copy",
+    "host": "100.67.114.67",
+    "user": "user",
+    "key": "C:\\Users\\Anton\\Desktop\\keyburo\\buro",
+    "root": "C:\\Users\\user\\Desktop\\rowanai",
+    "task": "RowanRoomClient",
+    "note": "Клон публичного релиза rowanai, но git pull требует креды GitHub -> обновляется файлами."
+  }
+]
