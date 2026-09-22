@@ -19,12 +19,27 @@ client:
     phrases: [rowan ai, rowan a i, roan ai]
   audio:
     sample_rate: 16000
+    # Barge-in (ТЗ F-102) needs echo cancellation: without it the client hears
+    # Rowan through the speakers and would interrupt itself. Off without AEC,
+    # with a warning in the HUD.
+    echo_cancellation: true
+    barge_in: true
   vad:
     silence_ms: 700
+  # --- ТЗ F-103: окно follow-up после ответа (без wake word) ---
+  attention_mode: window      # window = 6 с после ответа слушаем без имени; wake_word = имя в каждой реплике
+  followup_window_s: 6
   camera:
     enabled: true
     name: "Main camera"
     index: 0
+    tracks_message: true       # ТЗ F-201: треки людей отдельным сообщением tracks
+    auto_profile: false        # ТЗ F-312: автовыбор профиля детекции по замеру при старте
+    profile_measure_frames: 3  # сколько кадров меряем у каждого профиля
+    profiles:                  # порядок = от сильного к слабому; yolo11x.engine — из scripts/export_tensorrt.py
+      tensorrt: {model: yolo11x.engine, fps: 20, half: true, budget_ms: 30}
+      gpu: {model: yolo11x.pt, fps: 10, half: true, budget_ms: 90}
+      weak: {model: yolo11s.pt, fps: 10, half: false, budget_ms: 200}
   overlay:
     enabled: true
     position: bottom_right
@@ -35,3 +50,20 @@ client:
     interval_s: 3600           # раз в час, как в ТЗ
     healthy_after_s: 60        # столько новый тег должен прожить, иначе откат
     state_path: data/ota_state.json
+  # --- жизнь комнаты без хаба (ТЗ 4.8) ---
+  offline:
+    enabled: true
+    after_s: 3                 # «потеря соединения дольше 3 с» — голос и HUD
+    backoff_base_s: 1          # экспоненциальная задержка реконнекта: 1, 2, 4 …
+    backoff_factor: 2
+    backoff_max_s: 30          # но не чаще, чем раз в 30 с на длинном простое
+    stt:
+      enabled: true
+      model: base              # ТЗ 4.8: faster-whisper small (или base)
+      device: auto             # auto: сначала CUDA, потом CPU
+      compute_type: int8
+      language: ""             # пусто — определять язык автоматически
+      timeout_s: 20
+    phrases_cache: true        # хаб приносит фразы заранее: своей TTS у ПК нет
+    phrases_dir: data/tts_cache
+    presence_buffer: 120       # сколько событий присутствия копим без хаба

@@ -79,11 +79,21 @@ def rule_value(key, value):
         'target': {'any': 'Any person', 'unknown': 'Unknown face', 'person': 'Specific person'},
         'media': {'photo': 'Photo', 'video': 'Video'},
         'destination': {'owner': 'Owner private chat', 'group': 'Group chat'},
+        # ТЗ F-702: событие и канал доставки — словами, а не кодами.
+        'event': {'presence': 'Someone in frame', 'person_entered': 'Person came in',
+                  'person_left': 'Person left', 'unknown_appeared': 'Unknown face appeared',
+                  'zone_entered': 'Zone changed', 'sound_event': 'Sound event',
+                  'object': 'Object of interest'},
+        'channel': {'telegram': 'Telegram', 'push': 'Phone push', 'hud': 'HUD caption'},
     }
     if key in options:
         return options[key].get(value, display(value))
     if key == 'workplace_id' and not value:
         return 'All computers'
+    if key == 'home_id' and not value:
+        return 'Every home'
+    if key == 'zone' and not value:
+        return 'Any zone'
     if key in {'quiet_start', 'quiet_end'} and not value:
         return 'Off'
     return display(value)

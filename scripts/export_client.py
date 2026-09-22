@@ -15,8 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_FILES = (
     "client/__init__.py", "client/main.py", "client/setup.py", "client/ws_client.py",
     "client/audio.py", "client/audio_processing.py", "client/attention.py",
+    "client/barge_in.py",
     "client/vad.py", "client/wakeword.py", "client/voice_controls.py",
+    "client/local_commands.py",
+    "client/local_stt.py", "client/offline.py", "client/presence_buffer.py",
+    "client/tts_cache.py",
+    "client/tracking.py",
+    "client/body_crops.py",
+    "client/privacy.py",
     "client/ota.py",
+    "client/vision_profile.py",
     "client/camera.py", "client/camera_clips.py", "client/frame_recording.py", "client/room-tracker.yaml",
     "client/screen.py", "client/viewer.py", "client/overlay.py", "client/overlay_web/chat.html",
     "client/actions/__init__.py", "client/actions/app_control.py", "client/actions/apps.py",
@@ -27,6 +35,7 @@ RUNTIME_FILES = (
     "client/requirements-browser.txt", "client/requirements-camera.txt", "client/requirements-overlay.txt",
     "common/__init__.py", "common/client_config.py", "common/ids.py", "common/protocol.py",
     "common/voice_commands.py", "common/recording.py",
+    "common/body_crops.py",
 )
 TEMPLATE_FILES = (
     "README.md", ".gitignore", "config.example.yaml", "setup-client.bat", "start-client.bat",

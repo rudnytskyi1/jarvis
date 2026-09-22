@@ -37,7 +37,8 @@ def router(*, enabled=True, **kwargs):
 def test_routing_is_off_until_the_owner_provisions_levels():
     cfg = ModelsConfig()
     assert cfg.enabled is False
-    assert sorted(cfg.levels) == ["cloud_cheap", "cloud_strong", "local_fast", "local_strong"]
+    assert sorted(cfg.levels) == ["cloud_cheap", "cloud_strong", "local_fast",
+                                  "local_strong", "local_vision"]
     assert all(not entry.ready for entry in cfg.levels.values())
     assert ModelRouter(cfg).pick("anything").reason == "routing_off"
 

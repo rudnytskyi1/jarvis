@@ -27,7 +27,11 @@ def fresh_state(monkeypatch):
 
 
 def _connection(**attributes):
-    conn = hub_app.Connection(SimpleNamespace(client=None), Config())
+    cfg = Config()
+    # These tests are about the D-07 role matrix. The second witness F-208 adds
+    # to a privileged call has its own tests (tests/test_identity_fusion.py).
+    cfg.server.identity.enabled = False
+    conn = hub_app.Connection(SimpleNamespace(client=None), cfg)
     conn.session = Session(client_id="room-pc", devices=[], history_turns=4)
     conn.send_json = AsyncMock()
     conn._stream_tts = AsyncMock()

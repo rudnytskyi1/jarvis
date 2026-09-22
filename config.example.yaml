@@ -24,6 +24,7 @@ server:
   media:                    # room media retention under data/homes/<home_id>/media (ТЗ 4.6/F-304)
     media_ttl_days: 3       # frames and crops
     clip_ttl_days: 7        # short clips
+    cleanup_interval_s: 3600  # F-304: how often the scheduler job expires media (0 = только при старте)
 
   vectors:                  # sqlite-vec search index over the stored embeddings (ТЗ 4.6)
     enabled: true
@@ -32,6 +33,32 @@ server:
 
   outbound:                 # one send buffer per client, so a slow room cannot hold back the others (ТЗ 4.4/13)
     queue_capacity: 32      # background frames (camera state, HUD) are dropped first; replies/PCM never
+
+  memory:                   # память v2: факты в таблице `memories`, топ-8 в промпт (ТЗ 9.4, F-414)
+    retrieval_enabled: true # гибридный поиск (BM25 + вектор) перед каждым ответом
+    top_k: 8                # сколько фактов попадает в промпт (ТЗ: топ-8)
+    embedding_model: "models/multilingual-e5-small"  # или models/bge-m3; путь от корня репозитория
+    allow_download: false   # true — разрешить загрузку модели по HF id (иначе только локальная папка)
+    vector_weight: 0.5      # доля векторной половины в общей оценке (0 = только слова)
+    bm25_k1: 1.5            # параметры BM25
+    bm25_b: 0.75
+    embed_on_remember: true # считать эмбеддинг факта сразу при «запомни» (нет модели — вектор не пишется)
+    dialogs_from_db: false  # true — история и recall читаются из `dialog_turns` (P3-17); jsonl-архив остаётся читаемой копией
+    # Ночная консолидация памяти (F-416): в 04:00 по поясу ДОМА день
+    # превращается в 5–10 фактов, дубли сливаются, старые факты теряют вес,
+    # истёкшие удаляются, а недостающие векторы догоняются.
+    consolidation_enabled: true
+    consolidation_hour: 4         # час по местному времени дома
+    consolidation_minute: 0
+    consolidation_check_interval_s: 900 # как часто планировщик проверяет, чей дом уже «после 04:00»
+    consolidation_window_hours: 24 # что считается «днём»
+    consolidation_min_facts: 5     # ТЗ: день — это 5–10 фактов
+    consolidation_max_facts: 10
+    decay_per_day: 0.9             # какую долю веса факт сохраняет за сутки
+    decay_floor: 0.05              # ниже этого живого факта вес не опускается
+    duplicate_similarity: 0.93     # порог сходства эмбеддингов для слияния дублей
+    fold_sources: true             # факт, вошедший в сводку дня, удаляется (его содержание в сводке)
+    embed_batch: 256               # сколько недостающих векторов считать за проход
 
   stt:
     model: large-v3          # faster-whisper
@@ -107,6 +134,51 @@ server:
     burst_size: 3             # frames per multi-frame camera pull (v1.4 burst)
     enroll_bursts: 3          # background bursts enroll_face pulls after its first sample
 
+  identity:                  # ТЗ F-203/F-206: голос + лицо + тело → один человек
+    enabled: true
+    reid:                    # OSNet: кроп тела → вектор 512-d в body_embeddings (F-203)
+      enabled: true
+      model: osnet_x1_0      # или osnet_ain_x1_0 — оба варианта из ТЗ
+      threshold: 0.5         # cos тела ТОГО ЖЕ дня, чтобы связать трек с человеком (F-206)
+      match_margin: 0.05     # победитель должен обойти второго человека на столько
+      weights: ""            # пусто = предобученные веса torchreid; иначе путь к своим
+    admin_voice_threshold: 0.65   # ТЗ F-208: голос для привилегированного действия
+    admin_face_threshold: 0.55    # ...и лицо не ниже этого, ИЛИ тело того же дня
+    phone_admin_threshold: 0.65   # по телефону — свой порог голоса...
+    phone_pin_required: true      # ...плюс голосовой PIN (ТЗ F-208)
+    pin_window_s: 20              # сколько ждём произнесённый PIN
+    pin_max_failures: 3           # столько неверных попыток — и блокировка
+    pin_lockout_s: 300            # на сколько секунд
+    appearance_retention_days: 7  # ТЗ F-209: «внешность дня» живёт неделю
+    guest:                   # ТЗ F-210: регистрация гостя — фраза, 5–10 кадров, тело дня
+      enabled: true
+      min_frames: 5          # «5–10 кадров с разных ракурсов»
+      max_frames: 10
+      min_voice_seconds: 3.0 # столько чистой речи нужно для вектора голоса гостя
+      flow_ttl_s: 300        # незаконченная регистрация истекает
+      confirm_ttl_s: 900     # и вопрос владельцу в Telegram (F-210: обязателен)
+    learning:                # ТЗ F-211: дообучение профиля только при p ≥ 0,9 и без конфликта
+      enabled: true
+      min_p: 0.9             # сильнее порога «узнан» 0,8 из F-207
+      face_max_vectors: 12   # «до 12 векторов» лица
+      voice_max_vectors: 8   # «до 8 векторов» голоса
+      body_per_day: 4        # тело — по дням, вчерашняя одежда не сегодняшняя
+      conflict_similarity: 0.6
+      duplicate_similarity: 0.98
+    anti_spoofing:           # ТЗ F-214: экран/фотография перед камерой и challenge-слово
+      face: true             # искать муар, отсутствие микродвижений и плоское движение
+      model: ""              # путь к anti-spoof модели (insightface anti-spoof / MiniFASNet)
+      require_model: false   # true — без модели ни один бёрст не считается живым
+      window_frames: 8       # последние кадры трека = бёрст
+      min_frames: 5          # меньше — «судить не о чем» (это не «живой»)
+      moire_threshold: 0.35  # насколько спектр кадра похож на решётку экрана
+      motion_min: 0.004      # ниже — лицо в бёрсте застыло
+      planar_residual_max: 0.02  # движение объясняется одной плоскостью => фотография
+      planar_motion_min: 0.02    # но судить о плоскости можно только если что-то сдвинулось
+      challenge: on_missing_witness  # off | on_missing_witness | always (ТЗ F-214)
+      challenge_window_s: 20        # сколько ждём случайное слово
+      challenge_voice_threshold: 0.5  # ECAPA: тот же ли это голос
+
   segment:                   # SAM3 open-vocabulary object finder (v1.5, find_object tool)
     enabled: true
     checkpoint: third_party/sam3/server/model/sam3.pt   # resolved relative to the repo root
@@ -131,6 +203,13 @@ server:
   streaming_reply:           # стриминговый ответ: первое предложение звучит сразу (ТЗ F-101)
     enabled: true             # первое предложение уходит в синтез, пока пишется остальное
     first_audio_budget_ms: 1200  # конец речи → первый звук ответа (таблица 15.1)
+
+  confirmations:             # опасные действия: устное «да» за 8 с, иначе отмена (ТЗ F-113)
+    enabled: true
+    window_s: 8               # сколько секунд ждём «да»; молчание или другой ответ — отмена
+    tools: [run_command]      # инструменты целиком; read-only команды (dir, uptime, ...) не спрашивают
+    pc_commands:              # pc_control, который может потерять работу
+      [sleep, suspend, hibernate, shutdown, power_off, reboot, restart, logoff, logout, close_app]
 
   decider:                   # кто отвечает на какой вопрос и сколько ему на это дано (ТЗ 5.2)
     timeout_ms: 400           # бюджет «транскрипт → начало генерации» из таблицы 15.1
@@ -162,6 +241,18 @@ server:
     password_env: ROWAN_ADMIN_PASSWORD               # пароль только из окружения (ТЗ 15.4)
     session_minutes: 60
 
+  presence:                  # присутствие дома (ТЗ F-301)
+    enabled: true
+    absence_s: 30.0          # сколько секунд без кадров — и человек считается вышедшим
+    history_limit: 1000      # сколько событий дома читают вопросы «кто дома» и др.
+
+  greeting:                  # приветствия и прощания (ТЗ F-302)
+    enabled: true
+    cooldown_s: 1200         # ТЗ: не чаще одного раза в 20 минут на человека
+    quiet_start: ""          # «23:00» … «08:00» в местном времени дома; пусто = выключено
+    quiet_end: ""
+    farewell: true           # говорить «пока», когда человек вышел из комнаты
+
   tts:
     engine: silero
     language: en
@@ -187,6 +278,10 @@ models:
       provider: vllm
       base_url: http://127.0.0.1:8000/v1
       model: ""
+    local_vision:              # ТЗ F-404: one local multimodal level for screens and frames
+      provider: ollama_native
+      base_url: http://127.0.0.1:11434/v1
+      model: qwen2.5vl:7b      # empty = images still go to server.llm.vision_model (logged)
     cloud_cheap:               # used only for the overflow of F-403
       provider: openai_responses
       model: gpt-5.4-mini
@@ -201,7 +296,9 @@ models:
     overflow_wait_s: 1.5       # F-403: class-0 predicted wait before overflow
     overflow_level: cloud_cheap
     cloud_fallback: false      # true = the owner allows spending on overflow
+    vision_level: local_vision # F-404: which level looks at images
     cloud_vision: false        # F-404: send hard images to a cloud vision model
+    vision_cloud_level: cloud_strong   # F-404: where a hard image goes when allowed
 
 client:
   # Via ngrok (works from any network, including dorm Wi-Fi with client isolation):
@@ -231,8 +328,8 @@ client:
     pre_roll_ms: 300         # audio from BEFORE the trigger included in the recording
     min_speech_ms: 250       # shorter voiced bursts are noise blips - dropped, listening continues
 
-  attention_mode: wake_word # every turn needs Rowan; window explicitly opts into old behavior
-  followup_window_s: 0       # used only in attention_mode: window (maximum 30 s)
+  attention_mode: window     # ТЗ F-103: after a reply the microphone stays open without the wake word
+  followup_window_s: 6       # ...for this long (Ф-103; maximum 30 s). wake_word = every turn needs the name
   thinking_sounds: true      # soft blips when a reply takes longer than ~1.5 s (vision, tool chains)
 
   camera:                    # room camera -> YOLO presence + face frames (v1.4)
@@ -283,6 +380,18 @@ client:
     #   description: main room light (button pusher on the wall switch)
     #   mac: "AA:BB:CC:DD:EE:FF"
     #   mode: press          # press | lever
+
+# Дома (комнаты), которые обслуживает хаб. Пока список пуст, дома берутся из
+# данных хаба; заполните его, чтобы назвать владельца дома в Telegram (F-701):
+# владелец открывает /tools в СВОЁМ чате и видит только свои дома, а админ
+# хаба (server.telegram.control_user_id) видит все.
+# homes:
+#   - home_id: livingroom
+#     name: Living room
+#     tz: America/Chicago
+#     quiet_hours: {start: "23:00", end: "07:00"}   # ТЗ F-702: тихие часы дома
+#     alert_cooldown_s: 0        # минимум кулдауна уведомлений дома, 0 = как в правиле
+#     telegram_user_id: 8322835915   # 0 или без строки = владелец ещё не назван
 
 
 

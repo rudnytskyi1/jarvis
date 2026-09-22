@@ -227,6 +227,37 @@ SCENE_VERBS = ("start", "run", "play", "begin", "включи", "включит�
 
 _WAKE_PREFIX = re.compile(r"^(?:(?:hey|okay|ok|эй)\s+)?(?:rowan(?:\s+ai)?|роуан)[\s,.:!]+")
 
+#: ТЗ сценарий 1 говорит «Rowan, выключи свет и включи фильм» — это сцена
+#: «кино» (свет гаснет, лента горит, телевизор включается). Такую фразу хаб
+#: узнаёт САМ, тремя словами: то, что свет просят выключить, что свет вообще
+#: назван, и что назван фильм. Модель здесь не нужна — во-первых, две секунды
+#: бюджета на круг модели не оставляют запаса, во-вторых, выдумывать нечего:
+#: сцена давно есть у дома. Проверка держит и обратное: «включи свет» (свет
+#: назван, но не выключен и фильма нет) и «расскажи про кино» (фильм назван, а
+#: света нет) уходят туда же, куда уходили, — к обычному ходу.
+_LIGHT_OFF = re.compile(
+    r"выключ|\bпогас|\bотключ|\bturn(?:ing|s|ed)?\s+(?:the\s+)?off\b|\bturn\s+off\b|"
+    r"\bswitch(?:ing|es|ed)?\s+off\b|\bshut(?:ting)?\s+off\b|\bapag\w*",
+    re.IGNORECASE)
+_LIGHT_WORD = re.compile(r"\bсвет\w*|\bламп\w*|\bсветильник\w*|\blight\w*|\blamp\w*|"
+                         r"\bluz\b|\bluces\b", re.IGNORECASE)
+_FILM_WORD = re.compile(r"\bфильм\w*|\bкино\w*|\bcinema\b|\bfilms?\b|\bmovie\w*|"
+                        r"\bpel[ií]cul\w*", re.IGNORECASE)
+
+
+def cinema_request(text: str) -> bool:
+    """Does this request ask for the cinema scene in other words (ТЗ сценарий 1)?
+
+    The three words may come in any order and with anything between them, so
+    "выключи свет и включи фильм" and "turn off the light and put on a movie"
+    are the same request to this check — while a request that only names a film
+    or only touches the light is not.
+    """
+    wanted = plain_scene_text(text)
+    if not (wanted and _FILM_WORD.search(wanted)):
+        return False
+    return bool(_LIGHT_OFF.search(wanted) and _LIGHT_WORD.search(wanted))
+
 
 def plain_scene_text(text: str) -> str:
     """The words of a request without the wake word, politeness or scene verbs."""
@@ -253,6 +284,14 @@ def match_scene(store: SceneStore, home_id: str, text: str) -> Scene | None:
     for scene in scenes:
         if wanted in {name.casefold() for name in scene.names()}:
             return scene
+    # ТЗ сценарий 1: the request may describe the scene instead of naming it
+    # ("выключи свет и включи фильм"). The cinema preset of this home is what
+    # such a request means, and it is answered by the hub itself.
+    if cinema_request(wanted):
+        cinema = next((scene for scene in scenes
+                       if scene.preset and scene.name.casefold() == "кино"), None)
+        if cinema is not None:
+            return cinema
     for scene in scenes:
         for name in scene.names():
             if re.fullmatch(r".{0,20}?" + re.escape(name.casefold()) + r"[.!]?", wanted):
@@ -377,5 +416,6 @@ class SceneRunner:
 
 __all__ = ["MAX_DELAY_S", "MAX_STEPS", "PRESET_ALIASES", "PRESET_NAMES", "PcRunner", "Sayer",
            "REMEMBER_SCENE", "SCENE_VERBS", "Scene", "SceneRunner", "SceneStore", "Step",
-           "StepKind", "match_scene", "plain_scene_text", "preset_scenes", "preset_steps",
+           "StepKind", "cinema_request", "match_scene", "plain_scene_text", "preset_scenes",
+           "preset_steps",
            "scene_id_for", "steps_from_actions"]

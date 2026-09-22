@@ -105,6 +105,10 @@ def test_relaxed_overlap_reaches_pc_action_without_whole_room_identification(mon
         voices.people = Mock(return_value={})
         conn.cfg.server.permissions_enabled = False
         conn.cfg.server.diarization.reject_mixed_speech = False
+        # ТЗ F-108 (phase 2) turns an overlap of more than 40 % into "please
+        # repeat one at a time" - see tests/test_overlap_speech.py. This test
+        # keeps the phase-1 relaxed path itself, so the rule is switched off.
+        conn.cfg.server.diarization.overlap_limit = 0
         recognizer = DiarizationEngine(conn.cfg.server.diarization)
         recognizer.diarize = Mock(return_value=[Span(0, 1, 'a'), Span(.4, 1, 'b')])
         monkeypatch.setattr(app, '_diarizer', recognizer)

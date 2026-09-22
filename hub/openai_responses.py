@@ -5,6 +5,7 @@ Connection. Each function round is reserved separately before network I/O.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -60,13 +61,71 @@ class ResponsesClient:
         payload = {"model": self.model, "input": response_input(messages), "tools": definitions,
                    "max_output_tokens": self.max_output, "reasoning": {"effort": "none"},
                    "parallel_tool_calls": False, "store": False, "service_tier": "default"}
+        data = self._request(payload, key)
+        texts, calls = [], []
+        for item in data.get("output", []):
+            if item.get("type") == "function_call":
+                calls.append({"id": item["call_id"], "type": "function",
+                              "function": {"name": item["name"], "arguments": item["arguments"]}})
+            elif item.get("type") == "message":
+                for part in item.get("content", []):
+                    if part.get("type") == "output_text":
+                        texts.append(part["text"])
+                    elif part.get("type") == "refusal":
+                        texts.append(part["refusal"])
+        return "\n".join(texts), calls
+
+    # --- one budgeted look at an image (ТЗ F-404) ---------------------------
+
+    def describe_image(self, jpeg: bytes, prompt: str, *, max_output: int | None = None) -> str:
+        """Answer ``prompt`` about one JPEG, charged to the same ledger (F-404).
+
+        The call is deliberately shaped like the text one: the reservation is
+        taken BEFORE the network, the usage is reconciled after, and a failure
+        keeps the reservation because a timeout may still have been billed.
+        """
+        key = os.environ.get(self.key_env, "").strip()
+        if not key:
+            raise CloudUnavailable(f"Set {self.key_env} on the server to enable OpenAI. "
+                                   "Local commands still work.")
+        if not jpeg:
+            raise CloudUnavailable("There is no image to look at.")
+        question = " ".join(str(prompt or "").split()) or "Describe what is in this image."
+        image_url = "data:image/jpeg;base64," + base64.b64encode(bytes(jpeg)).decode("ascii")
+        payload = {
+            "model": self.model,
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": question},
+                {"type": "input_image", "image_url": image_url},
+            ]}],
+            "max_output_tokens": min(int(max_output or self.max_output), 2048),
+            "reasoning": {"effort": "none"},
+            "parallel_tool_calls": False,
+            "store": False,
+            "service_tier": "default",
+        }
+        data = self._request(payload, key,
+                             too_long="This image is too large for the configured API allowance.")
+        texts = []
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for part in item.get("content", []):
+                    if part.get("type") == "output_text":
+                        texts.append(part["text"])
+        return "\n".join(texts).strip()
+
+    def _request(self, payload: dict, key: str, *, too_long: str | None = None) -> dict:
+        """One charged round trip: reserve, post, settle, hand back the body."""
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(encoded) > self.max_input_bytes:
-            raise CloudUnavailable("Conversation is too long for the configured API allowance. Start a new conversation.")
-        # Conservative text byte estimate plus framing/schema headroom. This is
-        # not an exact tokenizer. Usage is reconciled without assuming caching.
+            raise CloudUnavailable(too_long or
+                                   "Conversation is too long for the configured API allowance."
+                                   " Start a new conversation.")
+        # Conservative byte estimate plus framing/schema headroom. This is not
+        # an exact tokenizer, and an image is charged by the API's own rules, so
+        # the reservation stays generous on purpose.
         try:
-            reservation = self.budget.reserve(len(encoded) * 2 + 4096, self.max_output)
+            reservation = self.budget.reserve(len(encoded) * 2 + 4096, int(payload["max_output_tokens"]))
         except CloudUnavailable:
             raise
         except Exception as exc:
@@ -89,18 +148,7 @@ class ResponsesClient:
             log.warning("Could not reconcile OpenAI usage (%s); reservation retained", type(exc).__name__)
         if data.get("status") != "completed":
             raise CloudUnavailable("The model did not finish its response; no partial tool calls were executed.")
-        texts, calls = [], []
-        for item in data.get("output", []):
-            if item.get("type") == "function_call":
-                calls.append({"id": item["call_id"], "type": "function",
-                              "function": {"name": item["name"], "arguments": item["arguments"]}})
-            elif item.get("type") == "message":
-                for part in item.get("content", []):
-                    if part.get("type") == "output_text":
-                        texts.append(part["text"])
-                    elif part.get("type") == "refusal":
-                        texts.append(part["refusal"])
-        return "\n".join(texts), calls
+        return data
 
     def close(self):
         self.http.close()

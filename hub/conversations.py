@@ -96,3 +96,15 @@ class Conversations:
         if self.key(old) and self.key(new):
             with self._db() as db:
                 db.execute("UPDATE turns SET person=? WHERE person=?", (self.key(new), self.key(old)))
+
+    def forget(self, person):
+        """Delete every archived turn of one person (ТЗ F-213, «забудь меня»).
+
+        A no-op for an unknown voice: pooled or unknown speech was never stored
+        under a name (`key`), so there is nothing to delete behind it.
+        """
+        name = self.key(person)
+        if not name:
+            return 0
+        with self._db() as db:
+            return db.execute("DELETE FROM turns WHERE person=?", (name,)).rowcount

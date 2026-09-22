@@ -68,7 +68,7 @@ class GpuQueue:
     """Bounded, priority-ordered admission control in front of the GPU."""
 
     def __init__(self, *, max_concurrent: int = 1, fair_share: float = 0.5,
-                 max_waiting: int = 256) -> None:
+                 max_waiting: int = 256, on_change: Callable[[], None] | None = None) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be at least 1")
         if not 0.0 < fair_share <= 1.0:
@@ -84,6 +84,11 @@ class GpuQueue:
         #: what is actually on the card.
         self._running_classes: dict[int, int] = {}
         self.dropped = 0
+        #: ТЗ F-708: called after every change of the queue's shape, so the hub
+        #: can tell the rooms' HUDs whether work is waiting for the GPU. It
+        #: must not raise and must not block: it is called from ``submit`` and
+        #: from a finishing job, on the loop.
+        self._on_change = on_change
         self._seq = 0
         self._closed = False
         self._tasks: set[asyncio.Task] = set()
@@ -114,13 +119,24 @@ class GpuQueue:
         item.future = asyncio.get_running_loop().create_future()
         self._waiting.append(item)
         self._pump()
+        self._changed()
         if timeout_s is None:
             return await item.future
         try:
             return await asyncio.wait_for(item.future, timeout_s)
         except TimeoutError:
             self._waiting = [queued for queued in self._waiting if queued is not item]
+            self._changed()
             raise QueueTimeout(f"{label or 'work'} did not finish in {timeout_s}s") from None
+
+    def _changed(self) -> None:
+        """Announce a new queue shape (ТЗ F-708); a broken hook is not fatal."""
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception as exc:  # noqa: BLE001 - the GPU work must go on
+            log.warning("The GPU queue change hook failed (%s)", exc)
 
     def stats(self) -> dict[str, Any]:
         waiting_by_priority = {name: 0 for name in PRIORITY_NAMES.values()}
@@ -248,6 +264,7 @@ class GpuQueue:
             else:
                 self._running_classes.pop(item.priority, None)
             self._pump()
+            self._changed()
 
     def _observe(self, priority: int, waited: float, seconds: float) -> None:
         """Fold one finished job into the estimates of its class."""

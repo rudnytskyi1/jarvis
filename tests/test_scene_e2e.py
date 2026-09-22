@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -26,6 +27,7 @@ from hub import migrations_runner
 from hub.devices import Device, DeviceStore, DeviceTools
 from hub.scenes import SceneStore
 from hub.session import Session
+from scripts import measure_scene_latency as scene_measure
 
 HOME = "livingroom"
 WAKE = "Rowan"
@@ -155,3 +157,30 @@ def test_the_answer_names_the_steps_that_failed_instead_of_pretending(room, monk
     assert "TV" in said, "the room is told which step did not happen"
     assert adapter.calls == [("lr-lamp", "on_off", False),
                              ("lr-strip", "color_rgb", (0x22, 0x11, 0x00))]
+
+
+#: ТЗ сценарий 1 is one sentence, and it is measured in
+#: ``scripts/measure_scene_latency.py``. The phrases are taken from there so
+#: the sentence this test drives is exactly the sentence that gets measured.
+@pytest.mark.parametrize("language", sorted(scene_measure.PHRASES))
+def test_the_sentence_of_the_criterion_runs_the_scene_inside_the_budget(room, monkeypatch,
+                                                                       language):
+    """«Rowan, выключи свет и включи фильм» → сцена «кино» меньше чем за 2 с."""
+    connection, socket, adapter, _ = room
+    transcript = scene_measure.PHRASES[language]
+    monkeypatch.setattr(hub_app, "_stt",
+                        SimpleNamespace(transcribe_pcm=lambda *args: (transcript, language)))
+    monkeypatch.setattr(hub_app, "_llm", SimpleNamespace(
+        generate=AsyncMock(side_effect=AssertionError("the scene must not need the model")),
+        verify=AsyncMock(side_effect=AssertionError("no verifier")),
+    ))
+
+    started = time.perf_counter()
+    asyncio.run(connection._handle_utterance(b"\x01" * 16000))
+    elapsed = time.perf_counter() - started
+
+    assert socket.said() == ["Cinema mode."], "the room hears the scene it asked for"
+    assert [call[0] for call in adapter.calls] == ["lr-lamp", "lr-strip", "lr-tv"]
+    assert elapsed < scene_measure.SCENE_BUDGET_S, (
+        f"the hub answered in {elapsed:.3f} s, the criterion is "
+        f"{scene_measure.SCENE_BUDGET_S} s")

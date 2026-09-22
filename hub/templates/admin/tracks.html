@@ -1,0 +1,46 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>Tracks nobody could name ({{ day }})</h2>
+  {% if message %}<p class="note">{{ message }}</p>{% endif %}
+  <p class="note">Every track below was seen that day and stayed without a person.
+    The numbers come from the hub's own evidence; a click binds the track and keeps
+    the label as data for the thresholds and for the set of 15.6.</p>
+  {% if tracks %}
+  <table>
+    <tr><th>Track</th><th>Home</th><th>Last seen</th><th>Face / body / voice</th>
+      <th>Best quality</th><th>Fusion</th><th>Crops</th><th>Bind to</th></tr>
+    {% for track in tracks %}
+    <tr>
+      <td>{{ track.track_id }}</td>
+      <td>{{ track.home_id }}</td>
+      <td>{{ track.last_seen }}</td>
+      <td>{{ track.faces }} / {{ track.bodies }} / {{ track.voices }}</td>
+      <td>{{ track.quality }}</td>
+      <td>p {{ track.belief_p }} → {{ track.belief_person }}<br><span class="note">{{ track.sources }}</span></td>
+      <td>
+        {% for crop in track.crops %}
+        <img src="/admin/crop/{{ crop.crop_id }}.jpg" alt="{{ crop.crop_id }}" width="96">
+        {% else %}<span class="note">no crop</span>{% endfor %}
+      </td>
+      <td>
+        <form method="post" action="/admin/label">
+          <input type="hidden" name="track_id" value="{{ track.track_id }}">
+          <input type="hidden" name="day" value="{{ day }}">
+          {% if track.crops %}<input type="hidden" name="crop_id" value="{{ track.crops[0].crop_id }}">{% endif %}
+          <select name="person_id">
+            {% for person in people %}
+            <option value="{{ person.person_id }}">{{ person.name }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Bind</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>Nobody is waiting for a name on that day.</p>{% endif %}
+  <form method="get" action="/admin/tracks">
+    <label>Day <input type="date" name="day" value="{{ day }}"></label>
+    <button type="submit">Show</button>
+  </form>
+{% endblock %}

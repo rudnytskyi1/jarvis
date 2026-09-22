@@ -8,6 +8,7 @@ import pytest
 from hub import app
 from hub.room_questions import current_people_question, current_people_reply
 from hub.telegram_control import TelegramController, current_chat_send_requested
+from hub.untrusted import is_wrapped, strip
 from tests.test_telegram_control import USER, FakeBrain, FakeRoom, config, message
 
 
@@ -107,10 +108,12 @@ def test_telegram_current_people_preflights_fresh_frame_even_without_model_tool(
             await controller([], message(private=True), text)
             room._request_image.assert_awaited_once()
             created[0]._camera_frame_people.assert_awaited_once_with(frame)
+            # ТЗ F-411: the fresh camera observation reaches the model wrapped
+            # as untrusted text; its fields are read under the marks.
             observations = [row['content'] for row in brain.messages
-                            if row['content'].startswith('FRESH CAMERA TOOL RESULT')]
+                            if row['role'] == 'user' and is_wrapped(row['content'])]
             assert len(observations) == 1
-            data = json.loads(observations[0].split('\n', 1)[1])
+            data = json.loads(strip(observations[0]))
             assert data['fresh'] and data['visible_people_count'] == 1
             assert data['faces_in_frame'][0]['name'] == 'Anton'
         finally:

@@ -39,7 +39,7 @@ def _accepts_face(row, observed_at):
 
 def valid_tracks(rows):
     clean = []
-    for row in (rows or [])[:24]:
+    for row in normalise_tracks(rows)[:24]:
         try:
             box = [float(v) for v in row['box']]
             if len(box) != 4 or not all(math.isfinite(v) and 0 <= v <= 1 for v in box):
@@ -50,6 +50,26 @@ def valid_tracks(rows):
         except (KeyError, TypeError, ValueError):
             continue
     return clean
+
+
+def normalise_tracks(rows):
+    """Both wire shapes of one track, as ``{"id": ..., "box": [...]}``.
+
+    The v1.4 ``camera_state`` frame sends ``{"id", "box"}``; the F-201
+    ``tracks`` message sends the protocol model's ``{"track_id", "bbox"}``.
+    The hub reads either, so a client can move to the dedicated message
+    without the room's geometry going blind in between.
+    """
+    normalised = []
+    for row in (rows or []):
+        if not isinstance(row, dict):
+            continue
+        track_id = row.get('id', row.get('track_id'))
+        box = row.get('box', row.get('bbox'))
+        if track_id is None or box is None:
+            continue
+        normalised.append({'id': track_id, 'box': box})
+    return normalised
 
 
 def enclosing_track(face, tracks):

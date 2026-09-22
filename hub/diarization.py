@@ -51,6 +51,8 @@ class AttributedUtterance:
     reason: str = ""
     words: list[Word] = field(default_factory=list)
     attribution_note: str = ""
+    #: Intervals where more than one voice was speaking at once (ТЗ F-108).
+    overlaps: list[tuple[float, float]] = field(default_factory=list)
 
 
 class DiarizationEngine:
@@ -313,6 +315,9 @@ def attribute(pcm: bytes, sample_rate: int, transcript: Transcript,
         return result
     duration = len(pcm) / (2 * sample_rate)
     timeline = _timeline(spans, duration)
+    #: ТЗ F-108: keep the overlap intervals themselves, not just a note - the
+    #: pipeline measures their share of the utterance before acting on it.
+    result.overlaps = [(a, b) for a, b, speakers in timeline if len(speakers) > 1]
     labels = list(dict.fromkeys(s.speaker for s in sorted(spans, key=lambda s: s.start)))
     identities = {}
     for index, label in enumerate(labels, 1):

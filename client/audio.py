@@ -228,6 +228,11 @@ class AudioInput:
     def running(self) -> bool:
         return self._stream is not None
 
+    @property
+    def processor(self):
+        """The local DSP stage, or ``None`` (ТЗ F-102 reads its ``aec_active``)."""
+        return self._processor
+
     def clear(self) -> None:
         """Drop everything captured so far (echo of our own playback, etc.)."""
         self._generation += 1
@@ -395,6 +400,38 @@ class AudioOutput:
             self._queue.task_done()
             dropped += 1
         self._tail = b""
+        return dropped
+
+    def abort(self) -> int:
+        """Go silent NOW: drop the queue *and* the device's own buffer (F-102).
+
+        ``cancel_pending`` empties the queue, but the audio device still holds
+        whatever PortAudio already accepted — with a 100 ms device block that
+        is another 100 ms of speech after the person started interrupting. The
+        ТЗ 15.1 budget for barge-in is 200 ms, so the stream itself is aborted
+        (which discards the queued device buffer) instead of stopped politely.
+
+        The stream is then dropped, so the next reply reopens it — reopening is
+        an output concern of that reply, not of the interruption.
+        """
+        dropped = self.cancel_pending()
+        stream, self._stream = self._stream, None
+        self._declared_rate = None
+        self._device_rate = None
+        if stream is None:
+            return dropped
+        abort = getattr(stream, "abort", None)
+        try:
+            if callable(abort):
+                abort()
+            else:  # pragma: no cover - a stream stub without abort()
+                stream.stop()
+        except Exception as exc:  # pragma: no cover - device teardown
+            log.debug("Error while aborting the audio output: %s", exc)
+        try:
+            stream.close()
+        except Exception as exc:  # pragma: no cover - device teardown
+            log.debug("Error while closing the aborted audio output: %s", exc)
         return dropped
 
     async def drain(self) -> None:

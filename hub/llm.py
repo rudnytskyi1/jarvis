@@ -33,10 +33,21 @@ from typing import Any
 
 import httpx
 
-from hub.action_completion import check_image_completion, image_generation_attempted, image_repair_already_requested
+from hub.action_completion import (
+    check_action_claim,
+    check_image_completion,
+    failed_tool_results,
+    image_generation_attempted,
+    image_repair_already_requested,
+)
 from hub.api_budget import CloudUnavailable
+from hub.multi_step import find_plan, strip_plan
 from hub.openai_responses import ResponsesClient
+from hub.tool_args import MAX_ARGUMENT_RETRIES, validate_args
 from hub.tools import FIRST_TOOL_ARG, TOOL_NAMES, TOOLS
+from hub.untrusted import source_of as untrusted_source
+from hub.untrusted import strip as strip_untrusted
+from hub.untrusted import wrap as wrap_untrusted
 
 log = logging.getLogger("jarvis.server.llm")
 
@@ -59,6 +70,9 @@ MAX_RETRIES = 0
 NO_EXECUTOR_RESULT: dict[str, Any] = {
     "ok": False,
     "error": "tool execution is not available",
+    #: Not a tool's verdict, and not a real result: the guard that reads
+    #: success claims (ТЗ F-410) must not be driven by the hub's own wiring.
+    "no_executor": True,
 }
 
 #: Executes one tool call and returns its result as a JSON-serializable dict.
@@ -257,7 +271,9 @@ def _browser_recovery_state(history: list[dict[str, Any]]) -> _BrowserRecovery:
             if call is not None:
                 browser_calls.remove(call)
             try:
-                raw = item.get('content', {})
+                # ТЗ F-411: this result may have travelled to the model wrapped
+                # as untrusted text; recovery reads the payload underneath.
+                raw = strip_untrusted(item.get('content', {}))
                 result = json.loads(raw) if isinstance(raw, str) else raw
             except (TypeError, ValueError):
                 continue
@@ -426,6 +442,8 @@ class LlmResult:
     #: tool call and result). Fed to :meth:`LlmClient.verify` so the self-check
     #: continues from the real state instead of redoing work.
     history: list[dict[str, Any]] = field(default_factory=list)
+    #: ТЗ F-114: how many actions the model returned in ONE structured output.
+    plan_steps: int = 0
 
 
 def native_base_url(base_url: str) -> str:
@@ -1024,11 +1042,20 @@ class LlmClient:
         return {"role": "assistant", "content": text or "", "tool_calls": tool_calls}
 
     def _tool_message(self, call: ToolCall, result: Any) -> dict[str, Any]:
-        """One ``role: "tool"`` message carrying the real execution result."""
+        """One ``role: "tool"`` message carrying the real execution result.
+
+        ТЗ F-411: a result that came from outside the room (a screen, a page, a
+        chat) is wrapped in the delimiters that say "this is data". The hub's own
+        results travel as they are.
+        """
+        content = _result_to_content(result)
+        source = untrusted_source(call.name)
+        if source is not None:
+            content = wrap_untrusted(content, source=source)
         message: dict[str, Any] = {
             "role": "tool",
             "name": call.name,
-            "content": _result_to_content(result),
+            "content": content,
         }
         if self.provider == PROVIDER_OLLAMA_NATIVE:
             message["tool_name"] = call.name
@@ -1055,6 +1082,30 @@ class LlmClient:
         if isinstance(result, dict):
             return result
         return {"ok": True, "result": result}
+
+    def _bad_arguments(self, call: ToolCall, problem: str,
+                       retries: dict[str, int]) -> dict[str, Any]:
+        """ТЗ F-409: bad arguments go back to the model, at most twice.
+
+        The call is NOT executed and NOT counted as an action - a turn that
+        only sent broken arguments has done nothing, and saying otherwise would
+        be the "the model claims it acted" failure guard F-410 exists to stop.
+        """
+        used = retries.get(call.name, 0)
+        if used >= MAX_ARGUMENT_RETRIES:
+            log.warning("Tool %s is refused for this turn: %s (retries exhausted)",
+                        call.name, problem)
+            return {"ok": False, "invalid_arguments": True, "retries_exhausted": True,
+                    "error": (f"{call.name} was not run: {problem}. It has already been "
+                              f"retried {MAX_ARGUMENT_RETRIES} times, so do not call it "
+                              f"again this turn - tell the user what is needed.")}
+        retries[call.name] = used + 1
+        log.warning("Tool %s has invalid arguments (%s); retry %d of %d",
+                    call.name, problem, used + 1, MAX_ARGUMENT_RETRIES)
+        return {"ok": False, "invalid_arguments": True,
+                "error": (f"{call.name} was NOT run: its arguments are invalid "
+                          f"({problem}). Retry {used + 1} of {MAX_ARGUMENT_RETRIES} - send "
+                          f"the call again with corrected arguments.")}
 
     async def verify(
         self,
@@ -1083,6 +1134,8 @@ class LlmClient:
         """Run one utterance through the tool loop and return the spoken reply."""
         history: list[dict[str, Any]] = list(messages)
         executed: list[ToolCall] = []
+        #: ТЗ F-114: how many actions arrived as one structured output.
+        plan_steps = 0
 
         artifact_retried = False
         # BUG 3: caps the forced "you didn't actually look" retry to exactly
@@ -1095,6 +1148,9 @@ class LlmClient:
         forced_act_retried = False
         image_repair_started = image_repair_already_requested(history)
         browser_recovery = _browser_recovery_state(history)
+        #: ТЗ F-409: how many times each tool was already sent back to the
+        #: model with bad arguments during this turn.
+        argument_retries: dict[str, int] = {}
         # A verifier cannot start another reserve after this turn already used
         # a recovery instruction. Cloud budget checks still govern every call.
         browser_reserve_available = not browser_recovery.requested
@@ -1113,7 +1169,8 @@ class LlmClient:
                 log.warning("Cloud turn stopped: %s", exc)
                 text = ("I couldn't finish the request. Some actions may already have completed. "
                         if executed else "") + str(exc)
-                return LlmResult(text=text, tool_calls=executed, rounds=round_index, history=history)
+                return LlmResult(text=text, tool_calls=executed, rounds=round_index,
+                                 history=history, plan_steps=plan_steps)
             if (
                 not calls
                 and text
@@ -1126,6 +1183,21 @@ class LlmClient:
                 artifact_retried = True
                 log.warning("Malformed inline tool call in the reply - retrying the round")
                 text, calls = await self._chat(history, with_tools=True)
+            if not calls:
+                # ТЗ F-114: a multi-step command may arrive as ONE structured
+                # output - the whole list of actions in a single reply - for
+                # providers that return one call at a time. The list becomes
+                # real tool calls, and the loop below runs them in order.
+                found = find_plan(text, TOOL_NAMES)
+                if found is not None:
+                    plan, start, end = found
+                    calls = [ToolCall(id=f"plan_{index}", name=step.tool,
+                                      arguments=dict(step.arguments))
+                             for index, step in enumerate(plan.steps, start=1)]
+                    plan_steps = len(calls)
+                    text = strip_plan(text, (start, end))
+                    log.info("Multi-step command: %d action(s) in one structured output: %s",
+                             len(calls), ", ".join(call.name for call in calls))
             log.info(
                 "LLM round %d/%d: text %r, %d tool call(s) (%s)%s",
                 round_index,
@@ -1177,31 +1249,44 @@ class LlmClient:
                     continue
                 # A promised action ("I'll do that now") or one REPORTED as done
                 # ("the photo has been hidden") with NO tool executed this whole
-                # turn never happened: force one real attempt.
+                # turn never happened: force one real attempt. The same holds -
+                # ТЗ F-410 - when a tool DID run but came back unsuccessful: a
+                # sentence is not a result.
+                promised = announces_undone_action(text)
+                claimed = claims_completed_action(text)
+                claim_issue = check_action_claim(history, text, claims=claimed)
+                failed_tools = failed_tool_results(history)
                 if (
                     not forced_act_retried
                     and round_index < self.max_tool_rounds
-                    and not executed
-                    and (announces_undone_action(text) or claims_completed_action(text))
+                    # Nothing ran at all, or something ran and failed:
+                    # either way the words are not backed by a result.
+                    and (not executed or failed_tools)
+                    and (promised or claimed)
                 ):
                     forced_act_retried = True
-                    promised = announces_undone_action(text)
                     log.warning(
-                        "Reply %s an action but ran no tool - forcing one retry: %r",
+                        "Reply %s an action%s - forcing one retry: %r",
                         "promises" if promised else "claims",
+                        f" over a failed {claim_issue.tool}" if claim_issue else " but ran no tool",
                         text,
                     )
+                    correction = (claim_issue.repair if claim_issue is not None
+                                  else (FORCE_ACT_MESSAGE if promised else FORCE_DONE_MESSAGE))
                     history.append({"role": "assistant", "content": text})
-                    history.append(
-                        {
-                            "role": "user",
-                            "content": FORCE_ACT_MESSAGE if promised else FORCE_DONE_MESSAGE,
-                        }
-                    )
+                    history.append({"role": "user", "content": correction})
                     continue
+                # ТЗ F-410: if the model still claims success over a tool that
+                # failed, the room does not hear the claim - it hears what the
+                # tool actually reported.
+                if claim_issue is not None:
+                    log.warning("Replacing a success claim over the failed tool %s: %r",
+                                claim_issue.tool, text)
+                    text = claim_issue.fallback
                 history.append({"role": "assistant", "content": text})
                 return LlmResult(
-                    text=text, tool_calls=executed, rounds=round_index, history=history
+                    text=text, tool_calls=executed, rounds=round_index,
+                    history=history, plan_steps=plan_steps
                 )
 
             history.append(self._assistant_message(text, calls))
@@ -1210,7 +1295,13 @@ class LlmClient:
             browser_read_required = browser_recovery.needs_read
             for call in calls:
                 command = str(call.arguments.get('command') or 'read')
-                if (
+                # ТЗ F-409: nothing runs before its arguments are validated
+                # against the schema the model was given, and a bad call is
+                # handed back to the model as a tool result with the reason.
+                arguments, problem = validate_args(call.name, call.arguments)
+                if problem:
+                    result = self._bad_arguments(call, problem, argument_retries)
+                elif (
                     call.name == 'browser_control'
                     and command != 'read'
                     and (browser_read_required or browser_recovery.needs_read)
@@ -1221,6 +1312,10 @@ class LlmClient:
                     result = {'ok': False, 'completion_repair_blocked': True,
                               'error': 'Do not repeat a paid image request during completion repair. Use the existing image or report the failure.'}
                 else:
+                    # The validated dictionary is what the tool gets: fields the
+                    # model did not send are left out so the tool's own default
+                    # still applies, and nulls do not become real arguments.
+                    call.arguments = arguments
                     result = await self._run_tool(executor, call)
                 if call.name == 'browser_control':
                     browser_recovery.observe(command, result)
@@ -1229,7 +1324,8 @@ class LlmClient:
                     browser_read_required = browser_read_required or browser_recovery.needs_read
                 log.info("Tool %s%s -> %s", call.name, call.arguments, result)
                 history.append(self._tool_message(call, result))
-                executed.append(call)
+                if not problem:
+                    executed.append(call)
 
         # Round cap hit: ask for the spoken reply with no tools available.
         log.info("Tool round cap (%d) reached — asking for a final reply", self.max_tool_rounds)
@@ -1240,14 +1336,24 @@ class LlmClient:
             final_cloud_failure = True
             text = "I couldn't finish the request. Some actions may already have completed. " + str(exc)
         image_issue = check_image_completion(history, text)
+        claim_issue = check_action_claim(history, text, claims=claims_completed_action(text))
         if image_issue is not None:
             text = image_issue.fallback
         elif browser_recovery.pending and not final_cloud_failure:
+            # The browser message names what remains unfinished, which is more
+            # use to the owner than the general "it did not happen".
             text = _BROWSER_REPAIR_FALLBACK
+        elif claim_issue is not None:
+            # ТЗ F-410: the same guard applies to a reply that arrives after the
+            # round cap - the room must not hear a success that never happened.
+            log.warning("Replacing a success claim over the failed tool %s: %r",
+                        claim_issue.tool, text)
+            text = claim_issue.fallback
         log.info("LLM final reply: %r", text)
         history.append({"role": "assistant", "content": text})
         return LlmResult(
-            text=text, tool_calls=executed, rounds=completed_rounds, history=history
+            text=text, tool_calls=executed, rounds=completed_rounds,
+            history=history, plan_steps=plan_steps
         )
 
     def close(self) -> None:

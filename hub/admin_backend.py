@@ -12,10 +12,18 @@ class AdminBackend:
     #: Actions worth a row in the hub's ``audit`` table (ТЗ F-706): privileged
     #: operations, settings changes and deleting data.
     AUDITED = ('settings.', 'profiles.', 'memory.', 'devices.', 'scenes.', 'alerts.', 'users.')
+    #: Раздача домов владельцам (ТЗ F-701) — тоже привилегированное действие.
+    AUDITED = AUDITED + ('homes.',)
+    #: Что доступно владельцу дома (ТЗ F-701): его комнаты и привязанное к ним.
+    #: Всё остальное — настройки хаба, люди, память, аккаунты Telegram, аудит,
+    #: калибровка — относится ко всему хабу целиком: у этих данных нет дома, и
+    #: «показать только своё» означало бы показать чужое под своим именем.
+    HOME_SCOPED = ('workplaces.', 'devices.', 'scenes.')
 
     def __init__(self, cfg, access, *, runtime, get_room, get_alerts, rename_profile=None,
                  get_workplaces=None, get_provider=None, get_decisions=None, get_switches=None,
-                 get_wizard=None, get_scenes=None, get_tools=None, get_audit=None):
+                 get_wizard=None, get_scenes=None, get_tools=None, get_audit=None,
+                 get_scope=None, get_workplace_home=None, get_home_owners=None):
         self.cfg, self.access = cfg, access
         self.runtime, self.get_room, self.get_alerts = runtime, get_room, get_alerts
         self.rename_profile = rename_profile
@@ -27,18 +35,39 @@ class AdminBackend:
         self.get_scenes = get_scenes or (lambda: None)
         self.get_tools = get_tools or (lambda: None)
         self.get_audit = get_audit or (lambda: None)
+        #: ``actor -> None (весь хаб) | frozenset(дома)`` (ТЗ F-701). По
+        #: умолчанию — весь хаб: панель без многодомности работает как раньше.
+        self.get_scope = get_scope or (lambda actor: None)
+        self.get_workplace_home = get_workplace_home or (lambda client_id: None)
+        self.get_home_owners = get_home_owners or (lambda: None)
         self.get_rooms = lambda: [room for row in self.get_workplaces()
                                  if (room := self.get_room(row['id'])) is not None]
         self._lock = asyncio.Lock()
 
     async def call(self, action, payload, actor_id):
-        if not self.access.is_owner(actor_id):
+        scope = self.get_scope(actor_id)
+        if scope is None and not self.access.is_owner(actor_id):
             return {'ok': False, 'error': 'Only the owner can access this panel.'}
+        if scope is not None and not scope:
+            # Аккаунт без домов: панель открыта, но показывать нечего.
+            return {'ok': False, 'error': 'No homes are assigned to this account yet.'}
         if not isinstance(payload, dict) or contains_secret(payload):
             return {'ok': False, 'error': 'Do not send API keys or passwords to this panel.'}
+        if scope is not None:
+            # ТЗ F-701: «у каждого владельца дома свой чат» — если дом у него
+            # один, действие без явного дома относится к нему; с несколькими
+            # домами нужен явный home_id, иначе панель гадает.
+            if (len(scope) == 1 and str(action).startswith(self.HOME_SCOPED)
+                    and not self._home_of(action, payload)):
+                payload = {**payload, 'home_id': next(iter(scope))}
+            refusal = self._scope_refusal(action, payload, scope)
+            if refusal:
+                return {'ok': False, 'error': refusal}
         async with self._lock:
             try:
                 result = await self._call(action, payload, actor_id)
+                if scope is not None and result.get('ok'):
+                    result = self._scope_result(action, result, scope)
                 self._audit(action, payload, actor_id, 'ok' if result.get('ok') else 'failed')
                 if not action.endswith('.list') and action != 'status' and result.get('ok'):
                     await asyncio.to_thread(self.access.audit, actor_id, action,
@@ -198,6 +227,22 @@ class AdminBackend:
                 self._sync_hotwords()
             elif action == 'profiles.role':
                 await asyncio.to_thread(registry.set_role, name, payload.get('role'))
+            elif action == 'profiles.language':
+                # ТЗ F-106: the field whisper and the model follow. The DB row
+                # is canonical (section 14) and the registry keeps the copy the
+                # voice pipeline reads, so both are written here. The two live
+                # in different threads: the registry is blocking file I/O (a
+                # worker thread), the hub's SQLite connection belongs to the
+                # event loop (DECISIONS.md, P1-44).
+                from hub.languages import set_preferred_language
+
+                code = payload.get('language')
+                written = await asyncio.to_thread(set_preferred_language, registry, None,
+                                                  name, code)
+                set_preferred_language(None, runtime.get('hub_conn'), name, code)
+                return {'ok': True,
+                        'message': 'Preferred language saved.',
+                        'language': written}
             elif action in {'profiles.create', 'profiles.delete', 'profiles.reset_voice', 'profiles.reset_face'}:
                 await asyncio.to_thread(registry.admin_profile, action.split('.')[1], name,
                                         role=payload.get('role', 'user'))
@@ -336,6 +381,40 @@ class AdminBackend:
                 self._sync_hotwords()
                 return {'ok': True, 'message': f'Scene {scene.name} deleted.'}
             raise ValueError('Unknown scene operation.')
+        if action.startswith('homes.'):
+            # ТЗ F-701: домами владеют Telegram-аккаунты. Раздавать их может
+            # только админ хаба (у владельца дома для этого нет прав), а сам
+            # владелец видит свои дома там, где ему положено: в /tools.
+            owners = self.get_home_owners()
+            if owners is None:
+                raise ValueError('Home ownership is unavailable.')
+            names = {str(getattr(home, 'home_id', '')): str(getattr(home, 'name', '') or '')
+                     for home in (getattr(self.cfg, 'homes', None) or [])}
+            if action == 'homes.list':
+                return {'ok': True, 'items': [
+                    {'home_id': home_id, 'name': names.get(home_id) or home_id, 'owners': list(ids)}
+                    for home_id, ids in owners.owners().items()]}
+            if action == 'homes.grant':
+                home_id = str(payload.get('home_id') or '')
+                try:
+                    user_id = int(payload.get('user_id'))
+                except (TypeError, ValueError):
+                    raise ValueError('Enter the numeric Telegram ID of the owner.') from None
+                added = owners.grant(actor, user_id, home_id)
+                return {'ok': True, 'added': added,
+                        'message': (f'Home {home_id} is now owned by Telegram ID {user_id}.'
+                                    if added else f'Telegram ID {user_id} already owns {home_id}.')}
+            if action == 'homes.revoke':
+                home_id = str(payload.get('home_id') or '')
+                try:
+                    user_id = int(payload.get('user_id'))
+                except (TypeError, ValueError):
+                    raise ValueError('Enter the numeric Telegram ID of the owner.') from None
+                removed = owners.revoke(actor, user_id, home_id)
+                return {'ok': True, 'removed': removed,
+                        'message': (f'Telegram ID {user_id} no longer owns {home_id}.'
+                                    if removed else f'Telegram ID {user_id} did not own {home_id}.')}
+            raise ValueError('Unknown home ownership operation.')
         raise ValueError('Unknown panel action.')
 
     def _scene_runner(self, store, payload):
@@ -437,7 +516,65 @@ class AdminBackend:
             device = switches.store.get(str(payload.get('device_id') or payload.get('id') or ''))
             if device is not None:
                 return device.home_id
-        return payload.get('home_id')
+        home_id = payload.get('home_id')
+        if not home_id and action.startswith('workplaces.'):
+            # ТЗ F-701: у рабочего места дома нет в имени, и взять его можно
+            # только у подключения (или у того, что записано при hello).
+            home_id = self.get_workplace_home(str(payload.get('id') or ''))
+        return home_id
+
+    def _scope_refusal(self, action, payload, scope):
+        """Why this home owner may not run this action (``''`` when they may)."""
+        if action == 'status':
+            return ''
+        if not str(action).startswith(self.HOME_SCOPED):
+            return ('This setting belongs to the whole hub; only the hub administrator '
+                    'can change it.')
+        home_id = self._home_of(action, payload)
+        if not home_id:
+            if action in {'workplaces.list', 'workplaces.'}:
+                return ''
+            return 'This operation does not name a home, so it cannot be checked.'
+        if str(home_id) not in scope:
+            return 'This home belongs to another owner.'
+        return ''
+
+    def _scope_result(self, action, result, scope):
+        """Drop everything outside the account's homes from a list (F-701)."""
+        items = result.get('items')
+        if isinstance(items, list) and action == 'workplaces.list':
+            kept = []
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                home_id = str(row.get('home_id') or '')
+                if not home_id and action == 'workplaces.list':
+                    home_id = str(self.get_workplace_home(str(row.get('id') or '')) or '')
+                if home_id and home_id in scope:
+                    kept.append(row)
+            result = {**result, 'items': kept}
+        if action == 'status':
+            # Бюджет API — деньги хаба, а не дома: владельцу комнаты он не виден.
+            result = {key: value for key, value in result.items()
+                      if key not in {'api_usage', 'profiles'}}
+            result['scoped_homes'] = sorted(scope)
+            places = result.get('workplaces')
+            if isinstance(places, list):
+                kept = []
+                for row in places:
+                    if not isinstance(row, dict):
+                        continue
+                    home_id = str(row.get('home_id')
+                                  or self.get_workplace_home(str(row.get('id') or '')) or '')
+                    if home_id and home_id in scope:
+                        kept.append(row)
+                result = {**result, 'workplaces': kept}
+        if action == 'workplaces.list' and result.get('selected_id') is not None:
+            selected = str(result['selected_id'])
+            allowed = {str(row.get('id')) for row in result.get('items', [])}
+            if selected not in allowed:
+                result = {**result, 'selected_id': None}
+        return result
 
 
 def _aliases(value):

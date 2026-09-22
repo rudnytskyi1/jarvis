@@ -1,9 +1,16 @@
 """WebSocket transport for the room client (SPEC §4, §7).
 
 Thin wrapper around the ``websockets`` library: connect with auto-reconnect
-(3 s backoff, ``hello`` re-sent on every (re)connect), send JSON control
-frames and binary payloads (microphone PCM, screenshot JPEG), receive
-messages. Text frames come back as parsed ``dict``, binary frames as ``bytes``.
+(``hello`` re-sent on every (re)connect), send JSON control frames and binary
+payloads (microphone PCM, screenshot JPEG), receive messages. Text frames come
+back as parsed ``dict``, binary frames as ``bytes``.
+
+Since ТЗ 4.8 the wait between attempts is a policy of the caller
+(``backoff(attempt)``): the room client passes the exponential delay of
+``client/offline.py`` and a ``before_retry`` hook, which is how the HUD learns
+about a long outage and the room hears «Хаб недоступен, работаю локально».
+Without those arguments the old fixed ``reconnect_delay`` is used, so nothing
+that predates the offline mode changes behaviour.
 
 Since v1.4 exactly one task — the reader in :mod:`client.main` — calls
 :meth:`WSClient.recv` for the lifetime of a connection (the server may talk
@@ -14,6 +21,7 @@ between utterances: proactive greetings, ``camera_request``), so it reads with
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from collections.abc import Callable
@@ -65,6 +73,8 @@ class WSClient:
         ready_timeout: float = READY_TIMEOUT_S,
         recv_timeout: float = RECV_TIMEOUT_S,
         should_stop: Callable[[], bool] | None = None,
+        backoff: Callable[[int], float] | None = None,
+        before_retry: Callable[[float, int], Any] | None = None,
     ) -> None:
         self.url = str(url)
         self.hello = dict(hello)
@@ -72,6 +82,14 @@ class WSClient:
         self.ready_timeout = float(ready_timeout)
         self.recv_timeout = float(recv_timeout)
         self._should_stop = should_stop or (lambda: False)
+        #: ТЗ 4.8: exponential delay for attempt ``n`` (1-based); ``None`` keeps
+        #: the historical fixed ``reconnect_delay``.
+        self._backoff = backoff
+        #: ТЗ 4.8: called with ``(delay, attempt)`` before every wait. The room
+        #: client uses it to put «мозг оффлайн» on the HUD and to say once that
+        #: it is working locally. An awaitable result is awaited.
+        self._before_retry = before_retry
+        self.attempts = 0
         self._conn: Any = None
         self._send_lock = asyncio.Lock()
         self._announced_failure = False
@@ -134,7 +152,7 @@ class WSClient:
                     self._announced_failure = True
                 else:
                     log.debug("Reconnect attempt failed: %s", exc)
-                await self._sleep(self.reconnect_delay)
+                await self._wait_before_retry()
                 continue
 
             self._conn = conn
@@ -144,13 +162,36 @@ class WSClient:
             except (WSDisconnected, TimeoutError) as exc:
                 log.warning("Handshake with the server failed: %s", exc)
                 self._drop()
-                await self._sleep(self.reconnect_delay)
+                await self._wait_before_retry()
                 continue
 
             self._announced_failure = False
+            self.attempts = 0
             log.info("Connected to the server %s", self.url)
             return
         raise WSDisconnected("the client is shutting down")
+
+    async def _wait_before_retry(self) -> None:
+        """One wait between two attempts, with its own delay policy (ТЗ 4.8)."""
+        self.attempts += 1
+        delay = self.reconnect_delay
+        if self._backoff is not None:
+            try:
+                delay = float(self._backoff(self.attempts))
+            except Exception as exc:  # noqa: BLE001 - a bad policy cannot stop the room
+                log.warning("The reconnect backoff failed (%s); waiting %.0f s",
+                            exc, self.reconnect_delay)
+                delay = self.reconnect_delay
+        if self._before_retry is not None:
+            try:
+                result = self._before_retry(delay, self.attempts)
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the retry itself is what matters
+                log.debug("The retry hook failed (%s)", exc)
+        await self._sleep(delay)
 
     async def _await_ready(self) -> None:
         deadline = asyncio.get_running_loop().time() + self.ready_timeout

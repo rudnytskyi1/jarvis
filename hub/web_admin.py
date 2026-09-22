@@ -21,16 +21,22 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+
+from hub import labelling
+from hub.audit import AuditLog
 
 log = logging.getLogger(__name__)
 
 TEMPLATES = Path(__file__).resolve().parent / "templates"
 COOKIE = "rowan_admin"
+#: The panel knows one password, not which member typed it, so the audit says
+#: honestly where the click came from (see ``DECISIONS.md``, P2-26).
+PANEL_ACTOR = "web-panel"
 
 
 class WebAdminAuth:
@@ -106,13 +112,19 @@ class WebAdminData:
     free of the writer.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, root: str | Path | None = None) -> None:
         self.path = str(path)
+        #: Crops may only be served from here: the database stores a path, and a
+        #: path that escaped the data directory must not reach the web server.
+        self.root = Path(root) if root is not None else Path(self.path).resolve().parent
 
-    def _read(self, sql: str) -> list[Any]:
-        conn = sqlite3.connect(self.path, timeout=5.0)
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=5.0)
+
+    def _read(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        conn = self._connect()
         try:
-            return conn.execute(sql).fetchall()
+            return conn.execute(sql, params).fetchall()
         finally:
             conn.close()
 
@@ -145,7 +157,8 @@ class WebAdminData:
 
     def counts(self) -> dict[str, int]:
         return {"homes": len(self.homes()), "clients": len(self.clients()),
-                "people": len({row["person_id"] for row in self.people()})}
+                "people": len({row["person_id"] for row in self.people()}),
+                "pending": len(self.unknown_tracks())}
 
     def audit(self, limit: int = 50) -> list[dict[str, Any]]:
         """The newest privileged actions of the hub (ТЗ F-706)."""
@@ -156,6 +169,61 @@ class WebAdminData:
                  "actor": row[1] or "—", "home_id": row[2] or "—", "action": row[3],
                  "target": row[4] or "—", "result": row[5] or "ok",
                  "detail": row[6] or "{}"} for row in rows]
+
+    # --- manual labelling (ТЗ F-216) ---------------------------------------
+
+    def unknown_tracks(self, *, day: str | None = None, home_id: str | None = None,
+                       limit: int = labelling.QUEUE_LIMIT) -> list[dict[str, Any]]:
+        """The tracks of one day that nobody could name, with their evidence."""
+        conn = self._connect()
+        try:
+            tracks = labelling.queue(conn, home_id=home_id, day=day, limit=limit)
+        finally:
+            conn.close()
+        return [self._track_view(track) for track in tracks]
+
+    def labelling_people(self) -> list[dict[str, Any]]:
+        """Who the track may be bound to: the click names a person, not a name."""
+        rows = self._read("SELECT person_id, display_name FROM persons"
+                          " ORDER BY display_name, person_id")
+        return [{"person_id": row[0], "name": row[1] or row[0]} for row in rows]
+
+    def save_label(self, track_id: str, person_id: str, *, day: str | None = None,
+                   crop_id: str = "") -> dict[str, Any]:
+        """One click: name the track, link that day's samples, keep the label."""
+        conn = self._connect()
+        try:
+            result = labelling.label(conn, track_id, person_id, day=day, crop_id=crop_id,
+                                     actor=PANEL_ACTOR, source="admin", audit=AuditLog(conn))
+        except sqlite3.Error as exc:
+            log.warning("The panel could not label track %s (%s)", track_id, exc)
+            return {"ok": False, "track_id": str(track_id), "person_id": str(person_id),
+                    "note": f"database error: {exc}"}
+        finally:
+            conn.close()
+        return result.summary()
+
+    def crop_path(self, crop_id: str) -> Path | None:
+        """The JPEG of a crop, and only when it lives under the data directory."""
+        conn = self._connect()
+        try:
+            return labelling.crop_file(conn, crop_id, self.root)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _track_view(track: labelling.UnknownTrack) -> dict[str, Any]:
+        belief = dict(track.belief)
+        sources = belief.get("sources") if isinstance(belief.get("sources"), dict) else {}
+        return {"track_id": track.track_id, "home_id": track.home_id or "—",
+                "first_seen": track.first_seen, "last_seen": track.last_seen,
+                "faces": track.faces, "bodies": track.bodies, "voices": track.voices,
+                "quality": f"{track.quality:.2f}",
+                "belief_p": f"{float(belief.get('p') or 0.0):.2f}",
+                "belief_person": belief.get("person_id") or "—",
+                "sources": ", ".join(f"{name} {float(value):.2f}"
+                                     for name, value in sorted(sources.items())) or "—",
+                "crops": [{"crop_id": crop.crop_id} for crop in track.crops]}
 
 
 def _hash_hint(token_hash: str) -> str:
@@ -249,6 +317,52 @@ def build_router(*, cfg: Any, data: WebAdminData | None, auth: WebAdminAuth) -> 
     router.add_api_route("/admin/audit", page("admin/audit.html", "events",
                                               lambda: data.audit(50) if data else []),
                          methods=["GET"], response_class=HTMLResponse)
+
+    def tracks_page(request: Request, day: str = ""):
+        """ТЗ F-216: the unrecognized tracks of a day, with crops and numbers."""
+        if (blocked := denied(request)) is not None:
+            return blocked
+        if not signed_in(request):
+            return RedirectResponse("/admin", status_code=303)
+        wanted = str(day)[:10] or labelling.day_of()
+        return templates.TemplateResponse(request, "admin/tracks.html", {
+            "tracks": data.unknown_tracks(day=wanted) if data is not None else [],
+            "people": data.labelling_people() if data is not None else [],
+            "day": wanted, "message": request.query_params.get("message", ""),
+            "counts": data.counts() if data is not None else {}})
+
+    router.add_api_route("/admin/tracks", tracks_page, methods=["GET"],
+                         response_class=HTMLResponse)
+
+    @router.post("/admin/label")
+    async def apply_label(request: Request, track_id: str = Form(""),
+                          person_id: str = Form(""), day: str = Form(""),
+                          crop_id: str = Form("")):
+        if (blocked := denied(request)) is not None:
+            return blocked
+        if not signed_in(request):
+            return RedirectResponse("/admin", status_code=303)
+        wanted = str(day)[:10]
+        query: dict[str, str] = {"day": wanted} if wanted else {}
+        if data is None or not track_id or not person_id:
+            query["message"] = "Nothing changed: pick a track and a person."
+        else:
+            result = data.save_label(track_id, person_id, day=wanted or None, crop_id=crop_id)
+            query["message"] = (f"Track {track_id} is now {result['name']}."
+                                if result.get("ok")
+                                else f"Nothing changed: {result.get('note', 'failed')}")
+        return RedirectResponse("/admin/tracks?" + urlencode(query), status_code=303)
+
+    @router.get("/admin/crop/{crop_id}.jpg")
+    async def crop(request: Request, crop_id: str):
+        """The crop of a track, from the data directory and nowhere else."""
+        if (blocked := denied(request)) is not None:
+            return blocked
+        path = data.crop_path(crop_id) if (data is not None and signed_in(request)) else None
+        if path is None:
+            return HTMLResponse("<h1>404</h1><p>No such crop.</p>", status_code=404)
+        return Response(content=path.read_bytes(), media_type="image/jpeg")
+
     return router
 
 
@@ -268,5 +382,5 @@ def mount(app: Any, *, cfg: Any, data: WebAdminData | None) -> Any:
     return auth
 
 
-__all__ = ["COOKIE", "TEMPLATES", "WebAdminAuth", "WebAdminData", "build_router", "mount",
-           "overlay_only", "quote"]
+__all__ = ["COOKIE", "PANEL_ACTOR", "TEMPLATES", "WebAdminAuth", "WebAdminData", "build_router",
+           "mount", "overlay_only", "quote"]

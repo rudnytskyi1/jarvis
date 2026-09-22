@@ -10,12 +10,77 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 log = logging.getLogger("jarvis.server.tts")
+
+
+class TtsCache:
+    """Кэш синтеза коротких фиксированных реплик (ТЗ F-302).
+
+    Приветствия и прощания — это заранее известные строки, которые человек
+    слышит снова и снова, а синтез идёт на CPU и занимает секунды. Кэш хранит
+    готовый PCM последних коротких реплик, поэтому повторное приветствие
+    звучит сразу. Кэш ограничен по числу записей и по объёму: длинные ответы
+    модели в него не попадают, иначе память хаба стала бы архивом аудио.
+
+    Потокобезопасен: синтез идёт в рабочем потоке через ``asyncio.to_thread``.
+    """
+
+    def __init__(self, *, max_items: int = 64, max_chars: int = 240,
+                 max_bytes: int = 8_000_000) -> None:
+        self.max_items = max(1, int(max_items))
+        self.max_chars = max(1, int(max_chars))
+        self.max_bytes = max(1, int(max_bytes))
+        self._items: OrderedDict[tuple[str, int], bytes] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, text: Any, sample_rate: int = 0) -> bytes | None:
+        """The PCM of exactly this line, or ``None`` (a miss is counted)."""
+        key = (str(text or ""), int(sample_rate or 0))
+        with self._lock:
+            found = self._items.get(key)
+            if found is None:
+                self.misses += 1
+                return None
+            self._items.move_to_end(key)
+            self.hits += 1
+            return found
+
+    def put(self, text: Any, sample_rate: int, pcm: bytes) -> bool:
+        """Remember a line; ``False`` when it is too long to belong here."""
+        line = str(text or "")
+        if not pcm or not line or len(line) > self.max_chars or len(pcm) > self.max_bytes:
+            return False
+        key = (line, int(sample_rate or 0))
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old)
+            self._items[key] = pcm
+            self._bytes += len(pcm)
+            while len(self._items) > self.max_items or self._bytes > self.max_bytes:
+                _, dropped = self._items.popitem(last=False)
+                self._bytes -= len(dropped)
+        return True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._bytes = 0
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {"items": len(self._items), "bytes": self._bytes,
+                    "hits": self.hits, "misses": self.misses}
 
 SILERO_REPO = "snakers4/silero-models"
 SILERO_MODEL = "silero_tts"

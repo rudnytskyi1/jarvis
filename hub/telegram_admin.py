@@ -26,10 +26,17 @@ TTL_SECONDS = 900
 _COMMAND = re.compile(r'^/(tools|cancel|tools_input)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$')
 _ALERT_FIELDS = {
     'workplace_id': ('Workplace and camera', 'workplace'),
+    # ТЗ F-702: правило слушает событие (F-301/F-109/F-311), а не только кадр.
+    'event': ('What to watch', ('presence', 'person_entered', 'person_left',
+                                'unknown_appeared', 'zone_entered', 'sound_event', 'object')),
     'target': ('Who to detect', ('any', 'unknown', 'person')),
     'name': ('Profile name (for person)', 'str'),
+    'zone': ('Zone (empty = any)', 'str'),
     'media': ('Attachment', ('photo', 'video')),
     'destination': ('Destination', ('owner', 'group')),
+    # ТЗ F-702: канал доставки — Telegram, пуш на телефон или подпись в HUD.
+    'channel': ('Delivery channel', ('telegram', 'push', 'hud')),
+    'home_id': ('Home id (empty = every home)', 'str'),
     'cooldown_s': ('Notification cooldown, seconds', 'float'),
     'min_stable_s': ('Stable presence, seconds', 'float'),
     'absence_s': ('Absence before a new entry, seconds', 'float'),
@@ -40,7 +47,8 @@ _ALERT_FIELDS = {
 }
 _ALERT_DEFAULTS = dict(enabled=False, workplace_id='', target='any', name='', media='photo', destination='owner',
                        cooldown_s=300, min_stable_s=2, absence_s=15, quiet_start='', quiet_end='',
-                       timezone='America/Chicago', clip_seconds=5)
+                       timezone='America/Chicago', clip_seconds=5, event='presence',
+                       channel='telegram', home_id='', zone='')
 #: One-tap values for the numeric alert settings, so a rule no longer needs a
 #: reply-based text input for the common cases. The ranges come from
 #: hub.presence_alerts.RULE_RANGES, so a preset can never be rejected.
@@ -77,8 +85,11 @@ class TelegramAdmin:
     The access store is synchronous; disk calls run off the asyncio loop.
     """
 
-    def __init__(self, provider, cfg, access, backend, *, clock=time.monotonic):
+    def __init__(self, provider, cfg, access, backend, *, clock=time.monotonic, homes=None):
         self.provider, self.cfg, self.access, self.backend = provider, cfg, access, backend
+        #: ТЗ F-701: кто ещё может открыть панель — владельцы домов. ``None``
+        #: оставляет прежнее поведение «панель только у админа хаба».
+        self.homes = homes
         self.clock = clock
         self.bot_id, self.username = None, ''
         self._panels, self._tokens = {}, {}
@@ -98,10 +109,41 @@ class TelegramAdmin:
                 and sender.get('is_bot') is False and self.access.is_owner(sender['id'])
                 and sender['id'] == getattr(self._cfg, 'control_user_id', None))
 
+    def _may_panel(self, user_id):
+        """ТЗ F-701: админ хаба — везде, владелец дома — в своём чате."""
+        if type(user_id) is not int or user_id <= 0:
+            return False
+        if self.access.is_owner(user_id) and user_id == getattr(self._cfg, 'control_user_id', None):
+            return True
+        if self.homes is None:
+            return False
+        try:
+            return bool(self.homes.may_use_panel(user_id)) and not self.access.is_owner(user_id)
+        except Exception:  # noqa: BLE001 - unreadable grants are not a permission
+            return False
+
+    def _scope(self, user_id):
+        """``None`` для админа хаба, иначе — дома этого аккаунта (F-701)."""
+        if self.homes is None:
+            return None
+        try:
+            return self.homes.scope(user_id)
+        except Exception:  # noqa: BLE001 - без грантов аккаунт видит только себя
+            return frozenset()
+
+    def _allowed_sender(self, sender):
+        """A human account allowed to use the panel: hub admin or home owner."""
+        return (isinstance(sender, dict) and type(sender.get('id')) is int
+                and sender.get('is_bot') is False and self._may_panel(sender['id']))
+
     def _route(self, chat, owner):
-        return (isinstance(chat, dict) and type(chat.get('id')) is int and (
-            (chat.get('type') == 'private' and chat['id'] == owner) or
-            (chat.get('type') in {'group', 'supergroup'} and chat['id'] == self._cfg.chat_id)))
+        if not isinstance(chat, dict) or type(chat.get('id')) is not int:
+            return False
+        if chat.get('type') == 'private':
+            # ТЗ F-701: у владельца дома свой чат — свой, а не только у админа.
+            return self._may_panel(chat['id']) and chat['id'] == owner
+        return (chat.get('type') in {'group', 'supergroup'}
+                and chat['id'] == self._cfg.chat_id and self.access.is_owner(owner))
 
     def _prune(self):
         now = self.clock()
@@ -134,8 +176,7 @@ class TelegramAdmin:
             panel.message_id = message_id
 
     async def _backend(self, panel, action, payload=None):
-        if (self._closed or not self.access.is_owner(panel.owner)
-                or panel.owner != getattr(self._cfg, 'control_user_id', None)):
+        if self._closed or not self._may_panel(panel.owner):
             return {'ok': False, 'error': 'Owner access is no longer confirmed.'}
         try:
             target = self.backend.call if hasattr(self.backend, 'call') else self.backend
@@ -183,7 +224,7 @@ class TelegramAdmin:
             if command and command[2] and command[2].casefold() != self.username.casefold():
                 return False
             sender, chat = message.get('from'), message.get('chat')
-            if (not self._owner(sender) or not self._route(chat, sender['id'])
+            if (not self._allowed_sender(sender) or not self._route(chat, sender['id'])
                     or message.get('sender_chat') or message.get('forward_origin') or message.get('forward_date')):
                 return bool(command)
             panel = self._panels.get((sender['id'], chat['id']))
@@ -217,7 +258,7 @@ class TelegramAdmin:
         sender, message = callback.get('from'), callback.get('message')
         chat = message.get('chat') if isinstance(message, dict) else None
         token = self._tokens.get(callback.get('data'))
-        valid = (self._owner(sender) and isinstance(message, dict) and self._route(chat, sender['id'])
+        valid = (self._allowed_sender(sender) and isinstance(message, dict) and self._route(chat, sender['id'])
                  and type(message.get('message_id')) is int and token is not None)
         if valid:
             panel, generation, action = token
@@ -312,21 +353,15 @@ class TelegramAdmin:
             await self._prompt(panel, dict(action, label='Invalid format. ' + action.get('label', '')))
 
     async def _execute(self, panel, action):
-        if (self._closed or not self.access.is_owner(panel.owner)
-                or panel.owner != getattr(self._cfg, 'control_user_id', None)):
+        if self._closed or not self._may_panel(panel.owner):
             return
         name, payload = action['action'], dict(action.get('payload', {}))
         if name.startswith('users.'):
-            try:
-                if name == 'users.remove':
-                    await asyncio.to_thread(self.access.remove_user, payload['user_id'])
-                else:
-                    await asyncio.to_thread(self.access.set_user, payload['user_id'], payload['role'],
-                                            payload.get('capabilities'), payload.get('label', ''))
-                await self._audit(panel, name, payload)
-                result = {'ok': True}
-            except (ValueError, KeyError, TypeError):
-                result = {'ok': False, 'error': 'Invalid user, role or permissions. The owner cannot be changed.'}
+            # ТЗ F-701: аккаунты Telegram — общие для хаба, их ведёт админ хаба.
+            if not self.access.is_owner(panel.owner):
+                result = {'ok': False, 'error': 'Only the hub administrator can change Telegram users.'}
+            else:
+                result = await self._execute_users(panel, name, payload)
         else:
             result = await self._backend(panel, name, payload)
             await self._audit(panel, name, {'ok': result.get('ok') is True, 'id': payload.get('id'),
@@ -336,13 +371,32 @@ class TelegramAdmin:
             panel.draft = panel.draft_id = None
         await self._page(panel, action.get('back', 'home'), notice=notice, **action.get('back_payload', {}))
 
+    async def _execute_users(self, panel, name, payload):
+        try:
+            if name == 'users.remove':
+                await asyncio.to_thread(self.access.remove_user, payload['user_id'])
+            else:
+                await asyncio.to_thread(self.access.set_user, payload['user_id'], payload['role'],
+                                        payload.get('capabilities'), payload.get('label', ''))
+            await self._audit(panel, name, payload)
+            result = {'ok': True}
+        except (ValueError, KeyError, TypeError):
+            result = {'ok': False, 'error': 'Invalid user, role or permissions. The owner cannot be changed.'}
+        return result
+
     async def _page(self, panel, page, *, notice='', offset=0, **payload):
         self._invalidate(panel)
         panel.pending = None
         rows, text = [], ''
         button = lambda caption, **action: self._button(panel, caption, action)
         if page == 'home':
-            text = 'Rowan control panel · owner\nOnly you can use these buttons. They expire after 15 minutes.\nPersonal memory opens in your private chat, even from a group.'
+            scope = self._scope(panel.owner)
+            if scope is None:
+                text = 'Rowan control panel · owner\nOnly you can use these buttons. They expire after 15 minutes.\nPersonal memory opens in your private chat, even from a group.'
+            else:
+                # ТЗ F-701: владелец дома видит только свои дома.
+                text = ('Rowan control panel · ' + ', '.join(sorted(scope)) + '\n'
+                        'Only the homes named above are shown here. Buttons expire after 15 minutes.')
             places = await self._backend(panel, 'workplaces.list')
             online = [item for item in places.get('items', []) if item.get('connected')]
             text += f'\n\nComputers online: {len(online)}'
@@ -356,7 +410,10 @@ class TelegramAdmin:
                     ('Telegram users', 'users'), ('Computers and cameras', 'workplaces'),
                     ('Notifications', 'alerts'), ('Audit log', 'audit'),
                     ('Calibration', 'calibration'), ('Wall switches', 'switches'),
-                    ('Scenes', 'scenes')]
+                    ('Scenes', 'scenes'), ('Homes and owners', 'homes')]
+            if scope is not None:
+                # Домашняя панель: то, что относится к дому, и ничего чужого.
+                menu = [row for row in menu if row[1] in {'status', 'workplaces', 'switches', 'scenes'}]
             # Two buttons per row keeps the whole panel one screen tall on a phone.
             for index in range(0, len(menu), 2):
                 rows.append([button(label, kind='page', page=name) for label, name in menu[index:index + 2]])
@@ -376,6 +433,31 @@ class TelegramAdmin:
             result = await self._backend(panel, 'status')
             text = status_text(result)
             rows = [[button('Refresh', kind='page', page='status')], self._back(panel)]
+        elif page == 'homes':
+            # ТЗ F-701: админ хаба видит все дома и раздаёт их владельцам.
+            result = await self._backend(panel, 'homes.list')
+            text = ('Homes and their Telegram owners\n'
+                    'An owner opens /tools in their own private chat and sees only their homes.')
+            if result.get('ok') is False:
+                text += '\n' + _display(result.get('error'))
+            items = result.get('items', [])
+            if not items:
+                text += ('\n\nNo homes are known yet. Add a home to the hub config, or let a '
+                         'client connect, then tap Refresh.')
+            for item in items:
+                home_id = str(item.get('home_id') or '')
+                owners = ', '.join(str(value) for value in item.get('owners', [])) or 'nobody yet'
+                text += '\n\n' + _clip(f"{item.get('name') or home_id} ({home_id})\nOwners: {owners}", 240)
+                rows.append([button('Grant: ' + str(item.get('name') or home_id), kind='prompt',
+                                    label=f'Enter the Telegram ID that owns {home_id}',
+                                    type='int', action='homes.grant', field='user_id',
+                                    payload={'home_id': home_id}, back='homes')])
+                for user_id in item.get('owners', []):
+                    rows.append([button(f'Revoke {user_id} from {home_id}', kind='execute',
+                                        action='homes.revoke', payload={'home_id': home_id,
+                                                                        'user_id': user_id},
+                                        back='homes')])
+            rows.append([button('Refresh', kind='page', page='homes'), self._back(panel)])
         elif page == 'workplaces':
             result = await self._backend(panel, 'workplaces.list')
             selected = result.get('selected_id')

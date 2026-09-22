@@ -111,6 +111,7 @@ def _prepare_hub_database(cfg) -> None:
         changed = sync_homes_from_config(conn, getattr(cfg, "homes", []) or [])
         legacy_counts = _import_legacy_data(conn)
         media_counts = _cleanup_media(conn, cfg)
+        identity_counts = _consolidate_identity(conn, cfg)
         vector_dims = _prepare_vector_indexes(conn, cfg)
     finally:
         conn.close()
@@ -122,6 +123,10 @@ def _prepare_hub_database(cfg) -> None:
         log.info("Legacy data imported into the hub database: %s", legacy_counts)
     if media_counts and media_counts.get("expired_rows"):
         log.info("Expired media cleaned up: %s", media_counts)
+    if identity_counts and identity_counts.appearances:
+        log.info("Yesterday's identity consolidated: %d appearance(s) of the day, "
+                 "%d unattached cluster(s) dropped",
+                 identity_counts.appearances, identity_counts.dropped_unattached)
     if vector_dims:
         log.info("Vector indexes ready: %s", vector_dims)
 
@@ -138,9 +143,15 @@ def _import_legacy_data(conn) -> dict:
 
 
 def _cleanup_media(conn, cfg) -> dict:
-    """Remove expired room media rows and files at startup (ТЗ 4.6/F-304)."""
+    """Remove expired room media rows and files at startup (ТЗ 4.6/F-304).
+
+    Медиа живёт по TTL и удаляется задачей планировщика (``hub/scheduler.py``)
+    уже во время работы хаба; этот проход — тот же отчёт в аудит, но на старте,
+    чтобы хаб, поднявшийся после долгого простоя, не ждал первого интервала.
+    """
     try:
-        from hub.media import MediaStore
+        from hub.audit import AuditLog
+        from hub.media import MediaStore, MediaTtlTask
 
         media = getattr(cfg.server, "media", None)
         store = MediaStore(
@@ -149,10 +160,32 @@ def _cleanup_media(conn, cfg) -> dict:
             media_ttl_days=getattr(media, "media_ttl_days", 3),
             clip_ttl_days=getattr(media, "clip_ttl_days", 7),
         )
-        return store.cleanup_expired()
+        return MediaTtlTask(store, audit=AuditLog(conn)).run()
     except Exception as exc:  # noqa: BLE001 - retention cleanup must not stop the hub
         log.warning("Media cleanup skipped (%s); expired rows stay until the next start", exc)
         return {}
+
+
+def _consolidate_identity(conn, cfg):
+    """Run the nightly F-209 identity pass at startup (ТЗ F-209).
+
+    Like the media TTL, it runs when the hub starts: a hub started in the
+    morning consolidates yesterday, drops the body clusters nobody was
+    identified in, averages the rest into the "appearance of the day" and
+    purges the appearances older than the retention. Never stops the hub.
+    """
+    try:
+        from hub.identity_lifecycle import consolidate
+
+        identity = getattr(cfg.server, "identity", None)
+        if not getattr(identity, "enabled", True):
+            log.info("Identity consolidation is off (server.identity.enabled: false)")
+            return None
+        return consolidate(conn,
+                           retention_days=int(getattr(identity, "appearance_retention_days", 7)))
+    except Exception as exc:  # noqa: BLE001 - retention must not stop the hub
+        log.warning("Identity consolidation skipped (%s); the next start will retry", exc)
+        return None
 
 
 def _prepare_vector_indexes(conn, cfg) -> dict:

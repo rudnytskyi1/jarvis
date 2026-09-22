@@ -62,6 +62,21 @@ def _ensure_person(conn: sqlite3.Connection, display_name: str) -> str:
     return person_id
 
 
+def _person_for(conn: sqlite3.Connection, display_name: str) -> str:
+    """The person this name already is, or the stable legacy id.
+
+    A hub that has been running has its own ``persons`` rows (the identity
+    pipeline creates them), and the tail of an archive must attach to THOSE:
+    a second row with the same display name would hide the imported dialogues
+    and facts from everybody, because the hub resolves a name to one person.
+    """
+    row = conn.execute(
+        "SELECT person_id FROM persons WHERE lower(display_name)=lower(?) LIMIT 1",
+        (" ".join(str(display_name).split()),),
+    ).fetchone()
+    return str(row[0]) if row else _ensure_person(conn, display_name)
+
+
 def _pack_vector(vector: list[float]) -> bytes:
     return struct.pack(f"<{len(vector)}f", *vector)
 
@@ -136,7 +151,11 @@ def migrate_memory(conn: sqlite3.Connection, data_dir: Path | str = DEFAULT_DATA
             continue
         person = " ".join(str(record.get("person") or "").split())
         if person:
-            scope, owner_id, key = "person", _ensure_person(conn, person), str(record.get("key") or "")
+            # A fact's owner is the NAME the hub knows a person by, exactly as
+            # ``remember`` writes it: ``memories`` has no person_id column, and
+            # the retrieval and the isolation of F-415 compare by name.
+            _person_for(conn, person)
+            scope, owner_id, key = "person", person, str(record.get("key") or "")
         else:
             scope, owner_id, key = "home", LEGACY_HOME_ID, str(record.get("key") or "")
         kind = "setting" if key else "fact"
@@ -162,7 +181,16 @@ def _parse_ts(value: Any) -> float | None:
 
 
 def migrate_dialogs(conn: sqlite3.Connection, data_dir: Path | str = DEFAULT_DATA_DIR) -> int:
-    """Import ``data/dialogs/*.jsonl`` into ``dialog_turns``."""
+    """Import the TAIL of ``data/dialogs/*.jsonl`` into ``dialog_turns`` (P3-17).
+
+    The archive keeps growing while the hub runs - every turn appends a line -
+    so this import runs at every startup and must copy only what the table does
+    not have yet. A line carrying an ``utterance_id`` that is already in
+    ``dialog_turns`` is the human-readable twin of rows the live writer stored
+    (ТЗ 4.5), not a second turn: importing it would double the dialogue. Lines
+    without an id (an older client, or a line written before the table existed)
+    are imported under a content-derived id, so a re-run changes nothing.
+    """
     directory = Path(data_dir) / DIALOGS_DIRNAME
     if not directory.is_dir():
         return 0
@@ -182,6 +210,11 @@ def migrate_dialogs(conn: sqlite3.Connection, data_dir: Path | str = DEFAULT_DAT
                 continue
             if not isinstance(entry, dict):
                 continue
+            utterance = str(entry.get("utterance_id") or "").strip()
+            if utterance and conn.execute(
+                    "SELECT 1 FROM dialog_turns WHERE utterance_id=? LIMIT 1",
+                    (utterance,)).fetchone() is not None:
+                continue
             home_id = str(entry.get("client_id") or LEGACY_HOME_ID)
             if home_id not in known_homes:
                 _legacy_home(conn, home_id, name=home_id)
@@ -190,7 +223,7 @@ def migrate_dialogs(conn: sqlite3.Connection, data_dir: Path | str = DEFAULT_DAT
             speaker = " ".join(str(entry.get("speaker") or "").split())
             person_id = None
             if speaker.casefold() not in _UNKNOWN_SPEAKERS:
-                person_id = _ensure_person(conn, speaker)
+                person_id = _person_for(conn, speaker)
             turns = (
                 ("user", " ".join(str(entry.get("transcript") or "").split()), timestamp),
                 ("assistant", " ".join(str(entry.get("reply") or "").split()), timestamp + 0.001),
@@ -199,12 +232,15 @@ def migrate_dialogs(conn: sqlite3.Connection, data_dir: Path | str = DEFAULT_DAT
                 if not text:
                     continue
                 turn_id = f"legacy-dlg-{_sha(f'{path.name}:{number}:{role}:{line}')}"
-                conn.execute(
+                cursor = conn.execute(
                     "INSERT OR IGNORE INTO dialog_turns(turn_id, home_id, person_id, role, text, ts) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (turn_id, home_id, person_id if role == "user" else None, role, text, turn_ts),
                 )
-                imported += 1
+                # The tail is "whatever the table does not have yet", so the
+                # count is the rows this run really added - not the lines it
+                # looked at (`INSERT OR IGNORE` reports 0 for a known turn).
+                imported += max(0, cursor.rowcount)
     conn.commit()
     return imported
 

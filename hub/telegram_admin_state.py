@@ -17,6 +17,8 @@ _SECRET_KEY = re.compile(r'(?:^|[.\-_:])(?:token|secret|password|credentials?|ap
                          r'access[_-]?token|bot[_-]?token|authorization)(?:$|[.\-_:])', re.I)
 _SECRET_VALUE = re.compile(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b|\bsk-[A-Za-z0-9_-]{16,}\b|'
                            r'-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+\S+', re.I)
+#: Home ids look exactly like the ``homes.home_id`` pattern of section 14.
+_HOME_ID = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
 
 
 def contains_secret(value):
@@ -71,9 +73,16 @@ class TelegramAdminState:
                 CREATE TABLE IF NOT EXISTS telegram_admin_audit (
                     id INTEGER PRIMARY KEY, ts REAL NOT NULL, actor INTEGER NOT NULL,
                     event TEXT NOT NULL, details TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS telegram_home_owners (
+                    user_id INTEGER NOT NULL, home_id TEXT NOT NULL, granted REAL NOT NULL,
+                    PRIMARY KEY (user_id, home_id));
             ''')
             self._users_cache = {row['user_id']: dict(row) for row in db.execute('SELECT * FROM telegram_access')}
             self._settings_cache = {row['key']: row['value'] for row in db.execute('SELECT * FROM telegram_settings')}
+            owners: dict[int, set[str]] = {}
+            for row in db.execute('SELECT user_id, home_id FROM telegram_home_owners'):
+                owners.setdefault(int(row['user_id']), set()).add(str(row['home_id']))
+            self._homes_cache = {user_id: frozenset(homes) for user_id, homes in owners.items()}
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=5)
@@ -136,6 +145,74 @@ class TelegramAdminState:
             values.append(value)
         return values
 
+    # --- ТЗ F-701: чьи дома видит этот Telegram-аккаунт ---------------------
+
+    @staticmethod
+    def _home_id(home_id):
+        value = str(home_id or '').strip()
+        if not _HOME_ID.match(value):
+            raise ValueError('Unknown home.')
+        return value
+
+    def homes_of(self, user_id):
+        """The homes granted to this account (empty when none).
+
+        The hub admin is NOT handled here: ``homes_of`` answers about grants
+        only, so a caller that wants "all homes" asks the admin first (see
+        ``hub/telegram_homes.py``). This keeps the store honest about what was
+        actually granted.
+        """
+        if type(user_id) is not int or user_id <= 0:
+            return frozenset()
+        return self._homes_cache.get(user_id, frozenset())
+
+    def is_home_owner(self, user_id):
+        """True when this account owns at least one home (ТЗ F-701)."""
+        return bool(self.homes_of(user_id))
+
+    def grant_home(self, user_id, home_id):
+        """Give one home to one account; returns True when it is new."""
+        _user_id(user_id)
+        value = self._home_id(home_id)
+        with self._write_lock:
+            current = self._homes_cache.get(user_id, frozenset())
+            if value in current:
+                return False
+            with self._db() as db:
+                db.execute('INSERT OR REPLACE INTO telegram_home_owners VALUES(?,?,?)',
+                           (user_id, value, time.time()))
+            self._homes_cache = {**self._homes_cache, user_id: frozenset(current | {value})}
+        return True
+
+    def revoke_home(self, user_id, home_id):
+        """Take one home back; returns True when the grant existed."""
+        _user_id(user_id)
+        value = self._home_id(home_id)
+        with self._write_lock:
+            current = self._homes_cache.get(user_id, frozenset())
+            if value not in current:
+                return False
+            left = frozenset(current - {value})
+            with self._db() as db:
+                db.execute('DELETE FROM telegram_home_owners WHERE user_id=? AND home_id=?',
+                           (user_id, value))
+            updated = dict(self._homes_cache)
+            if left:
+                updated[user_id] = left
+            else:
+                updated.pop(user_id, None)
+            self._homes_cache = updated
+        return True
+
+    def owners_of(self, home_id):
+        """Every account that owns this home, smallest id first."""
+        value = self._home_id(home_id)
+        return tuple(sorted(user_id for user_id, homes in self._homes_cache.items() if value in homes))
+
+    def home_owners(self):
+        """All grants as ``{user_id: (home_id, ...)}`` for the panel."""
+        return {user_id: tuple(sorted(homes)) for user_id, homes in sorted(self._homes_cache.items())}
+
     def set_user(self, user_id, role, capabilities=None, label=''):
         _user_id(user_id)
         if self.is_owner(user_id):
@@ -166,7 +243,11 @@ class TelegramAdminState:
         with self._write_lock:
             with self._db() as db:
                 db.execute('DELETE FROM telegram_access WHERE user_id=?', (user_id,))
+                # ТЗ F-701: дом без владельца лучше, чем дом у удалённого аккаунта.
+                db.execute('DELETE FROM telegram_home_owners WHERE user_id=?', (user_id,))
             self._users_cache = {key: row for key, row in self._users_cache.items() if key != user_id}
+            self._homes_cache = {key: homes for key, homes in self._homes_cache.items()
+                                 if key != user_id}
 
     def observe_user(self, sender):
         if (not isinstance(sender, dict) or type(sender.get('id')) is not int

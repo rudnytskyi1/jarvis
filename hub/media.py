@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from hub.homes import ensure_home
 
@@ -173,10 +174,54 @@ class MediaStore:
                         pass
 
 
+class MediaTtlTask:
+    """The F-304 scheduler job: expire media and report the pass to the audit.
+
+    ТЗ F-304/15.4: "Кропы и кадры удаляются через ``media_ttl_days`` (по
+    умолчанию 3), клипы — через 7; эмбеддинги и события остаются. Задача в
+    Scheduler, отчёт в аудит". This is the same deletion the hub performs while
+    booting (``hub/main.py::_cleanup_media``), but on a schedule, so a hub that
+    runs for weeks still forgets frames. Embeddings and presence events are
+    never touched here - they live until "забудь меня" (ТЗ 15.4).
+
+    The pass runs on the hub's loop, because ``data/hub.db`` is opened on that
+    thread (DECISIONS P1-44); it only visits the rows whose ``expires_at`` has
+    passed. A pass that removed nothing writes no audit row, so an idle hub
+    does not fill the table with empty reports; a pass that failed is reported
+    by the scheduler (``result='failed'``, see ``hub/app.py``).
+    """
+
+    #: The audit action (and the scheduler job name) of the retention pass.
+    NAME = "media.ttl"
+
+    def __init__(self, store: MediaStore, *, audit: Any = None,
+                 interval_s: float = 3600.0,
+                 clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+        self.store = store
+        self.audit = audit
+        self.name = self.NAME
+        self.interval_s = float(interval_s)
+        self.clock = clock
+
+    def run(self) -> dict[str, Any]:
+        """One retention pass; returns the counts that go into the report."""
+        report: dict[str, Any] = dict(self.store.cleanup_expired(now=self.clock()))
+        report["media_ttl_days"] = self.store.media_ttl_days
+        report["clip_ttl_days"] = self.store.clip_ttl_days
+        if report.get("expired_rows"):
+            log.info("Media TTL expired %s row(s), deleted %s file(s)",
+                     report["expired_rows"], report["deleted_files"])
+            if self.audit is not None:
+                self.audit.record(action=self.NAME, target="media", result="ok",
+                                  detail=report)
+        return report
+
+
 __all__ = [
     "DEFAULT_DATA_DIR",
     "MEDIA_KINDS",
     "FRAME_KINDS",
     "CLIP_KINDS",
     "MediaStore",
+    "MediaTtlTask",
 ]

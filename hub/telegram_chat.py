@@ -18,6 +18,8 @@ from hub.api_budget import BudgetExceeded
 from hub.conversations import Conversations
 from hub.image_prompt import action_revoked, is_image_request, visual_request
 from hub.telegram import TelegramError
+from hub.untrusted import TELEGRAM_SOURCE
+from hub.untrusted import wrap as wrap_untrusted
 
 log = logging.getLogger(__name__)
 PROMPT = Path(__file__).resolve().parents[1] / 'prompts' / 'telegram.md'
@@ -347,6 +349,17 @@ class TelegramChat:
         # numeric sender ID explicitly separate from the current requester.
         return json.dumps({**metadata, 'timestamp': stamp, 'text': text}, ensure_ascii=False)
 
+    @classmethod
+    def _wrapped_context_text(cls, text, stamp, metadata):
+        """ТЗ F-411: chat history is text from outside the room — marked as data.
+
+        The CURRENT request is not wrapped: it is the message the sender wrote
+        and the caller has already checked who they are. Prior turns and other
+        members' lines are exactly what must not read as instructions.
+        """
+        return wrap_untrusted(cls._context_text(text, stamp, metadata),
+                              source=TELEGRAM_SOURCE)
+
     def _recent_group_context(self, message=None):
         """Read one route's exchanges; private history never includes the group."""
         private = message is not None and message['chat']['type'] == 'private'
@@ -378,14 +391,15 @@ class TelegramChat:
                 sender_id = int(suffix) if suffix.isdecimal() else None
                 metadata = {'sender_id': sender_id,
                             'author': f'Telegram user {sender_id}' if sender_id else 'Unknown Telegram author'}
-            block = [{'role': 'user', 'content': self._context_text(question, stamp, metadata)},
+            block = [{'role': 'user', 'content': self._wrapped_context_text(question, stamp, metadata)},
                      {'role': 'assistant', 'content': answer}]
             timeline.append((stamp, metadata.get('message_id', identifier), block))
         for identifier, stamp, text, raw in ambient:
             metadata = json.loads(raw)
             metadata['group_context_only'] = True
             timeline.append((stamp, identifier,
-                             [{'role': 'user', 'content': self._context_text(text, stamp, metadata)}]))
+                             [{'role': 'user',
+                               'content': self._wrapped_context_text(text, stamp, metadata)}]))
         def chronological(item):
             try:
                 moment = datetime.fromisoformat(item[0].replace('Z', '+00:00')).timestamp()

@@ -13,6 +13,7 @@ from hub.llm import (
     LlmClient,
     ToolCall,
 )
+from hub.untrusted import strip as strip_untrusted
 
 STALE = {'ok': False, 'error': 'ValueError: Stale or missing element ref. Read the page again.'}
 CHANGED = {'ok': False, 'error': 'The element changed. Read the page again.'}
@@ -130,7 +131,10 @@ def test_no_browser_action_repeats_before_read(retry):
         ('The video is playing.', []),
     ], [STALE, READ, SUCCESS])
     assert commands(executed) == ['click', 'read', 'click']
-    results = [json.loads(item['content']) for item in result.history if item.get('role') == 'tool']
+    # ТЗ F-411: a browser result reaches the model wrapped as untrusted text;
+    # the assertions read the payload underneath the marks.
+    results = [json.loads(strip_untrusted(item['content']))
+               for item in result.history if item.get('role') == 'tool']
     assert results[1]['browser_recovery_blocked'] is True
 
 

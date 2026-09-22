@@ -14,12 +14,22 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from common.protocol import CAMERA_CLIP_MAX_BYTES
+from common.protocol import CAMERA_CLIP_MAX_BYTES, DEFAULT_STATUS_TTL_S, MSG_STATUS
 
 log = logging.getLogger(__name__)
 DEFAULT_RULE = dict(enabled=False, target='any', name='', media='photo', destination='owner',
                     cooldown_s=300, min_stable_s=2, absence_s=15, quiet_start='', quiet_end='',
-                    timezone='America/Chicago', clip_seconds=5, workplace_id='')
+                    timezone='America/Chicago', clip_seconds=5, workplace_id='',
+                    # ТЗ F-702: правило слушает событие, а не только «человек в
+                    # кадре»; канал доставки выбирается; дом может дать свои
+                    # тихие часы и свой минимум кулдауна.
+                    event='presence', channel='telegram', home_id='', zone='')
+#: ТЗ F-702: события F-301 (`person_entered`…), F-109 (`sound_event`), F-311
+#: (`object`) плюс прежнее `presence` — «человек стабильно в кадре».
+EVENT_KINDS = ('presence', 'person_entered', 'person_left', 'unknown_appeared',
+               'zone_entered', 'sound_event', 'object')
+#: ТЗ F-702: «выбор канала (Telegram, пуш на телефон, HUD)».
+CHANNELS = ('telegram', 'push', 'hud')
 #: Allowed ``(min, max)`` for the numeric alert settings. The Telegram panel
 #: reads this too, so its presets and this validation can never drift apart.
 #: The cooldown floor is 1 s (it used to be 10 s): short rules are legitimate,
@@ -39,9 +49,25 @@ def validate_rule(patch, existing=None):
                          ('destination', {'owner', 'group'})]:
         if not isinstance(rule[key], str) or rule[key] not in allowed:
             raise ValueError(f'Invalid {key}.')
+    if rule['event'] not in EVENT_KINDS:
+        raise ValueError('Unknown alert event.')
+    if rule['channel'] not in CHANNELS:
+        raise ValueError('Unknown alert channel.')
     if not isinstance(rule['name'], str) or len(rule['name']) > 120 or any(ord(c) < 32 for c in rule['name']):
         raise ValueError('Provide a person name of at most 120 characters.')
-    rule['name'] = ' '.join(rule['name'].split()) if rule['target'] == 'person' else ''
+    # Имя — это человек для `target: person` и МЕТКА объекта для события F-311;
+    # во всех остальных случаях оно не хранится, чтобы правило не выглядело так,
+    # будто оно кого-то ищет.
+    keep_name = rule['target'] == 'person' or rule['event'] == 'object'
+    rule['name'] = ' '.join(rule['name'].split()) if keep_name else ''
+    rule['home_id'] = str(rule['home_id'] or '').strip()
+    if rule['home_id'] and not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', rule['home_id']):
+        raise ValueError('Provide a home id, or leave it empty for every home.')
+    if not isinstance(rule['zone'], str) or len(rule['zone']) > 120 or any(ord(c) < 32 for c in rule['zone']):
+        raise ValueError('Provide a zone name of at most 120 characters.')
+    rule['zone'] = ' '.join(rule['zone'].split())
+    if rule['event'] == 'object' and not rule['name']:
+        raise ValueError('An object alert needs the object label to watch for.')
     if rule['target'] == 'person' and not rule['name']:
         raise ValueError('A person alert needs an enrolled person name.')
     if (not isinstance(rule['workplace_id'], str) or len(rule['workplace_id']) > 100
@@ -78,6 +104,41 @@ def quiet_now(rule, timestamp):
     return start <= clock < end if start < end else clock >= start or clock < end
 
 
+def home_settings(home):
+    """A home's alert window as a plain dict (ТЗ F-702, «на дом»)."""
+    if not isinstance(home, dict):
+        return {}
+    quiet = home.get('quiet_hours') if isinstance(home.get('quiet_hours'), dict) else {}
+    start = str(home.get('quiet_start') or quiet.get('start') or '').strip()
+    end = str(home.get('quiet_end') or quiet.get('end') or '').strip()
+    try:
+        cooldown = float(home.get('cooldown_s') or 0)
+    except (TypeError, ValueError):
+        cooldown = 0.0
+    return {'quiet_start': start, 'quiet_end': end,
+            'timezone': str(home.get('timezone') or '').strip(),
+            'cooldown_s': max(0.0, cooldown) if math.isfinite(cooldown) else 0.0}
+
+
+def home_quiet_now(home, timestamp, fallback_timezone='UTC'):
+    """Тихие часы ДОМА: правило может молчать само, дом — тоже (ТЗ F-702)."""
+    window = home_settings(home)
+    start, end = window.get('quiet_start') or '', window.get('quiet_end') or ''
+    if not start or not end or start == end:
+        return False
+    try:
+        zone = ZoneInfo(window.get('timezone') or fallback_timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        zone = ZoneInfo('UTC')
+    clock = datetime.fromtimestamp(timestamp, zone).strftime('%H:%M')
+    return start <= clock < end if start < end else clock >= start or clock < end
+
+
+def home_cooldown(home, rule_cooldown):
+    """Дом может сделать правило РЕЖЕ (свой минимум), но не чаще (F-702)."""
+    return max(float(rule_cooldown), float(home_settings(home).get('cooldown_s') or 0.0))
+
+
 class PresenceAlerts:
     """Callbacks are synchronous; CRUD/status use disk and belong in to_thread.
 
@@ -87,10 +148,17 @@ class PresenceAlerts:
     remembered room identities. ``unknown_count`` also requires fresh evidence.
     """
 
-    def __init__(self, folder, get_provider, get_room, owner_id, group_id):
+    def __init__(self, folder, get_provider, get_room, owner_id, group_id, *,
+                 get_home=None, get_push=None):
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.get_provider, self.get_room = get_provider, get_room
+        #: ``home_id -> {'quiet_start','quiet_end','timezone','cooldown_s'}``
+        #: (ТЗ F-702): тихие часы и минимум кулдауна берутся у дома.
+        self.get_home = get_home or (lambda home_id: None)
+        #: Push-транспорт (F-712) или ``None``: без него канал `push` честно
+        #: сообщает, что доставлять нечем, а не притворяется отправленным.
+        self.get_push = get_push or (lambda: None)
         self.owner_id, self.group_id = owner_id, group_id
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.folder / 'alerts.sqlite3', check_same_thread=False, isolation_level=None)
@@ -175,12 +243,71 @@ class PresenceAlerts:
         if jpeg:
             self._latest_photo = (timestamp, source_id, jpeg)
         event = dict(at=float(timestamp), persons=persons, names=names, unknown_count=unknown_count,
-                     jpeg=jpeg, source_id=source_id)
+                     jpeg=jpeg, source_id=source_id, kind='presence', home_id='',
+                     label='', zone='', confidence=None)
         if self._queue.full():
             self.dropped += 1
             return False
         self._queue.put_nowait(event)
         return True
+
+    def observe_event(self, kind, *, source_id='', home_id='', name='', label='', zone='',
+                      confidence=None, observed_at=None):
+        """ТЗ F-702: событие для правил — F-301, F-109 (звук), F-311 (объект).
+
+        ``kind`` — один из :data:`EVENT_KINDS` без ``presence``; остальное —
+        подробности события. Возвращает ``False``, когда событие не принято
+        (сервис не запущен, время не похоже на настоящее, вид неизвестен), и
+        никогда не бросает: правило не может ломать ход комнаты.
+        """
+        if self._closed or self._worker is None or self._worker.done():
+            return False
+        if kind not in EVENT_KINDS or kind == 'presence':
+            return False
+        now = time.time()
+        timestamp = now if observed_at is None else observed_at
+        if type(timestamp) not in (int, float) or not math.isfinite(timestamp) or abs(now - timestamp) > 30:
+            return False
+        try:
+            confidence = None if confidence is None else float(confidence)
+        except (TypeError, ValueError):
+            confidence = None
+        event = dict(at=float(timestamp), persons=None, names=((str(name).strip(),) if str(name or '').strip() else ()),
+                     unknown_count=None, jpeg=None, source_id=str(source_id)[:100],
+                     kind=kind, home_id=str(home_id)[:64], label=str(label)[:120],
+                     zone=str(zone)[:120], confidence=confidence)
+        if self._queue.full():
+            self.dropped += 1
+            return False
+        self._queue.put_nowait(event)
+        return True
+
+    def _home_for(self, rule, event):
+        """Дом правила или дома события — как словарь для тихих часов."""
+        home_id = str(rule.get('home_id') or event.get('home_id') or '')
+        if not home_id:
+            return {}, ''
+        try:
+            return (self.get_home(home_id) or {}), home_id
+        except Exception as exc:  # noqa: BLE001 - дом без настроек всё равно дом
+            log.debug('Alert home %s is unreadable (%s)', home_id, exc)
+            return {}, home_id
+
+    @staticmethod
+    def _event_match(rule, event):
+        """Does this non-presence event satisfy this rule? (ТЗ F-702)"""
+        kind = str(event.get('kind') or '')
+        if rule.get('event') != kind:
+            return False
+        label = str(event.get('label') or '')
+        if kind == 'object' and rule.get('name', '').casefold() != label.casefold():
+            return False
+        if kind in {'person_entered', 'person_left', 'unknown_appeared'} and rule.get('target') == 'person':
+            wanted = rule.get('name', '').casefold()
+            if wanted and wanted not in {str(name).casefold() for name in (event.get('names') or ())}:
+                return False
+        zone = rule.get('zone') or ''
+        return not zone or zone == str(event.get('zone') or '')
 
     def _reserve(self, event):
         """Persist each claim and cooldown BEFORE starting any media/network work."""
@@ -194,13 +321,42 @@ class PresenceAlerts:
                     rule, global_state = {**DEFAULT_RULE, **json.loads(raw)}, json.loads(saved)
                     if not rule['enabled'] or (rule['workplace_id'] and rule['workplace_id'] != event['source_id']):
                         continue
+                    # ТЗ F-702: правило дома применяется только к событиям дома.
+                    event_home = str(event.get('home_id') or '')
+                    if rule['home_id'] and rule['home_id'] != event_home:
+                        continue
+                    home, _ = self._home_for(rule, event)
+                    cooldown = home_cooldown(home, rule['cooldown_s'])
                     source = self._db.execute('SELECT state FROM rule_sources WHERE rule_id=? AND source_id=?',
                                               (rule_id, event['source_id'])).fetchone()
                     state = json.loads(source[0]) if source else (
                         dict(global_state) if global_state.get('source_id') == event['source_id'] else {})
-                    if now <= state.get('observed', 0):
+                    # Каждый ВИД наблюдения помнит своё время: на Windows
+                    # ``time.time()`` идёт шагом ~16 мс, поэтому событие F-301
+                    # вполне может иметь ту же метку, что и кадр присутствия, и
+                    # одно не должно глушить другое.
+                    seen_key = ('observed' if str(event.get('kind') or 'presence') == 'presence'
+                                else 'observed:' + str(event.get('kind')))
+                    if now <= state.get(seen_key, 0):
                         continue
-                    state['observed'] = now
+                    state[seen_key] = now
+                    if rule['event'] != 'presence':
+                        # Событие F-301/F-109/F-311: правилу не нужна «стабильность»
+                        # в кадре — событие уже произошло, и оно либо подходит,
+                        # либо нет. Кулдаун и тихие часы те же, что у присутствия.
+                        if (self._event_match(rule, event)
+                                and now - global_state.get('last_attempt', 0) >= cooldown
+                                and not quiet_now(rule, now)
+                                and not home_quiet_now(home, now, rule['timezone'])):
+                            global_state['last_attempt'] = now
+                            delivery = dict(id=uuid.uuid4().hex, rule_id=rule_id, rule=rule, event=event)
+                            self._db.execute('INSERT INTO deliveries(id,rule_id,at,status) VALUES (?,?,?,?)',
+                                             (delivery['id'], rule_id, now, 'pending'))
+                            ready.append(delivery)
+                        self._db.execute('UPDATE rules SET state=? WHERE id=?', (json.dumps(global_state), rule_id))
+                        self._db.execute('INSERT OR REPLACE INTO rule_sources VALUES (?,?,?)',
+                                         (rule_id, event['source_id'], json.dumps(state)))
+                        continue
                     signal = (event['persons'] > 0 if event['persons'] is not None else None) if rule['target'] == 'any' else (
                         event['unknown_count'] > 0 if event['unknown_count'] is not None else None) if rule['target'] == 'unknown' else (
                         rule['name'].casefold() in {name.casefold() for name in event['names']} if event['names'] is not None else None)
@@ -217,7 +373,9 @@ class PresenceAlerts:
                         stable = (now - state['since'] >= rule['min_stable_s']
                                   and (rule['min_stable_s'] == 0 or state['observations'] >= 2))
                         if (stable and not state.get('episode_sent')
-                                and now - global_state.get('last_attempt', 0) >= rule['cooldown_s'] and not quiet_now(rule, now)):
+                                and now - global_state.get('last_attempt', 0) >= cooldown
+                                and not quiet_now(rule, now)
+                                and not home_quiet_now(home, now, rule['timezone'])):
                             state['episode_sent'] = True
                             global_state['last_attempt'] = now
                             delivery = dict(id=uuid.uuid4().hex, rule_id=rule_id, rule=rule, event=event)
@@ -313,6 +471,20 @@ class PresenceAlerts:
                     return
                 if time.time() - delivery['event']['at'] > 30:
                     raise RuntimeError('Observation expired while waiting for delivery.')
+                rule = delivery['rule']
+                home, _ = self._home_for(rule, delivery['event'])
+                if (quiet_now(rule, time.time())
+                        or home_quiet_now(home, time.time(), rule['timezone'])):
+                    await asyncio.to_thread(self._finish, delivery, 'skipped',
+                                            'Quiet hours started before delivery')
+                    return
+                # ТЗ F-702: «выбор канала (Telegram, пуш на телефон, HUD)».
+                if rule['channel'] == 'hud':
+                    await self._deliver_hud(delivery)
+                    return
+                if rule['channel'] == 'push':
+                    await self._deliver_push(delivery)
+                    return
                 provider = self.get_provider()
                 if provider is None or not provider.ready:
                     raise RuntimeError('Telegram is unavailable.')
@@ -320,16 +492,10 @@ class PresenceAlerts:
                 if not await asyncio.to_thread(self._unchanged, delivery):
                     await asyncio.to_thread(self._finish, delivery, 'skipped', 'Rule changed or was removed')
                     return
-                rule = delivery['rule']
-                if quiet_now(rule, time.time()):
+                if quiet_now(rule, time.time()) or home_quiet_now(home, time.time(), rule['timezone']):
                     await asyncio.to_thread(self._finish, delivery, 'skipped', 'Quiet hours started before delivery')
                     return
-                target = rule['name'] if rule['target'] == 'person' else 'неопознанный человек' if rule['target'] == 'unknown' else 'человек'
-                when = datetime.fromtimestamp(delivery['event']['at'], ZoneInfo(rule['timezone'])).strftime('%Y-%m-%d %H:%M:%S %Z')
-                source_id = delivery['event']['source_id']
-                room = self._room(source_id)
-                workplace = ' '.join(str(getattr(room, 'workplace_name', '') or source_id or 'Комната').split())[:100]
-                caption = f'Rowan · {workplace}: камера заметила — {target}.\n{when}'
+                caption = self._caption(rule, delivery['event'])
                 kwargs = {'private_reply_to_user_id': self.owner_id} if rule['destination'] == 'owner' else {}
                 attempted = True
                 if rule['media'] == 'video':
@@ -350,6 +516,69 @@ class PresenceAlerts:
             status = 'uncertain' if getattr(exc, 'uncertain', False) or (attempted and isinstance(exc, (TimeoutError, OSError))) else 'failed'
             await asyncio.to_thread(self._finish, delivery, status, _safe_text(str(exc)))
             log.warning('Presence alert %s (%s); no automatic retry', status, type(exc).__name__)
+
+    def _event_text(self, rule, event):
+        """Что случилось, словами (ТЗ F-702: у каждого вида события своя фраза)."""
+        kind = str(event.get('kind') or 'presence')
+        name = str(rule.get('name') or '')
+        label = str(event.get('label') or '')
+        zone = str(event.get('zone') or '')
+        if kind == 'person_entered':
+            who = name or ', '.join(str(item) for item in (event.get('names') or ())) or 'человек'
+            return f'пришёл — {who}.'
+        if kind == 'person_left':
+            who = name or ', '.join(str(item) for item in (event.get('names') or ())) or 'человек'
+            return f'ушёл — {who}.'
+        if kind == 'unknown_appeared':
+            return 'появился незнакомый человек.'
+        if kind == 'zone_entered':
+            return f'человек в зоне: {zone}.' if zone else 'человек перешёл в другую зону.'
+        if kind == 'sound_event':
+            return f'звук: {label or "событие"}.'
+        if kind == 'object':
+            return f'камера видит: {label or name}.'
+        target = ('неопознанный человек' if rule['target'] == 'unknown'
+                  else rule['name'] if rule['target'] == 'person' else 'человек')
+        return f'камера заметила — {target}.'
+
+    def _caption(self, rule, event):
+        when = datetime.fromtimestamp(event['at'], ZoneInfo(rule['timezone'])).strftime('%Y-%m-%d %H:%M:%S %Z')
+        source_id = event['source_id']
+        room = self._room(source_id)
+        workplace = ' '.join(str(getattr(room, 'workplace_name', '') or source_id or 'Комната').split())[:100]
+        return f'Rowan · {workplace}: {self._event_text(rule, event)}\n{when}'
+
+    async def _deliver_hud(self, delivery):
+        """ТЗ F-702: канал HUD — подпись на экране комнаты, без медиа.
+
+        Медиа здесь не запрашивается осознанно: подпись видит тот, кто и так в
+        комнате, и дергать камеру ради неё значило бы мешать ходу.
+        """
+        rule, event = delivery['rule'], delivery['event']
+        room = self._room(event['source_id'])
+        if room is None or not self._idle(room):
+            raise RuntimeError('The room is busy or offline; no automatic retry.')
+        sender = getattr(room, 'send_json', None)
+        if sender is None:
+            raise RuntimeError('This room has no HUD channel.')
+        await sender({'type': MSG_STATUS, 'text': self._caption(rule, event),
+                      'ttl_s': float(DEFAULT_STATUS_TTL_S)})
+        await asyncio.to_thread(self._finish, delivery, 'sent', 'HUD caption')
+
+    async def _deliver_push(self, delivery):
+        """ТЗ F-702: канал «пуш на телефон»; транспорт даёт F-712 (фаза 3)."""
+        push = self.get_push()
+        if push is None:
+            await asyncio.to_thread(self._finish, delivery, 'skipped',
+                                    'Push transport is not configured yet (ТЗ F-712)')
+            return
+        payload = {'title': 'Rowan', 'text': self._caption(delivery['rule'], delivery['event']),
+                   'rule_id': delivery['rule_id'], 'source_id': delivery['event']['source_id'],
+                   'at': delivery['event']['at'], 'kind': delivery['event'].get('kind', 'presence')}
+        ack = await push(payload)
+        if isinstance(ack, dict) and ack.get('ok') is False:
+            raise RuntimeError(str(ack.get('error') or 'The push transport refused the message.'))
+        await asyncio.to_thread(self._finish, delivery, 'sent', 'push')
 
     async def drain(self):
         """Wait for currently queued work; useful during a controlled shutdown."""

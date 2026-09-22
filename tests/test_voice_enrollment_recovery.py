@@ -261,8 +261,12 @@ def test_additional_session_keeps_existing_samples_and_commits_after_six(tmp_pat
                 assert conn._enroll_pending['samples'] == index + 1
         assert 'samples are saved' in reply and conn._enroll_pending is None
         person = speaker.VoiceRegistry(tmp_path)._people['Anton']
-        assert len(person['voice_embeddings']) == 15
-        assert person['voice_embeddings'][:9] == [[1., 0.]] * 9
+        # ТЗ F-211 caps a voice profile at 8 vectors (the phase-1 default was
+        # 30, see DECISIONS.md P2-21): the oldest of the 9 stored samples step
+        # aside for the six new ones, the rest are kept as they were.
+        assert len(person['voice_embeddings']) == speaker.MAX_VOICE_SAMPLES_PER_PERSON
+        assert speaker.MAX_VOICE_SAMPLES_PER_PERSON == 8
+        assert person['voice_embeddings'][:2] == [[1., 0.]] * 2
         assert person['role'] == 'admin' and person['face_embeddings'] == [[.1, .2]]
         conn._confirm_voice_recovery.assert_not_awaited()
     asyncio.run(run())

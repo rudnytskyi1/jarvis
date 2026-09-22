@@ -55,11 +55,16 @@ def changed_rooms(conn: sqlite3.Connection, config: Config) -> list[HomeConfigCh
     """Refresh ``homes`` from ``config`` and describe what changed."""
     changed_ids = sync_homes_from_config(conn, config.homes)
     by_id = {home.home_id: home for home in config.homes}
-    return [
-        HomeConfigChange(home_id, home_config_rev(conn, home_id), home_patch(by_id[home_id]))
-        for home_id in changed_ids
-        if home_id in by_id
-    ]
+    changes: list[HomeConfigChange] = []
+    for home_id in changed_ids:
+        if home_id not in by_id:
+            continue
+        patch = home_patch(by_id[home_id])
+        # ТЗ F-117/4.8: the room keeps its scenes locally, so the same frame
+        # that announces new settings announces the scenes to cache.
+        patch["scenes"] = _scenes_of(conn, home_id)
+        changes.append(HomeConfigChange(home_id, home_config_rev(conn, home_id), patch))
+    return changes
 
 
 def reload_home_settings(
@@ -80,7 +85,10 @@ def current_room_frame(conn: sqlite3.Connection, home_id: str) -> dict[str, Any]
     """The ``config_update`` frame describing a room as it is right now.
 
     Sent right after ``hello`` so a client that was offline during a reload
-    still starts with the current revision; ``None`` for an unknown room.
+    still starts with the current revision; ``None`` for an unknown room. The
+    frame also carries the room's SCENES (ТЗ F-117/4.8): a room whose brain is
+    unreachable must still be able to run the scenes it already knows about,
+    and it cannot ask the hub for a list it cannot reach.
     """
     row = conn.execute(
         "SELECT name, tz, quiet_hours_json, settings_json FROM homes WHERE home_id=?", (home_id,)
@@ -96,8 +104,35 @@ def current_room_frame(conn: sqlite3.Connection, home_id: str) -> dict[str, Any]
             "tz": str(tz),
             "quiet_hours": _json_object(quiet_json),
             "settings": _json_object(settings_json),
+            "scenes": _scenes_of(conn, home_id),
         },
     ).frame()
+
+
+def _scenes_of(conn: sqlite3.Connection, home_id: str) -> list[dict[str, Any]]:
+    """The room's scenes as the client caches them (name, aliases, steps)."""
+    try:
+        rows = conn.execute(
+            "SELECT name, aliases_json, steps_json FROM scenes WHERE home_id=? ORDER BY name",
+            (str(home_id),),
+        ).fetchall()
+    except sqlite3.Error:  # a hub without the scenes table still serves the room
+        return []
+    scenes: list[dict[str, Any]] = []
+    for name, aliases_json, steps_json in rows:
+        aliases = _json_list(aliases_json)
+        steps = _json_list(steps_json)
+        scenes.append({"name": str(name), "aliases": [str(a) for a in aliases],
+                       "steps": [dict(step) for step in steps if isinstance(step, Mapping)]})
+    return scenes
+
+
+def _json_list(raw: Any) -> list[Any]:
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return list(value) if isinstance(value, list) else []
 
 
 def _json_object(raw: Any) -> dict[str, Any]:

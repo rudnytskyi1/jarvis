@@ -62,6 +62,22 @@ class UtteranceMetrics:
             while len(self._active) > self._capacity:
                 self._active.popitem(last=False)
 
+    def route(self, utterance_id: str, route: dict[str, Any]) -> None:
+        """Attach the answering model level to a turn in progress (ТЗ F-401).
+
+        The level is known in the middle of the turn (the router decides before
+        the model round) and is finished with at the end of it, so it is
+        remembered here and travels into the trace that ``/health.utterances``
+        publishes. An unknown or already finished turn is ignored: a late
+        caller must not invent a trace.
+        """
+        if not utterance_id:
+            return
+        with self._lock:
+            active = self._active.get(utterance_id)
+            if active is not None:
+                active["route"] = dict(route)
+
     def finished(self, utterance_id: str, *, stages: dict[str, int] | None = None,
                  actions: int = 0, note: str = "", ok: bool = True,
                  degraded: list[str] | None = None,
@@ -83,6 +99,10 @@ class UtteranceMetrics:
             }
             if note:
                 trace["note"] = note
+            #: ТЗ F-401/F-403: which model level answered this turn, and why.
+            route = (started or {}).get("route")
+            if route:
+                trace["route"] = dict(route)
             if not ok:
                 self._failed += 1
             if degraded:

@@ -251,6 +251,154 @@
   }
   .status.visible { opacity: 1; }
 
+  /* -- capability warning (ТЗ F-102: barge-in without echo cancellation).
+        Amber, below the caption, and it does not fade: it says why the room
+        cannot interrupt Rowan, which the owner has to be able to read. -- */
+  .warning {
+    position: absolute;
+    top: 132px;
+    left: 50%;
+    max-width: 620px;
+    transform: translateX(-50%);
+    text-align: center;
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 13px;
+    line-height: 1.45;
+    letter-spacing: .04em;
+    color: rgba(255, 199, 122, .96);
+    text-shadow: 0 0 18px rgba(255, 176, 64, .35);
+    opacity: 0;
+    transition: opacity 380ms ease;
+  }
+  .warning.visible { opacity: 1; }
+
+  /* -- camera off (ТЗ F-303): privacy mode is not a moment, it is a state.
+        A red badge in the top corner with a struck-through camera, so anybody
+        in the room can see at a glance that nobody is being watched. -- */
+  .camera-off {
+    position: absolute;
+    top: 18px;
+    right: 22px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 116, 116, .55);
+    background: rgba(40, 8, 10, .55);
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 12px;
+    letter-spacing: .06em;
+    color: rgba(255, 168, 168, .96);
+    text-shadow: 0 0 16px rgba(255, 92, 92, .45);
+    opacity: 0;
+    transition: opacity 320ms ease;
+  }
+  .camera-off.visible { opacity: 1; }
+  .camera-off svg { width: 16px; height: 16px; display: block; }
+
+  /* -- ТЗ F-708: строка живого транскрипта — что хаб услышал прямо сейчас.
+        Показывается только для ТЕКУЩЕЙ реплики; черновой текст курсивом. -- */
+  .transcript {
+    position: absolute;
+    left: 50%;
+    bottom: 24vh;
+    width: max-content;
+    max-width: 70vw;
+    transform: translateX(-50%);
+    padding: 8px 14px;
+    border-radius: 14px;
+    background: rgba(8, 12, 24, .55);
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 18px;
+    line-height: 1.35;
+    text-align: center;
+    color: rgba(238, 234, 255, .92);
+    opacity: 0;
+    transition: opacity 180ms ease-out;
+  }
+  .transcript.visible { opacity: 1; }
+  .transcript.provisional { font-style: italic; color: rgba(238, 234, 255, .68); }
+
+  /* -- ТЗ F-708: статус хаба — онлайн / очередь / оффлайн. -- */
+  .hub {
+    position: absolute;
+    right: 22px;
+    bottom: 22px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(8, 12, 24, .55);
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 12px;
+    letter-spacing: .06em;
+    color: rgba(238, 234, 255, .85);
+    opacity: 0;
+    transition: opacity 180ms ease-out;
+  }
+  .hub.visible { opacity: 1; }
+  .hub-dot { width: 8px; height: 8px; border-radius: 50%; background: #5ad07a; }
+  .hub.queue .hub-dot { background: #f0c15a; }
+  .hub.offline .hub-dot { background: #e06767; }
+
+  /* -- ТЗ F-708: имена над треками поверх показанного кадра. -- */
+  .track-layer { position: absolute; inset: 0; pointer-events: none; }
+  .track-label {
+    position: absolute;
+    transform: translate(-50%, -100%);
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: rgba(8, 12, 24, .7);
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 14px;
+    white-space: nowrap;
+    color: rgba(238, 234, 255, .95);
+  }
+
+  /* -- follow-up window (ТЗ F-103): a thin draining bar + the seconds left.
+        It is only visible while the microphone is actually open without the
+        wake word; the client closes it the moment it stops listening. -- */
+  .followup {
+    position: absolute;
+    top: 158px;
+    left: 50%;
+    width: 190px;
+    transform: translateX(-50%);
+    text-align: center;
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    opacity: 0;
+    transition: opacity 300ms ease;
+  }
+  .followup.visible { opacity: 1; }
+  .followup-track {
+    width: 100%;
+    height: 2px;
+    border-radius: 1px;
+    background: rgba(184, 216, 197, .18);
+    overflow: hidden;
+  }
+  .followup-bar {
+    height: 100%;
+    width: 100%;
+    background: rgba(184, 216, 197, .8);
+    box-shadow: 0 0 12px rgba(184, 216, 197, .4);
+  }
+  .followup-label {
+    margin-top: 7px;
+    font-size: 11px;
+    letter-spacing: .16em;
+    text-transform: lowercase;
+    color: rgba(184, 216, 197, .85);
+  }
+
   /* -- typing: three small dots fading in sequence -- */
   .typing {
     position: absolute;
@@ -330,9 +478,30 @@
       <div class="glow-core"></div>
     </div>
     <div id="status" class="status"></div>
+    <div id="warning" class="warning"></div>
+    <div id="followup" class="followup">
+      <div class="followup-track"><div id="followup-bar" class="followup-bar"></div></div>
+      <div id="followup-label" class="followup-label"></div>
+    </div>
     <div id="typing" class="typing"><span></span><span></span><span></span></div>
   </div>
   <div id="speaker" class="speaker"></div>
+  <div id="transcript" class="transcript"></div>
+  <div id="hub" class="hub">
+    <span class="hub-dot"></span>
+    <span id="hub-label"></span>
+  </div>
+  <div id="track-layer" class="track-layer"></div>
+  <div id="camera-off" class="camera-off">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" aria-hidden="true">
+      <path d="M3 3l18 18"></path>
+      <path d="M15 15H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h1"></path>
+      <path d="M9.5 5H17a2 2 0 0 1 2 2v6a2 2 0 0 1-.6 1.4"></path>
+      <path d="M21 8.5l-4 2.5"></path>
+    </svg>
+    <span id="camera-off-label"></span>
+  </div>
   <div id="scan" class="scan"></div>
   <div id="shot" class="shot"></div>
   <div id="shot-frame" class="shot-frame"></div>
@@ -344,9 +513,20 @@
 
   var body = document.body;
   var statusEl = document.getElementById("status");
+  var warningEl = document.getElementById("warning");
+  var followupEl = document.getElementById("followup");
+  var followupBarEl = document.getElementById("followup-bar");
+  var followupLabelEl = document.getElementById("followup-label");
+  var followupTotal = 0;
   var typingEl = document.getElementById("typing");
   var clickLayer = document.getElementById("click-layer");
   var speakerEl = document.getElementById("speaker");
+  var transcriptEl = document.getElementById("transcript");
+  var hubEl = document.getElementById("hub");
+  var hubLabelEl = document.getElementById("hub-label");
+  var trackLayerEl = document.getElementById("track-layer");
+  var cameraOffEl = document.getElementById("camera-off");
+  var cameraOffLabelEl = document.getElementById("camera-off-label");
   var shotEl = document.getElementById("shot");
   var shotFrameEl = document.getElementById("shot-frame");
   var STATES = ["idle", "listening", "thinking", "speaking"];
@@ -381,9 +561,40 @@
     statusEl.textContent = status;
     statusEl.classList.toggle("visible", status.length > 0);
 
+    var warning = typeof opts.warning === "string" ? opts.warning : "";
+    warningEl.textContent = warning;
+    warningEl.classList.toggle("visible", warning.length > 0);
+
+    // ТЗ F-303: приватность камеры — постоянный значок, а не подпись момента.
+    var cameraOff = typeof opts.camera_off === "string" ? opts.camera_off : "";
+    cameraOffLabelEl.textContent = cameraOff;
+    cameraOffEl.classList.toggle("visible", cameraOff.length > 0);
+
     typingEl.classList.toggle("visible", !!opts.typing);
 
     body.classList.toggle("scan-on", !!opts.scan);
+  };
+
+  // -- window.hudFollowup(secondsLeft) - the follow-up window of ТЗ F-103.
+  // The client calls it with the window length when the microphone opens
+  // without the wake word, ticks it about four times a second, and ends with
+  // 0 the moment the window stops listening.
+  window.hudFollowup = function (seconds) {
+    var left = Number(seconds);
+    if (!isFinite(left) || left <= 0) {
+      followupTotal = 0;
+      followupEl.classList.remove("visible");
+      followupBarEl.style.width = "0%";
+      followupLabelEl.textContent = "";
+      return;
+    }
+    if (left > followupTotal) {
+      followupTotal = left;
+    }
+    followupEl.classList.add("visible");
+    var share = followupTotal > 0 ? Math.max(0, Math.min(1, left / followupTotal)) : 0;
+    followupBarEl.style.width = (share * 100).toFixed(1) + "%";
+    followupLabelEl.textContent = "listening \u00b7 " + Math.ceil(left) + "s";
   };
 
   // -- window.hudClick(xNorm, yNorm) - one thin ring at that exact point.
@@ -418,6 +629,94 @@
       speakerEl.textContent = text;
     }
     speakerEl.classList.toggle("visible", text.length > 0);
+  };
+
+  // -- window.hudTranscript({text, provisional}) - ТЗ F-708: живой транскрипт
+  // ТЕКУЩЕЙ реплики. Пустой текст убирает строку; `provisional` (черновой
+  // распознанный текст, который хаб ещё уточняет) показывается курсивом.
+  window.hudTranscript = function (payload) {
+    payload = payload || {};
+    if (payload.clear === true) {
+      transcriptEl.textContent = "";
+      transcriptEl.classList.remove("provisional", "visible");
+      return;
+    }
+    var text = typeof payload.text === "string" ? payload.text.trim() : "";
+    transcriptEl.textContent = text;
+    transcriptEl.classList.toggle("provisional", payload.provisional === true && text.length > 0);
+    transcriptEl.classList.toggle("visible", text.length > 0);
+  };
+
+  // -- window.hudHub({state, queue}) - ТЗ F-708: статус хаба. `online` (зелёный),
+  // `queue` (жёлтый, с числом ожидающих задач) и `offline` (красный, когда
+  // связь потеряна). Пустой state прячет значок.
+  window.hudHub = function (payload) {
+    payload = payload || {};
+    var state = payload.state;
+    var known = ["online", "queue", "offline"].indexOf(state) >= 0;
+    hubEl.classList.toggle("visible", known);
+    hubEl.classList.toggle("queue", state === "queue");
+    hubEl.classList.toggle("offline", state === "offline");
+    if (!known) {
+      hubLabelEl.textContent = "";
+      return;
+    }
+    var label = state === "offline" ? "brain offline" : state === "queue" ? "queue" : "online";
+    var queued = Number(payload.queue);
+    if (state === "queue" && isFinite(queued) && queued > 0) {
+      label += " \u00b7 " + Math.round(queued);
+    }
+    hubLabelEl.textContent = label;
+  };
+
+  // -- window.hudTracks([{name, box}]) - ТЗ F-708: имена над треками поверх
+  // показанного кадра. `box` — нормализованный [x1, y1, x2, y2] от левого
+  // верхнего угла; подпись встаёт над верхней гранью. Пустой список убирает
+  // подписи. Вторым полем может прийти сам кадр {w, h}: полноэкранный снимок
+  // держит пропорции, поэтому подписи считаются по рамке кадра, а не по экрану.
+  window.hudTracks = function (payload) {
+    var tracks = payload;
+    var frame = null;
+    if (payload && !Array.isArray(payload) && typeof payload === "object") {
+      tracks = payload.tracks || [];
+      frame = payload;
+    }
+    while (trackLayerEl.firstChild) {
+      trackLayerEl.removeChild(trackLayerEl.firstChild);
+    }
+    if (!tracks || !tracks.length) {
+      return;
+    }
+    var vw = window.innerWidth || 1;
+    var vh = window.innerHeight || 1;
+    var fitX = 0, fitY = 0, spanX = vw, spanY = vh;
+    var iw = frame ? Number(frame.w) : 0;
+    var ih = frame ? Number(frame.h) : 0;
+    if (isFinite(iw) && isFinite(ih) && iw > 0 && ih > 0) {
+      var scale = Math.min(vw / iw, vh / ih);
+      spanX = iw * scale;
+      spanY = ih * scale;
+      fitX = (vw - spanX) / 2;
+      fitY = (vh - spanY) / 2;
+    }
+    for (var i = 0; i < tracks.length; i++) {
+      var item = tracks[i] || {};
+      var name = typeof item.name === "string" ? item.name.trim() : "";
+      var box = item.box;
+      if (!name || !box || box.length < 4) {
+        continue;
+      }
+      var x1 = Number(box[0]), y1 = Number(box[1]), x2 = Number(box[2]);
+      if (!isFinite(x1) || !isFinite(y1) || !isFinite(x2)) {
+        continue;
+      }
+      var label = document.createElement("div");
+      label.className = "track-label";
+      label.textContent = name;
+      label.style.left = (fitX + spanX * Math.max(0, Math.min(1, (x1 + x2) / 2))) + "px";
+      label.style.top = (fitY + spanY * Math.max(0, Math.min(1, y1))) + "px";
+      trackLayerEl.appendChild(label);
+    }
   };
 
   // -- window.hudFlash(kind) - "wake" (bright bloom), "error" (soft red) or
@@ -455,6 +754,9 @@
   // real event.
   window.hudState({ state: "idle", status: "", typing: false, scan: false });
   window.hudSpeaker("");
+  window.hudTranscript({ text: "" });
+  window.hudHub({ state: "" });
+  window.hudTracks([]);
 })();
 </script>
 </body>

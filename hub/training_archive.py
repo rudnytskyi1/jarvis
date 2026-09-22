@@ -179,6 +179,46 @@ class TrainingArchive:
         local = utc.astimezone(self.timezone)
         return captured_at, utc, local
 
+    def forget(self, person):
+        """Delete every archived event and folder of one person (ТЗ F-213).
+
+        «Забудь меня» must reach the frames themselves, not only the hub
+        database: the archive keeps person folders (photos and clips) and an
+        event index next to them. This removes the person's rows, their alias
+        and every folder that belongs to them, and reports what it removed. An
+        unknown voice was never archived under a name, so it is a no-op.
+        """
+        name = _name(person)
+        if name == 'unknown':
+            return {'person_id': '', 'events': 0, 'folders': 0}
+        key = name.casefold()
+        with self._lock:
+            db = self._db()
+            try:
+                row = db.execute('SELECT person_id FROM aliases WHERE name_key=?', (key,)).fetchone()
+                if row is None:
+                    return {'person_id': '', 'events': 0, 'folders': 0}
+                person_id = str(row['person_id'])
+                folders = {str(item['folder']) for item in db.execute(
+                    'SELECT DISTINCT folder FROM events WHERE person_id=?', (person_id,))}
+                db.execute('BEGIN IMMEDIATE')
+                events = db.execute('DELETE FROM events WHERE person_id=?', (person_id,)).rowcount
+                db.execute('DELETE FROM aliases WHERE name_key=?', (key,))
+                db.execute('DELETE FROM identities WHERE id=?', (person_id,))
+                db.commit()
+            finally:
+                db.close()
+        removed = 0
+        for folder in folders:
+            try:
+                target = self._path(folder)
+            except ValueError:  # a record outside the root is not ours to delete
+                continue
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                removed += 1
+        return {'person_id': person_id, 'events': int(events or 0), 'folders': removed}
+
     def _identity(self, db, name, profile_id, now):
         if name == 'unknown':
             return 'unknown'

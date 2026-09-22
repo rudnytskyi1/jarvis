@@ -76,8 +76,20 @@ from client.audio import (
     RingBuffer,
     frame_bytes,
 )
+from client.barge_in import BargeInAvailability, BargeInStop, SpeechGate
 from client.devices.registry import build_registry
+from client.local_commands import LocalOutcome, LocalRunner, parse_local_command
+from client.local_stt import LocalStt
+from client.offline import (
+    OFFLINE_PHRASE_ID,
+    OfflineMode,
+    language_of,
+    offline_notice,
+    prefetch_phrases,
+)
+from client.presence_buffer import PresenceBuffer
 from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
+from client.tts_cache import PhraseCache
 from client.vad import VadRecorder
 from client.voice_controls import ConfirmedWakeDetector, SilenceDetector
 from client.wakeword import WakeWordDetector
@@ -94,6 +106,7 @@ from common.protocol import (
     MSG_ERROR,
     MSG_HELLO,
     MSG_IMAGE_SHOW,
+    MSG_OFFLINE_HINT,
     MSG_READY,
     MSG_SAY,
     MSG_SCREENSHOT,
@@ -103,6 +116,8 @@ from common.protocol import (
     MSG_STATUS,
     MSG_TRANSCRIPT,
     MSG_TTS_END,
+    MSG_TTS_PHRASE,
+    MSG_TTS_PREFETCH,
     MSG_TTS_START,
     MSG_UTTERANCE_END,
     MSG_UTTERANCE_START,
@@ -159,6 +174,12 @@ NO_SPEECH_BEEP_MS = 90
 #: TV with real speakers, and it also gives the person a beat to start talking
 #: instead of the microphone opening while the reply is still hanging in the air.
 FOLLOWUP_ECHO_GUARD_S = 2.0
+#: ТЗ 4.8: как часто сторож проверяет, не пропал ли хаб и не пора ли сказать
+#: комнате, что он оффлайн (проверка дешёвая — это флаг, а не сеть).
+OFFLINE_POLL_S = 0.25
+#: ТЗ F-708: how long the names over the shown camera view stay up when the
+#: hub does not say. Matches ``hub.app.IMAGE_SHOW_TTL_S``.
+TRACK_LABEL_TTL_S = 60.0
 #: "Thinking" sounds: when the server takes longer than this to start replying
 #: (vision, tool rounds), a soft two-tone blip repeats so the user knows Jarvis
 #: is working rather than stuck. Silenced the moment the reply begins.
@@ -199,6 +220,22 @@ MODE_IDLE = "idle"
 MODE_CONVERSATION = "conversation"
 #: How often a waiting conversation re-checks that the reader is still alive.
 INBOX_POLL_S = 0.5
+
+#: ТЗ F-117/4.8: how much of the last reply the client keeps, so "повтори"
+#: works with no hub involved at all. Half a minute is one spoken answer.
+REPLY_CACHE_SECONDS = 30.0
+
+
+def human_seconds(seconds: int) -> str:
+    """A countdown the room can hear: "20 minutes", "45 seconds", "1 hour"."""
+    seconds = max(1, int(seconds))
+    if seconds >= 3600 and seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} hour" + ("s" if hours > 1 else "")
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute" + ("s" if minutes > 1 else "")
+    return f"{seconds} second" + ("s" if seconds != 1 else "")
 
 
 def _ota_enabled(ccfg: Any) -> bool:
@@ -276,6 +313,16 @@ def _opt_str(value: Any) -> str | None:
     return text or None
 
 
+def _int_or_zero(value: Any) -> int:
+    """A non-negative int from the wire, or 0 when it is anything else."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        try:
+            value = int(str(value))
+        except (TypeError, ValueError):
+            return 0
+    return max(0, int(value))
+
+
 def clip_output(value: Any) -> str | None:
     """Normalise the dispatcher's ``output`` for ``action_result`` (SPEC §4).
 
@@ -293,7 +340,7 @@ def clip_output(value: Any) -> str | None:
     return text
 
 
-def build_hello(cfg_client: Any) -> dict[str, Any]:
+def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
     """Build the ``hello`` payload from the client config (SPEC §4.1)."""
     devices: list[dict[str, Any]] = []
     for dev in (_attr(cfg_client, "devices") or []):
@@ -315,6 +362,9 @@ def build_hello(cfg_client: Any) -> dict[str, Any]:
         "camera_name": str(_attr(_attr(cfg_client, 'camera'), 'name') or 'Основная камера'),
         "capabilities": ["voice_confirmation", "live_transcript", _protocol.CAP_CAMERA_CLIP],
         "devices": devices,
+        # ТЗ F-303: приватность живёт на клиенте, поэтому он и говорит, что у
+        # него на самом деле (а не хаб угадывает по своим воспоминаниям).
+        "privacy": bool(privacy),
     }
 
 
@@ -387,6 +437,14 @@ class JarvisClient:
         self._thinking_task: asyncio.Task | None = None
         self._barge_task: asyncio.Task | None = None
         self._barged = False
+        #: ТЗ F-102: how much continuous speech counts as an interruption, and
+        #: the words the microphone already holds when it fires (the watcher
+        #: consumed them, so the turn that follows must get them back).
+        self._barge_gate = SpeechGate(self.frame_ms)
+        self._barge_preroll: bytes = b""
+        #: Replaced by the measured AEC state in :meth:`_apply_barge_in_state`.
+        self.barge_in = BargeInAvailability(
+            configured=bool(getattr(audio_cfg, 'barge_in', True)), aec_active=False)
         self._interrupt_id = ''
         self._notice_tts = False
         self._enrollment_until = 0.0
@@ -406,10 +464,27 @@ class JarvisClient:
 
         self.registry = build_registry(self.ccfg)
         self.dispatcher = Dispatcher(self.ccfg, self.registry)
+        #: ТЗ 4.8: how long a broken link may last before the room is told, and
+        #: how the client comes back (exponential, capped).
+        offline_cfg = _attr(self.ccfg, "offline")
+        self.offline = OfflineMode(offline_cfg)
+        self.presence_buffer = PresenceBuffer(
+            int(getattr(offline_cfg, "presence_buffer", 0) or 0))
+        self.phrase_cache = PhraseCache(
+            REPO_ROOT / str(getattr(offline_cfg, "phrases_dir", "data/tts_cache")
+                            or "data/tts_cache"),
+            enabled=bool(getattr(offline_cfg, "phrases_cache", True)))
+        #: ТЗ 4.8: faster-whisper small/base on THIS machine, for the turns
+        #: that happen while the hub is away. Loaded lazily, never fatal.
+        self.local_stt = LocalStt(getattr(offline_cfg, "stt", None))
         self.ws = WSClient(
             url=str(self.ccfg.server_url),
             hello=build_hello(self.ccfg),
             should_stop=lambda: self._stopping,
+            # ТЗ 4.8: экспоненциальная задержка вместо фиксированных 3 с, и
+            # хук, который говорит комнате, что мозг оффлайн.
+            backoff=self.offline.delay_for,
+            before_retry=self._before_retry,
         )
 
         self.wake: ConfirmedWakeDetector | None = None
@@ -417,6 +492,11 @@ class JarvisClient:
         self._action_task: asyncio.Task | None = None
         self._tts_active = False
         self._tts_bytes = 0
+        #: ТЗ F-117/4.8: the last reply's PCM, kept so "повтори" works with no
+        #: hub involved, and the local countdown timers of this room.
+        self._reply_pcm = b""
+        self._reply_rate = 0
+        self._local_tasks: set[asyncio.Task] = set()
         self._last_say = ""
         #: Server's follow-up window request from the last reply (say.listen_s).
         self._listen_hint_s = 0.0
@@ -482,6 +562,14 @@ class JarvisClient:
             self.overlay = _NoOverlay()
         #: The image_show header awaiting its single binary JPEG frame.
         self._pending_image_show: dict[str, Any] | None = None
+        #: ТЗ F-708: the track labels drawn over the shown photo, and a token
+        #: that stops an older photo's labels from clearing a newer one's.
+        self._track_labels_token = 0
+        #: ТЗ 4.8: the ``tts_phrase`` header awaiting its single binary PCM
+        #: frame, plus the background tasks of the offline mode.
+        self._pending_phrase: dict[str, Any] | None = None
+        self._reconnect_task: asyncio.Task | None = None
+        self._offline_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # setup / teardown
@@ -515,6 +603,12 @@ class JarvisClient:
 
     async def _shutdown(self) -> None:
         self._stopping = True
+        # ТЗ 4.8: the background search for the hub and the offline watchdog
+        # must not outlive the client they belong to.
+        await self._cancel_task(getattr(self, "_reconnect_task", None), "reconnect")
+        self._reconnect_task = None
+        await self._cancel_task(getattr(self, "_offline_task", None), "offline watch")
+        self._offline_task = None
         await self._stop_reader()
         await self._cancel_task(self._dismiss_task, 'silence acknowledgement')
         await self._cancel_task(self._idle_drain_task, "proactive playback")
@@ -576,6 +670,27 @@ class JarvisClient:
         except Exception as exc:  # pragma: no cover - helpers must not break teardown
             log.debug("The %s task ended with: %s", what, exc)
 
+    def _apply_barge_in_state(self) -> None:
+        """Fix the F-102 availability from the audio pipeline that really came up.
+
+        The config says what the owner wants; this says what the machine can
+        do. Barge-in on real speech is allowed only when the WebRTC echo
+        canceller is actually running - otherwise the microphone hears Rowan
+        through the speakers and every reply would cut itself short. The room
+        is told in the HUD, and the reason is logged once.
+        """
+        processor = getattr(self.audio_in, "processor", None)
+        self.barge_in = BargeInAvailability(
+            configured=bool(getattr(self.ccfg.audio, "barge_in", True)),
+            aec_active=bool(getattr(processor, "aec_active", False)),
+        )
+        log.info("Barge-in %s (%s)", "on" if self.barge_in.speech else "off",
+                 self.barge_in.detail())
+        warning = self.barge_in.warning
+        if warning:
+            log.warning("%s", warning)
+        self.overlay.barge_in_warning(warning)
+
     def _start_camera(self) -> None:
         """Start the optional camera service (SPEC v1.4); never fatal."""
         camera = self.camera
@@ -592,6 +707,9 @@ class JarvisClient:
                 self.ws.send_json,
                 self.ws.send_bytes,
                 send_lock=self._wire_lock,
+                # ТЗ 4.8: то, что комната увидела без хаба, копится и дойдёт
+                # до него после переподключения.
+                on_unsent=self._keep_presence_for_replay,
             )
         except Exception as exc:  # noqa: BLE001 - the camera is never worth a crash
             log.warning("Could not start the camera service: %s - running voice only", exc)
@@ -610,15 +728,22 @@ class JarvisClient:
                 self.overlay.start()
             except Exception as exc:  # noqa: BLE001 - the HUD is never worth a crash
                 log.debug("Could not start the overlay HUD: %s", exc)
+            # ТЗ F-102: barge-in follows what the audio pipeline really built,
+            # so this runs after the microphone (and its AEC) is up - and after
+            # the HUD, so the warning can be shown on it.
+            self._apply_barge_in_state()
             self._started = True
             log.info(
                 "Jarvis client started: client_id=%s, server=%s",
                 _attr(self.ccfg, "client_id"),
                 self.ccfg.server_url,
             )
+            # ТЗ 4.8: связь с хабом ищется ФОНОМ, а комната продолжает жить:
+            # пока мозга нет, свои команды она выполняет сама.
+            self._start_reconnect()
+            self._start_offline_watch()
             while not self._stopping:
                 try:
-                    await self._ensure_link()
                     await self._conversation()
                 except _Stopping:
                     break
@@ -626,6 +751,10 @@ class JarvisClient:
                     if self._stopping:
                         break
                     log.warning("Lost the connection to the server: %s", exc)
+                    # ТЗ 4.8: о пропаже хаба комната узнаёт через 3 с — и на
+                    # экране, и голосом (см. ``_offline_loop``).
+                    self.offline.link_down()
+                    self._start_reconnect()
                     await self._beep(ERROR_BEEP_FREQ_HZ, ERROR_BEEP_MS)
         finally:
             await self._shutdown()
@@ -649,6 +778,223 @@ class JarvisClient:
         await self._stop_reader()
         await self.ws.ensure_connected()
         self._start_reader()
+        self._announce_privacy()
+        # ТЗ 4.8: после восстановления связи — досылка накопленного и просьба
+        # о фразах, которые комнате понадобятся, если хаб уйдёт снова.
+        await self._after_reconnect()
+
+    def _link_alive(self) -> bool:
+        """The socket AND its single reader (SPEC v1.4) are both up."""
+        return bool(self.ws.connected and self._reader_alive())
+
+    def _hub_is_away(self) -> bool:
+        """ТЗ 4.8: true when the room really has no hub to talk to.
+
+        A client object assembled without the transport pieces (unit tests, or
+        an object whose loop never started) is NOT offline: there is nothing to
+        fall back from, and the classic path stays exactly as it was.
+        """
+        if getattr(self, "ws", None) is None or "_reader_task" not in vars(self):
+            return False
+        return not self._link_alive()
+
+    def _start_reconnect(self) -> None:
+        """Look for the hub in the background while the room works locally."""
+        task = getattr(self, "_reconnect_task", None)
+        if task is not None and not task.done():
+            return
+        self._reconnect_task = asyncio.get_running_loop().create_task(
+            self._reconnect_loop(), name="jarvis-reconnect"
+        )
+
+    async def _reconnect_loop(self) -> None:
+        try:
+            await self._ensure_link()
+        except asyncio.CancelledError:
+            raise
+        except WSDisconnected as exc:
+            log.debug("The reconnect loop stopped: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - the room keeps working anyway
+            log.warning("The reconnect loop failed (%s)", exc)
+
+    def _start_offline_watch(self) -> None:
+        task = getattr(self, "_offline_task", None)
+        if task is not None and not task.done():
+            return
+        self._offline_task = asyncio.get_running_loop().create_task(
+            self._offline_loop(), name="jarvis-offline-watch"
+        )
+
+    async def _offline_loop(self) -> None:
+        """ТЗ 4.8: через 3 с без хаба экран и голос говорят об этом."""
+        while not self._stopping:
+            if not self._link_alive():
+                self.offline.link_down()
+                if self.offline.take_notice():
+                    await self._enter_offline_mode()
+            await asyncio.sleep(OFFLINE_POLL_S)
+
+    async def _before_retry(self, delay_s: float, attempt: int) -> None:
+        """Called by the transport before every reconnect wait (ТЗ 4.8).
+
+        The transport owns the wait, the watchdog owns the announcement; this
+        only records the fact and leaves a readable line in the log about how
+        long the room has been on its own.
+        """
+        self.offline.link_down()
+        log.info("Still no hub: attempt %d in %.0f s (offline for %.1f s)",
+                 attempt, delay_s, self.offline.down_s())
+
+    async def _enter_offline_mode(self) -> None:
+        """Once per outage: «мозг оффлайн» на экране и голосом (ТЗ 4.8)."""
+        log.info("The hub has been away for %.1f s - working locally", self.offline.down_s())
+        try:
+            self.overlay.hub_state({"state": "offline"})
+        except Exception as exc:  # noqa: BLE001 - the HUD is never worth a crash
+            log.debug("Could not show the offline badge: %s", exc)
+        await self._say_offline_notice()
+
+    async def _say_offline_notice(self) -> None:
+        """Say the pre-synthesized line; without cached audio, show it."""
+        code = language_of(self._room_language())
+        phrase_id = f"{OFFLINE_PHRASE_ID}.{code}"
+        text = offline_notice(code)
+        cached = self.phrase_cache.get(phrase_id)
+        if cached is None:
+            # Ни звука, ни выдумки: строку видно на экране комнаты, а в лог
+            # попадает причина — хаб не присылал эту фразу заранее.
+            log.info("No cached audio for %r - showing it on the room screen", phrase_id)
+            self._show_status(text, 20.0)
+            return
+        pcm, rate = cached
+        try:
+            await self.audio_out.open(int(rate) or self.sample_rate)
+            await self.audio_out.write(pcm)
+            await self.audio_out.drain()
+            log.info("Played the cached offline notice (%d bytes)", len(pcm))
+        except Exception as exc:  # noqa: BLE001 - a dead speaker is survivable
+            log.warning("Could not play the offline notice (%s)", exc)
+            self._show_status(text, 20.0)
+
+    def _room_language(self) -> str:
+        """The room's own language (the camera badge uses the same one)."""
+        camera = getattr(self, "camera", None)
+        privacy = getattr(camera, "privacy", None)
+        if privacy is not None:
+            return str(getattr(privacy, "language", "") or "")
+        return str(_attr(getattr(self.ccfg, "camera", None), "language") or "")
+
+    async def _after_reconnect(self) -> None:
+        """ТЗ 4.8: the hub is back - catch it up and arm the cache again."""
+        was_down = self.offline.down_s()
+        self.offline.link_up()
+        if was_down:
+            log.info("The hub is back after %.0f s - catching it up", was_down)
+        if len(self.presence_buffer):
+            await self._flush_presence()
+        await self._request_phrases()
+
+    def _keep_presence_for_replay(self, payload: Any) -> None:
+        """ТЗ 4.8: keep a presence frame the socket could not carry."""
+        if self.presence_buffer.add(payload):
+            log.debug("Buffered %s for the next connection", payload.get("type"))
+
+    async def _flush_presence(self) -> int:
+        """Send what the room saw while the hub was away (ТЗ 4.8)."""
+        rows = self.presence_buffer.take()
+        if not rows:
+            return 0
+        sent = 0
+        try:
+            for row in rows:
+                await self.ws.send_json(row)
+                sent += 1
+        except WSDisconnected as exc:
+            # Связь пропала снова: накопленное не теряется, оно снова в буфере.
+            for row in rows[sent:]:
+                self.presence_buffer.add(row)
+            log.info("The hub went away again before the replay finished (%s)", exc)
+            return sent
+        log.info("Replayed %d presence event(s) collected while the hub was away", sent)
+        return sent
+
+    async def _request_phrases(self) -> None:
+        """Ask the hub for the fixed lines this room may have to say alone."""
+        if not self.phrase_cache.enabled:
+            return
+        missing = [item for item in prefetch_phrases() if not self.phrase_cache.has(item["id"])]
+        if not missing:
+            return
+        try:
+            await self.ws.send_json({"type": MSG_TTS_PREFETCH, "phrases": missing})
+            log.info("Asked the hub to synthesize %d offline phrase(s)", len(missing))
+        except WSDisconnected as exc:
+            log.debug("Could not ask for the offline phrases (%s)", exc)
+
+    def _on_tts_phrase(self, msg: dict[str, Any]) -> None:
+        """ТЗ 4.8: one prefetched line is on its way (or could not be made)."""
+        error = str(msg.get("error") or "")
+        if error:
+            log.info("The hub could not synthesize %r (%s)", msg.get("id"), error)
+            self._pending_phrase = None
+            return
+        self._pending_phrase = {
+            "id": str(msg.get("id") or ""),
+            "text": str(msg.get("text") or ""),
+            "rate": _int_or_zero(msg.get("rate")),
+        }
+
+    def _on_phrase_audio(self, data: bytes) -> None:
+        """ТЗ 4.8: keep the PCM of one fixed line on this machine's disk."""
+        header, self._pending_phrase = self._pending_phrase, None
+        header = header or {}
+        phrase_id = str(header.get("id") or "")
+        if not phrase_id or not data:
+            log.warning("A tts_phrase frame arrived without its phrase - dropped")
+            return
+        self.phrase_cache.store(phrase_id, str(header.get("text") or ""), bytes(data),
+                                int(header.get("rate") or 0))
+
+    async def _on_offline_hint(self, msg: dict[str, Any]) -> None:
+        """ТЗ 4.8: the hub is going away on purpose - go local at once."""
+        reason = str(msg.get("reason") or "")[:200]
+        try:
+            eta = float(msg.get("eta_s") or 0.0)
+        except (TypeError, ValueError):
+            eta = 0.0
+        log.info("The hub asked this room to go local (%s, eta %.0f s)", reason or "no reason", eta)
+        self.offline.link_down()
+        await self._enter_offline_mode()
+
+    def _announce_privacy(self) -> None:
+        """ТЗ F-303: after a reconnect the hub learns what the camera really has.
+
+        The `hello` was built before the camera existed, so a client that had
+        privacy switched on and reconnected would otherwise leave the hub
+        thinking the room is being watched.
+        """
+        camera = getattr(self, "camera", None)
+        if camera is not None and camera.privacy.on:
+            camera.announce_privacy()
+
+    def _apply_privacy(self, msg: dict[str, Any]) -> None:
+        """ТЗ F-303: the hub asks this room's camera to stop (or start) watching.
+
+        The flag, the frames and the badge live on the client; this only obeys
+        and shows. An empty caption clears the badge when the camera is back.
+        """
+        on = bool(msg.get('on', True))
+        reason = str(msg.get('reason') or 'voice')[:100]
+        camera = getattr(self, 'camera', None)
+        changed = bool(camera is not None and camera.set_privacy(on, reason=reason))
+        privacy = camera.privacy if camera is not None else None
+        caption = privacy.indicator() if privacy is not None and privacy.on else ""
+        try:
+            self.overlay.camera_privacy(caption)
+        except Exception as exc:  # noqa: BLE001 - the HUD is never worth a crash
+            log.debug("Could not show the privacy badge: %s", exc)
+        log.info("Privacy mode %s from the hub%s",
+                 "on" if on else "off", "" if changed else " (already in that state)")
 
     def _start_reader(self) -> None:
         if self._reader_alive():
@@ -671,6 +1017,8 @@ class JarvisClient:
         # dropped connection - the next frame on a fresh connection would
         # otherwise be misrouted to the viewer instead of audio/TTS.
         self._pending_image_show = None
+        # ТЗ 4.8: то же правило для заголовка заранее синтезированной фразы.
+        self._pending_phrase = None
         self._drain_inbox("message from the previous connection")
 
     def _drain_inbox(self, what: str) -> int:
@@ -712,6 +1060,9 @@ class JarvisClient:
 
     async def _route_message(self, msg: Any) -> None:
         """Send one server message where it belongs (see the module docstring)."""
+        if isinstance(msg, dict) and msg.get('type') == _protocol.MSG_PRIVACY:
+            self._apply_privacy(msg)
+            return
         if isinstance(msg, dict) and msg.get('type') == _protocol.MSG_CAMERA_CLIP_REQUEST:
             # A 3–10 s recording must never occupy the sole socket reader.
             task = getattr(self, '_camera_clip_task', None)
@@ -734,7 +1085,10 @@ class JarvisClient:
                 await self._handle_camera_request(msg)
             return
         if isinstance(msg, bytes):
-            if self._pending_image_show is not None:
+            if self._pending_phrase is not None:
+                # ТЗ 4.8: the PCM of one fixed line, announced by tts_phrase.
+                self._on_phrase_audio(msg)
+            elif self._pending_image_show is not None:
                 # v1.6: the JPEG announced by an image_show header, in EITHER
                 # mode - never microphone audio, TTS or a conversation message.
                 await self._on_image_show_binary(msg)
@@ -751,6 +1105,19 @@ class JarvisClient:
             if (getattr(self, '_recording_live', False)
                     and msg.get('utterance_id') == self._live_turn_id):
                 self.overlay.transcript(msg)
+            return
+        if mtype == _protocol.MSG_HUB_STATUS:
+            # ТЗ F-708: the brain's own state, answered in BOTH modes - a room
+            # waiting for a reply wants to see the queue, not just an idle one.
+            self.overlay.hub_state(msg)
+            return
+        if mtype == MSG_TTS_PHRASE:
+            # ТЗ 4.8: the header of one pre-synthesized line; the PCM follows.
+            self._on_tts_phrase(msg)
+            return
+        if mtype == MSG_OFFLINE_HINT:
+            # ТЗ 4.8: the hub says it is going away on purpose.
+            await self._on_offline_hint(msg)
             return
         if mtype == MSG_IMAGE_SHOW:
             # v1.6: handled directly here, in both idle and conversation mode -
@@ -989,6 +1356,8 @@ class JarvisClient:
                 fmt, channels, PCM_FORMAT,
             )
         self._idle_tts_bytes = 0
+        self._reply_pcm = b""
+        self._reply_rate = sample_rate
         self._idle_interrupted = False
         # Set before opening the device: even if playback fails, the frames of
         # this block belong to the reader and must not reach the inbox.
@@ -1011,6 +1380,7 @@ class JarvisClient:
         if not self._idle_tts_active or self._idle_interrupted:
             return  # interrupted or muted: swallow the rest of the block
         self._idle_tts_bytes += len(data)
+        self._remember_reply_audio(data)
         await self.audio_out.write(data)
 
     async def _on_idle_tts_end(self) -> None:
@@ -1127,6 +1497,10 @@ class JarvisClient:
         lead_in: float | None = proactive if proactive > 0 else None
         verify_wake = proactive <= 0 and self.attention_mode == 'wake_word'
         while not self._stopping:
+            if self._hub_is_away():
+                # ТЗ 4.8: хаб пропал между репликами — отвечаем локально.
+                await self._local_turn(pre_roll)
+                return
             result = await self._handle_utterance(pre_roll, lead_in, verify_wake=verify_wake)
             if result == RESULT_BARGE_IN:
                 # The wake word cut the turn short: drop whatever the abandoned
@@ -1142,8 +1516,18 @@ class JarvisClient:
                         break
                 if stale:
                     log.debug("Dropped %d stale message(s) of the abandoned turn", stale)
-                await self._beep(BEEP_FREQ_HZ, BEEP_MS)
-                pre_roll = self._drain_beep_window()
+                kept = getattr(self, '_barge_preroll', b'')
+                if kept:
+                    # ТЗ F-102: the person was already talking when the playback
+                    # stopped, so their first words are the request - they are
+                    # passed on as they are and the ack beep is skipped (it
+                    # would land in the middle of the sentence).
+                    self._barge_preroll = b''
+                    pre_roll = kept
+                    log.info("Barge-in: recording the request that cut the reply short")
+                else:
+                    await self._beep(BEEP_FREQ_HZ, BEEP_MS)
+                    pre_roll = self._drain_beep_window()
                 lead_in = None
                 verify_wake = False
                 continue
@@ -1161,10 +1545,77 @@ class JarvisClient:
             await asyncio.sleep(FOLLOWUP_ECHO_GUARD_S)
             self.audio_in.clear()
             self.overlay.set_state("listening")
+            # ТЗ F-103: the room can see that the microphone stays open
+            # without the wake word, and for how long. The indicator is closed
+            # the moment the window stops listening (first recorded audio or
+            # the end of the turn).
+            self._overlay_followup(window)
             log.info(
                 "Listening for a follow-up for %.1f s (no wake word needed)...",
                 window,
             )
+
+    async def _local_turn(self, pre_roll: bytes) -> None:
+        """ТЗ 4.8: one turn with the hub gone — local STT, local command.
+
+        Nothing leaves the room: the phrase is transcribed by the client's own
+        faster-whisper (small/base) and carried out by the client's own
+        dispatcher (свет, громкость, приложения, сцены — F-117/4.8). If there
+        is no local speech model at all, the room is told that honestly instead
+        of pretending to understand.
+        """
+        log.info("The hub is away - handling this turn locally")
+        try:
+            audio = await self.vad.record(self._read_frame, pre_roll=pre_roll)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a broken mic is not a crash
+            log.warning("Could not record the local turn (%s)", exc)
+            return
+        if not audio:
+            log.info("Nothing was recorded for the local turn")
+            await self._beep(NO_SPEECH_BEEP_FREQ_HZ, NO_SPEECH_BEEP_MS, volume=0.22)
+            return
+        text = await self._local_transcript(audio)
+        if text is None:
+            # Локального распознавания нет: сказать «понял» было бы выдумкой.
+            self._show_status(offline_notice(self._room_language()), 12.0)
+            return
+        if not text:
+            log.info("The local recognizer heard nothing in the utterance")
+            await self._beep(NO_SPEECH_BEEP_FREQ_HZ, NO_SPEECH_BEEP_MS, volume=0.22)
+            return
+        outcome = await self._run_local_command(text)
+        if outcome is None:
+            # Команда не локальная: честный ответ — та же строка про хаб.
+            await self._say_offline_notice()
+            return
+        self.overlay.set_state("idle")
+
+    async def _local_transcript(self, audio: bytes) -> str | None:
+        """Transcribe one utterance on THIS machine, off the event loop."""
+        if not getattr(self.local_stt, "enabled", False):
+            return None
+        try:
+            text = await asyncio.wait_for(
+                asyncio.to_thread(self.local_stt.transcribe, audio, self.sample_rate),
+                timeout=float(getattr(self.local_stt, "timeout_s", 20.0)),
+            )
+        except TimeoutError:
+            log.warning("Local STT did not answer within %.0f s",
+                        float(getattr(self.local_stt, "timeout_s", 20.0)))
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - local ASR must never break a room
+            log.warning("Local STT failed (%s)", exc)
+            return None
+        if text is None:
+            log.info("Local STT could not transcribe this utterance: %s",
+                     getattr(self.local_stt, "reason", ""))
+            return None
+        log.info("Locally recognised: %s", text or "(empty)")
+        return str(text).strip()
 
     def _drain_beep_window(self) -> bytes:
         """Return the speech captured while the ack beep played (beep itself dropped).
@@ -1200,13 +1651,12 @@ class JarvisClient:
             self.silence.reset()
         silence_active = False
         while not self._stopping:
-            if not self.ws.connected or not self._reader_alive():
-                log.info("No connection to the server - reconnecting...")
-                await self._ensure_link()
-                self.audio_in.clear()
-                self.preroll.clear()
-                self.wake.reset()
-                log.info("Waiting for the wake word '%s'...", word)
+            if self._hub_is_away():
+                # ТЗ 4.8: комната не стоит в очереди на переподключение. Связь
+                # ищется фоном, а этот цикл продолжает слушать: пока хаба нет,
+                # свои команды выполняются локально.
+                self.offline.link_down()
+                self._start_reconnect()
             if self.attention_mode != "window":
                 self._proactive_listen_s = 0.0
             if self._proactive_listen_s > 0:
@@ -1219,16 +1669,25 @@ class JarvisClient:
                 continue
             self.preroll.push(frame)
             active = self._idle_playing and not self._quiet_turn
+            # ТЗ F-117/4.8: while the brain is away the room's own commands
+            # ("громче", "повтори", "включи свет") still work - the phrases are
+            # recognized locally and carried out on this PC.
+            offline = not self.ws.connected or not self._reader_alive()
             if self.silence:
-                if active != silence_active:
+                local_listening = bool(active or offline)
+                if local_listening != silence_active:
                     self.silence.reset()
-                    silence_active = active
-                if active and not mentions_silence_command(self._last_say) and self.silence.accept_frame(frame):
-                    self._request_silence()
-                    await self._finish_dismissal()
-                    self.preroll.clear()
-                    self.wake.reset()
-                    continue
+                    silence_active = local_listening
+                if local_listening and not mentions_silence_command(self._last_say):
+                    heard = self.silence.accept_phrase(frame)
+                    if heard is not None:
+                        outcome = await self._run_local_command(heard)
+                        if outcome is not None:
+                            self.preroll.clear()
+                            self.wake.reset()
+                            if active and outcome.kind == "stop":
+                                await self._finish_dismissal()
+                            continue
             # Only an activity bit leaves the idle client, never ambient audio.
             # Do not stall wake detection behind a camera burst's wire lock.
             now = time.monotonic()
@@ -1307,11 +1766,17 @@ class JarvisClient:
                 # this turn. The hub echoes the same id back.
                 self._live_turn_id = new_ulid()
                 self._recording_live = True
+                # ТЗ F-103: tell the hub whether this utterance came from the
+                # follow-up window, so D-02/D-11 can judge addressability with
+                # the fact only the client has - the microphone was already
+                # open for an answer, rather than opened by a wake word.
+                self._overlay_followup(0)
                 await self.ws.send_json(
                     {
                         "type": MSG_UTTERANCE_START,
                         "utterance_id": self._live_turn_id,
                         "verify_wake": verify_wake,
+                        "followup": bool(lead_in_s) and not verify_wake,
                         "sr": self.sample_rate,
                         "format": PCM_FORMAT,
                         "channels": CHANNELS,
@@ -1534,6 +1999,9 @@ class JarvisClient:
             await self._await_actions()
             # The name belongs to the turn that is now over.
             self.overlay.speaker("")
+            # ТЗ F-708: so does the live transcript - the next utterance must
+            # not start under the words of the previous one.
+            self.overlay.transcript({"clear": True})
         return result
 
     def _says_wake_word(self, text: Any) -> bool:
@@ -1543,8 +2011,54 @@ class JarvisClient:
 
     # -- barge-in: the wake word interrupts playback -------------------------
 
+    def _overlay_followup(self, seconds: float) -> None:
+        """Open/close the follow-up window indicator (ТЗ F-103).
+
+        A client object built without a HUD (tests, or a machine where the
+        overlay could not start) simply has nothing to draw on.
+        """
+        overlay = getattr(self, 'overlay', None)
+        if overlay is not None:
+            overlay.followup_window(seconds)
+
+    def _speech_barge_in(self) -> bool:
+        """May a real interruption cut the playback on this machine (F-102)?
+
+        ``barge_in`` is measured when the audio pipeline comes up; a client
+        object built without it (tests, or a client whose loop never started)
+        simply has the feature off rather than a crash.
+        """
+        availability = getattr(self, 'barge_in', None)
+        return bool(availability is not None and availability.speech)
+
+    def _cut_playback_for_speech(self, pre_roll: bytes) -> None:
+        """Go silent for a person talking over Rowan, and keep their words.
+
+        The order is the requirement: the speaker is aborted first (ТЗ 15.1
+        allows 200 ms from the interruption to silence), then the measurement
+        is reported, then the words are stored for the turn that follows. The
+        interruption is *not* sent here - ``_receive_response`` sees
+        ``_barged`` and the conversation loop records the new request.
+        """
+        gate = getattr(self, '_barge_gate', None)
+        started = getattr(gate, 'started_at', None)
+        stop = BargeInStop(speech_at=time.monotonic() if started is None else started,
+                           reason='speech')
+        dropped = self.audio_out.abort()
+        stop.stop()
+        inside, line = stop.report()
+        (log.info if inside else log.warning)("%s (%d audio chunk(s) dropped)", line, dropped)
+        self._barge_preroll = bytes(pre_roll or b"")
+        self._barged = True
+
     async def _barge_loop(self) -> None:
-        """Listen for the wake word while the reply is playing."""
+        """Cut the playback short when the room interrupts Rowan (ТЗ F-102).
+
+        Two ways in: real speech while Rowan speaks (only with echo
+        cancellation - see :meth:`_apply_barge_in_state`), and the wake word,
+        which is an explicit request and works with or without AEC. Both stop
+        the speaker first and hand the recorded words to the turn that follows.
+        """
         if self.wake is None:
             return
         self.audio_in.clear()  # drop stale audio buffered while the server thought
@@ -1552,17 +2066,39 @@ class JarvisClient:
         silence = getattr(self, 'silence', None)
         if silence:
             silence.reset()
+        gate = getattr(self, '_barge_gate', None)
+        if gate is None:
+            gate = self._barge_gate = SpeechGate(self.frame_ms)
+        gate.reset()
         preroll = RingBuffer(int(math.ceil(2200 / float(self.frame_ms))))
         while True:
             frame = await self.audio_in.read_frame(timeout=0.5)
             if not frame:
                 continue
             preroll.push(frame)
-            if silence and not self._silence_muted and silence.accept_frame(frame):
-                self._request_silence()
-                return
+            if silence and not self._silence_muted:
+                # ТЗ F-117: the same local phrases the idle loop knows, so
+                # "громче" or "повтори" never has to reach the hub.
+                heard = silence.accept_phrase(frame)
+                if heard is not None:
+                    outcome = await self._run_local_command(heard)
+                    if outcome is not None:
+                        if outcome.kind == "stop":
+                            return  # the runner already asked for silence
+                        self.preroll.clear()
+                        continue
             if getattr(self, '_wake_muted', False):
                 continue
+            if getattr(self, '_tts_active', False) and self._speech_barge_in():
+                if gate.accept(self.vad.is_speech(frame)):
+                    # ТЗ F-102: the person is talking over Rowan. Stop the audio
+                    # FIRST (the 200 ms budget is about silence, not about
+                    # logging) and keep what the microphone already heard, so
+                    # the new turn starts with the beginning of the request.
+                    self._cut_playback_for_speech(preroll.snapshot())
+                    return
+            else:
+                gate.reset()
             if self.wake.accept_frame(frame):
                 log.info("Wake word during work - requesting cancellation confirmation")
                 self.wake.reset()
@@ -1594,9 +2130,118 @@ class JarvisClient:
             except asyncio.QueueEmpty:
                 break
 
+    # ------------------------------------------------------------------
+    # local commands (ТЗ F-117, раздел 4.8): the room PC's own hands
+    # ------------------------------------------------------------------
+
+    def _remember_reply_audio(self, data: bytes) -> None:
+        """Keep the last reply's PCM, so "повтори" works with no hub involved."""
+        if not data:
+            return
+        rate = self._reply_rate or self.sample_rate
+        limit = int(REPLY_CACHE_SECONDS * rate * 2)
+        kept = self._reply_pcm + data
+        self._reply_pcm = kept[-limit:] if 0 < limit < len(kept) else kept
+
+    def _local_scenes(self) -> dict[str, list[dict[str, Any]]]:
+        """The scenes the hub pushed, by name and by alias (ТЗ 4.8 cache)."""
+        scenes: dict[str, list[dict[str, Any]]] = {}
+        raw = self.room_config.get("scenes") if isinstance(self.room_config, Mapping) else None
+        if not isinstance(raw, list):
+            return scenes
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            name = str(entry.get("name") or "").strip()
+            steps = entry.get("steps")
+            if not name or not isinstance(steps, list):
+                continue
+            scenes[name] = [dict(step) for step in steps if isinstance(step, Mapping)]
+            for alias in entry.get("aliases") or []:
+                if str(alias).strip():
+                    scenes[str(alias).strip()] = list(scenes[name])
+        return scenes
+
+    def _local_devices(self) -> list[str]:
+        names = getattr(self.registry, "names", None)
+        return [str(name) for name in names()] if callable(names) else []
+
+    def _local_runner(self) -> LocalRunner:
+        """The F-117 runner built on this client's real hands."""
+        return LocalRunner(
+            dispatch=self.dispatcher.execute,
+            stop=self._request_silence,
+            repeat=self._replay_last_reply,
+            schedule_timer=self._local_timer,
+            scenes=self._local_scenes(),
+        )
+
+    async def _run_local_command(self, text: str) -> LocalOutcome | None:
+        """Carry out a local command (F-117); ``None`` when the phrase is not one."""
+        wake = self.ccfg.wakeword
+        words = [str(getattr(wake, "word", "") or "")]
+        words.extend(str(phrase) for phrase in (getattr(wake, "phrases", ()) or ()))
+        command = parse_local_command(
+            text,
+            wake_words=[word for word in words if word],
+            devices=self._local_devices(),
+            scenes=list(self._local_scenes()),
+        )
+        if command is None:
+            return None
+        outcome = await self._local_runner().run(command)
+        log.info("Local %s command %r -> %s (%s)", command.kind, command.heard,
+                 outcome.spoken or "done", "ok" if outcome.ok else "failed")
+        if outcome.spoken:
+            if outcome.ok:
+                self._show_status(outcome.spoken, 4.0)
+            else:
+                self.overlay.chat_reply(outcome.spoken, "")
+        return outcome
+
+    def _replay_last_reply(self) -> bool:
+        """Play the last reply again from this client's own cache (F-117/F-118)."""
+        if not self._reply_pcm:
+            return False
+        task = asyncio.get_running_loop().create_task(self._play_cached_reply())
+        self._local_tasks.add(task)
+        task.add_done_callback(self._local_tasks.discard)
+        return True
+
+    async def _play_cached_reply(self) -> None:
+        pcm, rate = self._reply_pcm, self._reply_rate or self.sample_rate
+        try:
+            await self.audio_out.open(rate)
+            await self.audio_out.write(pcm)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dead speaker must not stop the client
+            log.warning("Could not repeat the last reply: %s", exc)
+
+    def _local_timer(self, seconds: int) -> str:
+        """Start a countdown on this PC: keeping time needs no hub (F-117)."""
+        seconds = max(1, int(seconds))
+        task = asyncio.get_running_loop().create_task(self._timer_after(seconds))
+        self._local_tasks.add(task)
+        task.add_done_callback(self._local_tasks.discard)
+        return f"Timer set for {human_seconds(seconds)}."
+
+    async def _timer_after(self, seconds: int) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            raise
+        if self._stopping:
+            return
+        text = f"Your {human_seconds(seconds)} timer is up."
+        self._show_status(text, 20.0)
+        self.overlay.chat_reply(text, "")
+        await self._beep(ERROR_BEEP_FREQ_HZ, ERROR_BEEP_MS, volume=0.3)
+
     def _silence_locally(self):
         self._recording_live = False
         self._quiet_turn = True
+        self._barge_preroll = b''
         self._interrupt_id = ''
         self._listen_hint_s = self._proactive_listen_s = 0.0
         self._enrollment_until = self._selection_until = 0.0
@@ -1612,6 +2257,7 @@ class JarvisClient:
         self.overlay.typing(False)
         self.overlay.scan_screen(False)
         self.overlay.speaker('')
+        self.overlay.transcript({'clear': True})
         self._show_status('', 0)
         self.overlay.chat({})
         self.overlay.set_state('idle')
@@ -1702,6 +2348,8 @@ class JarvisClient:
                 fmt, channels, PCM_FORMAT,
             )
         self._tts_bytes = 0
+        self._reply_pcm = b""
+        self._reply_rate = sample_rate
         try:
             await self.audio_out.open(sample_rate)
         except Exception as exc:
@@ -1718,6 +2366,7 @@ class JarvisClient:
         if self._barged:
             return  # interrupted: swallow the rest of the stream silently
         self._tts_bytes += len(data)
+        self._remember_reply_audio(data)
         await self.audio_out.write(data)
 
     async def _beep(self, freq: float, ms: int, volume: float = 0.35) -> None:
@@ -1887,6 +2536,9 @@ class JarvisClient:
         header = self._pending_image_show or {}
         self._pending_image_show = None
         title = str(header.get("title") or "Jarvis")
+        # ТЗ F-708: the hub sends the names over the boxes of THIS image; the
+        # screen draws them for as long as the photo itself is up.
+        self._show_track_labels(header)
         if title.startswith('Which person are you?'):
             self.overlay.photo(data)
             return
@@ -1902,6 +2554,37 @@ class JarvisClient:
             await asyncio.to_thread(self.viewer.show, data, title, ttl_s)
         except Exception as exc:  # noqa: BLE001 - never let a viewer bug break the reader
             log.warning("Could not show the detections photo: %s", exc)
+
+    def _show_track_labels(self, header: dict[str, Any]) -> None:
+        """ТЗ F-708: names over the tracks of the image that was just shown.
+
+        The labels belong to one picture: they are cleared when the next
+        ``image_show`` arrives without tracks and when this picture's own TTL
+        runs out, so a name can never outlive the photo it described.
+        """
+        self._track_labels_token += 1
+        token = self._track_labels_token
+        tracks = header.get("tracks")
+        if not isinstance(tracks, list) or not tracks:
+            self.overlay.tracks([])
+            return
+        self.overlay.tracks({"tracks": tracks, "w": header.get("w"), "h": header.get("h")})
+        try:
+            ttl = float(header.get("ttl_s") or 0.0)
+        except (TypeError, ValueError):
+            ttl = 0.0
+        task = asyncio.get_running_loop().create_task(
+            self._clear_track_labels(token, ttl if ttl > 0 else TRACK_LABEL_TTL_S))
+        self._local_tasks.add(task)
+        task.add_done_callback(self._local_tasks.discard)
+
+    async def _clear_track_labels(self, token: int, ttl_s: float) -> None:
+        try:
+            await asyncio.sleep(max(0.05, ttl_s))
+        except asyncio.CancelledError:
+            raise
+        if token == self._track_labels_token:
+            self.overlay.tracks([])
 
     # ------------------------------------------------------------------
     # actions (executed by W3's dispatcher)

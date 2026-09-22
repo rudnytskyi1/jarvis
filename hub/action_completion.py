@@ -11,8 +11,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from hub.untrusted import strip as strip_untrusted
+
 IMAGE_REPAIR_MARKER = '[image completion check:'
-_INTERNAL_PREFIXES = ('[system', IMAGE_REPAIR_MARKER)
+ACTION_CLAIM_MARKER = '[action claim check:'
+_INTERNAL_PREFIXES = ('[system', IMAGE_REPAIR_MARKER, ACTION_CLAIM_MARKER)
 _IMAGE_TOOLS = {'generate_image', 'save_photo', 'set_wallpaper', 'show_photo'}
 _NEGATIVE = re.compile(
     r"\b(?:can't|cannot|couldn't|didn't|wasn't|isn't|hasn't|unable|failed|failure|"
@@ -36,6 +39,85 @@ class ImageCompletionIssue:
     fallback: str
 
 
+@dataclass(frozen=True)
+class ActionClaimIssue:
+    """ТЗ F-410: a reply reports success while a tool of this turn failed."""
+
+    tool: str
+    error: str
+    repair: str
+    fallback: str
+
+
+def _failure_text(result: dict[str, Any]) -> str:
+    error = result.get('error') or result.get('detail') or result.get('message')
+    if isinstance(error, dict):
+        error = error.get('message') or error.get('error')
+    return ' '.join(str(error or 'the tool reported a failure').split())[:200]
+
+
+def failed_tool_results(history: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """``(tool, why)`` for every tool of THIS turn that came back unsuccessful.
+
+    Only real results count: they arrive as ``role: "tool"`` messages written
+    from the client's ``action_result`` (or the server tool's own answer), which
+    is the only thing ТЗ F-409/F-410 accepts as proof.
+
+    The LAST result of a tool is the one that counts: a retry that succeeded
+    makes the claim true, and holding the earlier failure against the model
+    would punish it for fixing the cause.
+    """
+    last: dict[str, tuple[bool, str]] = {}
+    order: list[str] = []
+    for item in _current_turn(history):
+        if item.get('role') != 'tool':
+            continue
+        result = _result(item)
+        if not result:
+            continue
+        if result.get('no_executor') is True:
+            # The hub had nothing to run the tool with: that is not the tool's
+            # verdict, and only real results count (ТЗ F-409/F-410).
+            continue
+        name = str(item.get('name') or item.get('tool_name') or 'the tool')
+        if name not in last:
+            order.append(name)
+        last[name] = (result.get('ok') is True, _failure_text(result))
+    return [(name, last[name][1]) for name in order if not last[name][0]]
+
+
+def check_action_claim(history: list[dict[str, Any]], reply: str, *,
+                       claims: bool) -> ActionClaimIssue | None:
+    """ТЗ F-410: «сделал» costs a successful tool result, not a sentence.
+
+    ``claims`` is the caller's verdict on the wording (the phrase list lives
+    next to the rest of the reply guards in :mod:`hub.llm`), so this function
+    answers one question only: is there a failed tool of this turn that the
+    reply is claiming over? A turn with no failures, or a reply that admits the
+    failure, has nothing to correct. Telling those two apart matters: "the
+    player is not running" matches the done-claim phrases ("no longer",
+    "not ... any more") while being the honest opposite of a claim.
+    """
+    if not claims or not reply:
+        return None
+    if _NEGATIVE.search(reply):
+        return None
+    failures = failed_tool_results(history)
+    if not failures:
+        return None
+    tool, why = failures[-1]
+    return ActionClaimIssue(
+        tool=tool,
+        error=why,
+        repair=(f'{ACTION_CLAIM_MARKER} your last words report this as done, '
+                f'but {tool} did not succeed: {why}. Do not claim it. Either fix the '
+                f'cause and call the tool again, or tell the user plainly that it did '
+                f'not happen and what is needed.]'),
+        fallback=(f"I couldn't do that: {tool} reported {why}. "
+                  f"Nothing was changed."),
+    )
+
+
 def _current_turn(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for index in range(len(history) - 1, -1, -1):
         message = history[index]
@@ -55,7 +137,11 @@ def image_generation_attempted(history: list[dict[str, Any]]) -> bool:
 
 
 def _result(message: dict[str, Any]) -> dict[str, Any]:
+    # ТЗ F-411: a tool result from outside the room travels wrapped for the
+    # model; the hub's own checks read the payload underneath the marks.
     raw = message.get('content', {})
+    if isinstance(raw, str):
+        raw = strip_untrusted(raw)
     try:
         result = json.loads(raw) if isinstance(raw, str) else raw
     except (ValueError, TypeError):

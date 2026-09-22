@@ -40,6 +40,9 @@ class SkillManifest(BaseModel):
     caps: list[str] = Field(default_factory=list)
     version: str = "0.1.0"
     enabled: bool = False
+    #: ТЗ F-411: this skill reads something outside the room (a web page, an
+    #: API), so its answer is untrusted text and has to be marked as such.
+    reads_internet: bool = False
 
 
 def load_manifest(path: Path) -> SkillManifest:

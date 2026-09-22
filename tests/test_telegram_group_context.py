@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from hub.telegram_chat import MAX_CONTEXT_BYTES, addressed_text
+from hub.untrusted import strip as strip_untrusted
 from tests.test_telegram_chat import runtime, update
 
 
@@ -22,7 +23,10 @@ def reply_update(number=1, *, user=7, message_id=10, text='Could you explain tha
 
 
 def user_payloads(messages):
-    return [json.loads(message['content']) for message in messages if message['role'] == 'user']
+    # ТЗ F-411: chat history reaches the model wrapped as untrusted text; the
+    # assertions read the payload underneath the marks.
+    return [json.loads(strip_untrusted(message['content']))
+            for message in messages if message['role'] == 'user']
 
 
 def test_reply_without_mention_answers_once_and_keeps_parent_context(tmp_path):

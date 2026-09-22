@@ -201,6 +201,26 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
+def _landmarks(face: Any) -> list[list[float]]:
+    """insightface's five ``kps`` points, or ``[]`` when the model gave none.
+
+    F-205 asks whether the person talking is facing the camera with a moving
+    mouth, and that question is answered from these points (left eye, right
+    eye, nose, mouth corners). A detector without landmarks simply says "no",
+    which keeps the caller honest instead of inventing a face direction.
+    """
+    points = getattr(face, "kps", None)
+    if points is None:
+        return []
+    try:
+        array = np.asarray(points, dtype=float).reshape(-1, 2)
+    except (TypeError, ValueError):
+        return []
+    if array.size == 0 or not np.isfinite(array).all():
+        return []
+    return [[float(x), float(y)] for x, y in array]
+
+
 def select_best_face(
     per_frame_detections: Iterable[Iterable[tuple[float, float, Any]]] | None,
 ) -> tuple[Any, float] | None:
@@ -385,7 +405,8 @@ class FaceEngine:
                 continue
             box = np.asarray(face.bbox, dtype=float).ravel()[:4]
             box /= [image.shape[1], image.shape[0], image.shape[1], image.shape[0]]
-            found.append(dict(score=score, area=area, embedding=vector, box=box.tolist()))
+            found.append(dict(score=score, area=area, embedding=vector, box=box.tolist(),
+                              landmarks=_landmarks(face)))
         return found
 
     def _face_detections(self, jpeg_bytes: bytes) -> list[tuple[float, float, np.ndarray]]:

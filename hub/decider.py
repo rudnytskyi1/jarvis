@@ -32,7 +32,14 @@ Outcome = Literal["act", "log", "ask"]
 HEURISTIC_TYPES = frozenset({
     "addressed", "hallucination", "action_result", "sight_claim",
     "admin_rights", "injection", "follow_up",
+    # ТЗ F-404/P3-03: "какой уровень смотрит на картинку" — правила считают
+    # сложность кадра, а провайдер может ответить своим словом.
+    "vision_level",
 })
+
+#: The name the offline rules answer under. Spelled once, because the router has
+#: to tell "the rules said so" from "a provider overruled the rules".
+RULES_PROVIDER = "rules"
 
 
 class Decision(BaseModel, Generic[T]):
@@ -103,7 +110,7 @@ def _decision(value: T, confidence: float, provider: str, started: float,
 class RulesDecider:
     """The offline fallback: the heuristics the pipeline already used (ТЗ 5.2)."""
 
-    name = "rules"
+    name = RULES_PROVIDER
 
     #: Above this many characters per second of audio the transcript cannot be
     #: real speech in this pipeline (F-105, D-03). The engine's own thresholds
@@ -138,9 +145,26 @@ class RulesDecider:
         started = time.perf_counter()
         if decision_type == "addressed":
             text = str(context.get("text") or "")
+            heuristic = context.get("heuristic")
+            if isinstance(heuristic, bool):
+                # ТЗ F-103: the caller knows something the wake word cannot
+                # show - whether the conversation is already open (the
+                # follow-up window) - and D-02 asks for exactly that "was this
+                # addressed to Rowan?". When the pipeline passes its answer,
+                # that answer IS the rule; without it (a caller that only has
+                # the text) the wake word stays the rule, as before.
+                return _decision(heuristic, 0.9 if heuristic else 0.6, self.name, started, text)
             value = has_wake_prefix(text, self._wake_words(context))
             return _decision(value, 0.9 if value else 0.6, self.name, started, text)
         if decision_type == "hallucination":
+            heuristic = context.get("heuristic")
+            if isinstance(heuristic, bool):
+                # ТЗ F-105: the caller ran the whole screen (stop phrases, a
+                # decode loop, the speech rate) and its verdict is the rule;
+                # this provider only answers for a caller that has the text
+                # alone, which is what ``_looks_impossible`` covers.
+                return _decision(heuristic, 0.8 if heuristic else 0.6, self.name, started,
+                                 str(context.get("text") or ""))
             return _decision(self._looks_impossible(context), 0.7, self.name, started,
                              str(context.get("text") or ""))
         heuristic = context.get("heuristic")
@@ -166,6 +190,14 @@ class RulesDecider:
             text = str(context.get("text") or "")
             if "local_strong" not in options and "local_fast" not in options:
                 raise NotImplementedError(f"the rules provider cannot pick from {list(options)!r}")
+            heuristic = context.get("heuristic")
+            if isinstance(heuristic, str) and heuristic in options:
+                # ТЗ F-401: the level rule lives in ONE place — the router's
+                # `pick` (length, complexity, images, queue). A caller that
+                # wants the chain in front of it hands that answer in, exactly
+                # as it does for the other heuristic decisions; a provider that
+                # knows better can still overrule it.
+                return _decision(heuristic, 0.7, self.name, started, text)
             value = "local_strong" if looks_complex(text) else "local_fast"
             if value not in options:
                 value = "local_strong" if "local_strong" in options else options[0]

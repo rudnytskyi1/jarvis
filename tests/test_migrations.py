@@ -9,6 +9,10 @@ from hub import migrations_runner as runner
 
 REQUIRED_TABLES = {
     "homes", "persons", "clients", "memberships", "contacts", "tracks",
+    "body_crops",
+    "identity_belief",
+    "identity_labels",
+    "daily_appearance",
     "voice_embeddings", "face_embeddings", "body_embeddings", "presence_events",
     "devices", "scenes", "rules", "skills", "skill_state", "dialog_turns",
     "memories", "reminders", "polls", "poll_answers", "objects_index",
@@ -23,9 +27,10 @@ def _tables(conn):
 def test_fresh_database_reaches_the_full_schema(tmp_path):
     conn = runner.connect(str(tmp_path / "hub.db"))
     try:
-        assert runner.migrate(conn) == [1, 2, 3]
+        assert runner.migrate(conn) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         assert REQUIRED_TABLES <= _tables(conn)
-        assert [row[0] for row in conn.execute("SELECT version FROM schema_version")] == [1, 2, 3]
+        assert [row[0] for row in conn.execute("SELECT version FROM schema_version")] == \
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
         columns = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
         assert "observed" in columns
         assert "preset" in {row[1] for row in conn.execute("PRAGMA table_info(scenes)")}
@@ -38,7 +43,7 @@ def test_migrate_is_idempotent(tmp_path):
     try:
         runner.migrate(conn)
         assert runner.migrate(conn) == []
-        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 3
+        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 9
     finally:
         conn.close()
 

@@ -81,8 +81,11 @@ Calling rules:
 - Volume for `volume_set` is a number from 0 to 100.
 - For `run_command`, prefer one short PowerShell command; you will get back its
   output and can chain another call if needed.
-- If a request needs several actions, call the tools one after another and only
-  then give one short spoken summary.
+- If a request needs several actions, send the WHOLE list in one reply — several
+  tool calls together, or one JSON object `{"steps": [{"tool": "set_light",
+  "arguments": {...}}, ...]}` — and only then give one short spoken summary. The
+  steps are carried out in the order you list them; a step that fails does not
+  stop the ones after it, so say which step failed.
 - Working with what is on the screen: `click_screen` the element, `type_text`
   to type, `hotkey` with enter to submit, `scroll` to move down a page or a
   list. Example — "play some music on YouTube": open the site, `click_screen`

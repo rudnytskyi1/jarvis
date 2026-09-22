@@ -55,6 +55,11 @@ class AudioConfig(_Strict):
     output_device: int | str | None = None
     sample_rate: int = Field(default=16000, ge=8000)
     echo_cancellation: bool = False
+    #: Barge-in (ТЗ F-102): speaking over Rowan stops the playback in under
+    #: 200 ms and the utterance is recorded. Requires ``echo_cancellation``:
+    #: without a running WebRTC AEC the client hears its own voice through the
+    #: speakers, so the feature switches itself off and the HUD says why.
+    barge_in: bool = True
     noise_suppression: bool = False
     noise_suppression_level: int = Field(default=1, ge=0, le=3)
 
@@ -69,6 +74,35 @@ class VADConfig(_Strict):
     #: Minimum voiced audio for a recording to count as an utterance; anything
     #: shorter is a noise blip - discarded without contacting the server.
     min_speech_ms: int = Field(default=250, ge=0)
+
+
+class VisionProfileConfig(_Strict):
+    """One detection profile of the client (ТЗ F-312).
+
+    "Ускорение клиента. Экспорт YOLO11x в TensorRT (FP16) для 3060 Ti; профиль
+    для слабых ПК: YOLO11s и треки 10 FPS. Автовыбор профиля по измеренной
+    задержке при старте клиента." A profile therefore names the model file, the
+    track rate and whether FP16 CUDA inference is used; ``budget_ms`` is the
+    per-frame inference time the profile is expected to fit in — a machine that
+    cannot hold it steps down to the next profile.
+    """
+
+    model: str = Field(min_length=1)
+    fps: float = Field(default=10.0, ge=0)
+    half: bool = True
+    budget_ms: float = Field(default=60.0, gt=0)
+
+
+def default_vision_profiles() -> dict[str, VisionProfileConfig]:
+    """The profiles of ТЗ F-312, strongest first (the order they are tried in)."""
+    return {
+        # A 3060 Ti (and anything faster): YOLO11x exported to TensorRT FP16.
+        "tensorrt": VisionProfileConfig(model="yolo11x.engine", fps=20, half=True, budget_ms=30),
+        # A CUDA machine without a TensorRT engine: the same weights in PyTorch.
+        "gpu": VisionProfileConfig(model="yolo11x.pt", fps=10, half=True, budget_ms=90),
+        # "Профиль для слабых ПК" — exactly what the ТЗ names: YOLO11s, 10 FPS.
+        "weak": VisionProfileConfig(model="yolo11s.pt", fps=10, half=False, budget_ms=200),
+    }
 
 
 class CameraConfig(_Strict):
@@ -95,8 +129,22 @@ class CameraConfig(_Strict):
     frame_recording: RecordingConfig = Field(default_factory=RecordingConfig)
     #: Ultralytics model file (downloaded automatically on first run).
     model: str = "yolo11n.pt"
+    #: ТЗ F-312: pick the detection profile by MEASURED latency at startup.
+    #: Off by default: a shipped client keeps exactly the profile its config
+    #: names, and a machine that wants the automatic choice turns it on.
+    auto_profile: bool = False
+    #: How many frames one profile is measured on while choosing.
+    profile_measure_frames: int = Field(default=3, ge=1, le=30)
+    #: The profiles the automatic choice may pick from, strongest first
+    #: (``client/vision_profile.py`` walks this order).
+    profiles: dict[str, VisionProfileConfig] = Field(default_factory=default_vision_profiles)
     #: One frame is sent to the server this often while a person is visible.
     face_check_interval_s: float = Field(default=0.5, gt=0.0)
+    #: ТЗ F-201: report the room's person TRACKS in their own ``tracks``
+    #: message (id, box, confidence, since) instead of only a person count.
+    #: On by default; a hub that predates the message ignores it and the
+    #: ``camera_state`` frame still carries the same tracks.
+    tracks_message: bool = True
 
 
 class OverlayConfig(_Strict):
@@ -165,6 +213,46 @@ class ClientOTAConfig(_Strict):
     state_path: str = Field(default="data/ota_state.json", min_length=1, max_length=200)
 
 
+class OfflineSttConfig(_Strict):
+    """Локальный распознаватель комнаты на время, когда хаба нет (ТЗ 4.8).
+
+    ТЗ называет faster-whisper small (или base) на своём GPU/CPU. Модель
+    грузится только при первой надобности: клиент без неё продолжает работать
+    на локальных фразах (``client/voice_controls.py``, F-117), а не молчит.
+    """
+
+    enabled: bool = True
+    model: Literal["base", "small"] = "base"
+    #: ``auto`` предпочитает CUDA и отступает на CPU, если её нет.
+    device: Literal["auto", "cuda", "cpu"] = "auto"
+    compute_type: str = Field(default="int8", min_length=1, max_length=30)
+    #: Пусто — язык берётся из распознавания (autodetect) faster-whisper.
+    language: str = Field(default="", max_length=10)
+    #: Дольше этого локальный распознаватель не думает: комната ждёт ответа.
+    timeout_s: float = Field(default=20.0, gt=0.0, le=120.0)
+
+
+class OfflineConfig(_Strict):
+    """Деградация комнаты без хаба (ТЗ 4.8)."""
+
+    enabled: bool = True
+    #: ТЗ 4.8: «потеря соединения дольше 3 с» — тогда HUD говорит «мозг
+    #: оффлайн», а голос объясняет, что Rowan работает локально.
+    after_s: float = Field(default=3.0, ge=0.0, le=120.0)
+    #: Реконнект с экспоненциальной задержкой: base * factor**n, не больше max.
+    backoff_base_s: float = Field(default=1.0, gt=0.0, le=60.0)
+    backoff_factor: float = Field(default=2.0, ge=1.0, le=10.0)
+    backoff_max_s: float = Field(default=30.0, gt=0.0, le=600.0)
+    stt: OfflineSttConfig = Field(default_factory=OfflineSttConfig)
+    #: Кэш заранее синтезированных фраз (ТЗ 4.8): без хаба своя TTS на
+    #: комнатном ПК не живёт, поэтому нужные строки приносит хаб заранее.
+    phrases_cache: bool = True
+    phrases_dir: str = Field(default="data/tts_cache", min_length=1, max_length=200)
+    #: Сколько событий присутствия копить, пока хаба нет (ТЗ 4.8: после
+    #: восстановления связи накопленное досылается).
+    presence_buffer: int = Field(default=120, ge=0, le=2000)
+
+
 class ClientConfig(_Strict):
     """Everything the room PC reads (``client``)."""
 
@@ -193,6 +281,8 @@ class ClientConfig(_Strict):
     devices: list[DeviceConfig] = Field(default_factory=list)
     #: Self-update from the hub's release tag (ТЗ 4.9); off by default.
     ota: ClientOTAConfig = Field(default_factory=ClientOTAConfig)
+    #: Degradation without the hub (ТЗ 4.8).
+    offline: OfflineConfig = Field(default_factory=OfflineConfig)
     #: Hub identity (ТЗ phase 0): which home this client belongs to and how it
     #: authenticates. ``hub_url`` falls back to the legacy ``server_url`` and the
     #: token itself is only ever read from the named environment variable.

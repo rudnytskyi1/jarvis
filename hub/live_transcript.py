@@ -27,6 +27,14 @@ class LiveTranscript:
         # Do not cancel a native GPU inference and release its lock prematurely.
         self.active = False
 
+    def draft_text(self):
+        """The preview transcript as it stands (ТЗ F-101, P2-41).
+
+        Called at ``utterance_end``: this is the draft the model may start on
+        while the final, punctuated STT pass runs.
+        """
+        return ' '.join(w.text.strip() for w in self.words).strip()
+
     def feed(self, audio):
         if (not self.active or len(audio) < self.rate * 2 * 1.2
                 or time.monotonic() < self.next_at or (self.task and not self.task.done())):

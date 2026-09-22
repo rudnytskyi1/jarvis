@@ -33,6 +33,9 @@ Client -> Server
   format: "mp4", bytes, w, h, seconds, fps}`` followed by one silent MP4 binary
   frame of at most CAMERA_CLIP_MAX_BYTES, or ``{type: MSG_CAMERA_CLIP_ERROR,
   id, error}`` with no binary. Header and MP4 share the client's wire lock.
+* ``{"type": MSG_TTS_PREFETCH, "phrases": [{"id": str, "text": str}]}`` (ТЗ 4.8)
+  asks for the fixed lines the room must be able to SAY with the hub gone; the
+  hub answers with one MSG_TTS_PHRASE header + binary PCM per phrase.
 
 Server -> Client
 ----------------
@@ -54,6 +57,16 @@ Server -> Client
 * ``{type: MSG_CAMERA_CLIP_REQUEST, id, seconds: 3..10, fps: 5..10}`` is sent
   only when the client advertises ``camera_clip``. Recording uses existing
   camera capture frames; it does not open another camera or run extra YOLO.
+* ``{"type": MSG_SOUND_EVENT, "label": str, "conf": 0..1, "at_ms": int}`` --
+  v2 (ТЗ F-109): one sound the client's own detector heard (knock, bell,
+  alarm, breaking glass, cough). No audio leaves the room; the hub turns the
+  label into an alert-rule event (F-702).
+* ``{"type": MSG_OFFLINE_HINT, "reason": str, "eta_s": float}`` (ТЗ 4.8) -- the
+  hub is going away on purpose (restart, maintenance), so the client switches
+  to its local mode before the socket breaks.
+* ``{"type": MSG_TTS_PHRASE, "id": str, "rate": int, "bytes": int}`` (ТЗ 4.8)
+  followed by exactly ONE binary frame with the PCM of that fixed line; a line
+  the hub could not synthesize comes back with ``error`` and no binary frame.
 * ``{"type": MSG_SAY, "text": str, "listen_s": float, "status": str}`` --
   ``listen_s`` and ``status`` are optional. v1.7: ``status`` is a caption the
   client shows on the HUD for the follow-up window this reply opens (voice
@@ -117,6 +130,18 @@ MSG_SCREENSHOT = "screenshot"
 MSG_SCREENSHOT_ERROR = "screenshot_error"
 #: v1.4: what the room camera currently sees (people count + object counts).
 MSG_CAMERA_STATE = "camera_state"
+#: v2 (ТЗ F-109): one sound event the client's own detector heard (knock, bell,
+#: alarm, breaking glass, cough). The hub turns it into an alert-rule event
+#: (F-702); the client never sends audio for it, only the label and confidence.
+MSG_SOUND_EVENT = "sound_event"
+#: v2 (ТЗ F-201): the live person TRACKS of one client - each person in the
+#: frame keeps its ``track_id`` while it is visible, and a lost track is
+#: remembered for up to 30 s so the same person comes back as the same track.
+#: ``camera_state`` keeps carrying its count for a client that predates this.
+MSG_TRACKS = "tracks"
+#: v2 (ТЗ F-202): header announcing ONE binary frame with a person's body
+#: crop - JPEG, up to 640 px tall, cut on the client for ReID (F-203).
+MSG_BODY_CROP = "body_crop"
 #: v1.4: header announcing the single binary frame with a camera JPEG.
 MSG_CAMERA_FRAME = "camera_frame"
 #: v1.4: the client could not grab a camera frame; no binary frame follows.
@@ -136,6 +161,15 @@ MSG_SCREENSHOT_REQUEST = "screenshot_request"
 #: v1.4: ask the client for one frame of the room camera.
 MSG_CAMERA_REQUEST = "camera_request"
 MSG_CAMERA_CLIP_REQUEST = "camera_clip_request"
+#: v1.8 (ТЗ F-303): the room's camera goes (or comes) back — the client stops
+#: sending frames and shows the indicator; the microphone keeps working, so the
+#: same voice can ask for the camera back.
+MSG_PRIVACY = "privacy"
+#: v2 (ТЗ 4.8): the hub is going away on purpose (restart, maintenance). The
+#: client switches to its local mode at once instead of waiting for the socket
+#: to break, so the room is told what is happening while the brain is still
+#: there to say it.
+MSG_OFFLINE_HINT = "offline_hint"
 MSG_SAY = "say"
 MSG_TTS_START = "tts_start"
 MSG_TTS_END = "tts_end"
@@ -145,6 +179,21 @@ MSG_IMAGE_SHOW = "image_show"
 #: shown on the HUD while something slow happens in the background (face
 #: enrollment photos). Empty text clears it. Nothing is spoken.
 MSG_STATUS = "status"
+#: v2 (ТЗ F-708): what the brain itself is doing, for the room HUD --
+#: ``{"state": "online" | "queue" | "offline", "queue": int}``. The hub sends
+#: it when a room connects and when the GPU queue picks up or finishes work;
+#: ``offline`` is normally the CLIENT's own conclusion when the socket is gone,
+#: so the HUD never has to guess whether the room or the brain is the problem.
+MSG_HUB_STATUS = "hub_status"
+#: v2 (ТЗ 4.8): "synthesize these fixed lines and send me the audio". The
+#: client asks for the phrases it must be able to SAY while the hub is gone
+#: (there is no TTS on a room PC), and keeps the PCM it gets back.
+MSG_TTS_PREFETCH = "tts_prefetch"
+#: v2 (ТЗ 4.8): the answer to ``MSG_TTS_PREFETCH`` - one header naming the
+#: phrase and its rate, followed by ONE binary frame with the PCM. A phrase the
+#: hub could not synthesize comes back with ``error`` and no audio, so the
+#: client never plays silence as if it were a cached line.
+MSG_TTS_PHRASE = "tts_phrase"
 #: v1.7: who the server just recognised by voice, ``{"name": str, "score":
 #: float}``. Sent right after identification, before the reply is produced, so
 #: the HUD can show the name while the person is still looking at it. An empty
@@ -158,7 +207,8 @@ MSG_CONFIG_UPDATE = "config_update"
 #: keep up with the send queue, these are dropped first. A reply's text and its
 #: PCM chunks are never in this set.
 BACKGROUND_SERVER_MESSAGE_TYPES = frozenset(
-    {"camera_state", "camera_frame", "device_state", "hud", "status", "speaker", "offline_hint"}
+    {"camera_state", "camera_frame", "device_state", "hud", "status", "speaker",
+     "hub_status", "offline_hint"}
 )
 
 
@@ -229,10 +279,13 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_SCREENSHOT,
         MSG_SCREENSHOT_ERROR,
         MSG_CAMERA_STATE,
+        MSG_TRACKS,
+        MSG_BODY_CROP,
         MSG_CAMERA_FRAME,
         MSG_CAMERA_ERROR,
         MSG_CAMERA_CLIP,
         MSG_CAMERA_CLIP_ERROR,
+        MSG_TTS_PREFETCH,
     }
 )
 
@@ -257,12 +310,16 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_SCREENSHOT_REQUEST,
         MSG_CAMERA_REQUEST,
         MSG_CAMERA_CLIP_REQUEST,
+        MSG_PRIVACY,
         MSG_SAY,
         MSG_TTS_START,
         MSG_TTS_END,
         MSG_IMAGE_SHOW,
         MSG_STATUS,
+        MSG_HUB_STATUS,
         MSG_SPEAKER,
+        MSG_OFFLINE_HINT,
+        MSG_TTS_PHRASE,
         MSG_ERROR,
         MSG_CONFIG_UPDATE,
     }
@@ -282,11 +339,18 @@ __all__ = [
     "MSG_SCREENSHOT",
     "MSG_SCREENSHOT_ERROR",
     "MSG_CAMERA_STATE",
+    "MSG_TRACKS",
+    "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_ERROR",
     "MSG_CAMERA_CLIP",
     "MSG_CAMERA_CLIP_ERROR",
     "MSG_CAMERA_CLIP_REQUEST",
+    "MSG_SOUND_EVENT",
+    "MSG_PRIVACY",
+    "MSG_OFFLINE_HINT",
+    "MSG_TTS_PREFETCH",
+    "MSG_TTS_PHRASE",
     "CAP_CAMERA_CLIP",
     "CAMERA_CLIP_MAX_BYTES",
     "MSG_READY",
@@ -299,6 +363,7 @@ __all__ = [
     "MSG_TTS_END",
     "MSG_IMAGE_SHOW",
     "MSG_STATUS",
+    "MSG_HUB_STATUS",
     "MSG_SPEAKER",
     "MSG_CONFIG_UPDATE",
     "BACKGROUND_SERVER_MESSAGE_TYPES",
@@ -406,6 +471,9 @@ class Hello(Envelope):
     caps: list[str] = Field(default_factory=list)
     version: str = Field(default="", max_length=50)
     hw: str = Field(default="", max_length=200)
+    #: ТЗ F-303: privacy mode lives on the CLIENT, so a client that restarted
+    #: says what it really has and the hub believes it over its own memory.
+    privacy: bool = False
 
 
 class UtteranceStart(Envelope):
@@ -413,6 +481,11 @@ class UtteranceStart(Envelope):
     sample_rate: int = Field(default=MIC_SAMPLE_RATE, gt=0)
     channels: int = Field(default=AUDIO_CHANNELS, gt=0)
     pre_roll_ms: int = Field(default=0, ge=0)
+    #: F-103: ``True`` when this utterance arrived inside the client's own
+    #: follow-up window (no wake word was said), ``False`` when it did not,
+    #: ``None`` for a client that predates the window and must keep its old
+    #: behaviour. The hub asks D-02/D-11 about the turn either way.
+    followup: bool | None = None
 
 
 class UtteranceEnd(Envelope):
@@ -580,6 +653,14 @@ class CameraClipRequest(Envelope):
     type: Literal["camera_clip_request"] = "camera_clip_request"
     seconds: int = Field(default=5, ge=3, le=10)
     fps: int = Field(default=8, ge=5, le=10)
+
+
+class Privacy(Envelope):
+    """Server → client: the camera of this room goes off, or comes back (F-303)."""
+
+    type: Literal["privacy"] = "privacy"
+    on: bool = True
+    reason: str = Field(default="", max_length=100)
 
 
 class DeviceSet(Envelope):

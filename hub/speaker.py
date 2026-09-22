@@ -38,11 +38,15 @@ log = logging.getLogger("jarvis.server.speaker")
 ROLE_ADMIN = "admin"
 ROLE_TRUSTED = "trusted"
 ROLE_USER = "user"
+#: ТЗ F-210: an owner-registered guest of one room. Below ``user`` in the
+#: ordering of section 14 (``admin > trusted > user > guest``), and the role a
+#: confirmed guest registration of ``hub/guest_registration.py`` writes.
+ROLE_GUEST = "guest"
 ROLE_UNKNOWN = "unknown"
-ROLES = (ROLE_ADMIN, ROLE_TRUSTED, ROLE_USER)
+ROLES = (ROLE_ADMIN, ROLE_TRUSTED, ROLE_USER, ROLE_GUEST)
 #: Rank used to pick the winning role when ``rename_person`` merges two
 #: profiles (v1.6) - a merge must never demote whichever identity was admin.
-_ROLE_RANK = {ROLE_USER: 0, ROLE_TRUSTED: 1, ROLE_ADMIN: 2}
+_ROLE_RANK = {ROLE_GUEST: -1, ROLE_USER: 0, ROLE_TRUSTED: 1, ROLE_ADMIN: 2}
 
 
 def _higher_role(a: str, b: str) -> str:
@@ -73,8 +77,12 @@ ENROLL_MIN_SAMPLES = 1 + ENROLL_EXTRA_SAMPLES
 #: to actually recognize the person later.
 MIN_ENROLL_SPEECH_S = 20.0
 #: Separate caps keep voice additions from changing face-gallery behavior.
-MAX_SAMPLES_PER_PERSON = 10
-MAX_VOICE_SAMPLES_PER_PERSON = 30
+#: ТЗ F-211 states the numbers: "как сейчас для лиц (до 12 векторов)" and
+#: "расширить на голос (до 8 векторов)". The phase-1 defaults (10 and 30) were
+#: the executor's; the profile of the hub database is capped by the same numbers
+#: in ``hub/adaptive_learning.py``, so the two stores cannot disagree.
+MAX_SAMPLES_PER_PERSON = 12
+MAX_VOICE_SAMPLES_PER_PERSON = 8
 
 #: v1.7: identifies the model that produced the stored voice vectors. Written
 #: at the top of people.json; vectors from any other model are meaningless to
@@ -365,6 +373,8 @@ def normalize_people(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "role": str(person.get("role") or ROLE_USER),
             VOICE_KEY: _vector_list(voices),
             FACE_KEY: _vector_list(person.get(FACE_KEY)),
+            #: ТЗ F-106: what language this person wants to be answered in.
+            "preferred_language": person.get("preferred_language"),
         }
     return people
 
@@ -630,10 +640,54 @@ class VoiceRegistry:
             return ({'name': name, 'voice_model': VOICE_MODEL_ID,
                      **json.loads(json.dumps(person))} if person is not None else {'name': name})
 
+    def vectors_of(self, name: str) -> list[np.ndarray]:
+        """The person's own voice vectors (ТЗ F-214: the challenge compares them).
+
+        The challenge word of a privileged call has to prove that the SAME
+        person said the random word, so the utterance's embedding is compared
+        against the person's own profile - not against the room's population,
+        where the best match would always be somebody. A person without a
+        profile has no vectors, and ``[]`` is the honest answer.
+        """
+        with self._lock:
+            person = self._people.get(str(name or "").strip())
+            if person is None:
+                return []
+            stored = person.get(VOICE_KEY) or person.get(LEGACY_VOICE_KEY) or []
+            return [np.asarray(vector, dtype="float32") for vector in stored]
+
     def role_of(self, name: str) -> str | None:
         with self._lock:
             person = self._people.get(name)
         return str(person.get("role") or ROLE_USER) if person else None
+
+    def language_of(self, name: str) -> str | None:
+        """The person's preferred language, or ``None`` (ТЗ F-106)."""
+        cleaned = " ".join(str(name or "").split())
+        with self._lock:
+            person = self._people.get(cleaned)
+            value = person.get("preferred_language") if person else None
+        text = str(value or "").strip().lower()
+        return text or None
+
+    def set_language(self, name: str, code: str | None) -> str:
+        """Store the language whisper and the model should use (ТЗ F-106).
+
+        The registry keeps a copy of the canonical ``persons.preferred_language``
+        so the voice pipeline never needs a database round-trip mid-turn; the
+        caller (:func:`hub.languages.set_preferred_language`) writes both.
+        """
+        cleaned = " ".join(str(name or "").split())
+        stored = str(code or "").strip().lower() or None
+        with self._lock:
+            person = self._people.get(cleaned)
+            if person is None:
+                known = ", ".join(sorted(self._people)) or "(nobody enrolled yet)"
+                raise ValueError(f"no profile for {cleaned!r}; enrolled: {known}")
+            person["preferred_language"] = stored
+            self._save_locked()
+        log.info("Preferred language of %s set to %s", cleaned, stored or "(auto)")
+        return stored or ""
 
     def admin_profile(self, action, name, *, role=ROLE_USER):
         """Explicit owner-panel changes to active enrollment; archives remain."""
@@ -670,15 +724,28 @@ class VoiceRegistry:
 
     def identify(self, pcm_s16le: bytes, sample_rate: int) -> tuple[str, str, float]:
         """Return ``(name, role, score)``; ``("unknown", "unknown", score)`` on no match."""
+        name, role, score, _embedding = self.identify_ex(pcm_s16le, sample_rate)
+        return name, role, score
+
+    def identify_ex(self, pcm_s16le: bytes, sample_rate: int,
+                    ) -> tuple[str, str, float, np.ndarray | None]:
+        """``identify`` plus the embedding it scored (ТЗ F-205).
+
+        Binding a voice to the right body (F-205) needs the vector that was
+        matched, and computing it a second time would cost another ECAPA pass
+        in the middle of a turn. The fourth element is ``None`` whenever no
+        embedding could be made (disabled registry, unusable speech, failure),
+        in which case the result is exactly what :meth:`identify` returns.
+        """
         if not self.enabled:
-            return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0
+            return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0, None
         try:
             embedding = self._embed(pcm_s16le, sample_rate)
         except Exception:
             log.exception("Voice embedding failed")
-            return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0
+            return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0, None
         if embedding is None:
-            return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0
+            return ROLE_UNKNOWN, ROLE_UNKNOWN, 0.0, None
 
         with self._lock:
             scores = self._scores_locked(embedding)
@@ -713,7 +780,7 @@ class VoiceRegistry:
             f" - unknown: {reason}" if reason else "",
             board,
         )
-        return name, role, max(best_score, 0.0)
+        return name, role, max(best_score, 0.0), embedding
 
     def prepare_enrollment_sample(self, pcm: bytes, sample_rate: int, previous: list) -> dict:
         """Validate a recording without changing any profile or permissions."""
@@ -1019,6 +1086,7 @@ __all__ = [
     "ROLE_ADMIN",
     "ROLE_TRUSTED",
     "ROLE_USER",
+    "ROLE_GUEST",
     "ROLE_UNKNOWN",
     "ROLES",
     "PEOPLE_FILENAME",

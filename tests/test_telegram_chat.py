@@ -13,6 +13,7 @@ from PIL import Image
 from hub.image_generation import ImageStore, decode_image
 from hub.telegram import TelegramError
 from hub.telegram_chat import TelegramChat, addressed_text, current_image_request
+from hub.untrusted import strip as strip_untrusted
 
 
 def mention(text='@RowanBot hello', *, user=7, chat=-100, message_id=10, caption=False):
@@ -125,7 +126,8 @@ def test_shared_history_reads_legacy_senders_and_only_last_25_requests(tmp_path)
         await bot.process_update(update())
         messages = bot.reply.call_args.args[0]
         assert len(messages) == 52
-        assert json.loads(messages[1]['content'])['text'] == 'Question 6'
+        # ТЗ F-411: prior turns travel to the model wrapped as untrusted text.
+        assert json.loads(strip_untrusted(messages[1]['content']))['text'] == 'Question 6'
         assert json.loads(messages[-1]['content'])['text'] == 'hello'
         assert 'Other group member' in str(messages)
         await bot.process_update(update(number=2, user=9, message_id=11))

@@ -16,6 +16,9 @@ from hub.storage import Memory
 def connection(name='Anton', role='admin', *, permissions=True):
     cfg = Config()
     cfg.server.permissions_enabled = permissions
+    # This file is about the browser/app choice flow. The extra second witness
+    # F-208 demands for a privileged call is tested in tests/test_identity_fusion.py.
+    cfg.server.identity.enabled = False
     conn = app.Connection(SimpleNamespace(client=None), cfg)
     conn._speaker_name, conn._speaker_role, conn._speaker_score = name, role, .9
     conn._send_status = AsyncMock()
