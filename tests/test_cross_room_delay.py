@@ -51,8 +51,11 @@ def test_a_slow_room_does_not_delay_a_fast_one(harness):
     assert result["slow_turn_s"]["count"] == 2
     assert result["solo_fast_s"]["count"] == 2
     assert result["extra_s"]["max_s"] <= CRITERION_S
-    # Sanity: the slow room really was slow, and the fast room was not.
-    assert result["slow_turn_s"]["median_s"] >= 1.0
+    # Sanity: the slow room really was slow, and the fast room was not. The
+    # tolerance is one Windows scheduler tick (15.6 ms): a 1.0 s sleep is
+    # measured as 0.999 s often enough that a bare ">= 1.0" flakes, and the
+    # question here is "was it about a second", not "was it one exact second".
+    assert result["slow_turn_s"]["median_s"] >= 0.98
     assert result["solo_fast_s"]["median_s"] < 1.0
 
 

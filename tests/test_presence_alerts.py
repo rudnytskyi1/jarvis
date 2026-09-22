@@ -241,7 +241,13 @@ def test_named_rule_uses_only_fresh_direct_names_not_room_history(tmp_path, monk
     asyncio.run(run())
 
 
-def test_unknown_rule_requires_explicit_fresh_unknown_evidence(tmp_path):
+def test_unknown_rule_requires_explicit_fresh_unknown_evidence(tmp_path, monkeypatch):
+    # Two observations in the SAME clock tick are one observation: presence
+    # frames are deduplicated by their timestamp, and ``time.time()`` on
+    # Windows steps ~16 ms. The test's own second look therefore has to be a
+    # later moment, not a race with the test runner.
+    clock = [1000.0]
+    monkeypatch.setattr('hub.presence_alerts.time.time', lambda: clock[0])
     async def run():
         api = provider()
         alerts = engine(tmp_path, api)
@@ -250,6 +256,7 @@ def test_unknown_rule_requires_explicit_fresh_unknown_evidence(tmp_path):
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
         api.send_image.assert_not_awaited()
+        clock[0] += 1.0
         alerts.observe(unknown_count=1, jpeg=b'jpeg')
         await alerts.drain()
         api.send_image.assert_awaited_once()

@@ -346,6 +346,7 @@ class _FakeBridge:
         self.flash_requested = _FakeSignal()
         self.hide_now_requested = _FakeSignal()
         self.stop_requested = _FakeSignal()
+        self.raise_requested = _FakeSignal()
 
 
 class TestPublicApiMarshalsValidatedPayloads:
@@ -392,6 +393,35 @@ class TestPublicApiMarshalsValidatedPayloads:
         hud = self._hud_with_fake_bridge()
         hud.hide_now()
         assert hud._bridge.hide_now_requested.calls == [()]
+
+    def test_keep_on_top_asks_the_window_to_win_over_a_photo(self):
+        """ТЗ F-708: the HUD stays above the detections photo window."""
+        hud = self._hud_with_fake_bridge()
+        hud.keep_on_top()
+        assert hud._bridge.raise_requested.calls == [()]
+
+    def test_keep_on_top_holds_the_window_for_as_long_as_the_photo_lasts(self):
+        import time as _time
+
+        hud = self._hud_with_fake_bridge()
+        before = _time.monotonic()
+        hud.keep_on_top(10)
+        assert before + 10 <= hud._top_guard_until <= _time.monotonic() + 10
+        # A shorter follow-up request never shortens a longer one already asked.
+        hud.keep_on_top(1)
+        assert hud._top_guard_until > _time.monotonic() + 5
+
+    def test_keep_on_top_survives_a_bad_duration(self):
+        hud = self._hud_with_fake_bridge()
+        hud.keep_on_top("soon")
+        hud.keep_on_top(None)
+        assert len(hud._bridge.raise_requested.calls) == 2
+
+    def test_a_disabled_hud_never_asks_for_the_top_slot(self):
+        hud = OverlayHUD({"enabled": False})
+        hud._bridge = _FakeBridge()
+        hud.keep_on_top(5)
+        assert hud._bridge.raise_requested.calls == []
 
     def test_invalid_state_never_reaches_the_bridge(self):
         hud = self._hud_with_fake_bridge()
