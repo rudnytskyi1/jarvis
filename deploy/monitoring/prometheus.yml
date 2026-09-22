@@ -1,0 +1,16 @@
+# Prometheus, который собирает метрики хаба Rowan (ТЗ F-707).
+#
+# Порт хаба — свой у каждого профиля: config.yaml и config.openai.yaml у
+# владельца используют 8770, шаблон config.example.yaml — 8765. Здесь стоит
+# тот, на котором хаб слушает сейчас; правится одной строкой.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: rowan
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8770"]
+        labels:
+          hub: rowan

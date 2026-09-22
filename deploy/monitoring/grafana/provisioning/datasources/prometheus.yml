@@ -1,0 +1,15 @@
+# Источник данных дашборда Rowan: UID ровно ``prometheus`` — на него смотрит
+# переменная datasource в deploy/grafana/rowan-dashboard.json, поэтому дашборд
+# открывается без ручной настройки.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST

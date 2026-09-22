@@ -1,0 +1,15 @@
+# Дашборд Rowan подхватывается с диска: файл лежит в репозитории рядом с
+# клиентом, поэтому правка дашборда в git сразу видна в Grafana.
+apiVersion: 1
+
+providers:
+  - name: rowan
+    orgId: 1
+    folder: Rowan
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: C:\Users\Anton\Desktop\jarvis\deploy\grafana
+      foldersFromFilesStructure: false
