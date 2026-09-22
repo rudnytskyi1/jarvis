@@ -16,7 +16,7 @@ from pathlib import Path
 
 from hub.api_budget import BudgetExceeded
 from hub.conversations import Conversations
-from hub.image_prompt import action_revoked, is_image_request, visual_request
+from hub.image_prompt import action_revoked, is_image_request, visual_request, visual_target
 from hub.telegram import TelegramError
 from hub.untrusted import TELEGRAM_SOURCE
 from hub.untrusted import wrap as wrap_untrusted
@@ -40,12 +40,19 @@ _ATTACHED_EDIT = re.compile(
     r'(?:(?:edit|modify|change|transform|add|remove|replace|put|give)\b|'
     r'(?:make|turn)\s+(?:me|us|him|her|them|it|this|that|the\s+(?:photo|picture|image))\b|'
     r'(?:сделай|измени|измените|преврати|превратите|отредактируй|добавь|убери|замени|поставь|надень)\b)', re.I)
+#: The same verbs with almost any object: an attached photo plus "make Anton
+#: sit in that chair" is a real edit even though it names no picture and no
+#: person pronoun, so the object is left open and the TARGET decides.
+_ATTACHED_RESHAPE = re.compile(
+    _REQUEST_START +
+    r'(?:make|turn|change|edit|put|place|add|сделай|сделать|измени|поставь|посади)\b', re.I)
 _VISUAL_COMMAND = re.compile(
     _REQUEST_START +
     r'(?P<verb>draw|paint|sketch|illustrate|render|generate|create|edit|modify|change|remove|'
-    r'replace|add|put|give|make|turn|transform|нарисуй|нарисовать|изобрази|изобразить|'
+    r'replace|add|put|place|insert|include|give|make|turn|transform|нарисуй|нарисовать|изобрази|изобразить|'
     r'сгенерируй|сгенерировать|дорисуй|дорисовать|отредактируй|сделай|сделать|измени|измените|'
-    r'преврати|превратить|превратите|добавь|добавить|надень|надеть|поставь|убери|замени)\b'
+    r'преврати|превратить|превратите|добавь|добавить|надень|надеть|поставь|убери|замени|'
+    r'посади|посадить)\b'
     r'(?P<detail>[\s\S]*)', re.I)
 _NONVISUAL_DRAW = re.compile(
     r'^\s*(?:(?:me|us)\s+)?(?:(?:a|an|the|some|any|no|your|our|my)\s+)?'
@@ -74,7 +81,14 @@ def current_image_request(text, *, has_photo=False):
         r'(?:conclusions?|code|functions?|scripts?|programs?|verdicts?|judgments?|arguments?|strategies|strategy)\b',
         command['detail'], re.I):
         return False
-    return bool(is_image_request(value) or (has_photo and _ATTACHED_EDIT.match(value)))
+    if is_image_request(value):
+        return True
+    if not has_photo:
+        return False
+    if _ATTACHED_EDIT.match(value):
+        return True
+    # "make sense" is not an edit; "make Anton sit in that chair" is.
+    return bool(_ATTACHED_RESHAPE.match(value) and visual_target(value))
 
 
 class TelegramInputError(RuntimeError):

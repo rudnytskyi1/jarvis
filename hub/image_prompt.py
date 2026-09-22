@@ -163,6 +163,31 @@ _VISUAL_ACTION = re.compile(
     r'\b(?:сделай|сделать|преврати|превратить|добавь|добавить|надень|надеть|поставь|убери|замени|измени)\b'
     r'[^.!?]{0,100}\b(?:меня|его|её|ее|нас|изображение|картинку|фото|шляпу|шапку|голову|голове|лицо|фон|рядом)\b', re.I)
 _NEGATIVE_PREFIX = re.compile(r'(?:\b(?:do\s+not|don[’\x27]t|never|не)\s+)$', re.I)
+#: What an edit can point at when the verb alone says nothing: a person, the
+#: body or clothes, furniture, or a pose. "Make Anton sit in that chair with
+#: four people in suits" is a photo edit although it names no picture at all -
+#: requiring one of the old keywords refused the owner's every attempt.
+_VISUAL_TARGET = re.compile(
+    r'\b(?:person|people|guy|man|woman|boy|girl|group|family|friends?|'
+    r'face|head|hair|eyes?|smile|beard|moustache|mustache|body|hands?|arms?|legs?|skin|'
+    r'clothes|clothing|shirt|suits?|dress|jacket|coat|tie|shoes|uniform|glasses|hat|cap|hoodie|jeans|'
+    r'chair|seat|couch|sofa|bed|table|floor|ground|room|wall|background|window|door|car|tree|sky|'
+    r'sits?|sitting|stands?|standing|lies?|lying|sleep|sleeping|kiss|kissing|hug|hugging|'
+    r'dance|dancing|jump|jumping|walk|walking|run|running|pose|posing|wear|wearing|hold|holding|'
+    r'smile|smiling|laugh|laughing|eat|eating|drink|drinking|'
+    r'человек|люд(?:и|ей|ям)|парн\w*|девушк\w*|мужчин\w*|женщин\w*|групп\w*|семь\w*|друз\w*|'
+    r'лицо|голов\w*|волос\w*|глаз\w*|улыбк\w*|бород\w*|тело|рук\w*|ног\w*|'
+    r'одежд\w*|рубашк\w*|костюм\w*|плать\w*|куртк\w*|пальто|галстук\w*|обув\w*|очк\w*|шляп\w*|шапк\w*|'
+    r'стул\w*|кресл\w*|диван\w*|кроват\w*|стол\w*|пол\w*|стен\w*|фон\w*|окн\w*|двер\w*|машин\w*|дерев\w*|неб\w*|'
+    r'сид\w*|стоят\w*|стоит|лежат\w*|лежит|спат\w*|спит|целу\w*|обним\w*|танц\w*|прыг\w*|'
+    r'ид(?:ут|ет|ти)|беж\w*|поз\w*|держ\w*|смотр\w*)\b', re.I)
+#: Verbs that reshape what is already in the picture.
+_RESHAPE_VERB = (r'\b(?:make|turn|change|edit|add|put|place|insert|include|replace|remove|give|'
+                 r'сделай|сделать|измени|измените|добавь|добавить|поставь|поставить|замени|убери|'
+                 r'посади|посадить)\b')
+#: A reshape verb pointing at something visible, with no picture word needed:
+#: "make Anton sit in that chair", "посади Антона на диван".
+_RESHAPE_ACTION = re.compile(_RESHAPE_VERB + r'[^.!?]{0,80}' + _VISUAL_TARGET.pattern, re.I)
 _EXISTING_BACKGROUND = re.compile(
     r'\b(?:make|set|use|put|apply)\s+(?:the|this|that|my)\s+(?:desktop\s+)?'
     r'(?:background(?:\s+picture)?|wallpaper)\b[^.!?]*\b(?:use|using)\s+(?:it|that|this)\b', re.I)
@@ -175,10 +200,16 @@ def is_image_request(text: str) -> bool:
     # An existing-result workflow is not authorization to generate again.
     if not value or _PURE_WORKFLOW.fullmatch(value) or _EXISTING_BACKGROUND.search(value):
         return False
-    for match in _VISUAL_ACTION.finditer(value):
-        if not _NEGATIVE_PREFIX.search(value[max(0, match.start() - 20):match.start()]):
-            return True
+    for pattern in (_VISUAL_ACTION, _RESHAPE_ACTION):
+        for match in pattern.finditer(value):
+            if not _NEGATIVE_PREFIX.search(value[max(0, match.start() - 20):match.start()]):
+                return True
     return False
+
+
+def visual_target(text: str) -> bool:
+    """True when the wording points at something an edit can change."""
+    return bool(_VISUAL_TARGET.search(str(text or "")))
 
 
 def is_existing_image_workflow(text: str) -> bool:

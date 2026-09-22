@@ -225,3 +225,22 @@ def test_a_quoted_person_name_still_authorizes_their_reference(text):
 def test_a_real_caption_is_still_not_a_person_reference(text):
     assert not person_reference_requested(text, '9:16')
     assert not person_reference_requested(text, 'make this image vertical')
+
+
+@pytest.mark.parametrize('text', [
+    'Make Anton sit in that chair with 4 people in suits',
+    'make the people on the couch kiss',
+    'Put Anton on the couch',
+    'посади Антона на диван',
+])
+def test_reshaping_a_person_or_the_scene_is_an_image_request(text):
+    """No picture word is needed when the edit names a person, pose or place."""
+    assert is_image_request(text)
+
+
+@pytest.mark.parametrize('text', [
+    'make sense',
+    'do not make Anton sit in that chair',
+])
+def test_reshaping_wording_without_a_visible_target_is_not_an_image_request(text):
+    assert not is_image_request(text)

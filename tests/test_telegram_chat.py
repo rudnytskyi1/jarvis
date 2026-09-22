@@ -283,6 +283,32 @@ def test_attached_edit_gate_accepts_current_request_only():
     assert not current_image_request('Do not make us gay', has_photo=True)
 
 
+@pytest.mark.parametrize('wording', [
+    # The owner's own wording, which the gate refused on 2026-09-22.
+    'Make Anton sit in that chair with 4 people in suits',
+    'Edit the attached photo: make Anton sit in that chair with four people in suits.',
+    'Edit the attached photo make anton sit in yhat chair with four people in suit',
+    'Make him wear a suit',
+    'Put Anton on the couch',
+    'Can you make the people on the couch kiss?',
+    'посади Антона на диван',
+    'сделай так, чтобы Антон сидел на стуле с четырьмя людьми в костюмах',
+])
+def test_an_attached_photo_makes_reshaping_wording_an_edit(wording):
+    """A photo plus "make X sit in that chair" is an edit, with no picture word."""
+    assert current_image_request(wording, has_photo=True)
+
+
+@pytest.mark.parametrize('wording', [
+    'make sense',
+    'what do you make of this photo',
+    'Do not make Anton sit in that chair',
+    'Why did you make Anton sit in that chair?',
+])
+def test_reshaping_wording_without_a_target_is_still_not_an_edit(wording):
+    assert not current_image_request(wording, has_photo=True)
+
+
 @pytest.mark.parametrize('wording', ['Draw a sign saying "Cancel that."',
                                     'Draw the words “actually don’t”.',
                                     'Нарисуй надпись «Отмена».'])
