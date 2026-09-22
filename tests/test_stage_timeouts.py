@@ -137,6 +137,99 @@ def test_a_slow_diarizer_does_not_report_an_error(monkeypatch, fresh_metrics):
 # --- voice identity: a slow ReID step means "unknown", not "no answer" -----
 
 
+def _slow_stt(seconds: float):
+    """A Whisper stub that needs longer than the STT budget but does answer."""
+
+    def transcribe_pcm(*args, **kwargs):
+        time.sleep(seconds)
+        return ("turn the lights on", "en")
+
+    return SimpleNamespace(transcribe_pcm=transcribe_pcm)
+
+
+def test_a_transcript_over_its_budget_is_still_an_answer(monkeypatch, fresh_metrics):
+    """ТЗ 4.5/15.1: missing the STT budget costs latency, never the answer."""
+    monkeypatch.setattr(hub_app, "_stt", _slow_stt(0.35))
+    monkeypatch.setattr(hub_app, "_llm", _brain("Lights on."))
+    monkeypatch.setattr(hub_app, "_tts", object())
+    monkeypatch.setattr(hub_app, "_voices", None)
+    monkeypatch.setattr(hub_app, "_memory", None)
+
+    conn = _connection(_config(stt_ms=80))
+
+    async def scenario():
+        fresh_metrics.started(conn.utterance_id, home_id="livingroom")
+        await conn._handle_utterance(b"\0" * 1600)
+
+    asyncio.run(scenario())
+    said = [call.args[0] for call in conn.send_json.call_args_list
+            if call.args[0]["type"] == proto.MSG_SAY]
+    assert said, "a slow Whisper must not leave the room in silence"
+    errors = [call.args[0] for call in conn.send_json.call_args_list
+              if call.args[0].get("type") == proto.MSG_ERROR]
+    assert errors == [], "the turn is late, not broken"
+    trace = fresh_metrics.last()
+    assert trace["degraded"] == ["stt"]
+    assert trace["ok"] is True
+
+
+def test_a_stage_that_never_finishes_is_cut_at_the_safety_net():
+    """The budget is soft; the safety net is what actually stops the turn."""
+    conn = _connection()
+
+    async def never_finishes():
+        await asyncio.sleep(30)
+        raise AssertionError("the safety net should have cancelled this")
+
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await conn._wait_for_stage(never_finishes(), stage="stt", budget=0.05, safety=0.2)
+
+    asyncio.run(scenario())
+    assert conn._degradations == ["stt"]
+
+
+def test_a_stage_inside_its_budget_is_not_degraded():
+    conn = _connection()
+
+    async def quick():
+        return ("hello", "en")
+
+    result = asyncio.run(conn._wait_for_stage(quick(), stage="stt", budget=5.0, safety=45.0))
+    assert result == ("hello", "en")
+    assert getattr(conn, "_degradations", []) == []
+
+
+# --- a room without an authenticated home records no identity -------------
+
+
+def test_a_room_without_a_home_never_writes_identity(caplog, monkeypatch):
+    """Every identity row is home-keyed (ТЗ 14): a v1 room can only warn."""
+    import logging
+
+    def explode():
+        raise AssertionError("a home-less client must not touch the belief store")
+
+    monkeypatch.setattr(hub_app, "_identity_belief_store", explode)
+    conn = _connection()
+    conn.home_id = ""
+    with caplog.at_level(logging.WARNING, logger="jarvis.server.app"):
+        conn._fuse_identities()
+        conn._fuse_identities()
+
+    assert conn._identity_storage_ready() is False
+    warnings = [item for item in caplog.records if "not bound to a home" in item.getMessage()]
+    assert len(warnings) == 1, "one honest line per connection, not one per frame"
+
+
+def test_a_room_with_a_home_still_stores_its_identity(monkeypatch):
+    conn = _connection()
+    conn.home_id = "livingroom"
+    monkeypatch.setattr(hub_app, "_identity_belief_store", lambda: None)
+    assert conn._identity_storage_ready() is True
+
+
+
 def test_a_slow_voice_identifier_answers_without_identity(monkeypatch, fresh_metrics):
     monkeypatch.setattr(hub_app, "_stt", SimpleNamespace(transcribe_pcm=lambda *a: ("volume 30", "en")))
     monkeypatch.setattr(hub_app, "_llm", SimpleNamespace(generate=AsyncMock(side_effect=AssertionError),

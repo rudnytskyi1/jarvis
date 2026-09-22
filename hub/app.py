@@ -3741,6 +3741,10 @@ class Connection(CameraClipReceiver):
         if store is None:
             log.debug("Body crops are unavailable (no hub database) - dropping %d bytes", len(data))
             return
+        if not self._identity_storage_ready():
+            # A crop of a room we cannot name a home for has nowhere to go;
+            # storing it produced one foreign-key warning per frame.
+            return
         saved = store.save(home_id=self.home_id or '',
                            client_id=self.session.client_id if self.session else '',
                            track_id=str(header.get('track_id') or ''), jpeg=data)
@@ -3822,6 +3826,8 @@ class Connection(CameraClipReceiver):
         """
         store = _face_track_store()
         if store is None or not located or not resolved:
+            return
+        if not self._identity_storage_ready():
             return
         from hub.reid import session_day_of
 
@@ -4174,6 +4180,28 @@ class Connection(CameraClipReceiver):
             return None
         return str(person_id), float(score)
 
+    def _identity_storage_ready(self) -> bool:
+        """Whether this room may record faces, body vectors and beliefs at all.
+
+        Every identity row is keyed by ``home_id`` (ТЗ 14), so a client that
+        has not authenticated as a home - a v1 ``hello`` without a token
+        (ТЗ 4.3) - cannot store anything: each attempt raised, and the live hub
+        answered with two warning lines per track per fusion pass, thousands of
+        them an hour, while the unknown home also blocked the body crops. The
+        room keeps the whole voice path; it simply claims no identity storage
+        until the client authenticates, and says so exactly once.
+        """
+        if getattr(self, 'home_id', ''):
+            return True
+        if not getattr(self, '_identity_home_warned', False):
+            self._identity_home_warned = True
+            log.warning(
+                "Client %s is not bound to a home (a v1 hello without a token): faces, "
+                "body vectors and identity beliefs are not recorded until it "
+                "authenticates (ТЗ 4.3).", self.peer,
+            )
+        return False
+
     def _fuse_identities(self) -> None:
         """ТЗ F-206: one fusion pass over every live track of this room.
 
@@ -4182,6 +4210,8 @@ class Connection(CameraClipReceiver):
         ``identity_belief`` row F-207 reads and F-215 explains; the fusion
         itself never speaks and never changes permissions.
         """
+        if not self._identity_storage_ready():
+            return
         store = _identity_belief_store()
         if store is None:
             return
@@ -9194,16 +9224,49 @@ class Connection(CameraClipReceiver):
         budget = self._stage_budget('stt_ms', STT_TIMEOUT_S)
         batcher = _speech_batcher(engine)
         if batcher is None:
-            return await asyncio.wait_for(
+            return await self._wait_for_stage(
                 self._gpu(PRIORITY_UTTERANCE, "stt",
-                          lambda: asyncio.to_thread(engine.transcribe_pcm, pcm, self.sample_rate, self._whisper_language())),
-                timeout=budget,
+                          lambda: asyncio.to_thread(engine.transcribe_pcm, pcm, self.sample_rate,
+                                                    self._whisper_language())),
+                stage='stt', budget=budget, safety=STT_TIMEOUT_S,
             )
         # The batch itself is one GPU-queue slot (see _speech_batcher).
-        return await asyncio.wait_for(
+        return await self._wait_for_stage(
             batcher.transcribe(pcm, self.sample_rate, self._whisper_language()),
-            timeout=budget,
+            stage='stt', budget=budget, safety=STT_TIMEOUT_S,
         )
+
+    async def _wait_for_stage(self, work: Any, *, stage: str, budget: float,
+                              safety: float) -> Any:
+        """Wait for one stage under its budget, then under the safety net.
+
+        ТЗ 15.1 gives every stage a budget, and the rule for missing one is
+        degradation, never silence (ТЗ 4.5/15.1). Cancelling the stage when the
+        budget expires was doing the opposite: a working Whisper that needed
+        1.2 s for a 6 s clip was thrown away, the client got ``stt timed out``
+        and the room heard nothing at all. So the budget keeps its meaning -
+        the turn is marked degraded and the miss is counted - while the result
+        itself is still awaited, up to the absolute safety net. A later real
+        transcript beats no transcript.
+        """
+        task = asyncio.ensure_future(work)
+        grace = max(0.0, float(safety) - float(budget))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=max(0.0, float(budget)))
+            if not done:
+                self._degrade(stage, f'over its {float(budget):.2f} s budget; '
+                                     f'still waiting, up to {float(safety):.0f} s')
+                done, _ = await asyncio.wait({task}, timeout=grace)
+        except asyncio.CancelledError:
+            # The turn itself was cancelled: the stage must not keep running
+            # for a room that is no longer waiting for it.
+            if not task.done():
+                task.cancel()
+            raise
+        if not done:
+            task.cancel()
+            raise TimeoutError(f'{stage} did not finish within {float(safety):.0f} s')
+        return task.result()
 
     async def _handle_utterance(self, pcm: bytes) -> None:
         verify_wake = getattr(self, '_verify_wake', False) and not (
@@ -9290,11 +9353,13 @@ class Connection(CameraClipReceiver):
                     text, language = await self._plain_transcript(engine, pcm)
             else:
                 text, language = await self._plain_transcript(engine, pcm)
-        except TimeoutError:
+        except TimeoutError as exc:
+            # The message names the deadline that actually fired, not the
+            # diarization safety net: with stage budgets on, the plain pass has
+            # its own (much shorter) deadline and that is the one that expired.
             log.error(
-                "Speech recognition exceeded %.0f s. The worker may still be running; "
-                "restart the server if this repeats.",
-                self.cfg.server.diarization.timeout_s if self.cfg.server.diarization.enabled else STT_TIMEOUT_S,
+                "Speech recognition did not finish (%s). The worker may still be "
+                "running; restart the server if this repeats.", exc,
             )
             await self.send_error("stt timed out")
             self._finish_utterance(note='stt_timeout', ok=False)

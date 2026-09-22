@@ -52,6 +52,25 @@ def test_the_pages_clear_the_live_transcript_at_the_end_of_a_turn(name):
     assert "clear" in page(name)
 
 
+@pytest.mark.parametrize("name", ["hud.html", "chat.html"])
+def test_the_hud_pill_speaks_up_only_when_the_brain_is_gone(name):
+    """No permanent status pill in the corner of the room screen.
+
+    The hub keeps sending online/queue/offline (ТЗ F-708) and the page keeps
+    knowing all three, but the owner asked for the corner back: a chip reading
+    "online" and "queue" over their desktop was only ever noise. A real outage
+    still announces itself.
+    """
+    text = page(name)
+    flat = text.replace("'", '"').replace(" ", "")
+    # The class that puts the pill on screen is bound to a real outage...
+    assert '.classList.toggle("visible",state==="offline")' in flat
+    assert '"brainoffline"' in flat
+    # ...and the old label chain - offline ? "brain offline" : queue ? "queue"
+    # : "online" - is gone, so no state other than the outage writes text.
+    assert '"queue":"online"' not in flat
+
+
 def test_the_hud_page_still_carries_the_camera_badge_and_the_followup_bar():
     text = page("hud.html")
     assert 'id="camera-off"' in text and "opts.camera_off" in text

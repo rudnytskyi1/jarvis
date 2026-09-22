@@ -46,6 +46,7 @@ from hub import migrations_runner  # noqa: E402
 from hub.devices import Device, DeviceStore, DeviceTools  # noqa: E402
 from hub.scenes import SceneStore  # noqa: E402
 from hub.session import Session  # noqa: E402
+from hub.utterances import UtteranceMetrics  # noqa: E402
 from scripts.measure_overflow import summarize  # noqa: E402
 
 #: The acceptance criterion of phase 2 (ТЗ 16, сценарий 1).
@@ -185,6 +186,9 @@ class _Room:
         self.connection._stream_tts = self._tts(tts_ms)
         self.phrase = phrase
         self._stt_ms = stt_ms
+        #: The trace of this room's turn: what the hub itself recorded about
+        #: it, degradations included (ТЗ 15.1).
+        self.metrics = UtteranceMetrics()
 
     async def _no_pc_action(self, *args, **kwargs) -> dict[str, Any]:
         raise AssertionError("the cinema preset has no PC step")
@@ -218,16 +222,23 @@ class _Room:
         hub_app._device_store = lambda: self.devices
         hub_app._device_tools = lambda: DeviceTools(self.devices, {"mqtt": self.adapter})
         hub_app._scene_store = lambda: self.scenes
+        hub_app._utterance_metrics = self.metrics
 
     @property
     def applied(self) -> list[tuple[str, str, object]]:
         return list(self.adapter.calls)
 
+    @property
+    def degraded(self) -> list[str]:
+        """The stages the hub had to skip because they overran (ТЗ 15.1)."""
+        trace = self.metrics.last() or {}
+        return [str(stage) for stage in (trace.get("degraded") or [])]
+
 
 #: The hub's module globals a room replaces, and ``_stubbed`` puts back.
 _GLOBALS = ("_stt", "_llm", "_tts", "_voices", "_memory", "_dialogs", "_conversations",
             "_hub_conn", "_decider", "_decision_log", "_gpu", "_gpu_off", "_device_store",
-            "_device_tools", "_scene_store")
+            "_device_tools", "_scene_store", "_utterance_metrics")
 
 
 class _stubbed:
@@ -259,6 +270,7 @@ def measure(phrase: str = "", *, language: str = "ru", repeats: int = 5,
     text = phrase or PHRASES.get(language, PHRASES["ru"])
     turns: list[float] = []
     answered: list[bool] = []
+    degraded: list[str] = []
     answer = ""
     applied: list[tuple[str, str, object]] = []
     for _ in range(max(1, int(repeats))):
@@ -269,6 +281,7 @@ def measure(phrase: str = "", *, language: str = "ru", repeats: int = 5,
                 turns.append(asyncio.run(room.one_turn()))
             said = room.socket.said()
             answered.append(bool(said))
+            degraded.extend(stage for stage in room.degraded if stage not in degraded)
             answer = said[-1] if said else ""
             applied = room.applied
         finally:
@@ -288,18 +301,25 @@ def measure(phrase: str = "", *, language: str = "ru", repeats: int = 5,
         "total_s": summarize(total),
         "answer": answer,
         "answered_turns": sum(answered),
+        "degraded_stages": degraded,
         "applied_steps": [[device, capability, json_value(value)]
                           for device, capability, value in applied],
     }
     report["within_budget"] = bool(total) and all(answered) and max(total) <= SCENE_BUDGET_S
     report["seconds_left_s"] = round(SCENE_BUDGET_S - max(total), 3) if total else 0.0
-    if total and not all(answered):
-        # The injected engine cost passed a stage budget of the hub itself
-        # (ТЗ 15.1: 700 ms from the end of speech to the transcript), so the
-        # turn ended in words instead of a scene. That is the designed
-        # degradation showing up in a measurement, not a slow scene.
+    # ТЗ 15.1 also budgets the hub's own stages (700 ms from the end of speech
+    # to the transcript), and a measurement has to say out loud when one was
+    # missed - even when the injected cost still fits inside the scene's 2 s.
+    # What it must NOT claim is that the room was left without an answer: since
+    # the soft-budget fix a late transcript is still an answer.
+    report["stage_budget_met"] = not degraded
+    if not answered:
         report["note"] = ("a turn ended without an answer: the injected engine cost overran "
                           "a stage budget of the hub (ТЗ 15.1), so the room heard an error")
+    elif degraded:
+        report["note"] = ("a stage budget of the hub was missed (ТЗ 15.1: "
+                          + ", ".join(degraded)
+                          + "); the room still got its answer, later than the budget allows")
     return report
 
 
@@ -319,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     report = measure(args.phrase, language=args.language, repeats=args.repeats,
                      stt_ms=args.stt_ms, tts_ms=args.tts_ms)
     print(json.dumps(report, indent=2, ensure_ascii=False))
-    return 0 if report["within_budget"] else 1
+    return 0 if report["within_budget"] and report["stage_budget_met"] else 1
 
 
 if __name__ == "__main__":

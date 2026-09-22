@@ -647,26 +647,18 @@
     transcriptEl.classList.toggle("visible", text.length > 0);
   };
 
-  // -- window.hudHub({state, queue}) - ТЗ F-708: статус хаба. `online` (зелёный),
-  // `queue` (жёлтый, с числом ожидающих задач) и `offline` (красный, когда
-  // связь потеряна). Пустой state прячет значок.
+  // -- window.hudHub({state, queue}) - ТЗ F-708: статус хаба. Страница узнаёт
+  // всё три состояния (`online` / `queue` / `offline`), но угол экрана отдан
+  // только настоящей потере связи: постоянный значок «online» владелец читал
+  // как мусор поверх своей работы. Пустой state и `online`/`queue` прячут значок.
   window.hudHub = function (payload) {
     payload = payload || {};
     var state = payload.state;
     var known = ["online", "queue", "offline"].indexOf(state) >= 0;
-    hubEl.classList.toggle("visible", known);
+    hubEl.classList.toggle("visible", state === "offline");
     hubEl.classList.toggle("queue", state === "queue");
     hubEl.classList.toggle("offline", state === "offline");
-    if (!known) {
-      hubLabelEl.textContent = "";
-      return;
-    }
-    var label = state === "offline" ? "brain offline" : state === "queue" ? "queue" : "online";
-    var queued = Number(payload.queue);
-    if (state === "queue" && isFinite(queued) && queued > 0) {
-      label += " \u00b7 " + Math.round(queued);
-    }
-    hubLabelEl.textContent = label;
+    hubLabelEl.textContent = known && state === "offline" ? "brain offline" : "";
   };
 
   // -- window.hudTracks([{name, box}]) - ТЗ F-708: имена над треками поверх

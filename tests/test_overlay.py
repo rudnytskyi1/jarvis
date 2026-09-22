@@ -16,9 +16,12 @@ Plus the small pure helper functions (state validation, status truncation,
 the normalized-coordinate clamp, the hidden-at-idle decision) directly.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from client.overlay import (
+    BADGE_HOLD_S,
     CLICK_TOTAL_S,
     FLASH_ERROR,
     FLASH_SHOT,
@@ -29,10 +32,12 @@ from client.overlay import (
     STATE_THINKING,
     VALID_STATES,
     OverlayHUD,
+    _badge_deadline,
     _clamp01,
     _is_active,
     _truncate_status,
     _validate_state,
+    _visibility_now,
     norm_to_px,
 )
 
@@ -141,6 +146,55 @@ class TestIsActive:
 
     def test_idle_with_click_is_active(self):
         assert _is_active(STATE_IDLE, "", False, False, False, True) is True
+
+    def test_a_time_boxed_badge_is_active_only_while_it_lasts(self):
+        assert _is_active(STATE_IDLE, "", False, False, False, False, True) is True
+
+
+# ------------------------------------------------------------------
+# _badge_deadline / _visibility_now - a standing badge must not pin the
+# overlay over the owner's desktop (the report that started this fix: after
+# every call the window stayed up, because "barge-in is off" was counted as
+# activity for as long as the client ran).
+# ------------------------------------------------------------------
+def _owner(**overrides):
+    values = dict(
+        _state=STATE_IDLE,
+        _status="",
+        _speaker_name="",
+        _scanning=False,
+        _typing_on=False,
+        _flash_until=0.0,
+        _click_until=0.0,
+        _badge_until=0.0,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestBadgeDeadline:
+    def test_a_cleared_badge_holds_nothing(self):
+        assert _badge_deadline(100.0, "") == 0.0
+        assert _badge_deadline(100.0, None) == 0.0
+        assert _badge_deadline(100.0, "   ") == 0.0
+
+    def test_a_set_badge_holds_the_window_for_its_hold(self):
+        assert _badge_deadline(100.0, "barge-in is off") == 100.0 + BADGE_HOLD_S
+
+
+class TestVisibilityNow:
+    def test_a_badge_that_was_set_long_ago_no_longer_holds_the_window(self):
+        owner = _owner()
+        assert _visibility_now(owner, 1000.0) is False
+
+    def test_a_fresh_badge_announces_itself_and_then_lets_go(self):
+        owner = _owner(_badge_until=1000.0 + BADGE_HOLD_S)
+        assert _visibility_now(owner, 1001.0) is True
+        assert _visibility_now(owner, 1000.0 + BADGE_HOLD_S + 0.1) is False
+
+    def test_a_live_turn_still_shows_the_window(self):
+        assert _visibility_now(_owner(_state=STATE_SPEAKING), 5000.0) is True
+        assert _visibility_now(_owner(_status="looking at the screen"), 5000.0) is True
 
 
 # ------------------------------------------------------------------

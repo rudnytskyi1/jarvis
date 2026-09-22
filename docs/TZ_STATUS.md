@@ -242,3 +242,26 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   **Чего нет:** сумматор и эмбеддер проверены подставными (встроенной модели
   эмбеддингов ТЗ 9.4 в сборке нет — раздел 17), качество сводки и время прохода
   замеряются на стенде (P3-40).
+
+## Операционные исправления по живой эксплуатации (21–22.09.2026)
+
+- **EXP-01 — реплика больше не глохнет из-за бюджета стадии: сделано.**
+  `hub/app.py::Connection._wait_for_stage` ждёт стадию сначала бюджет 15.1,
+  затем (с отметкой деградации) абсолютный предохранитель. Причина: на живом
+  хабе отмена на 700-й мс выбрасывала готовый транскрипт, клиент получал
+  `stt timed out`, `/health.utterances.last.note = stt_timeout`, комната
+  слышала пустое TTS. Проверено: `pytest tests/test_stage_timeouts.py
+  tests/test_measure_scene_latency.py -q` → 30 passed; полный
+  `pytest tests -q` → 4382 passed, 10 skipped; `ruff check .` и `mypy common`
+  чисто.
+- **EXP-03 — клиент без дома не пишет личность: сделано.**
+  `hub/app.py::Connection._identity_storage_ready` закрывает путь записи лиц,
+  кропов тела и привязок для v1-`hello`, оставляя одну строку в логе вместо
+  предупреждений на каждый кадр. Покрыто `tests/test_stage_timeouts.py`.
+- **EXP-04/EXP-05 — оверлей комнаты: сделано.** Постоянный значок
+  `online`/`queue` убран из обоих экранов HUD (осталась только надпись
+  `brain offline` при потере связи), а бейджи F-102/F-303 держат прозрачное
+  окно не дольше `BADGE_HOLD_S` = 6 с (`client/overlay.py::_visibility_now`).
+  Проверено: `pytest tests/test_overlay.py tests/test_hud_v2.py
+  tests/test_overlay_followup.py tests/test_privacy_mode.py
+  tests/test_barge_in.py -q` → 178 passed.

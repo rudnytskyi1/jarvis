@@ -69,12 +69,14 @@ def test_the_declared_engine_costs_are_counted_in_the_total():
 def test_an_engine_cost_that_overruns_a_stage_budget_is_reported_not_hidden():
     """900 ms of STT is past the hub's own 700 ms stage budget (ТЗ 15.1).
 
-    The hub then degrades instead of answering, and the measurement has to say
-    that out loud rather than print a comfortable total.
+    The room still gets its answer - a late transcript beats silence - but the
+    measurement has to say the stage was degraded instead of printing a
+    comfortable total.
     """
     report = measure_mod.measure(repeats=1, stt_ms=900)
-    assert report["answered_turns"] == 0
-    assert report["within_budget"] is False
+    assert report["answered_turns"] == 1, "a slow engine must not leave the room in silence"
+    assert report["degraded_stages"] == ["stt"]
+    assert report["stage_budget_met"] is False
     assert "note" in report
 
 
