@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from hub import memories
 from hub.homes import ensure_home
 from hub.storage import DIALOGS_DIRNAME, MEMORY_FILENAME, Memory
 
@@ -158,7 +159,11 @@ def migrate_memory(conn: sqlite3.Connection, data_dir: Path | str = DEFAULT_DATA
             scope, owner_id, key = "person", person, str(record.get("key") or "")
         else:
             scope, owner_id, key = "home", LEGACY_HOME_ID, str(record.get("key") or "")
-        kind = "setting" if key else "fact"
+        # F-414: the table stores TYPED kinds. The older build wrote "setting"
+        # and "fact", which ``MemoryFact`` refuses - that made the whole memory
+        # read fail on a hub that had run it. New rows use the real kinds; the
+        # old spellings are still translated on read (``memories.kind_of``).
+        kind = str(memories.kind_for(key=key, shared=not person))
         memory_id = f"legacy-mem-{_sha('|'.join((scope, owner_id, kind, key, fact)))}"
         created_at = str(record.get("ts") or datetime.now(UTC).isoformat(timespec="seconds"))
         conn.execute(

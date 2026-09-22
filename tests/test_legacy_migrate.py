@@ -83,7 +83,15 @@ def test_migrate_memory_resolves_tombstones_and_scopes(tmp_path):
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT kind FROM memories WHERE scope='person' AND text='pref'",
-        ).fetchone()[0] == "setting"
+        ).fetchone()[0] == "preference"
+        # A legacy "fact" is stored as the typed kind it really is, so the
+        # memory read never has to refuse a row (F-414).
+        assert conn.execute(
+            "SELECT kind FROM memories WHERE text='room fact'",
+        ).fetchone()[0] == "home_fact"
+        assert conn.execute(
+            "SELECT kind FROM memories WHERE text='new'",
+        ).fetchone()[0] == "person_fact"
         assert conn.execute(
             "SELECT COUNT(*) FROM memories WHERE text='old' OR text='drop'",
         ).fetchone()[0] == 0

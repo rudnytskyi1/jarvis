@@ -81,6 +81,33 @@ _PURE_WORKFLOW = re.compile(r'^(?:' + _EN_WALLPAPER + r'|' + _EN_WALLPAPER_TO + 
 _CAPTION_INTRO = re.compile(
     r'\b(?:words|text|caption|phrase|message|says|saying|reads|reading|'
     r'надпись|надписью|текст|текстом|слова|словами|фразу|фразой)\b', re.I)
+#: Verbs that put somebody into the picture. A quoted name straight after one
+#: of these is a person reference, not artwork text.
+_ADD_VERB = re.compile(
+    r'\b(?:add|put|place|insert|include|paste|добавь|добавить|поставь|поставить|'
+    r'помести|поместить|вставь|вставить)\b', re.I)
+_QUOTE_PAIRS = {'"': '"', '\u201c': '\u201d', '\u00ab': '\u00bb', "'": "'"}
+
+
+def _quoted_person_name(prefix: str, after: str, name: str) -> bool:
+    """True when the match sits inside quotes that wrap exactly a person's name.
+
+    "add \u201cjohn the system\u201d to the photo" quotes the NAME, so the
+    caption rule must not read it as text drawn on the artwork: doing that made
+    the hub answer ``\"John the system\" was not requested in this image`` and
+    refuse a valid edit. The quotes have to close right after the name and the
+    clause has to be an add verb, so 'Say "make this picture our background
+    picture"' keeps its original meaning (quoted words, not a request), and a
+    real caption ('add the caption "9:16"') stays a caption.
+    """
+    if _CAPTION_INTRO.search(prefix) or any(char.isdigit() for char in str(name)):
+        return False
+    opener = prefix.rstrip()[-1:] if prefix.strip() else ''
+    closer = _QUOTE_PAIRS.get(opener, '')
+    if not closer or not after.lstrip().startswith(closer):
+        return False
+    clause = re.split(r'[.!?;,]|\b(?:but|however|но|зато)\b', prefix, flags=re.I)[-1]
+    return bool(_ADD_VERB.search(clause))
 
 
 def _possibly_literal_caption(prefix: str) -> bool:
@@ -169,10 +196,11 @@ def person_reference_requested(text: str, name: str) -> bool:
     allowed = False
     for match in matches:
         prefix = text[:match.start()]
-        if _possibly_literal_caption(prefix):
+        after = text[match.end():]
+        if _possibly_literal_caption(prefix) and not _quoted_person_name(prefix, after, name):
             continue
         clause = re.split(r'[.!?;,]|\b(?:but|however|но|зато)\b', prefix, flags=re.I)[-1]
-        after = re.split(r'[.!?;,]|\b(?:but|however|но|зато)\b', text[match.end():], flags=re.I)[0]
+        after = re.split(r'[.!?;,]|\b(?:but|however|но|зато)\b', after, flags=re.I)[0]
         if (_NEGATED_WORKFLOW.search(clause)
                 or re.search(r'\b(?:except|exclude|excluding|avoid|кроме|исключи)\b', clause, re.I)
                 or re.match(r"\s+(?:should\s+not|must\s+not|shouldn[’']t|mustn[’']t|не)\b", after, re.I)):

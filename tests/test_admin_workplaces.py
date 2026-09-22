@@ -40,6 +40,29 @@ def test_the_listing_reports_the_home_of_the_connection(monkeypatch):
     assert rows["dorm-max"]["name"] == "dorm-max workplace"
 
 
+# --- F-701: the owner's name for a computer survives a reconnect ------------
+
+
+def test_a_client_that_repeats_its_own_id_does_not_rename_the_workplace():
+    """The room PC used to send its client id as its name on every hello."""
+    assert hub_app.workplace_display_name(
+        "livingroom", "livingroom", stored="anton", home="anton") == "anton"
+
+
+def test_the_room_name_is_the_fallback_when_nothing_was_set():
+    assert hub_app.workplace_display_name("livingroom", "", home="anton") == "anton"
+
+
+def test_a_real_configured_name_from_the_client_still_wins():
+    assert hub_app.workplace_display_name(
+        "livingroom", "AntonDorm", stored="anton", home="anton") == "AntonDorm"
+
+
+def test_an_unknown_workplace_falls_back_to_its_client_id():
+    assert hub_app.workplace_display_name("room-9de3", "", stored="", home="") == "room-9de3"
+    assert hub_app.workplace_display_name("", "") == "Room"
+
+
 KNOWN = {
     "room-9de3bed07b44": {"id": "room-9de3bed07b44", "name": "buro",
                           "camera_name": "Buro camera", "home_id": ""},

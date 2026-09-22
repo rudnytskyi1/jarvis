@@ -1,7 +1,13 @@
 """Literal image requests: never change hat/head into emoji or invented style."""
 import pytest
 
-from hub.image_prompt import is_image_clarification, is_image_request, visual_request, wallpaper_change_requested
+from hub.image_prompt import (
+    is_image_clarification,
+    is_image_request,
+    person_reference_requested,
+    visual_request,
+    wallpaper_change_requested,
+)
 
 
 def test_actual_spiderman_request_keeps_stt_head_word_without_guessing():
@@ -195,3 +201,27 @@ def test_wallpaper_needs_positive_current_action(text):
 ])
 def test_image_edits_negations_quotes_and_history_never_authorize_wallpaper(text):
     assert not wallpaper_change_requested(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Take a picture of livingroom Add \u201cjohn the system\u201d,he\u2019s sitting on the couch',
+    'Add \u201cjohn the system\u201d to this photo.',
+    'Add the person \u201cJohn the system\u201d sitting on the couch.',
+])
+def test_a_quoted_person_name_still_authorizes_their_reference(text):
+    """Owner's report (2026-09-22): the answer was a refusal.
+
+    ``add \u201cjohn the system\u201d to the photo`` names an ENROLLED person. The
+    caption rule read the quotes as drawn text, so the hub answered "was not
+    requested in this image" and refused a valid edit.
+    """
+    assert person_reference_requested(text, 'John the system')
+
+
+@pytest.mark.parametrize('text', [
+    'Add the caption "9:16" beside Anton.',
+    'Add the caption "make this image vertical".',
+])
+def test_a_real_caption_is_still_not_a_person_reference(text):
+    assert not person_reference_requested(text, '9:16')
+    assert not person_reference_requested(text, 'make this image vertical')

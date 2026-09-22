@@ -55,6 +55,31 @@ class Scope(StrEnum):
     HUB = "hub"
 
 
+#: The legacy file import (``hub/legacy_migrate.py``) wrote ``"setting"`` for a
+#: keyed preference and ``"fact"`` for everything else, before F-414's typed
+#: kinds existed. Those rows are still in the table of a hub that ran the older
+#: build, and ``MemoryFact`` refuses them - which used to make the WHOLE read
+#: fail, so one legacy row blinded every turn to all 63 facts.
+LEGACY_FACT_KIND = "fact"
+LEGACY_SETTING_KIND = "setting"
+
+
+def kind_of(raw: Any, *, scope: Any = None) -> Kind:
+    """The typed kind of one stored value, with the two legacy names mapped.
+
+    Returns the kind itself rather than raising for the legacy spellings, and
+    tells the caller plainly when a value is neither.
+    """
+    text = str(raw or "").strip().casefold()
+    if text == LEGACY_SETTING_KIND:
+        return Kind.PREFERENCE
+    if text == LEGACY_FACT_KIND:
+        # A legacy "fact" about the home was a room-wide fact; anything else was
+        # about the person who said it.
+        return Kind.HOME_FACT if str(scope or "").casefold() == "home" else Kind.PERSON_FACT
+    return Kind(text)
+
+
 def _parse_time(value: Any) -> datetime | None:
     """A timestamp of the schema's own column, aware and in UTC."""
     if value in (None, ""):
@@ -230,7 +255,7 @@ class MemoryIndex:
         """One fact by id, expired or not."""
         row = self._conn.execute(
             _SELECT + " WHERE memory_id=?", (str(memory_id),)).fetchone()
-        return _fact(row) if row is not None else None
+        return self._one(row)
 
     def active(self, *, scope: Scope | None = None, owner_id: str | None = None,
                kind: Kind | None = None, limit: int | None = None,
@@ -250,13 +275,42 @@ class MemoryIndex:
             sql += " AND lower(owner_id)=lower(?)"
             params.append(" ".join(str(owner_id).split()))
         if kind is not None:
-            sql += " AND kind=?"
-            params.append(str(kind))
+            # A legacy row spells the same kind differently, and the typed model
+            # translates it on read - so the filter has to look for both names.
+            spellings = [str(kind)]
+            if str(kind) == str(Kind.PERSON_FACT):
+                spellings.append(LEGACY_FACT_KIND)
+            if str(kind) == str(Kind.HOME_FACT):
+                spellings.append(LEGACY_FACT_KIND)
+            if str(kind) == str(Kind.PREFERENCE):
+                spellings.append(LEGACY_SETTING_KIND)
+            sql += " AND kind IN (" + ", ".join("?" * len(spellings)) + ")"
+            params.extend(spellings)
         sql += " ORDER BY created_at DESC, rowid DESC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(max(0, int(limit)))
-        return [_fact(row) for row in self._conn.execute(sql, params)]
+        facts: list[MemoryFact] = []
+        for row in self._conn.execute(sql, params):
+            fact = self._one(row)
+            if fact is not None:
+                facts.append(fact)
+        return facts
+
+    def _one(self, row: Any) -> MemoryFact | None:
+        """One row as a model; an unreadable row is skipped, never fatal.
+
+        One damaged or written-by-an-older-build row used to make ``active()``
+        raise, which left every turn of the hub with an empty memory block and
+        a warning. The rest of the table is still readable, so it is.
+        """
+        if row is None:
+            return None
+        try:
+            return _fact(row)
+        except Exception as exc:  # noqa: BLE001 - one row is not the table
+            log.warning("Skipping an unreadable memory row %s (%s)", row[0], exc)
+            return None
 
     def count(self, *, include_expired: bool = False,
               now: datetime | None = None) -> int:
@@ -285,10 +339,11 @@ def _stamp(moment: datetime | None) -> str | None:
 
 
 def _fact(row: Any) -> MemoryFact:
-    """One row of the table as a model."""
+    """One row of the table as a model (legacy kinds are translated, not lost)."""
+    scope = Scope(str(row[1]))
     return MemoryFact(
-        memory_id=str(row[0]), scope=Scope(str(row[1])), owner_id=str(row[2] or ""),
-        kind=Kind(str(row[3])), text=str(row[4]),
+        memory_id=str(row[0]), scope=scope, owner_id=str(row[2] or ""),
+        kind=kind_of(row[3], scope=scope), text=str(row[4]),
         vector=bytes(row[5]) if row[5] is not None else None,
         dim=int(row[6]) if row[6] is not None else None,
         weight=float(row[7]), expires_at=_parse_time(row[8]),
@@ -304,5 +359,6 @@ __all__ = [
     "MemoryIndex",
     "Scope",
     "fact_from",
+    "kind_of",
     "kind_for",
 ]

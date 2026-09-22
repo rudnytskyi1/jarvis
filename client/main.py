@@ -381,7 +381,10 @@ def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
         "type": MSG_HELLO,
         "client_id": str(_attr(cfg_client, "client_id") or "client"),
         "kind": kind,
-        "workplace_name": str(_attr(cfg_client, 'workplace_name') or _attr(cfg_client, 'client_id') or 'client'),
+        # ТЗ F-701: only a REAL configured name (empty when unset). Repeating the
+        # client id here used to overwrite the name the owner had set for this
+        # computer in /tools on every reconnect.
+        "workplace_name": str(_attr(cfg_client, 'workplace_name') or ''),
         "camera_name": str(_attr(_attr(cfg_client, 'camera'), 'name') or 'Основная камера'),
         "capabilities": capabilities,
         "devices": devices,

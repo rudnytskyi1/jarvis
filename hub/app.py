@@ -1876,6 +1876,29 @@ def _workplaces():
     return list(values.values())
 
 
+def workplace_display_name(client_id: str, sent_name: Any = "", *, stored: Any = "",
+                           home: Any = "") -> str:
+    """Which name /tools shows for one computer (ТЗ F-701).
+
+    The client is NOT the authority on its own display name. Every room PC used
+    to send its ``client_id`` back in ``workplace_name`` when nobody had
+    configured one, and the hub stored that on every hello - so a workplace the
+    owner had renamed came back as "livingroom" the moment the client
+    reconnected. An explicit name from the client still wins, then the name
+    already stored for this workplace, then the room's own name
+    (``homes.name``), and only then the raw client id.
+    """
+    key = " ".join(str(client_id or "").split())
+    sent = " ".join(str(sent_name or "").split())[:80]
+    if sent and sent.casefold() != key.casefold():
+        return sent
+    for candidate in (stored, home):
+        value = " ".join(str(candidate or "").split())[:80]
+        if value and value.casefold() != key.casefold():
+            return value
+    return sent or key or "Room"
+
+
 def _workplace_home(client_id: str) -> str:
     """Which home one workplace belongs to (ТЗ F-701), or ``''`` when unknown."""
     identifier = str(client_id or '')
@@ -5480,10 +5503,19 @@ class Connection(CameraClipReceiver):
             kind = proto.ClientKind.ROOM_PC.value
         self._can_camera_clip = ('camera_clip' in (payload.get('capabilities') or [])
                                  and kind != proto.ClientKind.PHONE.value)
-        self.workplace_name = ' '.join(str(payload.get('workplace_name') or payload.get('client_id') or 'Room').split())[:80]
+        key = payload['client_id'][:100] if isinstance(payload.get('client_id'), str) else ''
+        stored_entry: dict[str, Any] = {}
+        if _telegram_access is not None and key:
+            known = await asyncio.to_thread(_telegram_access.get_setting, 'workplaces', {})
+            entry = (known or {}).get(key) if isinstance(known, dict) else None
+            stored_entry = entry if isinstance(entry, dict) else {}
+        # ТЗ F-701: the owner's name for this computer survives a reconnect; the
+        # client only renames it when it really sends a name of its own.
+        self.workplace_name = workplace_display_name(
+            key, payload.get('workplace_name'),
+            stored=stored_entry.get('name'), home=_home_name(self.home_id))
         self.camera_name = ' '.join(str(payload.get('camera_name') or 'Camera').split())[:80]
-        if _telegram_access is not None and isinstance(payload.get('client_id'), str):
-            key = payload['client_id'][:100]
+        if _telegram_access is not None and key:
             await asyncio.to_thread(_telegram_access.update_mapping_setting, 'workplaces', key,
                                    dict(id=key, name=self.workplace_name, camera_name=self.camera_name,
                                         home_id=self.home_id or ''))
