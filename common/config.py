@@ -1231,6 +1231,10 @@ class GamesConfig(_Strict):
     answer_window_s: float = Field(default=45.0, ge=5.0, le=600.0)
     #: Сколько очков даёт верный ответ.
     points: int = Field(default=1, ge=1, le=10)
+    #: ТЗ F-608 «угадай, кто сказал»: сколько секунд даётся на догадки.
+    guess_window_s: float = Field(default=20.0, ge=5.0, le=600.0)
+    #: ТЗ F-608: сколько очков получает самая быстрая комната (минимум — 1).
+    guess_points: int = Field(default=5, ge=1, le=20)
 
 
 class PresenceConfig(_Strict):

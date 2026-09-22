@@ -7,8 +7,7 @@ import pytest
 
 from hub import migrations_runner
 from hub.homes import ensure_home
-from hub.skill_state import (SkillScheduler, SkillSchedulerError, SkillStateError,
-                             SkillStateStore)
+from hub.skill_state import SkillScheduler, SkillSchedulerError, SkillStateError, SkillStateStore
 
 
 def _conn(tmp_path):

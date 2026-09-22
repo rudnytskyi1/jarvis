@@ -1,7 +1,7 @@
 """Absent requested people use saved examples without inventing scene identity."""
 import pytest
 
-from hub.image_subjects import select_image_subjects
+from hub.image_subjects import expand_person_names, person_named, resolve_named_person, select_image_subjects
 
 NAMES = ['Anton', 'John', 'Theodric']
 
@@ -96,3 +96,50 @@ def test_no_silent_two_person_truncation_or_fuzzy_name_matching():
 def test_case_and_explicit_duplicate_aliases_resolve_once():
     result = select('Draw ANTON next to me.', explicit=['anton', 'me', 'Anton'])
     assert result['reference_people'] == ['Anton']
+
+
+@pytest.mark.parametrize('text', ['Добавь антона сидящего на стуле', 'Добавь Антона на диван',
+                                  'Можешь сделать так чтобы там сидел Антон'])
+def test_a_russian_or_inflected_name_is_the_enrolled_person(text):
+    """Owner's report (2026-09-22): "Антон"/"антона" met the enrolled "Anton".
+
+    The hub refused with "\u00abAnton was not requested in this image\u00bb" for a request
+    that did name him, only in the spelling the owner actually uses.
+    """
+    assert select(text, explicit=['Anton'], names=['Anton'])['reference_people'] == ['Anton']
+    assert select(text, names=['Anton'], source='none')['reference_people'] == ['Anton']
+
+
+def test_a_short_form_of_an_enrolled_name_is_that_person():
+    result = select('Add john the system, he is sitting on the couch', explicit=['John'],
+                    names=['John the system'])
+    assert result['reference_people'] == ['John the system']
+    assert select('Draw Theodric sitting on the couch', names=['Theodric Krentz'],
+                  source='none')['reference_people'] == ['Theodric Krentz']
+
+
+def test_an_ambiguous_short_form_is_never_guessed():
+    names = ['Anton Petrov', 'Anton Sidorov']
+    assert not select('Add Anton to the picture.', explicit=['Anton'], names=names)['reference_people']
+
+
+@pytest.mark.parametrize('text', ['Draw Anthony next to him.', 'Photo from AntonDorm please.',
+                                  'Draw Antonia in a hat.'])
+def test_a_longer_unrelated_word_never_becomes_the_name(text):
+    assert not select(text, names=['Anton'])['reference_people']
+
+
+def test_expansion_is_only_a_wording_check_and_keeps_the_original_text():
+    assert expand_person_names('Добавь антона на диван', ['Anton']) == 'Добавь Anton на диван'
+    assert expand_person_names('Draw John the system', ['John', 'John the system']) == 'Draw John the system'
+    assert person_named('добавь антона', 'Anton', ['Anton'])
+    assert person_named('add john', 'John the system', ['John the system'])
+    assert not person_named('put a hat on my head', 'John the system', ['John the system'])
+
+
+def test_the_model_argument_resolves_short_and_transliterated_names():
+    assert resolve_named_person('John', ['John the system']) == 'John the system'
+    assert resolve_named_person('Антон', ['Anton']) == 'Anton'
+    assert resolve_named_person('антона', ['Anton']) == 'Anton'
+    assert resolve_named_person('Jo', ['John', 'Josh']) is None
+    assert resolve_named_person('', ['Anton']) is None

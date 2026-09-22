@@ -17,6 +17,7 @@ from pathlib import Path
 from hub.api_budget import BudgetExceeded
 from hub.conversations import Conversations
 from hub.image_prompt import action_revoked, is_image_request, visual_request, visual_target
+from hub.image_subjects import person_named
 from hub.telegram import TelegramError
 from hub.untrusted import TELEGRAM_SOURCE
 from hub.untrusted import wrap as wrap_untrusted
@@ -46,6 +47,19 @@ _ATTACHED_EDIT = re.compile(
 _ATTACHED_RESHAPE = re.compile(
     _REQUEST_START +
     r'(?:make|turn|change|edit|put|place|add|сделай|сделать|измени|поставь|посади)\b', re.I)
+#: Taking the photo and editing it in one sentence: "take a picture of the room
+#: and make Anton sit on the couch". The capture wording comes first, so the
+#: edit verb is not the first word of the message and the anchored command
+#: above never sees it.
+_CAPTURE_REQUEST = re.compile(
+    _REQUEST_START +
+    r'(?:take|capture|snap|сделай|сними|снять|сделать|сфотографируй)\s+'
+    r'(?:(?:a|an|the|new|fresh|новое|новую|свежее|свежую)\s+){0,2}'
+    r'(?:photo|picture|image|snapshot|screenshot|фото|фотографию|снимок|скриншот)\b', re.I)
+_EDIT_VERB = re.compile(
+    r'\b(?:make|turn|change|edit|modify|add|put|place|insert|include|remove|replace|give|'
+    r'сделай|сделать|измени|измените|добавь|добавить|поставь|поставить|посади|посадить|'
+    r'надень|надеть|убери|убрать|замени|заменить|отредактируй)\b', re.I)
 _VISUAL_COMMAND = re.compile(
     _REQUEST_START +
     r'(?P<verb>draw|paint|sketch|illustrate|render|generate|create|edit|modify|change|remove|'
@@ -61,7 +75,27 @@ _NONVISUAL_DRAW = re.compile(
     r'^\s*(?:on|upon)\s+|^\s*up\s+(?:(?:a|the)\s+)?(?:contract|agreement|plan)\b', re.I)
 
 
-def current_image_request(text, *, has_photo=False):
+def _capture_then_edit(value, people=()):
+    """A message that opens with taking a photo and carries the edit itself.
+
+    "Take a picture of the room and make Anton sit on the couch" is one image
+    request: the photo is the source and the second clause is the edit. The
+    second clause has to be a request of its own - an edit verb plus something
+    to change, either a visible thing or one of the people this hub knows by
+    face - so plain "take a picture of the room" stays a camera capture.
+    """
+    match = _CAPTURE_REQUEST.match(value)
+    if match is None:
+        return False
+    rest = value[match.end():]
+    if not _EDIT_VERB.search(rest):
+        return False
+    if is_image_request(rest):
+        return True
+    return any(person_named(value, name, people) for name in people or ())
+
+
+def current_image_request(text, *, has_photo=False, people=()):
     """Require a present affirmative visual command before spending on images.
 
     A visual verb mentioned in a complaint, quotation, explanation or ordinary
@@ -71,6 +105,8 @@ def current_image_request(text, *, has_photo=False):
     value = visual_request(text)
     if action_revoked(value):
         return False
+    if _capture_then_edit(value, people):
+        return True
     command = _VISUAL_COMMAND.match(value)
     if command is None or not re.search(r'\w', command['detail']):
         return False

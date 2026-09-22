@@ -57,5 +57,10 @@ dist/
 testtmp/
 ptroot/
 
+# --- scratch directories of the workspace tools (telemetry, latency runs) ---
+tmp/
+tmp[A-Za-z0-9]*/
+probe-[A-Za-z0-9]*/
+
 loop.log
 .pytest_tmp/

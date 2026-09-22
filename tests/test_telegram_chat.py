@@ -309,6 +309,38 @@ def test_reshaping_wording_without_a_target_is_still_not_an_edit(wording):
     assert not current_image_request(wording, has_photo=True)
 
 
+@pytest.mark.parametrize('wording', [
+    # The owner's own wording, which the gate refused on 2026-09-22: the
+    # capture wording comes first, so the edit verb is not the first word.
+    "Take a picture of buro's room and make theodric sit in the couch",
+    'Take a photo of livingroom and edit the photo so Anton is sitting on the couch.',
+    'Сделай фото комнаты и посади Антона на диван.',
+])
+def test_taking_the_photo_and_editing_it_in_one_sentence_is_one_request(wording):
+    assert current_image_request(wording, has_photo=True)
+    assert current_image_request(wording, people=('Anton', 'Theodric Krentz'))
+
+
+@pytest.mark.parametrize('wording', [
+    'Take a picture of the room',
+    'Take a picture of the room and describe it',
+    'Take a photo of the room and send it to me',
+])
+def test_taking_a_photo_alone_stays_a_capture_not_a_generated_edit(wording):
+    assert not current_image_request(wording, has_photo=True)
+    assert not current_image_request(wording, people=('Anton',))
+
+
+@pytest.mark.parametrize('wording', [
+    'Take a picture of antondorm and add \u201cJohn the system\u2019 to it',
+    'Take a photo of the room and add John the system to it.',
+])
+def test_a_named_person_makes_a_capture_and_add_one_image_request(wording):
+    """Owner's report (2026-09-22): "add \u00abJohn the system\u00bb to it" was refused."""
+    assert current_image_request(wording, has_photo=True, people=('John the system',))
+    assert not current_image_request(wording, has_photo=True, people=('Anton',))
+
+
 @pytest.mark.parametrize('wording', ['Draw a sign saying "Cancel that."',
                                     'Draw the words “actually don’t”.',
                                     'Нарисуй надпись «Отмена».'])

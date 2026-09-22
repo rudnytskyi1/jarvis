@@ -70,15 +70,18 @@ def reference_seconds(audio: bytes) -> float:
 
 
 class ConsentStore:
-    """Кто разрешил клон СВОЕГО голоса (ТЗ F-111), на диске.
+    """Кто разрешил использовать СВОЙ голос (ТЗ F-111, F-608), на диске.
 
     Согласие — не флаг дома: его даёт человек, и он же может его отозвать.
     Хранится рядом с остальными локальными данными хаба; в git и логи не
-    попадает ничего, кроме факта и момента.
+    попадает ничего, кроме факта и момента. ``purpose`` называет, на ЧТО дано
+    согласие (клон голоса F-111 или игра «угадай, кто сказал» F-608): у каждой
+    цели свой файл, и одно согласие не открывает другое.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, purpose: str = "voice clone") -> None:
         self.path = Path(path)
+        self.purpose = " ".join(str(purpose or "").split()) or "voice clone"
         self._items: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -114,7 +117,7 @@ class ConsentStore:
             "home_id": home, "person_id": person,
             "granted_at": time.time() if at is None else float(at)}
         self._save()
-        log.info("Voice-clone consent for %s in %s recorded", person, home)
+        log.info("%s consent for %s in %s recorded", self.purpose, person, home)
         return True
 
     def granted(self, home_id: str, person_id: str) -> bool:
@@ -124,7 +127,7 @@ class ConsentStore:
         removed = self._items.pop(self._key(home_id, person_id), None)
         if removed is not None:
             self._save()
-            log.info("Voice-clone consent for %s in %s revoked", person_id, home_id)
+            log.info("%s consent for %s in %s revoked", self.purpose, person_id, home_id)
         return removed is not None
 
     def snapshot(self) -> dict[str, Any]:

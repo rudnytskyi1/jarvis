@@ -96,6 +96,15 @@ or another face view. At most **four named reference images** accompany the
 primary `source` image. Each image is labeled with its person's name and role as
 an identity reference; the primary photograph remains the scene to edit.
 
+The selected photographs are the person's **newest usable appearance** in the
+gallery, and the body crop is taken from the same moment as the face whenever
+that moment has one, so the person is generated in the clothes they were last
+seen in. A weak frame (low identity score or blurred) is skipped in favor of the
+newest frame that clears the bar; only an archive whose every frame is weak
+falls back to the old quality ranking. The archive itself grows automatically
+while a recognized person stands in front of a room camera, so a new haircut or
+outfit becomes the reference after a few seconds of being visible.
+
 For example, after inspecting the current photo, use `source: camera`,
 `fresh: false`, `reference_people: ["John"]` and an artwork-only description to
 place John next to the person already in that photo. The tool never uploads the
@@ -111,8 +120,9 @@ asks for a brief clear view or face enrollment. A remaining body crop alone is
 insufficient. The face/body gallery is stored locally in `data/appearance/`
 without automatic deletion. A selection limit never deletes archived images.
 
-These images provide dated appearance examples; they do not prove current room
-presence, current clothing or position. The generator receives only requested
+These images are dated appearance examples of the person's most recent saved
+look; the photograph itself does not prove current room presence or position.
+The generator receives only requested
 people's references. Generated outputs never become new recognition samples.
 
 Successful images appear on the room display and are stored as PNGs in

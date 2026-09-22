@@ -111,6 +111,7 @@ from common.protocol import (
     MSG_HELLO,
     MSG_IMAGE_SHOW,
     MSG_OFFLINE_HINT,
+    MSG_PLAY_AUDIO,
     MSG_READY,
     MSG_SAY,
     MSG_SCREENSHOT,
@@ -618,6 +619,9 @@ class JarvisClient:
         #: ТЗ 4.8: the ``tts_phrase`` header awaiting its single binary PCM
         #: frame, plus the background tasks of the offline mode.
         self._pending_phrase: dict[str, Any] | None = None
+        #: ТЗ F-608: the ``play_audio`` header awaiting its single binary PCM
+        #: frame -- the recorded voice a room has to hear to guess it.
+        self._pending_play_audio: dict[str, Any] | None = None
         self._reconnect_task: asyncio.Task | None = None
         self._offline_task: asyncio.Task | None = None
 
@@ -1079,6 +1083,8 @@ class JarvisClient:
         self._pending_image_show = None
         # ТЗ 4.8: то же правило для заголовка заранее синтезированной фразы.
         self._pending_phrase = None
+        # ТЗ F-608: и для записи, которую игра должна проиграть.
+        self._pending_play_audio = None
         self._drain_inbox("message from the previous connection")
 
     def _drain_inbox(self, what: str) -> int:
@@ -1152,6 +1158,10 @@ class JarvisClient:
                 # v1.6: the JPEG announced by an image_show header, in EITHER
                 # mode - never microphone audio, TTS or a conversation message.
                 await self._on_image_show_binary(msg)
+            elif self._pending_play_audio is not None:
+                # ТЗ F-608: the recording announced by a play_audio header -
+                # also in EITHER mode, and never mistaken for the reply's TTS.
+                await self._on_play_audio_binary(msg)
             elif self._idle_stream_active:
                 await self._on_idle_tts_chunk(msg)
             elif self._mode == MODE_CONVERSATION:
@@ -1192,6 +1202,13 @@ class JarvisClient:
                         log.debug("Could not hide the photo: %s", exc)
                 return
             self._pending_image_show = dict(msg)
+            return
+        if mtype == MSG_PLAY_AUDIO:
+            # ТЗ F-608: the header just announces the ONE binary PCM frame that
+            # follows it -- the recorded voice of the «угадай, кто сказал»
+            # round. Handled here in both modes: the room must hear it whether
+            # or not it was already talking.
+            self._pending_play_audio = dict(msg)
             return
         if mtype == MSG_CAMERA_REQUEST:
             # Answered in both modes: the server pulls frames for
@@ -2911,6 +2928,37 @@ class JarvisClient:
             await asyncio.to_thread(self.viewer.show, data, title, ttl_s)
         except Exception as exc:  # noqa: BLE001 - never let a viewer bug break the reader
             log.warning("Could not show the detections photo: %s", exc)
+
+    async def _on_play_audio_binary(self, data: bytes) -> None:
+        """ТЗ F-608: play the recording announced by ``play_audio``.
+
+        The game is «угадай, кто сказал», so this really is somebody's voice and
+        it is NOT synthesized here: the PCM comes from the hub's own recording
+        of a person in another room. Playback goes through the same output
+        stream as the assistant's speech, which is why the frame is routed
+        before the TTS branch of :meth:`_route_message`.
+        """
+        header, self._pending_play_audio = self._pending_play_audio, None
+        header = header or {}
+        if not data:
+            log.warning("A play_audio frame arrived without the recording - dropped")
+            return
+        try:
+            rate = int(header.get("rate") or 0) or int(self.audio_out.default_sample_rate)
+        except (AttributeError, TypeError, ValueError):
+            rate = int(getattr(self, "sample_rate", 16000) or 16000)
+        title = str(header.get("title") or "")
+        try:
+            seconds = float(header.get("seconds") or 0.0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if title:
+            self._show_status(title, max(2.0, seconds) + 2.0)
+        log.info("Playing a recorded voice (%d bytes, %d Hz)", len(data), rate)
+        try:
+            await self.audio_out.play_pcm(bytes(data), rate)
+        except Exception as exc:  # noqa: BLE001 - a broken speaker cannot kill the reader
+            log.warning("Could not play the recording: %s", exc)
 
     def _show_track_labels(self, header: dict[str, Any]) -> None:
         """ТЗ F-708: names over the tracks of the image that was just shown.

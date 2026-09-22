@@ -86,7 +86,10 @@ _CAPTION_INTRO = re.compile(
 _ADD_VERB = re.compile(
     r'\b(?:add|put|place|insert|include|paste|добавь|добавить|поставь|поставить|'
     r'помести|поместить|вставь|вставить)\b', re.I)
-_QUOTE_PAIRS = {'"': '"', '\u201c': '\u201d', '\u00ab': '\u00bb', "'": "'"}
+#: Any of these may open or close a quoted name. Telegram clients mix them
+#: ("add \u201cJohn the system\u2019 to it"), and a mismatched pair still quotes the
+#: name rather than drawing it.
+_QUOTES = '"\'`\u201c\u201d\u2018\u2019\u00ab\u00bb'
 
 
 def _quoted_person_name(prefix: str, after: str, name: str) -> bool:
@@ -102,9 +105,9 @@ def _quoted_person_name(prefix: str, after: str, name: str) -> bool:
     """
     if _CAPTION_INTRO.search(prefix) or any(char.isdigit() for char in str(name)):
         return False
-    opener = prefix.rstrip()[-1:] if prefix.strip() else ''
-    closer = _QUOTE_PAIRS.get(opener, '')
-    if not closer or not after.lstrip().startswith(closer):
+    opened = prefix.rstrip()[-1:] if prefix.strip() else ''
+    following = after.lstrip()
+    if opened not in _QUOTES or not following or following[0] not in _QUOTES:
         return False
     clause = re.split(r'[.!?;,]|\b(?:but|however|но|зато)\b', prefix, flags=re.I)[-1]
     return bool(_ADD_VERB.search(clause))

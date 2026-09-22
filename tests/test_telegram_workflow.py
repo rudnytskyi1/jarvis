@@ -8,7 +8,7 @@ import pytest
 from common.config import Config
 from hub import app
 from hub.telegram import TelegramError
-from hub.telegram_intent import telegram_send_requested
+from hub.telegram_intent import picture_send_requested, telegram_send_requested
 
 
 def setup(monkeypatch):
@@ -104,6 +104,60 @@ def test_no_request_no_capture_or_post(monkeypatch):
     assert not result['ok']
     conn._request_camera_frame_full.assert_not_awaited()
     provider.send_image.assert_not_awaited()
+
+
+@pytest.mark.parametrize('text', [
+    'Rowan, отправь фото', 'Роуэн, скинь это фото', 'Send me the photo.',
+    'Rowan, перешли фото', 'Отправь фото, которое ты сделал.',
+])
+def test_a_picture_request_needs_no_chat_name_in_it(text):
+    """Owner's report (2026-09-22): "отправь фото" was refused as unclear.
+
+    Rowan has one Telegram chat, so the action and its object are enough; the
+    owner does not have to spell the chat out.
+    """
+    assert picture_send_requested(text)
+
+
+@pytest.mark.parametrize('text', [
+    'отправь фото маме', 'Send the photo to Anton.', 'Send mom the photo.',
+    'Send an image to my email.', 'Take a picture of me.',
+    'Do not send the photo.', 'Why did you send the photo?',
+    'Я отправил фото вчера', 'Draw the words "send the photo"',
+    # In the room "here" means the room screen first; only the Telegram route
+    # itself may read it as this chat.
+    'Take a picture of a room and send it here', 'скинь сюда фото с камеры',
+])
+def test_a_picture_promised_to_somebody_else_never_posts_here(text):
+    assert not picture_send_requested(text)
+
+
+def test_a_photo_send_without_a_chat_name_still_posts_once(monkeypatch):
+    conn, provider = setup(monkeypatch)
+    conn._last_frames['camera'] = SimpleNamespace(jpeg=b'exact discussed photo')
+    async def run():
+        token = app._recording_turn.set({'transcript': 'Роуэн, отправь фото'})
+        try:
+            result = await conn._run_telegram_send({'kind': 'image', 'source': 'camera'})
+            assert result['ok']
+            provider.send_image.assert_awaited_once()
+            assert provider.send_image.call_args.args[0] == b'exact discussed photo'
+        finally:
+            app._recording_turn.reset(token)
+    asyncio.run(run())
+
+
+def test_the_same_wording_never_posts_text_proactively(monkeypatch):
+    conn, provider = setup(monkeypatch)
+    async def run():
+        token = app._recording_turn.set({'transcript': 'Роуэн, отправь фото'})
+        try:
+            result = await conn._run_telegram_send({'kind': 'text', 'text': 'hello'})
+            assert not result['ok']
+            provider.send_text.assert_not_awaited()
+        finally:
+            app._recording_turn.reset(token)
+    asyncio.run(run())
 
 
 def test_generated_image_uses_original_pixels_without_new_generation(monkeypatch):

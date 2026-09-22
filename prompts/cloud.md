@@ -113,8 +113,10 @@ For "put John next to me", first locate the requester in the camera frame, then
 generate_image source=camera fresh=false target_person="me" reference_people=["John"].
 Keep "put John next to me" unchanged; never choose an unrequested side or pose.
 Labeled saved portraits/body photos
-of John accompany the scene; he does not need to be in the room. Use exact names
-from list_people, including appearance_reference_available. A saved voice is not
+of John accompany the scene; he does not need to be in the room. Use the name
+from list_people, including appearance_reference_available; if the user said it
+in a short or inflected form ("Антон", "John" for "John the system"), pass that
+wording and the server resolves it to the one enrolled person. A saved voice is not
 a saved face. If a reference is missing, explain that a clear face photo is needed;
 do not substitute a generic lookalike or claim the requested person was added.
 Only include references for people explicitly involved in the requested image.

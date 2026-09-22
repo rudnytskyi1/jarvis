@@ -115,7 +115,44 @@ def test_body_reference_requires_unambiguous_ownership(tmp_path):
     assert [r["kind"] for r in refs] == ["face", "body"]
     assert refs[0]["jpeg"].startswith(b"\xff\xd8")
     assert refs[0]["captured_at"] == 101
-    assert "not as evidence of current presence" in refs[0]["label"]
+    assert "most recent saved appearance" in refs[0]["label"]
+    assert "no evidence that they are in the room" in refs[0]["label"]
+
+
+def test_the_newest_appearance_wins_over_an_older_better_frame(tmp_path):
+    """Owner's report (2026-09-22): the generated look was from another day.
+
+    The gallery used to rank identity quality (with a small age penalty), so a
+    two-day-old frame could supply today's clothes. References now follow the
+    owner's newest usable photograph.
+    """
+    gallery = AppearanceGallery(tmp_path)
+    assert gallery.enroll(scene(1), "Anton", face(), now=100_000)
+    assert confirm(gallery, jpeg=scene(2), detected=face([.70, np.sqrt(1 - .49), 0]),
+                   start=103_600)  # an hour later, still a confirmed identity
+    refs = gallery.references("Anton")
+    assert refs[0]["captured_at"] == 103_601
+    assert refs[0]["quality"]["identity_score"] == pytest.approx(.70)
+
+
+def test_a_weak_newest_frame_does_not_become_the_reference(tmp_path):
+    gallery = AppearanceGallery(tmp_path)
+    assert gallery.enroll(scene(1), "Anton", face(), now=100_000)
+    assert confirm(gallery, jpeg=scene(2), detected=face([.62, np.sqrt(1 - .62 ** 2), 0]),
+                   start=103_600)
+    refs = gallery.references("Anton")
+    assert refs[0]["captured_at"] == 100_000
+    assert refs[0]["quality"]["identity_score"] == pytest.approx(1.0)
+
+
+def test_the_body_reference_comes_from_the_same_moment_as_the_face(tmp_path):
+    gallery = AppearanceGallery(tmp_path)
+    own_face = face()
+    assert confirm(gallery, jpeg=scene(1), detected=own_face, faces=[own_face], start=100)
+    assert confirm(gallery, jpeg=scene(2), detected=own_face, faces=[own_face], start=300)
+    refs = gallery.references("Anton")
+    assert [r["kind"] for r in refs] == ["face", "body"]
+    assert refs[0]["sample_id"] == refs[1]["sample_id"]
 
 
 @pytest.mark.parametrize("mode", ["missing_faces", "empty_faces", "other_face", "overlapping_bodies"])

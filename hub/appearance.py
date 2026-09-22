@@ -87,6 +87,12 @@ class AppearanceGallery:
     MIN_SHARPNESS = 30.0
     MIN_INTERVAL = 60.0
     ACTIVE_LIMIT = 12
+    #: An identity reference is the person's newest usable photograph: the owner
+    #: asked for today's clothes, not the best frame of the week. A frame has to
+    #: clear these bars to be preferred by recency; weaker frames are still used
+    #: when nothing fresher passes, so an archive never becomes unusable.
+    REFERENCE_MIN_IDENTITY = .65
+    REFERENCE_MIN_SHARPNESS = 40.0
 
     def __init__(self, root):
         self.root = Path(root)
@@ -323,7 +329,7 @@ class AppearanceGallery:
             return None
 
     def references(self, name, limit=2, profiles=None):
-        """Return dated references, optionally revalidated against current anchors.
+        """Return dated references: the newest usable appearance first.
 
         Pass current manual profiles when supplying identity images to tools.
         An empty mapping deliberately rejects all archived identities; omitting
@@ -354,17 +360,33 @@ class AppearanceGallery:
                     identity_score, sharpness = float(quality["identity_score"]), float(quality["sharpness"])
                     if not all(math.isfinite(v) for v in (captured_at, identity_score, sharpness)):
                         continue
-                    # Prefer recent photographs, allowing quality to choose within a day.
+                    # Quality decides whether a photograph is usable as a
+                    # reference; recency decides which usable one is the
+                    # person's look now.
                     rank = identity_score + min(sharpness, 1000) / 4000
                     rank -= min((newest - captured_at) / 86400, 10) * .1
-                    candidates.append((rank, row, quality, captured_at_iso))
+                    usable = (identity_score >= self.REFERENCE_MIN_IDENTITY
+                              and sharpness >= self.REFERENCE_MIN_SHARPNESS)
+                    candidates.append((captured_at, rank, usable, row, quality, captured_at_iso))
                 except (ValueError, KeyError, TypeError, OverflowError, OSError):
                     continue
-            candidates.sort(key=lambda item: item[0], reverse=True)
+            fresh = sorted((item for item in candidates if item[2]),
+                           key=lambda item: item[0], reverse=True)
+            by_rank = sorted(candidates, key=lambda item: item[1], reverse=True)
+            # Newest usable appearance; the quality ranking stays as the
+            # fallback for an archive whose every frame is weak.
+            ordered = fresh or by_rank
             result = []
+            chosen = None
             # First image always supplies a face, then an optional body reference.
             for kind in ["face", "body"] + ["face"] * max(0, limit - 2):
-                for _, row, quality, captured_at_iso in candidates:
+                pool = ordered
+                if kind == "body" and chosen is not None:
+                    # The outfit belongs to the same moment as the face photo
+                    # whenever that moment has a body crop.
+                    pool = ([item for item in ordered if item[3]["id"] == chosen["id"]]
+                            + [item for item in ordered if item[3]["id"] != chosen["id"]])
+                for _, _, _, row, quality, captured_at_iso in pool:
                     if any(r["sample_id"] == row["id"] and r["kind"] == kind for r in result):
                         continue
                     raw = self._read(row[f"{kind}_path"])
@@ -373,8 +395,12 @@ class AppearanceGallery:
                             captured_at=row["captured_at"], captured_name=row["captured_name"],
                             captured_at_iso=captured_at_iso,
                             sample_id=row["id"], quality=quality, source="appearance_gallery",
-                            label=f"{row['name']}: {kind} reference captured at {captured_at_iso}; "
-                                  "use for identity, not as evidence of current presence or clothing."))
+                            label=f"{row['name']}: {kind} reference photographed at {captured_at_iso}: "
+                                  "their most recent saved appearance. Use it for how this person "
+                                  "looks (clothes included), and treat the photograph itself as no "
+                                  "evidence that they are in the room now."))
+                        if kind == "face" and chosen is None:
+                            chosen = row
                         break
                 if kind == "face" and not result:
                     # A body crop alone cannot stand in for a usable identity

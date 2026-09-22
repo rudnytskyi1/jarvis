@@ -696,7 +696,7 @@ TOOLS.append({'type': 'function', 'function': {
         'For a person-specific edit, inspect the camera first. faces_in_frame gives matched names and normalized face boxes in that exact image. '
         'A unique name/position match resolves the target even when other people are unknown; set target_person to the exact name (or me) and use fresh=false. '
         'Ask which person only if the intended target is still ambiguous. '
-        'To add an enrolled person who is not in the scene, provide their exact name in reference_people (at most two). '
+        'To add an enrolled person who is not in the scene, name them in reference_people (at most two), as the user said the name; the server resolves short forms against enrolled people and refuses anyone the request did not name. '
         'Their curated local face/body photos are supplied as separately labeled references, including when they are absent. '
         'Use list_people to check appearance_reference_available; never invent a face or substitute a different person when a reference is missing. '
         'This tool cannot establish someone\'s consent or age. Do not infer consent from being in the room. '
@@ -711,9 +711,9 @@ TOOLS.append({'type': 'function', 'function': {
         'source': {'type': 'string', 'enum': ['none', 'camera', 'screen', 'last']},
         'fresh': {'type': 'boolean', 'description': 'For camera/screen: true (default) captures a new frame; false edits the exact already captured frame.'},
         'target': {'type': 'string', 'enum': ['display', 'wallpaper'], 'description': 'display (default) shows the art; wallpaper also installs it as the real Windows desktop background. This is an action, not part of the image prompt.'},
-        'target_person': {'type': 'string', 'description': 'For camera edits only: exact enrolled name explicitly requested as the edit subject, or me for the speaker. The server separately supplies the verified face box from that exact photo. Do not insert coordinates or descriptions into prompt.'},
+        'target_person': {'type': 'string', 'description': 'For camera edits only: the enrolled name explicitly requested as the edit subject (short forms the user said are resolved server-side), or me for the speaker. The server separately supplies the verified face box from that exact photo. Do not insert coordinates or descriptions into prompt.'},
         'reference_people': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 2,
-            'description': 'Exact enrolled names explicitly requested as person references, e.g. ["Theodric"] to add him next to the person in the camera photo. Only these people\'s curated photos go to the image provider. Omit when no extra identities are needed.'},
+            'description': 'Enrolled people explicitly requested as person references, e.g. ["Theodric"] to add him next to the person in the camera photo. The name may be the short form the user said ("John" for "John the system"); the server matches it to one enrolled person and refuses an unnamed or ambiguous one. Only these people\'s curated photos go to the image provider. Omit when no extra identities are needed.'},
     }, 'required': ['prompt', 'source']},
 }})
 TOOLS.append({'type': 'function', 'function': {

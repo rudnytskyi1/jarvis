@@ -235,3 +235,46 @@ def test_old_or_other_person_request_never_reappears(tmp_path, monkeypatch, reas
     result = spoken(conn, 'Draw a tree.', {'source': 'none', 'prompt': 'Draw a tree with a hat'})
     assert result['ok']
     assert provider.generate.call_args.args[0] == 'Draw a tree.'
+
+
+@pytest.mark.parametrize('text', ['Добавь антона сидящего на стуле',
+                                  'Можешь сделать так чтобы там сидел Антон',
+                                  'Add jon, he is sitting on the couch'])
+def test_the_owner_spelling_of_a_name_is_not_a_reason_to_refuse(tmp_path, monkeypatch, text):
+    """Owner's report (2026-09-22): the answer was a refusal for a named person.
+
+    "Антон"/"антона" is the enrolled "Anton" and "jon" is the enrolled "Jon";
+    the hub used to answer "\u00abAnton was not requested in this image\u00bb". The
+    wording sent to the provider stays the owner's own.
+    """
+    conn, provider, picture = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, '_voices', SimpleNamespace(face_profiles=lambda: {'Anton': [[1, 0]], 'Jon': [[0, 1]]}))
+    conn.gallery = Mock()
+    conn.gallery.references.return_value = [
+        {'jpeg': picture.jpeg, 'kind': kind, 'captured_at': 1, 'sample_id': kind}
+        for kind in ('face', 'body')]
+    name = 'Anton' if 'нтон' in text else 'Jon'
+    result = spoken(conn, text, {'source': 'camera', 'prompt': 'rewritten', 'reference_people': [name]})
+    assert result['ok'], result
+    assert provider.generate.call_args.args[0] == text
+    assert provider.generate.call_args.kwargs['references'][0]['name'] == name
+
+
+def test_the_model_may_pass_the_short_form_of_an_enrolled_name(tmp_path, monkeypatch):
+    """Owner's report (2026-09-22): the model asked for "John", the hub refused.
+
+    The message said "John the system" and the tool argument said "John"; the
+    hub answered "John was not requested in this image".
+    """
+    conn, provider, picture = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, '_voices',
+                        SimpleNamespace(face_profiles=lambda: {'John the system': [[1, 0]]}))
+    conn.gallery = Mock()
+    conn.gallery.references.return_value = [
+        {'jpeg': picture.jpeg, 'kind': kind, 'captured_at': 1, 'sample_id': kind}
+        for kind in ('face', 'body')]
+    result = spoken(conn, 'Add john the system, he is sitting on the couch',
+                    {'source': 'camera', 'prompt': 'rewritten', 'reference_people': ['John']})
+    assert result['ok'], result
+    assert provider.generate.call_args.args[0] == 'Add john the system, he is sitting on the couch'
+    assert provider.generate.call_args.kwargs['references'][0]['name'] == 'John the system'

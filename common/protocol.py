@@ -230,6 +230,13 @@ MSG_TTS_START = "tts_start"
 MSG_TTS_END = "tts_end"
 #: v1.6: show a photo on the room screen (header, then one binary JPEG frame).
 MSG_IMAGE_SHOW = "image_show"
+#: v2 (ТЗ F-608): play a RECORDING in the room -- ``{"type": MSG_PLAY_AUDIO,
+#: "id": str, "rate": int, "seconds": float, "title": str}`` followed by exactly
+#: ONE binary frame with raw PCM s16le mono (the same format as TTS). The room
+#: hears a real person's voice (the mystery phrase of «угадай, кто сказал»),
+#: never synthesized speech: the game is about whose voice it is. ``title`` is
+#: an optional HUD caption shown while the clip plays.
+MSG_PLAY_AUDIO = "play_audio"
 #: v1.7: a short caption for the room screen, ``{"text": str, "ttl_s": float}``,
 #: shown on the HUD while something slow happens in the background (face
 #: enrollment photos). Empty text clears it. Nothing is spoken.
@@ -385,6 +392,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_TTS_START,
         MSG_TTS_END,
         MSG_IMAGE_SHOW,
+        MSG_PLAY_AUDIO,
         MSG_STATUS,
         MSG_CARD,
         MSG_HUB_STATUS,
@@ -463,6 +471,7 @@ __all__ = [
     "MSG_TTS_START",
     "MSG_TTS_END",
     "MSG_IMAGE_SHOW",
+    "MSG_PLAY_AUDIO",
     "MSG_STATUS",
     "MSG_CARD",
     "DEFAULT_CARD_TTL_S",

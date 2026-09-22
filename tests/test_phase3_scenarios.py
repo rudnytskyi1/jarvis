@@ -143,7 +143,9 @@ def canvas_room(tmp_path, monkeypatch):
     monkeypatch.setattr(hub_app, "_hub_gateway", lambda: None)
     monkeypatch.setattr(hub_app, "_skills", registry)
 
-    def context(home_id, person_id, language):
+    def context(home_id, person_id, language, *, skill=""):
+        # ``skill`` называет скилл, который зовут (его состояние, ТЗ F-407);
+        # для Canvas оно не нужно, но подпись должна совпадать с хабовой.
         days = int(getattr(hub_app.get_config().server.skills.canvas, "days", 7))
         return SimpleNamespace(
             language=language or "ru", base_url="https://school.test", token="tok-anton",
@@ -166,6 +168,16 @@ def canvas_room(tmp_path, monkeypatch):
     monkeypatch.setattr(hub_app, "_decision_log", False)
     monkeypatch.setattr(hub_app, "_gpu", None)
     monkeypatch.setattr(hub_app, "_gpu_off", True)
+    # Хранилища, привязанные к соединению: хаб кэширует их на весь процесс, а
+    # здесь база у каждого теста своя, поэтому кэш предыдущего теста (с уже
+    # закрытым соединением) должен быть забыт — иначе ход падает на «Cannot
+    # operate on a closed database» вместо ответа Canvas.
+    for store_name in ("_polls", "_contacts", "_intercom", "_audit", "_guest_grants",
+                       "_preferences", "_home_modes", "_home_owners", "_learning",
+                       "_media", "_objects", "_body_crops", "_reid", "_face_tracks",
+                       "_voice_tracks", "_identity_beliefs", "_pin", "_push",
+                       "_home_watch"):
+        monkeypatch.setattr(hub_app, store_name, None)
     model = _CanvasModel()
     monkeypatch.setattr(hub_app, "_llm", model)
     monkeypatch.setattr(hub_app, "_stt", SimpleNamespace(
@@ -205,7 +217,7 @@ def test_scenario_3_asks_canvas_through_a_real_turn(canvas_room):
 def test_scenario_3_is_honest_when_canvas_has_no_token(canvas_room, monkeypatch):
     connection, socket, _, _ = canvas_room
     monkeypatch.delenv("ROWAN_TEST_CANVAS_TOKEN", raising=False)
-    monkeypatch.setattr(hub_app, "_skill_context", lambda home, person, language:
+    monkeypatch.setattr(hub_app, "_skill_context", lambda home, person, language, *, skill="":
                         SimpleNamespace(language="ru", base_url="https://school.test",
                                         token="", timeout_s=8.0, days=7, timezone=CHICAGO,
                                         home_id=home, person_id=person, transport=None,

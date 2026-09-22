@@ -1491,3 +1491,27 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   13 passed; `pytest tests -q` → 5844 passed, 11 skipped; `ruff check .` → All
   checks passed; `mypy common` → Success. **Чего нет:** живого Telegram/голоса в
   песочнице (комнаты подставные); названо в `DECISIONS.md` (P5-19).
+
+- **F-608 (P5-20) — игры между комнатами: квиз по темам сделан, «угадай, кто
+  сказал» и таймер-соревнование — P5-21.** Каркас — скилл с состоянием F-407:
+  `skills/games/` (`start`/`answer`/`score`/`stop`) поверх `hub/games.py`
+  (`QuizEngine` с `SkillStateStore` и `SkillScheduler`, `LlmQuizGenerator`
+  через `structured_json`, `answers_match` по границам слов). Партия живёт в
+  состоянии ХАБА (`hub:games`), поэтому счёт по домам виден из каждой
+  комнаты-участника и из `/health.games`; вопрос и счёт слышат все комнаты
+  партии, очко получает та, где ответили; опоздавший ответ называет правильный
+  ответ, но очка не даёт; темы нет или модели нет — хаб честно спрашивает
+  тему/называет причину отказа и не выдумывает ни вопросов, ни темы. Секция
+  `server.games` (`enabled: false`) в `common/config.py`, `config.yaml` и
+  `config.example.yaml`. **Найдено и исправлено по пути:** движок и скилл
+  держали состояние в разных местах (хаб писал в `hub:games`, скилл — в
+  `livingroom:games`); `_game_engine()` через `_audit_log()` подменял уже
+  открытое соединение хаба (та же ловушка, что у F-605); `_game_homes()` не
+  видел комнаты из таблицы `homes`; тест F-605 проходил только до 18:00 UTC;
+  подставная `_skill_context` в тестах сценария 3 не принимала параметр
+  `skill=`. Проверено: `pytest tests/test_games.py -q` → 27 passed;
+  `pytest tests -q` → 5918 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app, client.main"` →
+  ok. **Чего нет:** живого микрофона и голоса в песочнице (комнаты подставные,
+  генератор вопросов подставной, настоящий путь проверен на подставной
+  модели); межкомнатный голос «угадай, кто сказал» — P5-21.

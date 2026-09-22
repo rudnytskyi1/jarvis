@@ -91,6 +91,7 @@ from hub import device_state as device_state_mod
 from hub import emotions as emotions_mod
 from hub import games as games_mod
 from hub import greetings as greeting_mod
+from hub import guess_who as guess_who_mod
 from hub import intercom as intercom_mod
 from hub import metrics as metrics_mod
 from hub import ocr as ocr_mod
@@ -169,7 +170,7 @@ from hub.image_prompt import (
     visual_request,
     wallpaper_change_requested,
 )
-from hub.image_subjects import select_image_subjects
+from hub.image_subjects import person_named, resolve_named_person, select_image_subjects
 from hub.languages import effective as effective_language
 from hub.languages import instruction as language_instruction
 from hub.languages import language_of as preferred_language_of
@@ -199,7 +200,7 @@ from hub.telegram_admin import TelegramAdmin
 from hub.telegram_admin_state import TelegramAdminState
 from hub.telegram_chat import TelegramChat
 from hub.telegram_control import TelegramController
-from hub.telegram_intent import telegram_send_requested
+from hub.telegram_intent import picture_send_requested, telegram_send_requested
 from hub.telegram_media import PhotoInspector
 from hub.tools import (
     CLIENT_TOOLS,
@@ -858,6 +859,8 @@ _polls: Any = None
 _push: Any = None
 #: ``AuditLog`` for privileged panel actions (F-706).
 _audit: Any = None
+#: ТЗ F-608: согласие человека на СВОЙ голос в игре «угадай, кто сказал».
+_game_consent: Any = None
 #: ТЗ F-301: ``presence(home_id)`` — кто в комнате, с какого времени, кадр.
 _presence: Any = None
 #: ТЗ F-507: присутствие дома как автоматика — «ушёл» после тишины и возврат
@@ -1445,6 +1448,53 @@ def _game_engine() -> Any:
     return engine
 
 
+def _game_voice_consent() -> Any:
+    """Согласие на голос в игре (ТЗ F-608): свой файл, отдельно от клона F-111.
+
+    Одно согласие не открывает другое: человек, разрешивший клон голоса,
+    не разрешил тем самым записывать себя в игру.
+    """
+    global _game_consent
+    if _game_consent is None:
+        _game_consent = voice_clone_mod.ConsentStore(
+            REPO_ROOT / "data" / "game_voice_consent.json", purpose="voice game")
+    return _game_consent
+
+
+def _guess_engine() -> Any:
+    """Движок «угадай, кто сказал» (ТЗ F-608) на состоянии скилла games (F-407)."""
+    settings = getattr(get_config().server, "games", None)
+    if settings is None or not bool(getattr(settings, "enabled", False)):
+        return None
+    store = _skill_state_store("games")
+    if store is None:
+        return None
+    engine = guess_who_mod.GuessEngine(
+        store=store, consent=_game_voice_consent(), settings=settings,
+        scheduler=_skill_scheduler(), media=_media_store(),
+        home_name=_home_name, audit=_audit_log())
+    engine.on_timeout = _guess_timeout_handler(engine)
+    return engine
+
+
+def _guess_timeout_handler(engine: Any) -> Any:
+    """Время вышло — назвать, кто это был, во всех комнатах партии."""
+    async def handler() -> None:
+        try:
+            close = engine.close(reason="timeout")
+        except Exception as exc:  # noqa: BLE001 - таймер не роняет хаб
+            log.warning("The voice-game timeout could not be handled (%s)", exc)
+            return
+        if close is None:
+            return
+        for home in close.round.home_ids:
+            try:
+                await _say_in_home(home, close.line)
+            except Exception as exc:  # noqa: BLE001 - одна комната не отменяет игру
+                log.info("Could not speak the voice-game result in %s (%s)", home, exc)
+    return handler
+
+
 def _game_timeout_handler(engine: Any) -> Any:
     async def handler() -> None:
         round_ = engine.active()
@@ -1464,26 +1514,72 @@ def _game_timeout_handler(engine: Any) -> Any:
 
 async def _say_in_home(home_id: str, line: str, *, name: str = "") -> bool:
     """Сказать строку в комнате ``home_id``; ``False`` — там нет живого клиента."""
-    connection = next((item for item in list(_connections)
-                       if str(getattr(item, "home_id", "")) == str(home_id)
-                       and getattr(item, "session", None) is not None), None)
+    connection = _live_connection(home_id)
     if connection is None:
         log.info("No live client in %s to speak the game line", home_id)
         return False
     return await connection._say_proactive(line, name=name)
 
 
+def _live_connection(home_id: str) -> Any:
+    """Живое подключение комнаты, или ``None`` (для игры нужно именно оно)."""
+    wanted = str(home_id or "")
+    if not wanted:
+        return None
+    return next((item for item in list(_connections)
+                 if str(getattr(item, "home_id", "")) == wanted
+                 and getattr(item, "session", None) is not None), None)
+
+
+def _person_display_name(person_id: str) -> str:
+    """``persons.display_name`` по идентификатору: им подписывается загадка (F-204)."""
+    person = str(person_id or "")
+    if not person or _hub_conn is None:
+        return ""
+    try:
+        row = _hub_conn.execute("SELECT display_name FROM persons WHERE person_id=?",
+                                (person,)).fetchone()
+    except Exception as exc:  # noqa: BLE001 - имя не стоит партии
+        log.debug("Could not read the name of %s (%s)", person, exc)
+        return ""
+    return str(row[0] or "").strip() if row is not None else ""
+
+
 def _game_homes() -> list[str]:
-    """Комнаты-участники партии: из ``server.games.homes``, иначе все дома."""
+    """Комнаты-участники партии: из ``server.games.homes``, иначе все дома.
+
+    «Все дома» — это дома хаба из конфига И из таблицы ``homes``: конфиг
+    может быть ещё не перечитан, а комната уже заведена и комната-игрок в нём
+    одна. Названная владельцем комната остаётся в списке, даже если хаб её не
+    знает: это явный выбор владельца, а не выдумка хаба (просто там некому
+    будет ответить — и это видно в логе).
+    """
     cfg = get_config()
     settings = getattr(cfg.server, "games", None)
     listed = [str(home) for home in (getattr(settings, "homes", None) or []) if str(home)]
-    known = [str(getattr(home, "home_id", "")) for home in (getattr(cfg, "homes", []) or [])]
-    known = [home for home in known if home]
-    if not listed:
-        return known
-    allowed = set(known)
-    return [home for home in listed if home in allowed] or known
+    if listed:
+        return listed
+    known: list[str] = []
+    for home in (getattr(cfg, "homes", []) or []):
+        name = str(getattr(home, "home_id", "") or "")
+        if name and name not in known:
+            known.append(name)
+    for home_id in _known_home_ids():
+        if home_id not in known:
+            known.append(home_id)
+    return known
+
+
+def _known_home_ids() -> list[str]:
+    """Идентификаторы домов из таблицы ``homes``; нет базы — пустой список."""
+    if _hub_conn is None:
+        return []
+    try:
+        rows = _hub_conn.execute("SELECT home_id FROM homes ORDER BY home_id").fetchall()
+    except Exception as exc:  # noqa: BLE001 - список комнат не стоит партии
+        log.debug("Could not list the hub homes (%s)", exc)
+        return []
+    return [str(row[0]) for row in rows if str(row[0] or "")]
 
 
 #: Фразы, которыми спрашивают календарь (ТЗ F-605), на трёх языках.
@@ -1939,16 +2035,28 @@ def _selected_telegram_room(message):
     A request that names a computer - "photo from buro", "скриншот с AntоnDorm"
     - routes that turn to it, without touching the saved selection. Naming one
     that is offline answers with the reason instead of quietly acting on another
-    room; naming nobody keeps the selection exactly as before.
+    room. Naming nobody uses this chat's selection, then the sender's own
+    default (their private chat with the bot), then the only room that is
+    online - the owner asked not to be made to preselect a computer before
+    every photo request.
     """
     named = _named_workplace(str(message.get('text') or message.get('caption') or ''))
     if named:
         if _telegram_room(named) is None:
             return f'the computer "{_workplace_label(named)}" is not connected'
         return _telegram_room(named)
-    key = f"workplace:{message['chat']['id']}:{message['from']['id']}"
-    selected = _telegram_access.get_setting(key) if _telegram_access else None
-    return _telegram_room(selected) if selected else _telegram_room()
+    chat_id = message['chat']['id']
+    sender_id = message['from']['id']
+    keys = [f'workplace:{chat_id}:{sender_id}']
+    if chat_id != sender_id:
+        # In a group the owner's private choice is their default room.
+        keys.append(f'workplace:{sender_id}:{sender_id}')
+    for key in keys:
+        selected = _telegram_access.get_setting(key) if _telegram_access else None
+        room = _telegram_room(selected) if selected else None
+        if room is not None:
+            return room
+    return _telegram_room()
 
 
 def _fold_place(value: Any) -> str:
@@ -3207,13 +3315,12 @@ def _away_homes() -> list[str]:
 def _audit_log():
     """The hub's own ``audit`` table (ТЗ F-706)."""
     global _audit
-    if _audit is None:
+    if _audit is None and _hub_conn is None:
+        _hub_gateway()
+    if _audit is None and _hub_conn is not None:
         try:
             from hub.audit import AuditLog
 
-            _hub_gateway()
-            if _hub_conn is None:
-                raise RuntimeError("the hub database is unavailable")
             _audit = AuditLog(_hub_conn)
         except Exception as exc:  # noqa: BLE001 - the hub runs without an audit table
             log.info("The audit log is unavailable (%s)", exc)
@@ -3848,13 +3955,29 @@ def _skill_context(home_id: str, person_id: str, language: str, *,
     ctx.client_secret = _secret_value(getattr(settings, "client_secret_env", ""))
     ctx.refresh_token = _person_secret(settings, person_id, "refresh_token_env")
     ctx.calendar_id = str(getattr(settings, "calendar_id", "") or "primary")
-    ctx.state = _skill_state_store(skill, home_id) if skill else None
+    ctx.state = _skill_state_store(skill, _skill_state_home(skill, home_id)) if skill else None
     ctx.scheduler = _skill_scheduler()
     ctx.model = _llm
     ctx.quiz_generator = _quiz_question_generator()
     ctx.game_settings = getattr(get_config().server, "games", None)
     ctx.home_name = _home_name
     return ctx
+
+
+def _skill_state_home(skill: str, home_id: str) -> str:
+    """К какому месту приписано состояние скилла (ТЗ F-407).
+
+    ``SkillStateStore`` различает состояние комнаты (``home_id`` скилла дома) и
+    состояние хаба целиком (пустой ``home_id``), и его докблок называет пример
+    ровно нашего случая: «партия игры между комнатами». Скилл с манифестом
+    ``scope: hub`` живёт в реестре без ``home_id``, поэтому и состояние у него
+    общее: счёт по домам видит и соседняя комната, и ``/health``. Скилл дома
+    состояния не теряет — у него ``home_id`` свой.
+    """
+    if _skills is None:
+        return home_id
+    loaded = _skills.get(str(skill or ""), home_id=home_id or None)
+    return "" if loaded is not None and loaded.home_id is None else home_id
 
 
 def _secret_value(env_name: Any) -> str:
@@ -4865,12 +4988,15 @@ def _games_snapshot() -> dict[str, Any]:
     """ТЗ F-608: что хаб показывает про игры и таймеры скиллов (``/health``)."""
     settings = getattr(get_config().server, "games", None)
     engine = _game_engine() if settings is not None and bool(getattr(settings, "enabled", False)) else None
+    guess = _guess_engine()
     timers = _skill_timers.snapshot() if _skill_timers is not None else \
         {"pending": 0, "fired": 0, "reminders": False}
     return {
         "enabled": bool(getattr(settings, "enabled", False)) if settings is not None else False,
         "homes": _game_homes(),
         "engine": engine.snapshot() if engine is not None else {},
+        # ТЗ F-608: вторая игра — по голосам, с согласием человека.
+        "guess": guess.snapshot() if guess is not None else {},
         "generator": (getattr(_quiz_generator, "snapshot", None) or (lambda: {}))(),
         "timers": timers,
     }
@@ -5014,6 +5140,9 @@ class Connection(CameraClipReceiver):
         self._memory_seq = 1
         #: v1.6: id counter for image_show pushes (find_object's annotated photo).
         self._image_seq = 1
+        #: ТЗ F-608: id counter for play_audio pushes (the mystery voice of the
+        #: «угадай, кто сказал» round).
+        self._audio_seq = 1
         #: Last frame pulled per source, so ``show_photo`` can display exactly
         #: the picture that was just described instead of taking a new one.
         self._last_frames: dict[str, Any] = {}
@@ -7356,6 +7485,221 @@ class Connection(CameraClipReceiver):
     # -- computer use (ТЗ F-512) --------------------------------------------
 
     # -- игры между комнатами (ТЗ F-608) ------------------------------------
+
+    async def _guess_turn(self, text: str, language: str, voice: Any, started_at: float,
+                          session: Any, stt_ms: int, pcm: bytes) -> bool:
+        """ТЗ F-608: «угадай, кто сказал» — игра по голосам, только с согласия.
+
+        Разбирается до модели, потому что здесь всё — данные хода: кто говорит
+        (идентификация F-204), есть ли согласие человека, что за фраза и
+        сколько осталось времени. Загадка — НАСТОЯЩАЯ запись голоса: она
+        ложится в медиах хаба (F-304), а комнаты получают её кадром
+        ``play_audio``; синтезом её не подменяют, иначе игра была бы не про
+        голос. Очко забирает самая быстрая комната (таймер-соревнование).
+        """
+        settings = getattr(getattr(self, "cfg", None), "server", None)
+        settings = getattr(settings, "games", None)
+        if settings is None or not bool(getattr(settings, "enabled", False)):
+            return False
+        engine = _guess_engine()
+        if engine is None:
+            return False
+        home = str(getattr(self, "home_id", "") or "")
+        now = time.time()
+        armed_until = float(getattr(self, "_mystery_arm", 0.0) or 0.0)
+
+        # Согласие человек даёт сам и своим голосом (F-608: «с согласия»).
+        if guess_who_mod.is_voice_consent(text):
+            name = self._known_speaker_name()
+            person = _person_id_of(name)
+            if not person:
+                await self._guess_say(guess_who_mod.unknown_speaker_line(language=language),
+                                      language=language, voice=voice, started_at=started_at,
+                                      session=session, stt_ms=stt_ms, text=text,
+                                      note="guess_consent_unknown")
+                return True
+            try:
+                engine.grant_consent(home, person)
+            except guess_who_mod.GuessError as exc:
+                await self._guess_say(guess_who_mod.unavailable_line(str(exc), language=language),
+                                      language=language, voice=voice, started_at=started_at,
+                                      session=session, stt_ms=stt_ms, text=text,
+                                      note="guess_consent_failed")
+                return True
+            await self._guess_say(guess_who_mod.consent_recorded_line(name, language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="guess_consent")
+            return True
+
+        round_ = engine.active()
+
+        if guess_who_mod.is_guess_start(text):
+            if round_ is not None:
+                await self._guess_say(
+                    guess_who_mod.busy_line(round_, language=language, home_name=_home_name),
+                    language=language, voice=voice, started_at=started_at, session=session,
+                    stt_ms=stt_ms, text=text, note="guess_busy")
+                return True
+            # Фраза ещё не сказана: её записывает следующая реплика (окно
+            # ARM_WINDOW_S), и только с согласия этого человека.
+            self._mystery_arm = now + guess_who_mod.ARM_WINDOW_S
+            await self._guess_say(guess_who_mod.arm_line(language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="guess_armed")
+            return True
+
+        if round_ is not None and games_mod.is_stop(text):
+            line = engine.finish(language=language, reason="stop")
+            if line is None:
+                return False
+            await self._guess_say(line, language=language, voice=voice,
+                                  started_at=started_at, session=session, stt_ms=stt_ms,
+                                  text=text, note="guess_stop")
+            await self._guess_tell_others(round_.home_ids, home, line)
+            return True
+
+        if round_ is not None and games_mod.is_score_request(text):
+            line = engine.score(language=language) or guess_who_mod.score_line(
+                round_, language=language, home_name=_home_name)
+            await self._guess_say(line, language=language, voice=voice,
+                                  started_at=started_at, session=session, stt_ms=stt_ms,
+                                  text=text, note="guess_score")
+            return True
+
+        if round_ is not None:
+            verdict = engine.guess(home_id=home, text=text, language=language)
+            if verdict is None:
+                return False
+            line = " ".join(part for part in (verdict.line, verdict.next_line) if part)
+            await self._guess_say(line, language=language, voice=voice,
+                                  started_at=started_at, session=session, stt_ms=stt_ms,
+                                  text=text, note="guess_answer")
+            if verdict.correct or verdict.finished:
+                # Догадка прозвучала всем участникам: иначе счёт был бы тайной.
+                await self._guess_tell_others(round_.home_ids, home, line)
+            return True
+
+        if not armed_until or now > armed_until:
+            return False
+        name = self._known_speaker_name()
+        person = _person_id_of(name) or ""
+        if not person:
+            self._mystery_arm = 0.0
+            await self._guess_say(guess_who_mod.unknown_speaker_line(language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="guess_unknown_speaker")
+            return True
+        if not engine.consent_granted(home, person):
+            self._mystery_arm = 0.0
+            await self._guess_say(guess_who_mod.consent_missing_line(name, language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="guess_no_consent")
+            return True
+        minimum = int(guess_who_mod.MIN_PHRASE_S * self.sample_rate) * 2
+        if not pcm or len(bytes(pcm)) < minimum:
+            # Окно записи остаётся открытым: человек просто повторит фразу.
+            await self._guess_say(guess_who_mod.too_short_line(language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="guess_too_short")
+            return True
+        self._mystery_arm = 0.0
+        try:
+            start, prompt = engine.start(
+                speaker_id=person, speaker_name=name, home_id=home,
+                home_ids=_game_homes(), audio_pcm=bytes(pcm),
+                sample_rate=int(getattr(self, "sample_rate", 0) or 16000),
+                aliases=guess_who_mod.name_variants(_person_display_name(person)),
+                language=language)
+        except (guess_who_mod.GuessUnavailable, guess_who_mod.GuessError) as exc:
+            await self._guess_say(guess_who_mod.unavailable_line(str(exc), language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="guess_unavailable")
+            return True
+        await self._guess_say(guess_who_mod.speaker_line(start, language=language),
+                              language=language, voice=voice, started_at=started_at,
+                              session=session, stt_ms=stt_ms, text=text,
+                              note="guess_recorded")
+        played = await self._guess_play(start, prompt=prompt, language=language)
+        if played == 0:
+            # Других комнат нет — играть не с кем: закрываем честно, а не молча.
+            line = engine.finish(language=language, reason="nobody listening")
+            if line:
+                await self._guess_say(line, language=language, voice=voice,
+                                      started_at=started_at, session=session, stt_ms=stt_ms,
+                                      text=text, note="guess_no_rooms")
+        return True
+
+    async def _guess_play(self, round_: Any, *, prompt: str, language: str) -> int:
+        """Проиграть запись загадки в остальных комнатах партии (F-608).
+
+        Возвращает число комнат, которые её услышали: ноль — это честный факт
+        для вызывающего, а не «наверное, дошло».
+        """
+        data = _media_bytes(round_.audio_ref)
+        if data is None:
+            log.info("The voice-game recording %s is gone", round_.audio_ref)
+            return 0
+        try:
+            pcm, rate = guess_who_mod.wav_pcm(data)
+        except ValueError as exc:
+            log.warning("The voice-game recording is unreadable (%s)", exc)
+            return 0
+        played = 0
+        for other in round_.home_ids:
+            if str(other) == str(round_.speaker_home):
+                continue
+            connection = _live_connection(str(other))
+            if connection is None:
+                log.info("No live client in %s to hear the mystery voice", other)
+                continue
+            try:
+                await connection._say_proactive(prompt)
+                await connection._send_play_audio(
+                    pcm, rate, seconds=float(round_.audio_s or 0.0),
+                    title=guess_who_mod.prompt_line(round_, language=language))
+            except Exception as exc:  # noqa: BLE001 - одна комната не отменяет игру
+                log.info("Could not play the mystery voice in %s (%s)", other, exc)
+                continue
+            played += 1
+        return played
+
+    async def _guess_tell_others(self, home_ids: Any, home: str, line: str) -> None:
+        """Сказать строку партии в остальных её комнатах (счёт — общий)."""
+        for other in home_ids or ():
+            if str(other) == str(home):
+                continue
+            try:
+                await _say_in_home(str(other), line)
+            except Exception as exc:  # noqa: BLE001 - одна комната не отменяет игру
+                log.info("Could not speak the voice-game line in %s (%s)", other, exc)
+
+    async def _guess_say(self, line: str, *, language: str, voice: Any, started_at: float,
+                         session: Any, stt_ms: int, text: str, note: str) -> None:
+        """Ответ игры в комнату тем же путём, что у остальных реплик хаба."""
+        await self._speak_hub_line(
+            line, language=language, voice=voice, started_at=started_at, session=session,
+            stt_ms=stt_ms, text=text, note=note, status="The voice game is running")
+
+    async def _send_play_audio(self, pcm: bytes, rate: int, *, seconds: float = 0.0,
+                               title: str = "") -> None:
+        """Проиграть ЗАПИСЬ в комнате: заголовок ``play_audio`` + один PCM-кадр.
+
+        Кадр идёт тем же путём, что TTS, поэтому берётся ``_audio_lock``: иначе
+        запись могла бы влезть в середину фразы, которую комната ещё говорит.
+        """
+        audio_id = f"aud{self._audio_seq}"
+        self._audio_seq += 1
+        payload = {"type": proto.MSG_PLAY_AUDIO, "id": audio_id, "rate": int(rate),
+                   "seconds": float(seconds), "title": str(title)}
+        async with self._audio_lock:
+            await self.send_json(payload)
+            await self.send_bytes(bytes(pcm))
 
     async def _game_turn(self, text: str, language: str, voice: Any, started_at: float,
                          session: Any, stt_ms: int) -> bool:
@@ -13183,12 +13527,22 @@ class Connection(CameraClipReceiver):
             if turn is not None and isinstance(explicit, list):
                 requested = select_image_subjects(prompt, explicit, available_profiles, self._known_speaker_name(), source=source)
                 allowed = {name.casefold() for name in requested['requested_people']}
+                resolved: list[str] = []
                 for name in explicit:
                     normalized = ' '.join(str(name).split()).casefold()
                     if normalized in {'me', 'myself'}:
                         normalized = self._known_speaker_name().casefold()
-                    if normalized not in allowed:
+                    if normalized in allowed:
+                        resolved.append(name)
+                        continue
+                    # The chat model shortens names ("John" for the enrolled
+                    # "John the system") and this used to answer the owner with
+                    # a refusal for a person they HAD named. Follow the message.
+                    matched = resolve_named_person(name, requested['requested_people'])
+                    if matched is None:
                         raise CloudUnavailable(f'{name} was not requested in this image. Do not add unrequested person references.')
+                    resolved.append(matched)
+                explicit = resolved
             references, reference_info = await self._image_person_references(
                 explicit, request_text=prompt if turn is not None else None)
             reference, mime = None, 'image/jpeg'
@@ -13290,15 +13644,20 @@ class Connection(CameraClipReceiver):
             record['result'] = result
             return result
         turn = _recording_turn.get()
+        literal = turn.get('transcript', '') if turn else ''
+        kind = args.get('kind')
+        if kind not in {'text', 'image'}:
+            return done({'ok': False, 'error': 'Telegram kind must be text or image.'})
         requested = getattr(self, '_telegram_send_requested', None) or telegram_send_requested
-        if not requested(turn.get('transcript', '') if turn else ''):
+        # Sending a photo needs the action and the photo, not the name of the
+        # one chat Rowan posts to: "отправь фото" is as explicit as "отправь
+        # фото в телеграм". Text keeps the strict destination wording.
+        allowed = requested(literal) or (kind == 'image' and picture_send_requested(literal))
+        if not allowed:
             return done({'ok': False, 'error': 'Sending to Telegram requires an explicit user request in this turn. Do not post proactively.'})
         provider = getattr(self, '_telegram_provider', None) or _telegram
         if provider is None or not provider.ready:
             return done({'ok': False, 'error': 'Telegram is not configured on the brain server.'})
-        kind = args.get('kind')
-        if kind not in {'text', 'image'}:
-            return done({'ok': False, 'error': 'Telegram kind must be text or image.'})
         if type(args.get('fresh', False)) is not bool:
             return done({'ok': False, 'error': 'fresh must be a boolean.'})
         # An uncertain network result blocks all further sends this turn, even
@@ -13412,7 +13771,7 @@ class Connection(CameraClipReceiver):
             if not re.search(r'\b(?:me|my|myself|меня|мне|мой|мою|моей|моём|моем)\b', prompt, re.I):
                 raise CloudUnavailable('The request does not select the speaker as the image subject.')
             name = self._known_speaker_name()
-        elif not person_reference_requested(prompt, name):
+        elif not person_named(prompt, name, await self._image_registered_people()):
             raise CloudUnavailable('The selected image subject was not named in the user request.')
         if not name:
             raise CloudUnavailable('I cannot identify which person is speaking. Ask which person to edit.')
@@ -13422,6 +13781,18 @@ class Connection(CameraClipReceiver):
         if len(matches) != 1:
             raise CloudUnavailable('The selected person is not uniquely identified in this photo. Ask which person to edit.')
         return {'name': matches[0]['name'], 'face_box': matches[0]['face_box'], 'is_requester': requester}
+
+    async def _image_registered_people(self) -> list[str]:
+        """Every enrolled name, for wording checks that accept short forms.
+
+        The owner says "Антон" while the profile is spelled "Anton", and the
+        hub must not answer that the person was never requested. The names are
+        read here, never guessed from the room or the chat.
+        """
+        if _voices is None:
+            return []
+        profiles = await asyncio.to_thread(_voices.face_profiles)
+        return [str(name) for name in (profiles or {}) if str(name or '').strip()]
 
     async def _image_person_references(self, requested, *, request_text=None):
         if not isinstance(requested, list) or len(requested) > 2 or any(
@@ -13440,11 +13811,19 @@ class Connection(CameraClipReceiver):
                 key = self._known_speaker_name().casefold()
             name = canonical.get(key)
             if not name:
+                # A short or inflected spelling of an enrolled name ("John" for
+                # "John the system") is still that person, not an unknown one.
+                name = resolve_named_person(requested_name, list(canonical.values()))
+                if name:
+                    key = name.casefold()
+            if not name:
                 raise CloudUnavailable(f'No enrolled face profile matches {requested_name}. Use list_people to check names; the person can say Rowan AI, remember my face.')
-            if request_text is not None and not person_reference_requested(request_text, name):
+            if request_text is not None and not person_named(request_text, name, list(canonical.values())):
                 requester = name.casefold() == self._known_speaker_name().casefold()
-                named = re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', request_text, re.I)
-                if not (requester and not named and any(person_reference_requested(request_text, pronoun)
+                # Reaching this line means the owner named nobody, in any
+                # spelling: only the speaker's own pronoun can still mean this
+                # person, and never another profile's face.
+                if not (requester and any(person_reference_requested(request_text, pronoun)
                         for pronoun in ('me', 'my', 'myself', 'меня', 'мне', 'мой', 'мою', 'моей'))):
                     raise CloudUnavailable(f'{name} was not requested in this image. Do not add unrequested person references.')
             if key in seen:
@@ -14691,6 +15070,11 @@ class Connection(CameraClipReceiver):
         # ТЗ F-605: общий календарь группы — создание голосом и чтение.
         if await self._shared_event_turn(text, language, voice, started_at,
                                          session, stt_ms):
+            return
+
+        # ТЗ F-608: «угадай, кто сказал» — игра по голосам; свои фразы разбирает
+        # до квиза, потому что загадка — это данные хода (голос и согласие).
+        if await self._guess_turn(text, language, voice, started_at, session, stt_ms, pcm):
             return
 
         # ТЗ F-608: игры между комнатами — квиз по темам.

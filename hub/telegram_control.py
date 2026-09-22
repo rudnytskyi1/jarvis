@@ -248,6 +248,22 @@ def _message(text, english, russian):
     return russian if re.search('[А-Яа-яЁё]', text) else english
 
 
+async def _enrolled_people(facade):
+    """Enrolled names as the room connection knows them, never as chat text.
+
+    A wording check that accepts "Антон" for the enrolled "Anton" needs the
+    registry; a Telegram message can never supply or invent it.
+    """
+    reader = getattr(facade, '_image_registered_people', None)
+    if not callable(reader):
+        return ()
+    try:
+        return tuple(await reader())
+    except Exception as exc:  # noqa: BLE001 - the check falls back to exact names
+        log.debug('Could not read the enrolled people (%s)', exc)
+        return ()
+
+
 def _explicit_group_send(text):
     if not telegram_send_requested(text):
         return False
@@ -445,6 +461,8 @@ class TelegramController:
                     'existing/cached image. Camera photography does not use generate_image. '
                     'A request to EDIT a room photo - adding or changing people, clothes or the scene - is an '
                     'image edit OF THAT ROOM: take a fresh frame with generate_image source=camera fresh=true. '
+                    'One sentence that takes the photo and edits it ("take a picture of the room and make '
+                    'Anton sit on the couch") is that one generate_image call, not two steps. '
                     'If the requester follows up on a picture you sent here ("and make them ...") without '
                     'attaching one, redo the edit from the same room camera. NEVER ask the requester to attach '
                     'a photo while a camera of the named or selected computer is reachable. '
@@ -734,7 +752,8 @@ class TelegramController:
             if name == 'generate_image' and not has_photo and any(message.get(key) for key in _OTHER_MEDIA):
                 return {'ok': False, 'error': 'Attach the image as a Telegram photo. This attachment type is not supported for image edits.'}
             if name == 'generate_image' and has_photo:
-                if not current_image_request(text, has_photo=True):
+                if not current_image_request(text, has_photo=True,
+                                             people=await _enrolled_people(facade)):
                     return {'ok': False, 'error': 'The current message does not request creating or editing an image.'}
                 if self.get_image_reference is None:
                     return {'ok': False, 'error': 'The attached Telegram photo is unavailable. No image was generated.'}

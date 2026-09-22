@@ -2,8 +2,133 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from typing import Any
 
 from hub.image_prompt import action_revoked, person_reference_requested
+
+
+def _fold_name(value: Any) -> str:
+    """A name reduced to comparable letters: "John the system" -> "johnthesystem".
+
+    Cyrillic is transliterated first, because the owner says "Антон" while the
+    enrolled profile is spelled "Anton"; both have to meet in the same key.
+    """
+    return _name_key(value)
+
+
+#: Cyrillic letters as the hub writes the same sound in the Latin alphabet.
+_TRANSLIT = {'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+             'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'i', 'к': 'k', 'л': 'l', 'м': 'm',
+             'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+             'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+             'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'}
+_WORD = re.compile(r'[^\W_]+', re.UNICODE)
+_CYRILLIC = re.compile('[а-яё]', re.I)
+#: Shortest form that may stand for a longer enrolled name ("john" for "john the system").
+_MIN_FORM = 4
+#: Longest Russian ending an inflected form may add: "антона" for "anton".
+_MAX_TAIL = 3
+
+
+def _name_key(value: Any) -> str:
+    """The comparable key of one name: transliterated letters and digits only."""
+    letters = []
+    for char in str(value or '').casefold():
+        char = _TRANSLIT.get(char, char)
+        if char.isalnum():
+            letters.append(char)
+    return ''.join(letters)
+
+
+def _name_words(value: Any) -> list[str]:
+    return [match.group(0) for match in _WORD.finditer(str(value or ''))]
+
+
+def _form_score(word: Any, name: Any) -> int:
+    """2 when ``word`` is the name, 1 when it is a short or inflected form of it."""
+    word_key, name_key_value = _name_key(word), _name_key(name)
+    if not word_key or not name_key_value:
+        return 0
+    if word_key == name_key_value:
+        return 2
+    if name_key_value.startswith(word_key) and len(word_key) >= _MIN_FORM:
+        # The short form of a longer name: "John" for "John the system".
+        return 1
+    if (_CYRILLIC.search(str(word)) and word_key.startswith(name_key_value)
+            and len(name_key_value) >= _MIN_FORM):
+        # A Russian case ending: "антона" is the enrolled "Anton". Only Cyrillic
+        # wording inflects like that, so a longer Latin word is a different name
+        # ("Antonia", "AntonDorm") instead of an inflection.
+        return 1 if len(word_key) - len(name_key_value) <= _MAX_TAIL else 0
+    return 0
+
+
+def expand_person_names(text: Any, names: Iterable[Any]) -> str:
+    """``text`` with unambiguous short or inflected forms of enrolled names spelled out.
+
+    The owner uses the name the way they know it - "Антон" and "антона" for the
+    enrolled "Anton", "John" for "John the system" - and the hub answered that
+    the person "was not requested in this image". Rewriting the matched form as
+    the full enrolled name keeps every existing rule (negations, exclusions,
+    quoted captions) working on the same sentence. A form that fits more than
+    one enrolled person is left alone: guessing between two identities is worse
+    than asking.
+    """
+    value = str(text or '')
+    everyone = [str(name) for name in names or () if str(name or '').strip()]
+    if not value or not everyone:
+        return value
+    spelled = {name.casefold() for name in everyone}
+    spans: list[tuple[int, int, str]] = []
+    for match in _WORD.finditer(value):
+        word = match.group(0)
+        if word.casefold() in spelled:
+            continue  # The name itself, exactly as enrolled: nothing to rewrite.
+        matches = {name for name in everyone if _form_score(word, name)}
+        if len(matches) == 1:
+            spans.append((match.start(), match.end(), matches.pop()))
+    if not spans:
+        return value
+    rebuilt, cursor = [], 0
+    for start, end, name in spans:
+        rebuilt.append(value[cursor:start])
+        rebuilt.append(name)
+        cursor = end
+    rebuilt.append(value[cursor:])
+    return ''.join(rebuilt)
+
+
+def person_named(text: Any, name: Any, names: Iterable[Any] = ()) -> bool:
+    """Does the message name this person, allowing their short or inflected form?"""
+    if not isinstance(text, str) or not text.strip() or not str(name or '').strip():
+        return False
+    if person_reference_requested(text, str(name)):
+        return True
+    registry = [*names, name] if names else []
+    expanded = expand_person_names(text, registry)
+    return expanded != text and person_reference_requested(expanded, str(name))
+
+
+def resolve_named_person(asked: Any, candidates: Iterable[Any]) -> str | None:
+    """Which of the message's own people the model meant by ``asked``.
+
+    The chat model shortens names - it asked to add "John" while the message
+    said "John the system" - and the hub then refused the call as "not
+    requested in this image" even though the owner had named that person. When
+    exactly one candidate matches (equal after punctuation is dropped, or one
+    name is the beginning of the other) the call follows the message instead
+    of failing. Two plausible candidates mean no guess at all.
+    """
+    wanted = _fold_name(asked)
+    if len(wanted) < 3:
+        return None
+    names = [str(name) for name in candidates or () if str(name or '').strip()]
+    exact = [name for name in names if _fold_name(name) == wanted]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [name for name in names if _form_score(asked, name)]
+    return partial[0] if len(partial) == 1 else None
 
 _SELF = ('me', 'myself', 'меня')
 _POSSESSIVE = re.compile(
@@ -65,17 +190,22 @@ def select_image_subjects(prompt, explicit_references, registered_names, speaker
         return result
     canonical = _canonical_names(registered_names)
     names = list(canonical.values())
+    # "Добавь антона" and "add John" name enrolled people "Anton" and
+    # "John the system": the wording is read with those short and inflected
+    # forms spelled out, so the source request authorizes the identity without
+    # demanding one exact spelling from the owner.
+    wished = expand_person_names(prompt, names)
     selected = []
     positive = {}
     for name in names:
-        text = _person_text(prompt, name, names)
+        text = _person_text(wished, name, names)
         positive[name.casefold()] = person_reference_requested(text, name)
     speaker = canonical.get(' '.join(str(speaker_name or '').split()).casefold())
     self_requested = _self_requested(prompt)
     if speaker and self_requested:
         # An explicit exclusion of the same named person takes precedence over
         # an earlier or contradictory pronoun. Never upload an excluded face.
-        speaker_text = _person_text(prompt, speaker, names)
+        speaker_text = _person_text(wished, speaker, names)
         named = re.search(r'(?<!\w)' + re.escape(speaker) + r'(?!\w)', speaker_text, re.I)
         if not named or positive[speaker.casefold()]:
             positive[speaker.casefold()] = True
@@ -87,6 +217,11 @@ def select_image_subjects(prompt, explicit_references, registered_names, speaker
         if key in {'me', 'myself', 'меня', 'мне'}:
             key = speaker.casefold() if speaker and self_requested else ''
         name = canonical.get(key)
+        if name is None:
+            # The chat model shortens or inflects the name it passes as a tool
+            # argument; resolve it against the enrolled people, never invent one.
+            name = resolve_named_person(value, names)
+            key = name.casefold() if name else ''
         if name and positive.get(key) and name not in selected:
             selected.append(name)
 

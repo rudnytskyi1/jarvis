@@ -228,6 +228,19 @@ def test_a_real_caption_is_still_not_a_person_reference(text):
 
 
 @pytest.mark.parametrize('text', [
+    'Take a picture of antondorm and add \u201cJohn the system\u2019 to it',
+    'Take a photo of livingroom and add \u2018John the system\u2019 to it.',
+])
+def test_a_mismatched_quote_pair_still_quotes_the_person_name(text):
+    """Owner's report (2026-09-22): a phone keyboard mixed \u201c with \u2019.
+
+    The pair read as an unfinished caption, so the hub refused an edit that
+    named an enrolled person. Any quote character around a name is a quote.
+    """
+    assert person_reference_requested(text, 'John the system')
+
+
+@pytest.mark.parametrize('text', [
     'Make Anton sit in that chair with 4 people in suits',
     'make the people on the couch kiss',
     'Put Anton on the couch',

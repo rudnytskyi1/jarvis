@@ -7,7 +7,8 @@ from hub.image_prompt import _possibly_literal_caption
 _DESTINATION = r'(?:telegram|tg|group(?:\s+chat)?|телеграм\w*|телег[ауе]|тг|групп\w*|чат\w*)'
 _ACTION = re.compile(
     r'\b(?:send|post|share|message(?=\s+(?:(?:the|our|this)\s+)?(?:group|telegram)\b)|'
-    r'отправь(?:те)?|отправить|отошли|пришли|скинь(?:те)?|скинуть|'
+    r'отправь(?:те)?|отправить|отошли(?:те)?|пришли(?:те)?|перешли(?:те)?|переслать|'
+    r'скинь(?:те)?|скинуть|'
     r'напиши(?:те)?|написать|запости|опубликуй)\b', re.I)
 _TARGET_AFTER = re.compile(
     r'\b(?:to|in|into|on|with|в|во)\s+'
@@ -93,6 +94,94 @@ def _own_named_target(text):
             continue
         return target
     return None
+
+
+#: Anything the owner may call a picture they want sent.
+_PICTURE = re.compile(
+    r'\b(?:photo|picture|image|snapshot|screenshot|selfie|'
+    r'фото|фотк\w*|фотографи\w*|снимок|скриншот|картинк\w*|изображени\w*|селфи)\b', re.I)
+#: Destinations that mean the one chat Rowan posts to, or the sender themselves.
+_CURRENT_CHAT = {'me', 'us', 'myself', 'here', 'this', 'the', 'my', 'our', 'your',
+                 'telegram', 'tg', 'group', 'chat', 'rowan',
+                 'меня', 'мне', 'нас', 'нам', 'себя', 'сюда', 'этот', 'эту', 'это', 'эти',
+                 'наш', 'наша', 'наше', 'наши', 'телеграм', 'телеграмм', 'телеге', 'тг',
+                 'группа', 'группу', 'группы', 'групповой', 'чат', 'чате', 'чата'}
+#: Words that follow a picture object without naming a receiver.
+_NOT_A_RECIPIENT = {'которое', 'который', 'которую', 'которые', 'которого', 'которой',
+                    'что', 'кто', 'где', 'как', 'когда', 'если', 'пожалуйста', 'сейчас'}
+#: "Here" in a room belongs to the room first: only the Telegram route itself
+#: may read it as this chat (hub.telegram_control.current_chat_send_requested).
+_ROOM_HERE = re.compile(r'\b(?:here|сюда)\b', re.I)
+_PREPOSITION = re.compile(r"\b(?:to|for|into|on|at|with|в|во|для|к)\s+([\w'-]+)(?:\s+([\w'-]+))?", re.I)
+#: Determiners carry no receiver of their own: "to my email" is the email.
+_DETERMINER = {'my', 'our', 'your', 'his', 'her', 'their', 'the', 'this', 'that',
+               'a', 'an', 'some', 'any', 'мой', 'мою', 'моё', 'мое', 'наш', 'наша',
+               'наше', 'твой', 'ваш', 'его', 'её', 'ее', 'их', 'этот', 'эту', 'тот'}
+_EN_RECIPIENT = re.compile(
+    r'\b(?:send|share|post)\s+(?:(?:me|us|them|it|this|that|the|my|our|your|a|an|some)\s+)*'
+    r'(?P<word>[A-Za-z][A-Za-z\'-]{1,})', re.I)
+_PICTURE_RECIPIENT = re.compile(_PICTURE.pattern + r'\s*,?\s+(?P<word>[А-Яа-яЁё]{3,12})', re.I)
+
+
+def _names_other(word):
+    """Is this word somebody or somewhere else than the one Telegram chat?"""
+    value = str(word or '').casefold()
+    return bool(value) and not (
+        value in _CURRENT_CHAT or value in _NOT_A_RECIPIENT or _PICTURE.fullmatch(value))
+
+
+def _other_recipient(value):
+    """Does the send clause promise the picture to somebody else?
+
+    "Отправь фото маме" must never be read as "post it in Rowan's chat".
+    """
+    for match in _PREPOSITION.finditer(value):
+        first, second = match.group(1), match.group(2)
+        if _names_other(first):
+            return True
+        if second is not None and first.casefold() in _DETERMINER and _names_other(second):
+            return True
+    for match in _EN_RECIPIENT.finditer(value):
+        if _names_other(match['word']):
+            return True
+    for match in _PICTURE_RECIPIENT.finditer(value):
+        if _names_other(match['word']):
+            return True
+    return False
+
+
+def picture_send_requested(text):
+    """A current request to send a picture when the destination is implied.
+
+    Rowan has exactly one Telegram chat to post to, so "отправь фото" and
+    "send me the photo" already name the action and its object; the owner does
+    not have to spell out the chat. The guards of
+    :func:`telegram_send_requested` still apply: complaints, quotations,
+    reports and revocations never authorize a send, and a picture promised to
+    somebody else ("отправь фото маме") is not a request to post it here.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    plain = _without_quotes(text)
+    for match in _ACTION.finditer(plain):
+        prefix, after = plain[:match.start()], plain[match.end():]
+        clause = re.split(r'[.!?;\n]|\b(?:but|however|но|зато)\b', prefix, flags=re.I)[-1]
+        if (_NEGATED.search(clause) or _DISCUSSION.search(clause)
+                or _possibly_literal_caption(text[:match.start()])):
+            continue
+        direct = _POLITE.sub('', clause, count=1).strip()
+        if _REPORT_SUBJECT.search(direct) or _REPORTED_PLAN.search(direct):
+            continue
+        if _REVOCATION.search(after):
+            continue
+        send_clause = re.split(r'[.!?;\n]', after, maxsplit=1)[0]
+        # The verb itself belongs to the clause, so "send Anton the photo" is
+        # read as promising the picture to Anton, not to this chat.
+        sentence = ' '.join((clause, match.group(0), send_clause[:400]))
+        if (_PICTURE.search(sentence) and not _other_recipient(sentence)
+                and not _ROOM_HERE.search(sentence)):
+            return True
+    return False
 
 
 def telegram_send_requested(text):

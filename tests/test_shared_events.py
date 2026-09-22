@@ -214,8 +214,13 @@ def test_asking_for_the_calendar_reads_the_next_events(tmp_path, monkeypatch):
     conn, connection = _connection(tmp_path, monkeypatch)
     monkeypatch.setattr(hub_app, "_home_timezone_of", lambda home: "UTC")
     try:
+        # Событие — «завтра» от НАСТОЯЩИХ часов: чтение календаря идёт от
+        # настоящего времени (upcoming(now=None)), поэтому событие, привязанное
+        # к 18:00 сегодняшнего дня, после 18:00 UTC переставало находиться, и
+        # тест проходил только до этого часа.
+        today = datetime.now(tz=ZoneInfo("UTC"))
         store = shared_mod.SharedEventStore(conn)
-        store.create(shared_mod.parse_shared_event("встреча в 18:00", now=NOW, tz="UTC"))
+        store.create(shared_mod.parse_shared_event("встреча завтра в 12:00", now=today, tz="UTC"))
         handled = asyncio.run(connection._shared_event_turn(
             "что у нас в календаре?", "ru", None, 100.0, connection.session, 40))
         assert handled is True

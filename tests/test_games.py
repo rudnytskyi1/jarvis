@@ -14,6 +14,7 @@ from hub import games as games_mod
 from hub import migrations_runner
 from hub.homes import ensure_home
 from hub.session import Session
+from hub.skill_scaffold import scaffold
 from hub.skill_state import SkillStateStore
 from hub.skills_registry import SkillRegistry
 from hub.utterances import UtteranceMetrics
@@ -490,19 +491,29 @@ def test_the_skill_context_carries_state_and_a_scheduler(tmp_path, monkeypatch):
     migrations_runner.migrate(conn)
     ensure_home(conn, "livingroom", name="Гостиная", tz="UTC")
     cfg = Config()
+    registry = _registry()
+    # Скилл дома рядом с хабовым: состояние у них разное (ТЗ F-407).
+    scaffold(tmp_path, "coffee")
+    assert registry.load_directory(tmp_path / "skills", home_id="livingroom") == ["coffee"]
     monkeypatch.setattr(hub_app, "_hub_conn", conn)
     monkeypatch.setattr(hub_app, "_config", cfg)
+    monkeypatch.setattr(hub_app, "_skills", registry)
     try:
         ctx = hub_app._skill_context("livingroom", "p-anton", "ru", skill="games")
         assert isinstance(ctx.state, SkillStateStore)
-        assert ctx.state.skill_id == "livingroom:games"
+        # Партия идёт между комнатами, поэтому её состояние — хабовое (F-407:
+        # пустой home_id значит «принадлежит хабу целиком»), иначе соседняя
+        # комната и /health видели бы разные счёты.
+        assert ctx.state.skill_id == "hub:games"
         assert ctx.scheduler is hub_app._skill_scheduler()
         assert ctx.home_name("livingroom") == "Гостиная"
         assert ctx.game_settings is cfg.server.games
+        assert hub_app._skill_state_home("coffee", "livingroom") == "livingroom", "скилл дома"
         plain = hub_app._skill_context("livingroom", "", "ru")
         assert plain.state is None, "скиллу без имени состояние не подсовывают"
     finally:
         monkeypatch.setattr(hub_app, "_hub_conn", None)
+        monkeypatch.setattr(hub_app, "_skills", None)
         conn.close()
 
 
