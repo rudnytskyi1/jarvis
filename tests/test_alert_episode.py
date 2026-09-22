@@ -93,3 +93,35 @@ def test_the_room_presence_is_kept_per_room(tmp_path):
         assert alerts._people_now('unknown')[0] == 0
         await alerts.close()
     asyncio.run(run())
+
+
+def test_the_clip_is_converted_before_it_reaches_telegram(tmp_path, monkeypatch):
+    """ТЗ F-702: what is sent is the version a phone can open."""
+    seen = []
+
+    def convert(data):
+        seen.append(data)
+        return b'converted-for-phones'
+
+    monkeypatch.setattr(presence_alerts, 'phone_ready_mp4', convert)
+
+    async def run():
+        api, camera, alerts = await play_episode(tmp_path, monkeypatch, people=0)
+        try:
+            assert seen == [b'mp4-bytes'], 'the room clip goes in'
+            assert api.send_video.await_args.args[0] == b'converted-for-phones'
+        finally:
+            await alerts.close()
+    asyncio.run(run())
+
+
+def test_without_a_conversion_the_recording_still_arrives(tmp_path, monkeypatch):
+    monkeypatch.setattr(presence_alerts, 'phone_ready_mp4', lambda data: None)
+
+    async def run():
+        api, camera, alerts = await play_episode(tmp_path, monkeypatch, people=0)
+        try:
+            assert api.send_video.await_args.args[0] == b'mp4-bytes'
+        finally:
+            await alerts.close()
+    asyncio.run(run())

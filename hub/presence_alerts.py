@@ -15,6 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from common.protocol import CAMERA_CLIP_MAX_BYTES, DEFAULT_STATUS_TTL_S, MSG_STATUS
+from hub.video_transcode import phone_ready_mp4
 
 log = logging.getLogger(__name__)
 DEFAULT_RULE = dict(enabled=False, target='any', name='', media='photo', destination='owner',
@@ -551,13 +552,12 @@ class PresenceAlerts:
         client_id = getattr(getattr(room, 'session', None), 'client_id', '')
         if event['source_id'] and client_id != event['source_id']:
             raise RuntimeError('The observed room is no longer connected.')
-        if rule['media'] == 'photo':
-            frame = await asyncio.wait_for(room._request_camera_frame_full('alert-' + delivery['id']), 35)
-            data = getattr(frame, 'jpeg', None)
-        else:
-            result = await asyncio.wait_for(room._request_camera_clip('alert-' + delivery['id'],
-                seconds=rule['clip_seconds'], fps=8), rule['clip_seconds'] + 20)
-            data = result.get('data') if isinstance(result, dict) else result
+        if rule['media'] == 'video':
+            # One producer for alert video: the same call the later parts of an
+            # episode use, so every clip is converted for phones exactly once.
+            return await self._camera_video(delivery, rule)
+        frame = await asyncio.wait_for(room._request_camera_frame_full('alert-' + delivery['id']), 35)
+        data = getattr(frame, 'jpeg', None)
         if not isinstance(data, bytes) or not 0 < len(data) <= CAMERA_CLIP_MAX_BYTES:
             raise RuntimeError('The camera did not return usable alert media.')
         return data
@@ -573,7 +573,12 @@ class PresenceAlerts:
         data = result.get('data') if isinstance(result, dict) else result
         if not isinstance(data, bytes) or not 0 < len(data) <= CAMERA_CLIP_MAX_BYTES:
             raise RuntimeError('The camera did not return usable alert media.')
-        return data
+        # ТЗ F-702: the clip leaves the room as MPEG-4 Part 2 (OpenCV's writer),
+        # which phone players refuse; the hub converts it to H.264 before it is
+        # sent. Without an encoder the original still goes out - the owner gets
+        # the recording, just not a version every phone can open.
+        converted = await asyncio.to_thread(phone_ready_mp4, data)
+        return converted if converted is not None else data
 
     async def _next_episode_video(self, delivery, *, part):
         """The next video of one episode, or ``None`` when the room is clear.
