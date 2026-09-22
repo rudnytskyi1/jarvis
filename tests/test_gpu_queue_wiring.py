@@ -20,6 +20,7 @@ from hub.gpu_queue import (
     PRIORITY_UTTERANCE,
     GpuQueue,
 )
+from hub.stt import SttBatcher
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -230,3 +231,65 @@ def test_the_live_pipeline_routes_stt_and_the_llm_round_through_the_queue():
     assert 'PRIORITY_FACE_BURST, "camera-frame-faces"' in source
     assert 'PRIORITY_BACKGROUND, "presence-faces"' in source
     assert "await asyncio.to_thread(engine.located_faces" not in source
+
+
+# --- the STT batch path ---------------------------------------------------
+
+
+class _BatchEngine:
+    """Stands in for the faster-whisper engine: a BLOCKING batch decode."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def transcribe_batch(self, clips, sample_rate, language, *, batch_size):
+        self.calls.append((list(clips), sample_rate, language, batch_size))
+        return [(f"clip {index}", "en") for index in range(len(clips))]
+
+
+def test_the_stt_batch_job_runs_the_blocking_decode_through_the_queue(monkeypatch):
+    """The live failure: the batch runner awaited a blocking callable."""
+    monkeypatch.setattr(hub_app, "_config", _config())
+    recording = _RecordingQueue()
+    monkeypatch.setattr(hub_app, "_gpu", recording)
+
+    results = asyncio.run(hub_app._stt_batch_job(lambda: [("hello", "en")]))
+
+    assert results == [("hello", "en")], (
+        "the batch runner must return the decoded clips, not a coroutine"
+    )
+    assert recording.calls == [{"priority": PRIORITY_UTTERANCE, "home_id": "default",
+                                "label": "stt-batch",
+                                "timeout_s": hub_app._gpu_timeout(PRIORITY_UTTERANCE)}]
+
+
+def test_the_stt_batch_job_works_with_the_queue_switched_off(monkeypatch):
+    monkeypatch.setattr(hub_app, "_config", _config(enabled=False))
+    assert asyncio.run(hub_app._stt_batch_job(lambda: [("hi", "en")])) == [("hi", "en")]
+
+
+def test_the_batcher_decodes_one_batch_in_one_slot(monkeypatch):
+    """Two rooms that speak together share one batch and one queue slot."""
+    monkeypatch.setattr(hub_app, "_config", _config())
+    recording = _RecordingQueue()
+    monkeypatch.setattr(hub_app, "_gpu", recording)
+    engine = _BatchEngine()
+    batcher = SttBatcher(engine, batch_size=4, window_ms=40,
+                         runner=hub_app._stt_batch_job)
+
+    async def scenario():
+        return await asyncio.gather(
+            batcher.transcribe(b"one", 16000, "en"),
+            batcher.transcribe(b"two", 16000, "en"),
+        )
+
+    try:
+        answers = asyncio.run(scenario())
+    finally:
+        asyncio.run(batcher.aclose())
+
+    assert answers == [("clip 0", "en"), ("clip 1", "en")]
+    assert len(engine.calls) == 1, "both clips must be decoded as one batch"
+    assert engine.calls[0][3] == 2
+    assert len(recording.calls) == 1, "one batch must occupy exactly one slot"
+    assert recording.calls[0]["label"] == "stt-batch"

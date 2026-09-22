@@ -933,16 +933,28 @@ def _speech_batcher(engine: Any) -> Any:
 
         stt_cfg = get_config().server.stt
 
-        async def runner(work: Any) -> Any:
-            return await run_on_gpu(PRIORITY_UTTERANCE, "", work, label="stt-batch")
-
         _stt_batcher = SttBatcher(
             engine,
             batch_size=int(getattr(stt_cfg, "batch_size", 4)),
             window_ms=int(getattr(stt_cfg, "batch_window_ms", 40)),
-            runner=runner,
+            runner=_stt_batch_job,
         )
     return _stt_batcher
+
+
+async def _stt_batch_job(work: Any) -> Any:
+    """Decode one faster-whisper batch as ONE GPU-queue slot (ТЗ 4.4, 4.5).
+
+    The batcher hands over a BLOCKING callable, while the queue admits a
+    zero-argument coroutine function. Decoding the batch in a worker thread
+    keeps both promises: the slot stays held for as long as the card is busy
+    (one batch = one slot), and the loop keeps serving the other rooms' sockets
+    while the card works. Awaiting the blocking callable directly is what made
+    every spoken request fail with ``object list can't be used in 'await'
+    expression`` on a live hub.
+    """
+    return await run_on_gpu(PRIORITY_UTTERANCE, "",
+                            lambda: asyncio.to_thread(work), label="stt-batch")
 
 
 def _gpu_queue() -> GpuQueue | None:
