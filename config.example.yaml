@@ -88,6 +88,11 @@ server:
     enabled: false
     chat_id: null             # fixed negative group ID; tools cannot choose another destination
     control_user_id: null     # ONLY this numeric sender gets tools in the group and their private DM
+    # Extra accounts with the hub admin's own rights: they may open /tools,
+    # control the rooms and receive notifications in private. The owner stays
+    # the only account that cannot be removed. Groups the bot has been added to
+    # become selectable notification destinations by themselves.
+    admin_user_ids: []        # e.g. [8928749210, 6617808228]
     api_key_env: TELEGRAM_BOT_TOKEN # secret is saved on the brain PC, never in YAML
     timeout_s: 30
     respond_to_mentions: false # optional replies to new @bot mentions in this same group

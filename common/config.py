@@ -280,11 +280,23 @@ class TelegramConfig(_Strict):
     enabled: bool = False
     chat_id: int | None = Field(default=None, lt=0, gt=-(2 ** 63))
     control_user_id: int | None = Field(default=None, strict=True, gt=0, lt=2 ** 63)
+    #: Extra accounts with the hub admin's own rights (see DECISIONS.md TG-01):
+    #: they may open ``/tools``, control the rooms and be written to in private.
+    #: The owner stays the only account that cannot be removed.
+    admin_user_ids: list[int] = Field(default_factory=list)
     api_key_env: str = Field(default='TELEGRAM_BOT_TOKEN', min_length=1,
                              pattern=r'^[A-Za-z_][A-Za-z0-9_]*$')
     timeout_s: float = Field(default=30, ge=5, le=120)
     respond_to_mentions: bool = False
     poll_timeout_s: int = Field(default=25, ge=1, le=50)
+
+    @field_validator("admin_user_ids", mode="after")
+    @classmethod
+    def _check_admin_ids(cls, value: list[int]) -> list[int]:
+        for user_id in value:
+            if type(user_id) is not int or not 0 < user_id < 2 ** 63:
+                raise ValueError("every admin_user_ids entry must be a positive Telegram user id")
+        return sorted(set(value))
 
 
 class SpeakerConfig(_Strict):

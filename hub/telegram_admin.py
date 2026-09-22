@@ -113,23 +113,92 @@ class TelegramAdmin:
         """ТЗ F-701: админ хаба — везде, владелец дома — в своём чате."""
         if type(user_id) is not int or user_id <= 0:
             return False
-        if self.access.is_owner(user_id) and user_id == getattr(self._cfg, 'control_user_id', None):
+        # The owner and the accounts named in ``admin_user_ids`` share the
+        # panel; the owner is still the one whose row cannot be changed.
+        if self._hub_admin_now(user_id):
             return True
         if self.homes is None:
             return False
         try:
-            return bool(self.homes.may_use_panel(user_id)) and not self.access.is_owner(user_id)
+            return bool(self.homes.may_use_panel(user_id)) and not self.access.is_hub_admin(user_id)
         except Exception:  # noqa: BLE001 - unreadable grants are not a permission
             return False
 
+    def _hub_admin_now(self, user_id) -> bool:
+        """Is this account a hub admin *by the configuration in force now*.
+
+        The config is the source of truth for both lists: an account the owner
+        removed from ``control_user_id`` or from ``admin_user_ids`` loses the
+        panel at the next click, instead of keeping it until the process
+        restarts. The access store still has to know the account, so a stale
+        panel handle alone never confers rights.
+        """
+        if not self.access.is_hub_admin(user_id):
+            return False
+        if user_id == getattr(self.access, 'owner_id', None):
+            return getattr(self._cfg, 'control_user_id', None) == user_id
+        return user_id in set(getattr(self._cfg, 'admin_user_ids', ()) or ())
+
     def _scope(self, user_id):
         """``None`` для админа хаба, иначе — дома этого аккаунта (F-701)."""
-        if self.homes is None:
+        if self.access.is_hub_admin(user_id) or self.homes is None:
             return None
         try:
             return self.homes.scope(user_id)
         except Exception:  # noqa: BLE001 - без грантов аккаунт видит только себя
             return frozenset()
+
+    # --- ТЗ F-702: куда уходит уведомление -------------------------------
+
+    def _known_chats(self) -> dict:
+        """Group chats the bot has seen, as ``{'group:<id>': title}``.
+
+        A Telegram bot cannot ask for the list of its groups, so the hub keeps
+        the ones it has actually met (see ``TelegramChat._remember_chat``).
+        The panel offers exactly those, which is how a group created later
+        becomes a selectable destination.
+        """
+        if self.access is None:
+            return {}
+        chats = self.access.get_setting('chats', {})
+        if not isinstance(chats, dict):
+            return {}
+        configured = str(getattr(self._cfg, 'chat_id', '') or '')
+        named: dict[str, str] = {}
+        for key, value in chats.items():
+            chat_id = str(key).strip()
+            if not chat_id.lstrip('-').isdigit() or chat_id == configured:
+                continue
+            title = value.get('title') if isinstance(value, dict) else ''
+            named['group:' + chat_id] = str(title or ('Group ' + chat_id))[:60]
+        return dict(sorted(named.items(), key=lambda item: item[1].casefold()))
+
+    def _destination_options(self) -> tuple:
+        """``owner`` first, then the configured group, then every known group."""
+        options = ['owner']
+        if isinstance(getattr(self._cfg, 'chat_id', None), int) and self._cfg.chat_id < 0:
+            options.append('group')
+        options += list(self._known_chats())
+        return tuple(options)
+
+    def _alert_fields(self) -> dict:
+        """The static rule fields with the destination list filled in."""
+        fields = dict(_ALERT_FIELDS)
+        caption, _ = fields['destination']
+        fields['destination'] = (caption, self._destination_options())
+        return fields
+
+    def _destination_label(self, value) -> str:
+        people = 0
+        if self.access is not None and str(value or '') == 'owner':
+            people = len(self.access.private_recipients())
+        return rule_value('destination', value, private_to=people, chats=self._known_chats())
+
+    def _field_label(self, key, value) -> str:
+        """One field's current value in words (destinations know the groups)."""
+        if key == 'destination':
+            return self._destination_label(value)
+        return rule_value(key, value)
 
     def _allowed_sender(self, sender):
         """A human account allowed to use the panel: hub admin or home owner."""
@@ -143,7 +212,7 @@ class TelegramAdmin:
             # ТЗ F-701: у владельца дома свой чат — свой, а не только у админа.
             return self._may_panel(chat['id']) and chat['id'] == owner
         return (chat.get('type') in {'group', 'supergroup'}
-                and chat['id'] == self._cfg.chat_id and self.access.is_owner(owner))
+                and chat['id'] == self._cfg.chat_id and self._hub_admin_now(owner))
 
     def _prune(self):
         now = self.clock()
@@ -619,7 +688,7 @@ class TelegramAdmin:
                 rows += [[button('New rule', kind='page', page='alert_draft', new=True)], self._back(panel)]
             elif page == 'alert':
                 item = payload['item']
-                text = rule_text(item, _ALERT_FIELDS)
+                text = rule_text(item, self._alert_fields(), chats=self._known_chats())
                 rows = [[button('Edit settings', kind='page', page='alert_draft', item=item)],
                         [button('Disable' if item.get('enabled') else 'Enable', kind='confirm',
                                 label='Change this notification rule? An enabled rule sends photos or videos automatically.',
@@ -634,10 +703,11 @@ class TelegramAdmin:
                 if panel.draft is None:
                     await self._page(panel, 'alerts', notice='This draft has expired.')
                     return
-                text = rule_text(panel.draft, _ALERT_FIELDS, draft=True)
-                fields = list(_ALERT_FIELDS.items())
+                text = rule_text(panel.draft, self._alert_fields(), draft=True,
+                                 chats=self._known_chats())
+                fields = list(self._alert_fields().items())
                 for index in range(0, len(fields), 2):
-                    rows.append([button(label + ': ' + rule_value(key, panel.draft[key]),
+                    rows.append([button(label + ': ' + self._field_label(key, panel.draft[key]),
                                         kind='page', page='alert_field', key=key)
                                  for key, (label, _) in fields[index:index + 2]])
                 data = dict(panel.draft)
@@ -649,7 +719,7 @@ class TelegramAdmin:
                                  action=dict(action='alerts.update' if panel.draft_id else 'alerts.create', payload=data, back='alerts'))], self._back(panel, 'alerts')]
             else:
                 key = payload['key']
-                label, value_type = _ALERT_FIELDS[key]
+                label, value_type = self._alert_fields()[key]
                 text = label
                 if value_type == 'workplace':
                     result = await self._backend(panel, 'workplaces.list')
@@ -658,7 +728,8 @@ class TelegramAdmin:
                         rows.append([button(item.get('name') or item['id'], kind='draft', key=key, value=item['id'])])
                     rows.append(self._back(panel, 'alert_draft'))
                 elif isinstance(value_type, tuple):
-                    rows = [[button(rule_value(key, value), kind='draft', key=key, value=value)] for value in value_type]
+                    rows = [[button(self._field_label(key, value), kind='draft', key=key, value=value)]
+                            for value in value_type]
                     rows.append(self._back(panel, 'alert_draft'))
                 else:
                     presets = _ALERT_PRESETS.get(key)

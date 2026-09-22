@@ -24,6 +24,35 @@ def test_access_defaults_explicit_private_grants_and_observation(tmp_path):
     assert state.can_chat(42) and not state.can_chat(42, private=True)
 
 
+def test_named_extra_admins_share_the_hub_admin_rights(tmp_path):
+    """``admin_user_ids`` (config): the owner names who else may use /tools."""
+    extra, other = 8928749210, 6617808228
+    state = TelegramAdminState(tmp_path / 'admin.sqlite3', OWNER, [extra, other])
+    assert state.is_hub_admin(OWNER) and state.is_hub_admin(extra) and state.is_hub_admin(other)
+    assert not state.is_owner(extra), "they are admins, not the owner"
+    assert state.role(extra) == 'admin' and state.role(other) == 'admin'
+    assert all(state.allows(extra, cap) for cap in CAPABILITIES)
+    assert state.can_chat(extra, private=True), "the hub writes notifications to them"
+    assert extra in state.private_recipients()
+    listed = {user['user_id']: user for user in state.users()}
+    assert listed[extra]['role'] == 'admin' and listed[extra]['explicit'] is True
+    state.remove_user(extra)
+    assert state.is_hub_admin(extra) and state.allows(extra, 'pc'), (
+        "only the configuration revokes a named admin; the panel cannot"
+    )
+
+
+def test_private_recipients_are_everyone_with_access(tmp_path):
+    """What the panel calls "Private chat (everyone)" (ТЗ F-702)."""
+    extra = 8928749210
+    state = TelegramAdminState(tmp_path / 'admin.sqlite3', OWNER, [extra])
+    state.observe_user({'id': 42, 'is_bot': False, 'first_name': 'Waiter'})     # not explicit
+    state.set_user(43, 'member', label='Guest')                                 # explicit chat
+    state.set_user(44, 'operator', {'chat': False}, label='Muted')              # chat revoked
+    state.set_user(45, 'blocked', label='Blocked')                              # blocked
+    assert state.private_recipients() == (43, OWNER, extra)
+
+
 def test_permissions_settings_and_audit_survive_new_instance(tmp_path):
     path = tmp_path / 'admin.sqlite3'
     state = TelegramAdminState(path, OWNER)

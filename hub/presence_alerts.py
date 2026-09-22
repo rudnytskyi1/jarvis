@@ -37,6 +37,31 @@ CHANNELS = ('telegram', 'push', 'hud')
 RULE_RANGES = {'cooldown_s': (1.0, 86400.0), 'min_stable_s': (0.0, 300.0), 'absence_s': (0.0, 3600.0)}
 _ID = re.compile(r'alert-[0-9a-f]{32}')
 _CLOCK = re.compile(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]')
+#: ТЗ F-702: a rule's destination is either the private chats that have access
+#: (``owner``) or one concrete group - the configured one (``group``) or any
+#: group the bot has met (``group:<chat_id>``, see the panel's destination list).
+_GROUP_DESTINATION = re.compile(r'^group:-?[0-9]{1,20}$')
+
+
+def destination_chat_id(destination, default_group):
+    """Which chat a rule with this ``destination`` sends to.
+
+    ``None`` means "every private chat that has access" - what the panel calls
+    "Private chat (everyone)"; a number is one concrete group.
+    """
+    text = str(destination or '')
+    if text == 'owner':
+        return None
+    if text == 'group':
+        return default_group if type(default_group) is int else None
+    if _GROUP_DESTINATION.match(text):
+        return int(text.split(':', 1)[1])
+    return None
+
+
+def _valid_destination(value) -> bool:
+    return isinstance(value, str) and (value in {'owner', 'group'}
+                                       or bool(_GROUP_DESTINATION.match(value)))
 
 
 def validate_rule(patch, existing=None):
@@ -45,10 +70,11 @@ def validate_rule(patch, existing=None):
     rule = {**DEFAULT_RULE, **(existing or {}), **patch}
     if type(rule['enabled']) is not bool:
         raise ValueError('enabled must be a boolean.')
-    for key, allowed in [('target', {'any', 'unknown', 'person'}), ('media', {'photo', 'video'}),
-                         ('destination', {'owner', 'group'})]:
+    for key, allowed in [('target', {'any', 'unknown', 'person'}), ('media', {'photo', 'video'})]:
         if not isinstance(rule[key], str) or rule[key] not in allowed:
             raise ValueError(f'Invalid {key}.')
+    if not _valid_destination(rule['destination']):
+        raise ValueError('Invalid destination.')
     if rule['event'] not in EVENT_KINDS:
         raise ValueError('Unknown alert event.')
     if rule['channel'] not in CHANNELS:
@@ -149,7 +175,7 @@ class PresenceAlerts:
     """
 
     def __init__(self, folder, get_provider, get_room, owner_id, group_id, *,
-                 get_home=None, get_push=None):
+                 get_home=None, get_push=None, get_private_recipients=None):
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.get_provider, self.get_room = get_provider, get_room
@@ -160,6 +186,11 @@ class PresenceAlerts:
         #: сообщает, что доставлять нечем, а не притворяется отправленным.
         self.get_push = get_push or (lambda: None)
         self.owner_id, self.group_id = owner_id, group_id
+        #: ТЗ F-702: "Private chat (everyone)" — the accounts a notification is
+        #: written to. The hub passes the access store's list (owner, the extra
+        #: admins and everyone with an explicit chat grant); without it the
+        #: destination stays exactly the old behaviour, the owner's own DM.
+        self.get_private_recipients = get_private_recipients or (lambda: ())
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.folder / 'alerts.sqlite3', check_same_thread=False, isolation_level=None)
         self._db.execute('PRAGMA journal_mode=WAL')
@@ -184,6 +215,24 @@ class PresenceAlerts:
             return [dict(id=row[0], **{**DEFAULT_RULE, **json.loads(row[1])}, last_attempt=json.loads(row[2]).get('last_attempt'))
                     for row in self._db.execute('SELECT id, settings, state FROM rules ORDER BY rowid')]
 
+    def _private_recipients(self):
+        """ТЗ F-702: every account the 'Private chat (everyone)' rule writes to.
+
+        The owner's own DM stays in the list even when the access store cannot
+        answer (an older caller passes no callback), so an existing rule keeps
+        working exactly as it did.
+        """
+        people: set[int] = set()
+        try:
+            for value in self.get_private_recipients() or ():
+                if type(value) is int and 0 < value < 2 ** 63:
+                    people.add(value)
+        except Exception:  # noqa: BLE001 - an unreadable list is not a destination
+            people = set()
+        if type(self.owner_id) is int and 0 < self.owner_id < 2 ** 63:
+            people.add(self.owner_id)
+        return tuple(sorted(people))
+
     def save_rule(self, patch, rule_id=None):
         with self._lock:
             previous = None
@@ -196,9 +245,12 @@ class PresenceAlerts:
             elif self._db.execute('SELECT COUNT(*) FROM rules').fetchone()[0] >= 32:
                 raise ValueError('At most 32 alert rules can be saved.')
             rule = validate_rule(patch, json.loads(previous[0]) if previous else None)
-            destination = self.owner_id if rule['destination'] == 'owner' else self.group_id
-            if rule['enabled'] and (type(destination) is not int or
-                    (destination <= 0 if rule['destination'] == 'owner' else destination >= 0)):
+            destination = destination_chat_id(rule['destination'], self.group_id)
+            if rule['destination'] == 'owner':
+                ready = bool(self._private_recipients())
+            else:
+                ready = type(destination) is int and destination < 0
+            if rule['enabled'] and not ready:
                 raise ValueError('Configure the selected Telegram destination before enabling this rule.')
             rule_id = rule_id or 'alert-' + uuid.uuid4().hex
             old_state = json.loads(previous[1]) if previous else {}
@@ -496,18 +548,35 @@ class PresenceAlerts:
                     await asyncio.to_thread(self._finish, delivery, 'skipped', 'Quiet hours started before delivery')
                     return
                 caption = self._caption(rule, delivery['event'])
-                kwargs = {'private_reply_to_user_id': self.owner_id} if rule['destination'] == 'owner' else {}
                 attempted = True
-                if rule['media'] == 'video':
-                    ack = await provider.send_video(data, 'video/mp4', caption, 'presence.mp4', **kwargs)
-                else:
-                    ack = await provider.send_image(data, 'image/jpeg', caption, 'presence.jpg', **kwargs)
-                destination = self.owner_id if rule['destination'] == 'owner' else self.group_id
-                if (not isinstance(ack, dict) or ack.get('ok') is not True or ack.get('chat_id') != destination
-                        or type(ack.get('message_id')) is not int or ack['message_id'] <= 0):
-                    await asyncio.to_thread(self._finish, delivery, 'uncertain', 'Delivery acknowledgement was missing')
-                else:
-                    await asyncio.to_thread(self._finish, delivery, 'sent', f"Telegram message {ack['message_id']}")
+                group = destination_chat_id(rule['destination'], self.group_id)
+                targets = ([{'group_chat_id': group}] if group is not None
+                           else [{'private_reply_to_user_id': person}
+                                 for person in self._private_recipients()])
+                if not targets:
+                    await asyncio.to_thread(self._finish, delivery, 'failed',
+                                            'No destination for this rule')
+                    return
+                delivered: list[int] = []
+                for target in targets:
+                    if rule['media'] == 'video':
+                        ack = await provider.send_video(data, 'video/mp4', caption, 'presence.mp4', **target)
+                    else:
+                        ack = await provider.send_image(data, 'image/jpeg', caption, 'presence.jpg', **target)
+                    if (not isinstance(ack, dict) or ack.get('ok') is not True
+                            or ack.get('chat_id') != next(iter(target.values()))
+                            or type(ack.get('message_id')) is not int or ack['message_id'] <= 0):
+                        # One recipient is unconfirmed: the rest are not sent,
+                        # because a retry would duplicate what may already have
+                        # arrived (see the delivery rules of the module).
+                        await asyncio.to_thread(
+                            self._finish, delivery, 'uncertain',
+                            f'{len(delivered)} of {len(targets)} delivered; acknowledgement was missing')
+                        return
+                    delivered.append(int(ack['message_id']))
+                await asyncio.to_thread(
+                    self._finish, delivery, 'sent',
+                    'Telegram message ' + ', '.join(str(value) for value in delivered))
         except asyncio.CancelledError:
             await asyncio.to_thread(self._finish, delivery, 'uncertain' if attempted else 'cancelled', 'Delivery interrupted; no automatic retry')
             raise

@@ -74,11 +74,17 @@ def user_text(user, capabilities):
     return '\n'.join(lines)
 
 
-def rule_value(key, value):
+def rule_value(key, value, *, private_to=0, chats=None):
+    """One rule setting in words; ``chats`` names the groups the bot has seen.
+
+    ``private_to`` is how many accounts "Private chat" delivers to, so the
+    panel can say plainly where a notification goes instead of leaving the
+    owner to guess what "owner" means.
+    """
     options = {
         'target': {'any': 'Any person', 'unknown': 'Unknown face', 'person': 'Specific person'},
         'media': {'photo': 'Photo', 'video': 'Video'},
-        'destination': {'owner': 'Owner private chat', 'group': 'Group chat'},
+        'destination': {'owner': 'Private chat (everyone)', 'group': 'Notifications group chat'},
         # ТЗ F-702: событие и канал доставки — словами, а не кодами.
         'event': {'presence': 'Someone in frame', 'person_entered': 'Person came in',
                   'person_left': 'Person left', 'unknown_appeared': 'Unknown face appeared',
@@ -87,7 +93,9 @@ def rule_value(key, value):
         'channel': {'telegram': 'Telegram', 'push': 'Phone push', 'hud': 'HUD caption'},
     }
     if key in options:
-        return options[key].get(value, display(value))
+        if key != 'destination':
+            return options[key].get(value, display(value))
+        return destination_value(value, private_to=private_to, chats=chats)
     if key == 'workplace_id' and not value:
         return 'All computers'
     if key == 'home_id' and not value:
@@ -99,10 +107,26 @@ def rule_value(key, value):
     return display(value)
 
 
-def rule_text(item, fields, *, draft=False):
+def destination_value(value, *, private_to=0, chats=None):
+    """Where a notification goes: the group it names, or every private chat."""
+    text = str(value or '')
+    if text == 'owner':
+        return 'Private chat (everyone)' + (f' · {private_to}' if private_to else '')
+    named = (chats or {}).get(text)
+    if named:
+        return str(named)
+    if text == 'group':
+        return 'Notifications group chat'
+    if text.startswith('group:'):
+        return 'Group ' + text.split(':', 1)[1]
+    return display(value)
+
+
+def rule_text(item, fields, *, draft=False, chats=None, private_to=0):
     lines = ['Notification draft' if draft else 'Presence notification', '',
              'State: ' + ('Enabled' if item.get('enabled') else 'Disabled')]
-    lines += [f'{caption}: {rule_value(key, item.get(key))}' for key, (caption, _) in fields.items()]
+    lines += [f'{caption}: {rule_value(key, item.get(key), private_to=private_to, chats=chats)}'
+              for key, (caption, _) in fields.items()]
     if draft:
         lines += ['', 'Changes will not take effect until saved.']
     return '\n'.join(lines)

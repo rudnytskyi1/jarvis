@@ -57,9 +57,17 @@ class TelegramAdminState:
     process reloads both snapshots from the database.
     """
 
-    def __init__(self, path, owner_id):
+    def __init__(self, path, owner_id, admin_ids=()):
+        """``admin_ids`` are extra accounts with the hub admin's own rights.
+
+        They come from ``server.telegram.admin_user_ids``: the people the owner
+        named may open ``/tools``, control the rooms and be written to in
+        private. They are not the owner - the owner's row cannot be changed and
+        only the owner decides who is on this list (see DECISIONS.md, TG-01).
+        """
         self.path = Path(path)
         self.owner_id = _user_id(owner_id)
+        self.admin_ids = frozenset(_user_id(value) for value in (admin_ids or ()))
         self._write_lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
@@ -92,6 +100,10 @@ class TelegramAdminState:
     def is_owner(self, user_id):
         return type(user_id) is int and user_id == self.owner_id
 
+    def is_hub_admin(self, user_id):
+        """The owner or one of the accounts the owner named (``admin_user_ids``)."""
+        return self.is_owner(user_id) or (type(user_id) is int and user_id in self.admin_ids)
+
     def _row(self, user_id):
         if type(user_id) is not int or user_id <= 0:
             return None
@@ -101,6 +113,8 @@ class TelegramAdminState:
     def role(self, user_id):
         if self.is_owner(user_id):
             return 'owner'
+        if type(user_id) is int and user_id in self.admin_ids:
+            return 'admin'
         if type(user_id) is not int or user_id <= 0:
             return 'blocked'
         row = self._row(user_id)
@@ -111,7 +125,7 @@ class TelegramAdminState:
             return False
         if type(user_id) is not int or user_id <= 0:
             return False
-        if self.is_owner(user_id):
+        if self.is_hub_admin(user_id):
             return True
         row = self._row(user_id)
         role = row['role'] if row else 'member'
@@ -121,7 +135,7 @@ class TelegramAdminState:
         return overrides.get(capability, capability in _DEFAULTS[role]) is True
 
     def can_chat(self, user_id, private=False):
-        if self.is_owner(user_id):
+        if self.is_hub_admin(user_id):
             return True
         if type(user_id) is not int or user_id <= 0:
             return False
@@ -131,13 +145,39 @@ class TelegramAdminState:
         return (role != 'blocked' and overrides.get('chat', 'chat' in _DEFAULTS[role]) is True
                 and (not private or bool(row and row['explicit'])))
 
+    def private_recipients(self):
+        """Every account a notification may be written to in private.
+
+        This is what the panel calls "Private chat (everyone)": the hub admin,
+        the extra admins the owner named, and every account with an explicit
+        grant that includes ``chat``. The order is by id, so the delivery log
+        is stable.
+        """
+        people = {self.owner_id, *self.admin_ids}
+        for user_id, row in self._users_cache.items():
+            if type(user_id) is not int or user_id <= 0:
+                continue
+            role = row['role'] if row else 'member'
+            overrides = json.loads(row['capabilities']) if row else {}
+            if (bool(row and row['explicit']) and role != 'blocked'
+                    and overrides.get('chat', 'chat' in _DEFAULTS[role]) is True):
+                people.add(user_id)
+        return tuple(sorted(people))
+
     def users(self):
         with self._db() as db:
             rows = db.execute('SELECT * FROM telegram_access ORDER BY explicit DESC,label,user_id').fetchall()
         values = [{'user_id': self.owner_id, 'role': 'owner', 'label': 'Owner',
                    'explicit': True, 'capabilities': {cap: True for cap in CAPABILITIES}}]
+        for user_id in sorted(self.admin_ids):
+            if user_id == self.owner_id:
+                continue
+            row = self._users_cache.get(user_id) or {}
+            values.append({'user_id': user_id, 'role': 'admin',
+                           'label': row.get('label') or str(user_id), 'explicit': True,
+                           'capabilities': {cap: True for cap in CAPABILITIES}})
         for row in rows:
-            if row['user_id'] == self.owner_id:
+            if row['user_id'] == self.owner_id or row['user_id'] in self.admin_ids:
                 continue
             value = dict(row)
             value['capabilities'] = json.loads(value['capabilities'])

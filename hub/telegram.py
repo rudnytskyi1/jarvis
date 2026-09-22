@@ -266,7 +266,20 @@ class TelegramProvider:
                                 uncertain=method.startswith('send'))
         return result
 
-    def _destination(self, private_reply_to_user_id):
+    def _destination(self, private_reply_to_user_id, group_chat_id=None):
+        """Where this call goes: the configured group, one named group, or a DM.
+
+        ТЗ F-702: a notification rule may target any group the bot has been
+        added to, not only the fixed ``chat_id`` of the brain. The id still has
+        to be a real group id (negative), and the response must come back with
+        that same chat, so a typo cannot silently deliver elsewhere.
+        """
+        if group_chat_id is not None:
+            if private_reply_to_user_id is not None:
+                raise TelegramError('Pick one Telegram destination for this message.')
+            if not _valid_int(group_chat_id) or group_chat_id >= 0:
+                raise TelegramError('A Telegram group destination must be a negative chat id.')
+            return group_chat_id
         if private_reply_to_user_id is None:
             return self._chat_id
         if not _valid_int(private_reply_to_user_id) or not 0 < private_reply_to_user_id < 2 ** 63:
@@ -302,9 +315,9 @@ class TelegramProvider:
         return payload
 
     async def send_text(self, text, *, reply_to_message_id=None, private_reply_to_user_id=None,
-                        reply_markup=None):
+                        group_chat_id=None, reply_markup=None):
         self._require_ready()
-        destination = self._destination(private_reply_to_user_id)
+        destination = self._destination(private_reply_to_user_id, group_chat_id)
         if not isinstance(text, str) or not text.strip():
             raise TelegramError('Provide a nonempty Telegram message.')
         if _utf16_length(text) > MAX_TEXT_LENGTH:
@@ -339,9 +352,9 @@ class TelegramProvider:
                                'text': text, 'show_alert': show_alert, 'cache_time': 0})
 
     async def send_video(self, data, mime='video/mp4', caption='', filename='presence.mp4', *,
-                         reply_to_message_id=None, private_reply_to_user_id=None):
+                         reply_to_message_id=None, private_reply_to_user_id=None, group_chat_id=None):
         self._require_ready()
-        destination = self._destination(private_reply_to_user_id)
+        destination = self._destination(private_reply_to_user_id, group_chat_id)
         if mime != 'video/mp4' or not _mp4(data):
             raise TelegramError('Provide a complete MP4 video within 20 MB.')
         if not isinstance(caption, str) or _utf16_length(caption) > MAX_CAPTION_LENGTH:
@@ -355,9 +368,9 @@ class TelegramProvider:
         return self._sent(result, 'video', destination=destination)
 
     async def send_image(self, data, mime, caption='', filename='image.png', *, reply_to_message_id=None,
-                         private_reply_to_user_id=None):
+                         private_reply_to_user_id=None, group_chat_id=None):
         self._require_ready()
-        destination = self._destination(private_reply_to_user_id)
+        destination = self._destination(private_reply_to_user_id, group_chat_id)
         if not isinstance(caption, str) or _utf16_length(caption) > MAX_CAPTION_LENGTH:
             raise TelegramError('Telegram image captions must fit within 1024 characters.')
         if not isinstance(data, bytes) or not data or len(data) > MAX_DOCUMENT_BYTES:

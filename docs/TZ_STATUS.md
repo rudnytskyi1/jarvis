@@ -265,3 +265,30 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   Проверено: `pytest tests/test_overlay.py tests/test_hud_v2.py
   tests/test_overlay_followup.py tests/test_privacy_mode.py
   tests/test_barge_in.py -q` → 178 passed.
+
+## Telegram: доп. администраторы и назначения уведомлений (22.09.2026)
+
+- **TG-01 — доступ к `/tools` для названных аккаунтов: сделано.** Новое поле
+  `server.telegram.admin_user_ids` (`common/config.py`): аккаунты получают те
+  же права, что владелец хаба — панель в личном чате и в группе, все
+  возможности, личные уведомления; владелец остаётся единственным, кого
+  нельзя изменить. Право проверяется на каждый клик по конфигу, поэтому
+  удалённый из конфига аккаунт теряет панель сразу (`_hub_admin_now`).
+  На этом хабе в список внесены `8928749210`, `6617808228`, `1328190425`.
+  Проверено: `pytest tests/test_telegram_admin.py
+  tests/test_telegram_admin_state.py -q` → 41 passed (в полном прогоне
+  `pytest tests -q` → 4391 passed, 10 skipped; `ruff check .` и `mypy common`
+  чисто).
+- **TG-02 — «Private chat (everyone)»: сделано.** Назначение `owner` теперь
+  рассылает уведомление в личные чаты всех, у кого есть доступ
+  (`TelegramAdminState.private_recipients` → `PresenceAlerts._private_recipients`),
+  частичная доставка помечается `uncertain` и не повторяется. На этом хабе
+  получателей четверо (владелец + три админа). Проверено:
+  `pytest tests/test_presence_alerts.py -q` → 28 passed.
+- **TG-03 — группы в «Destination of notifications»: сделано.** `destination`
+  принимает `owner` или `group:<chat_id>`; хаб запоминает группы из апдейтов
+  (`TelegramChat._remember_chat`, максимум 20), панель показывает их
+  названиями, а доставка идёт явным `group_chat_id` (`hub/telegram.py`).
+  Группа заказчика `-1003570242441` («RowanAI Notifications», подтверждена
+  `getChat`) внесена в список. Проверено: `pytest tests/test_telegram_chat.py
+  tests/test_alert_rules.py -q` → 68 passed.

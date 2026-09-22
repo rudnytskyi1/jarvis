@@ -79,6 +79,64 @@ def callback(provider, token, *, sender=OWNER, chat=GROUP, message_id=None):
                 'from': {'id': BOT, 'is_bot': True}}}}
 
 
+def test_a_named_admin_gets_the_panel_and_the_groups_it_has_met(tmp_path):
+    """``admin_user_ids`` opens /tools; a known group becomes a destination."""
+    extra, notifications = 8928749210, -1003570242441
+
+    async def run():
+        state = TelegramAdminState(tmp_path / 'access.sqlite3', OWNER, [extra])
+        state.set_setting('chats', {str(notifications): {
+            'id': notifications, 'title': 'RowanAI Notifications', 'type': 'supergroup', 'seen': 1.0}})
+        provider, backend, now = Provider(), Backend(), [10.0]
+        admin = TelegramAdmin(provider, SimpleNamespace(control_user_id=OWNER,
+                                                        admin_user_ids=[extra], chat_id=GROUP),
+                              state, backend, clock=lambda: now[0])
+        admin.set_identity(BOT, 'RowanBot')
+        assert await admin.handle_update(message('/tools', sender=extra, chat=extra))
+        assert provider.sent, "a named admin opens the panel in their own chat"
+        await admin.handle_update(callback(provider, button(provider, 'Notifications'),
+                                           sender=extra, chat=extra))
+        await admin.handle_update(callback(provider, button(provider, 'New rule'),
+                                           sender=extra, chat=extra))
+        await admin.handle_update(callback(provider, button(provider, 'Destination'),
+                                           sender=extra, chat=extra))
+        labels = [item['text'] for row in provider.latest['reply_markup']['inline_keyboard']
+                  for item in row]
+        assert 'Private chat (everyone) · 2' in labels, labels
+        # The group the bot has met is offered by name, and it is what the rule
+        # stores when picked.
+        group_button = button(provider, 'RowanAI Notifications')
+        await admin.handle_update(callback(provider, group_button, sender=extra, chat=extra))
+        await admin.handle_update(callback(provider, button(provider, 'Save rule'),
+                                           sender=extra, chat=extra))
+        await admin.handle_update(callback(provider, button(provider, 'Confirm'),
+                                           sender=extra, chat=extra))
+        saved = next(call[1] for call in backend.calls if call[0] == 'alerts.create')
+        assert saved['destination'] == f'group:{notifications}'
+
+    asyncio.run(run())
+
+
+def test_the_owner_can_still_be_revoked_in_the_config(tmp_path):
+    """A named admin is a config fact, not a panel grant."""
+
+    async def run():
+        state = TelegramAdminState(tmp_path / 'access.sqlite3', OWNER, [8928749210])
+        provider, backend, now = Provider(), Backend(), [10.0]
+        cfg = SimpleNamespace(control_user_id=OWNER, admin_user_ids=[], chat_id=GROUP)
+        admin = TelegramAdmin(provider, cfg, state, backend, clock=lambda: now[0])
+        admin.set_identity(BOT, 'RowanBot')
+        # The owner is gone from the config, the extra admin is gone with it.
+        cfg.control_user_id = 1
+        # The command is still claimed (so the chat handler leaves it alone),
+        # but no panel is opened for either account.
+        await admin.handle_update(message('/tools', sender=OWNER))
+        await admin.handle_update(message('/tools', sender=8928749210, chat=8928749210))
+        assert not provider.sent, "the panel does not open for a revoked account"
+
+    asyncio.run(run())
+
+
 def test_panel_is_owner_only_and_exact_bot_command(tmp_path):
     async def run():
         admin, provider, _, state, _ = setup(tmp_path)

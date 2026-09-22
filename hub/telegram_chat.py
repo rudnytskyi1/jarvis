@@ -141,6 +141,43 @@ def _clip_text(text, maximum=4000):
     return raw[:maximum * 2].decode('utf-16-le', errors='ignore')
 
 
+def _update_chats(update):
+    """Every group chat one update carries (ТЗ F-702 destination list).
+
+    A Telegram bot cannot ask for the list of its groups, so the hub learns
+    them from the updates it receives: a message, being added to a group
+    (``my_chat_member``), an edit, or a button press. Private chats are not
+    collected here - the panel knows those accounts already.
+    """
+    if not isinstance(update, dict):
+        return []
+    sources = [update.get('message'), update.get('edited_message'),
+               update.get('channel_post'), update.get('my_chat_member')]
+    callback = update.get('callback_query')
+    if isinstance(callback, dict):
+        sources.append(callback.get('message'))
+    chats = []
+    for item in sources:
+        chat = item.get('chat') if isinstance(item, dict) else None
+        if isinstance(chat, dict) and chat.get('type') in {'group', 'supergroup'}:
+            chats.append(chat)
+    return chats
+
+
+def _chat_title(chat, fallback=''):
+    """A group name fit for a button: one line, no control characters."""
+    raw = str(chat.get('title') or fallback or chat.get('id') or '')
+    clean = ' '.join(''.join(ch if ch >= ' ' else ' ' for ch in raw).split())
+    return clean[:80]
+
+
+#: How often a known group's "seen" stamp is refreshed (seconds). The cap on
+#: the destination list drops the least recently used group, and this is the
+#: resolution of "recently": one settings write per group per hour, not one per
+#: message in the group.
+_CHAT_REFRESH_S = 3600.0
+
+
 class TelegramChat:
     def __init__(self, provider, cfg, reply, image_generator=None, image_store=None,
                  folder=Path('data/telegram'), *, control_reply=None, admin_handler=None, access=None):
@@ -440,6 +477,50 @@ class TelegramChat:
                               message['from']['id'], 'claimed'))
             return row.rowcount == 1
 
+    #: ТЗ F-702: how many groups the notification destination list remembers.
+    CHAT_LIMIT = 20
+
+    def _remember_chat(self, update):
+        """Remember a group the bot has met, so the panel can offer it.
+
+        The settings row grows only when a chat is new or its title changed,
+        and it is capped at :data:`CHAT_LIMIT` groups (oldest seen first out),
+        so a bot added to a hundred groups cannot grow one row without a bound.
+        """
+        if self.access is None:
+            return
+        chats = _update_chats(update)
+        if not chats:
+            return
+        known = self.access.get_setting('chats', {})
+        if not isinstance(known, dict):
+            known = {}
+        updated = dict(known)
+        changed = False
+        now = time.time()
+        for chat in chats:
+            chat_id, title = chat.get('id'), _chat_title(chat)
+            if not _integer(chat_id) or chat_id >= 0 or not title:
+                continue
+            key = str(chat_id)
+            entry = dict(updated.get(key) or {})
+            same = entry.get('title') == title and entry.get('type') == chat.get('type')
+            # "seen" is refreshed at most once an hour: enough for the cap to
+            # drop the least recently used group, without a write per message.
+            stale = now - float(entry.get('seen') or 0.0) >= _CHAT_REFRESH_S
+            if not same or stale:
+                entry.update(id=chat_id, title=title,
+                             type=str(chat.get('type') or 'group'), seen=now)
+                updated[key] = entry
+                changed = True
+        if len(updated) > self.CHAT_LIMIT:
+            order = sorted(updated.items(), key=lambda item: float((item[1] or {}).get('seen') or 0.0),
+                           reverse=True)
+            updated = dict(order[:self.CHAT_LIMIT])
+            changed = True
+        if changed:
+            self.access.set_setting('chats', updated)
+
     def _state(self, update_id, state):
         with self._db() as db:
             db.execute('UPDATE updates SET state=? WHERE update_id=?', (state, update_id))
@@ -570,6 +651,8 @@ class TelegramChat:
         async with self._process_lock:
             if update_id < await asyncio.to_thread(self._offset):
                 return False
+            # ТЗ F-702: the destination list learns every group the bot meets.
+            await asyncio.to_thread(self._remember_chat, update)
             if callable(self.admin_handler):
                 if not await asyncio.to_thread(self._claim_admin, update):
                     await asyncio.to_thread(self._advance, update_id)

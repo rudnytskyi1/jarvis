@@ -30,6 +30,58 @@ def test_rule_validation_is_strict(patch):
         validate_rule(patch)
 
 
+def test_a_known_group_destination_is_accepted():
+    """A rule may target any group the bot has met, not only the fixed one."""
+    rule = validate_rule({'destination': 'group:-1003570242441'})
+    assert rule['destination'] == 'group:-1003570242441'
+    with pytest.raises(ValueError):
+        validate_rule({'destination': 'group:not-a-number'})
+
+
+def test_private_chat_everyone_writes_to_each_account(tmp_path):
+    """ТЗ F-702: "Private chat (everyone)" - the owner and the named admins."""
+    async def run():
+        api = provider()
+        # The provider answers with the chat it was asked for, exactly as the
+        # real one does (an ack for a different chat is never a delivery).
+        async def send_image(data, mime, caption='', filename='', **kwargs):
+            return {'ok': True, 'chat_id': kwargs['private_reply_to_user_id'], 'message_id': 7}
+        api.send_image = AsyncMock(side_effect=send_image)
+        people = [123, 8928749210]
+        alerts = PresenceAlerts(tmp_path, lambda: api, lambda: None, 123, -456,
+                                get_private_recipients=lambda: people)
+        alerts.save_rule({'enabled': True, 'destination': 'owner', 'min_stable_s': 0})
+        alerts.start()
+        alerts.observe(persons=1, jpeg=b'jpeg')
+        await alerts.drain()
+        assert api.send_image.await_count == 2, "every account with access gets it"
+        assert {call.kwargs['private_reply_to_user_id'] for call in api.send_image.await_args_list} == set(people)
+        assert alerts.status()['deliveries'][0]['status'] == 'sent'
+        await alerts.close()
+    asyncio.run(run())
+
+
+def test_an_unconfirmed_recipient_stops_the_rest(tmp_path):
+    """A partial fan-out is reported as uncertain and never retried."""
+    async def run():
+        api = provider()
+        api.send_image = AsyncMock(side_effect=[
+            {'ok': True, 'chat_id': 123, 'message_id': 7},
+            {'ok': True, 'chat_id': 123},
+        ])
+        alerts = PresenceAlerts(tmp_path, lambda: api, lambda: None, 123, -456,
+                                get_private_recipients=lambda: [123, 8928749210])
+        alerts.save_rule({'enabled': True, 'destination': 'owner', 'min_stable_s': 0})
+        alerts.start()
+        alerts.observe(persons=1, jpeg=b'jpeg')
+        await alerts.drain()
+        assert api.send_image.await_count == 2
+        delivery = alerts.status()['deliveries'][0]
+        assert delivery['status'] == 'uncertain' and '1 of 2' in delivery['detail']
+        await alerts.close()
+    asyncio.run(run())
+
+
 def test_rules_are_disabled_by_default_and_patch_survives_restart(tmp_path):
     async def run():
         alerts = engine(tmp_path)
@@ -201,7 +253,9 @@ def test_video_uses_clip_transport_and_fixed_group_destination(tmp_path):
         room._request_camera_clip.assert_awaited_once()
         api.send_video.assert_awaited_once()
         assert api.send_video.call_args.args[:2] == (b'mp4', 'video/mp4')
-        assert api.send_video.call_args.kwargs == {}
+        # The group is named explicitly since a rule may target any group the
+        # bot has met (`group:<id>`), not only the one in the config.
+        assert api.send_video.call_args.kwargs == {'group_chat_id': -456}
         assert alerts.status()['deliveries'][0]['status'] == 'sent'
         await alerts.close()
     asyncio.run(run())

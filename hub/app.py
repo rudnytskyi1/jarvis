@@ -2056,7 +2056,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     cfg = get_config()
     if cfg.server.telegram.control_user_id:
         _telegram_access = await asyncio.to_thread(TelegramAdminState,
-            REPO_ROOT / 'data' / 'telegram' / 'admin.sqlite3', cfg.server.telegram.control_user_id)
+            REPO_ROOT / 'data' / 'telegram' / 'admin.sqlite3', cfg.server.telegram.control_user_id,
+            getattr(cfg.server.telegram, 'admin_user_ids', ()) or ())
         await asyncio.to_thread(restore_overrides, cfg, _telegram_access)
     log.info("Starting the Jarvis brain: %s:%s", cfg.server.host, cfg.server.port)
 
@@ -2138,7 +2139,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _presence_alerts = PresenceAlerts(REPO_ROOT / 'data' / 'telegram' / 'alerts',
             get_provider=lambda: _telegram, get_room=_telegram_room,
             owner_id=cfg.server.telegram.control_user_id, group_id=cfg.server.telegram.chat_id,
-            get_home=_alert_home)
+            get_home=_alert_home,
+            # ТЗ F-702: "Private chat (everyone)" — все, у кого есть доступ.
+            get_private_recipients=lambda: _telegram_access.private_recipients())
         _presence_alerts.start()
         backend = AdminBackend(cfg, _telegram_access, runtime=_admin_runtime, get_room=_telegram_room,
             get_alerts=lambda: _presence_alerts, rename_profile=_admin_rename_profile,

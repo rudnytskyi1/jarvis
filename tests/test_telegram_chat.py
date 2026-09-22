@@ -12,6 +12,7 @@ from PIL import Image
 
 from hub.image_generation import ImageStore, decode_image
 from hub.telegram import TelegramError
+from hub.telegram_admin_state import TelegramAdminState
 from hub.telegram_chat import TelegramChat, addressed_text, current_image_request
 from hub.untrusted import strip as strip_untrusted
 
@@ -55,6 +56,37 @@ def png():
 def image_generator():
     return SimpleNamespace(check_ready=Mock(), cfg=SimpleNamespace(model='gemini-3.1-flash-image'),
                            generate=AsyncMock(return_value=decode_image(png(), 'image/png')))
+
+
+def test_a_group_the_bot_meets_becomes_a_notification_destination(tmp_path):
+    """ТЗ F-702: the panel can only offer groups the bot has actually seen."""
+    store = TelegramAdminState(tmp_path / 'admin.sqlite3', 7)
+    chat = TelegramChat(provider(), SimpleNamespace(chat_id=-100, poll_timeout_s=20),
+                        AsyncMock(return_value='Hello.'), None, None, tmp_path / 'telegram',
+                        access=store)
+    chat._remember_chat({'message': {'chat': {'id': -1003570242441, 'type': 'supergroup',
+                                              'title': 'RowanAI Notifications'}}})
+    known = store.get_setting('chats')['-1003570242441']
+    assert (known['id'], known['title'], known['type']) == (
+        -1003570242441, 'RowanAI Notifications', 'supergroup')
+    assert known['seen'] > 0
+    # A private chat is not a destination, and a title is one clean line.
+    chat._remember_chat({'message': {'chat': {'id': 42, 'type': 'private', 'title': 'Anton'}}})
+    chat._remember_chat({'my_chat_member': {'chat': {'id': -1003570242441, 'type': 'supergroup',
+                                                     'title': 'RowanAI\n  Notifications'}}})
+    assert list(store.get_setting('chats')) == ['-1003570242441']
+    assert store.get_setting('chats')['-1003570242441']['title'] == 'RowanAI Notifications'
+
+
+def test_the_destination_list_is_capped_and_forgets_the_oldest_group(tmp_path):
+    store = TelegramAdminState(tmp_path / 'admin.sqlite3', 7)
+    chat = TelegramChat(provider(), SimpleNamespace(chat_id=-100), AsyncMock(), None, None,
+                        tmp_path / 'telegram', access=store)
+    chat.CHAT_LIMIT = 2
+    for index in range(3):
+        chat._remember_chat({'message': {'chat': {'id': -100 - index, 'type': 'supergroup',
+                                                  'title': f'Group {index}'}}})
+    assert set(store.get_setting('chats')) == {'-101', '-102'}
 
 
 def test_utf16_mentions_after_emoji_and_caption_entities():
