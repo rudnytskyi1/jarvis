@@ -277,7 +277,14 @@ class PresenceAlerts:
         if not self._closed and (self._worker is None or self._worker.done()):
             self._worker = asyncio.create_task(self._run(), name='presence-alerts')
 
-    def observe(self, *, persons=None, names=None, unknown_count=None, jpeg=None, source_id='', observed_at=None):
+    def observe(self, *, persons=None, names=None, unknown_count=None, jpeg=None, source_id='',
+                observed_at=None, home_id=''):
+        """A fresh look at the room: who is in frame and what they look like.
+
+        ``home_id`` is the room this look belongs to (ТЗ F-701/F-702). A rule
+        that names a home fires only for its own rooms, so an event that carried
+        no home would silently never match such a rule.
+        """
         if self._closed or self._worker is None or self._worker.done():
             return False
         now = time.time()
@@ -295,7 +302,7 @@ class PresenceAlerts:
         if jpeg:
             self._latest_photo = (timestamp, source_id, jpeg)
         event = dict(at=float(timestamp), persons=persons, names=names, unknown_count=unknown_count,
-                     jpeg=jpeg, source_id=source_id, kind='presence', home_id='',
+                     jpeg=jpeg, source_id=source_id, kind='presence', home_id=str(home_id)[:64],
                      label='', zone='', confidence=None)
         if self._queue.full():
             self.dropped += 1

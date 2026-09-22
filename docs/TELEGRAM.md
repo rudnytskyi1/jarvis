@@ -18,12 +18,24 @@ The token is encrypted for the current Windows account in
 process; neither the room client nor a public client distribution needs it.
 Never put the token in YAML, prompts, logs or the client package.
 
+## Where a notification can go
+
+A notification rule (owner panel, **Notifications**) writes either to the private
+chats of everyone with access (**Private chat (everyone)**), to the configured
+group above, or to any group the bot has been added to. A bot cannot enumerate
+its groups, so the hub remembers each group it receives an update from (at most
+twenty) and offers them by title. Telegram forbids a bot from writing first: a
+person must send the bot one message before private notifications can reach
+them. The full Russian reference for every Telegram setting is
+`docs/TELEGRAM_SETTINGS.md`.
+
 ```yaml
 server:
   telegram:
     enabled: true
     chat_id: -1234567890 # replace with the intended group's numeric ID
     control_user_id: null # optional positive USER ID, never a group/chat display name
+    admin_user_ids: []    # extra USER IDs with the hub admin's own rights (/tools)
     api_key_env: TELEGRAM_BOT_TOKEN
     timeout_s: 30
     respond_to_mentions: false

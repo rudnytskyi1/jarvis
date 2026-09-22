@@ -205,6 +205,15 @@ def _running(task):
     return task is not None and not task.done()
 
 
+def _room_name(room) -> str:
+    """How this room is called: its workplace name, else its client id."""
+    name = str(getattr(room, 'workplace_name', '') or '').strip()
+    if name:
+        return name
+    session = getattr(room, 'session', None)
+    return str(getattr(session, 'client_id', '') or 'this room')
+
+
 def _note_untrusted(facade, tool, result):
     """Hold one piece of outside text in this turn, for the D-09 check (F-411).
 
@@ -352,9 +361,14 @@ class TelegramController:
             return 'Please describe the action you want Rowan to perform.'
         message = copy.deepcopy(message)
         get_room = (lambda: self.select_room(message)) if self.select_room is not None else self.get_room
-        room = get_room()
-        unavailable = ('not selected; choose /tools → Места и камеры'
-                       if self.select_room is not None and room is None else 'offline')
+        # A selector may answer with a sentence instead of a room: "the computer
+        # 'buro' is not connected" is what a request that named an offline PC
+        # must hear, not the generic "not selected".
+        choice = get_room()
+        room = None if isinstance(choice, str) else choice
+        unavailable = (choice if isinstance(choice, str) else
+                       ('not selected; choose /tools → Места и камеры'
+                        if self.select_room is not None and room is None else 'offline'))
         if not _connected(room):
             room = None
         elif room_busy(room):
@@ -438,6 +452,13 @@ class TelegramController:
                     prompt += (f'\nThe room PC is currently {unavailable}. Continue normal conversation and server-side '
                         'image creation/editing, memory and Telegram delivery. Room PC actions, live camera and '
                         'screen capture cannot run until it reconnects; never claim they succeeded.')
+                else:
+                    # ТЗ F-701: the turn already knows which computer it acts on,
+                    # whether the owner named it in this message or picked it in
+                    # /tools, so it must not ask for a selection again.
+                    prompt += ('\nThe room PC for this request is ' + _room_name(room) +
+                               '. Its camera and screen belong to that computer; this request needs no '
+                               '/tools selection. Other computers are out of reach this turn.')
                 if isinstance(message.get('photo'), list) and message['photo']:
                     prompt += ('\nThe current message has an attached photo. For a requested image edit, '
                         'generate_image uses that photo as source=last; do not substitute a room camera image. '

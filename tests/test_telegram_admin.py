@@ -79,6 +79,80 @@ def callback(provider, token, *, sender=OWNER, chat=GROUP, message_id=None):
                 'from': {'id': BOT, 'is_bot': True}}}}
 
 
+def test_the_workplace_picker_offers_only_what_is_connected(tmp_path):
+    """A rule bound to a switched-off PC would look armed and never fire."""
+    connected, offline = 'buro', 'dorm'
+    items = [{'id': connected, 'name': 'buro', 'connected': True, 'home_id': 'livingroom'},
+             {'id': offline, 'name': 'DormPC', 'connected': False, 'home_id': ''}]
+
+    async def run():
+        state = TelegramAdminState(tmp_path / 'access.sqlite3', OWNER)
+        provider, now = Provider(), [10.0]
+
+        def shown():
+            return [item['text'] for row in provider.latest['reply_markup']['inline_keyboard']
+                    for item in row]
+
+        async def backend(action, payload, actor_id):
+            if action == 'workplaces.list':
+                return {'ok': True, 'items': deepcopy(items)}
+            return {'ok': True, 'items': []}
+
+        admin = TelegramAdmin(provider,
+                              SimpleNamespace(control_user_id=OWNER, chat_id=GROUP,
+                                              homes=[SimpleNamespace(home_id='flat', name='Flat')]),
+                              state, backend, clock=lambda: now[0])
+        admin.set_identity(BOT, 'RowanBot')
+        await admin.handle_update(message('/tools'))
+        await admin.handle_update(callback(provider, button(provider, 'Notifications')))
+        await admin.handle_update(callback(provider, button(provider, 'New rule')))
+        await admin.handle_update(callback(provider, button(provider, 'Workplace and camera')))
+        up = shown()
+        assert up[0] == 'Any workplace' and connected in up
+        assert not any('DormPC' in label for label in up), up
+
+        # Pick the one that is up, then bring it down: the choice stays reachable
+        # but is marked, so the draft is never silently pointing nowhere.
+        await admin.handle_update(callback(provider, button(provider, connected)))
+        items[0]['connected'] = False
+        items[1]['connected'] = True
+        await admin.handle_update(callback(provider, button(provider, 'Workplace and camera')))
+        down = shown()
+        assert 'Offline · buro' in down and 'DormPC' in down, down
+    asyncio.run(run())
+
+
+def test_the_home_picker_lists_real_homes_and_every_home(tmp_path):
+    """ТЗ F-701: a home owns the room; it is chosen, not typed."""
+    async def run():
+        state = TelegramAdminState(tmp_path / 'access.sqlite3', OWNER)
+        provider, now = Provider(), [10.0]
+
+        async def backend(action, payload, actor_id):
+            if action == 'workplaces.list':
+                return {'ok': True, 'items': [{'id': 'buro', 'name': 'buro', 'connected': True,
+                                               'home_id': 'livingroom'}]}
+            return {'ok': True, 'items': []}
+
+        admin = TelegramAdmin(provider,
+                              SimpleNamespace(control_user_id=OWNER, chat_id=GROUP,
+                                              homes=[SimpleNamespace(home_id='flat', name='Flat')]),
+                              state, backend, clock=lambda: now[0])
+        admin.set_identity(BOT, 'RowanBot')
+        await admin.handle_update(message('/tools'))
+        await admin.handle_update(callback(provider, button(provider, 'Notifications')))
+        await admin.handle_update(callback(provider, button(provider, 'New rule')))
+        await admin.handle_update(callback(provider, button(provider, 'Home')))
+        labels = [item['text'] for row in provider.latest['reply_markup']['inline_keyboard']
+                  for item in row]
+        assert labels[0] == 'Every home'
+        assert 'Flat' in labels and 'livingroom' in labels, labels
+        assert 'the room that owns people' in provider.latest['text']
+        await admin.handle_update(callback(provider, button(provider, 'Flat')))
+        assert admin._panels[(OWNER, GROUP)].draft['home_id'] == 'flat'
+    asyncio.run(run())
+
+
 def test_a_named_admin_gets_the_panel_and_the_groups_it_has_met(tmp_path):
     """``admin_user_ids`` opens /tools; a known group becomes a destination."""
     extra, notifications = 8928749210, -1003570242441

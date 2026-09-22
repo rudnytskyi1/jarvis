@@ -1444,9 +1444,64 @@ def _alert_home(home_id: str) -> dict[str, Any]:
 
 
 def _selected_telegram_room(message):
+    """The room a Telegram turn acts on (ТЗ F-701).
+
+    A request that names a computer - "photo from buro", "скриншот с AntоnDorm"
+    - routes that turn to it, without touching the saved selection. Naming one
+    that is offline answers with the reason instead of quietly acting on another
+    room; naming nobody keeps the selection exactly as before.
+    """
+    named = _named_workplace(str(message.get('text') or message.get('caption') or ''))
+    if named:
+        if _telegram_room(named) is None:
+            return f'the computer "{_workplace_label(named)}" is not connected'
+        return _telegram_room(named)
     key = f"workplace:{message['chat']['id']}:{message['from']['id']}"
     selected = _telegram_access.get_setting(key) if _telegram_access else None
     return _telegram_room(selected) if selected else _telegram_room()
+
+
+def _fold_place(value: Any) -> str:
+    """A place name reduced to letters and digits, for matching a request."""
+    return ''.join(ch for ch in str(value or '').casefold() if ch.isalnum())
+
+
+def _workplace_label(identifier: str) -> str:
+    """How one workplace is called in a message to the owner."""
+    wanted = str(identifier or '')
+    for row in _workplaces():
+        if str(row.get('id') or '') == wanted:
+            return str(row.get('name') or wanted)
+    return wanted
+
+
+def _named_workplace(text: str) -> str:
+    """The workplace a request names, or ``''`` when it names none.
+
+    The owner should not have to preselect a computer before asking for its
+    camera: the name in the sentence is the selection for that one request.
+    Spacing and case are ignored ("AntonDorm" == "anton dorm"), the workplace
+    id, its friendly name and its camera name all match, and the earliest
+    mention wins so "from buro, not antondorm" is not ambiguous.
+    """
+    haystack = _fold_place(text)
+    if not haystack:
+        return ''
+    found: tuple[int, str] | None = None
+    for row in _workplaces():
+        identifier = str(row.get('id') or '')
+        if not identifier:
+            continue
+        for candidate in (identifier, row.get('name'), row.get('camera_name')):
+            token = _fold_place(candidate)
+            if len(token) < 3:
+                continue
+            index = haystack.find(token)
+            if index < 0:
+                continue
+            if found is None or index < found[0]:
+                found = (index, identifier)
+    return found[1] if found else ''
 
 
 async def _admin_rename_profile(old, new):
@@ -4427,7 +4482,8 @@ class Connection(CameraClipReceiver):
             self.presence.note_persons(persons)
             return
         if _presence_alerts is not None and self.session is not None:
-            _presence_alerts.observe(persons=persons, source_id=self.session.client_id)
+            _presence_alerts.observe(persons=persons, source_id=self.session.client_id,
+                                     home_id=getattr(self, 'home_id', '') or '')
             # ТЗ F-311/F-702: появившийся объект внимания (кот, посылка) — это
             # событие правила, а не только счётчик в кадре. Событие рождается на
             # ПЕРЕХОДЕ (метки не было — метка появилась), иначе правило сработало
@@ -4634,7 +4690,8 @@ class Connection(CameraClipReceiver):
             source=source,
         )
         if source == SOURCE_CAMERA and _presence_alerts is not None and self.session is not None:
-            _presence_alerts.observe(jpeg=frame.jpeg, source_id=self.session.client_id)
+            _presence_alerts.observe(jpeg=frame.jpeg, source_id=self.session.client_id,
+                                     home_id=getattr(self, 'home_id', '') or '')
         if source == SOURCE_CAMERA and _training_archive is not None:
             # Keep received originals even when face inference is busy or a
             # stale frame cannot safely receive a person's identity label.
@@ -6769,7 +6826,8 @@ class Connection(CameraClipReceiver):
                         _presence_alerts.observe(names=[item['name'] for item in direct if item.get('name')],
                             unknown_count=sum(not item.get('name') for item in resolved if not item.get('stale')),
                             jpeg=frame.jpeg, source_id=self.session.client_id,
-                            observed_at=time.time() - max(0, time.monotonic() - received_at))
+                            observed_at=time.time() - max(0, time.monotonic() - received_at),
+                            home_id=getattr(self, 'home_id', '') or '')
                     best_named, max_unknown, any_face = {}, 0, False
                     if getattr(self.cfg.server.face, 'appearance_enabled', True):
                         observations = []
@@ -6806,7 +6864,8 @@ class Connection(CameraClipReceiver):
                         _presence_alerts.observe(names=[name for name, _ in faces if name],
                             unknown_count=sum(not name for name, _ in faces), jpeg=frame.jpeg,
                             source_id=self.session.client_id,
-                            observed_at=time.time() - max(0, time.monotonic() - received_at))
+                            observed_at=time.time() - max(0, time.monotonic() - received_at),
+                            home_id=getattr(self, 'home_id', '') or '')
                 if not faces:
                     continue
                 any_face = True

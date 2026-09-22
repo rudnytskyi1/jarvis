@@ -38,6 +38,23 @@ def test_a_known_group_destination_is_accepted():
         validate_rule({'destination': 'group:not-a-number'})
 
 
+def test_a_rule_that_names_a_home_only_fires_for_that_home(tmp_path):
+    """ТЗ F-701/F-702: a room's look must carry the room, or the rule is deaf."""
+    async def run():
+        api = provider()
+        alerts = engine(tmp_path, api)
+        alerts.save_rule({'enabled': True, 'home_id': 'livingroom', 'min_stable_s': 0})
+        alerts.start()
+        alerts.observe(persons=1, jpeg=b'jpeg', home_id='buro')
+        await alerts.drain()
+        api.send_image.assert_not_awaited()
+        alerts.observe(persons=1, jpeg=b'jpeg', home_id='livingroom')
+        await alerts.drain()
+        api.send_image.assert_awaited_once()
+        await alerts.close()
+    asyncio.run(run())
+
+
 def test_private_chat_everyone_writes_to_each_account(tmp_path):
     """ТЗ F-702: "Private chat (everyone)" - the owner and the named admins."""
     async def run():

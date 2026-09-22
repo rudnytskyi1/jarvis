@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from datetime import datetime
 
 import pytest
 
@@ -143,7 +144,10 @@ def test_the_events_reach_the_database_of_the_home(hub_db):
 
 def test_the_day_of_a_home_is_read_oldest_first_and_can_be_filtered(hub_db):
     log = PresenceLog(hub_db)
-    start = time.time()
+    # A fixed midday anchor, not "now": the day window is what this test checks,
+    # and a run at 23:55 used to push the "+600 s" event past midnight, where the
+    # query for today is right to ignore it.
+    start = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
     log.record(PresenceEvent(kind=KIND_ENTERED, home_id="livingroom", person_id="p-max",
                              track_id="a:1", ts=start, zone="дверь"))
     log.record(PresenceEvent(kind=KIND_ZONE, home_id="livingroom", person_id="p-max",

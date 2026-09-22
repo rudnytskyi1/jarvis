@@ -36,7 +36,10 @@ _ALERT_FIELDS = {
     'destination': ('Destination', ('owner', 'group')),
     # ТЗ F-702: канал доставки — Telegram, пуш на телефон или подпись в HUD.
     'channel': ('Delivery channel', ('telegram', 'push', 'hud')),
-    'home_id': ('Home id (empty = every home)', 'str'),
+    # ТЗ F-701/F-702: «дом» — это комната, которая владеет людьми, памятью и
+    # правилами; компьютер внутри неё — рабочее место. Поле выбирается из
+    # настоящих домов, а не вводится строкой.
+    'home_id': ('Home', 'home'),
     'cooldown_s': ('Notification cooldown, seconds', 'float'),
     'min_stable_s': ('Stable presence, seconds', 'float'),
     'absence_s': ('Absence before a new entry, seconds', 'float'),
@@ -199,6 +202,32 @@ class TelegramAdmin:
         if key == 'destination':
             return self._destination_label(value)
         return rule_value(key, value)
+
+    def _home_options(self) -> dict:
+        """The homes this hub serves, as ``{'<home_id>': 'label'}``.
+
+        A home (ТЗ F-701) is the room that owns people, memories and rules; a
+        workplace is one computer inside it. Only homes the owner actually has
+        are offered: the ones the config names and the ones the connected
+        computers are bound to. The database keeps test homes from the earlier
+        smoke runs, and those have no business in a picker.
+        """
+        named: dict[str, str] = {}
+        for home in getattr(self.cfg, 'homes', None) or []:
+            home_id = str(getattr(home, 'home_id', '') or '').strip()
+            if home_id:
+                named[home_id] = str(getattr(home, 'name', '') or home_id)
+        return named
+
+    async def _homes_of_workplaces(self, panel) -> dict:
+        """Homes the connected computers are bound to (ТЗ F-701)."""
+        named: dict[str, str] = {}
+        result = await self._backend(panel, 'workplaces.list')
+        for item in (result or {}).get('items', []) if isinstance(result, dict) else []:
+            home_id = str(item.get('home_id') or '').strip()
+            if home_id:
+                named.setdefault(home_id, home_id)
+        return named
 
     def _allowed_sender(self, sender):
         """A human account allowed to use the panel: hub admin or home owner."""
@@ -723,9 +752,30 @@ class TelegramAdmin:
                 text = label
                 if value_type == 'workplace':
                     result = await self._backend(panel, 'workplaces.list')
+                    items = result.get('items', []) if isinstance(result, dict) else []
                     rows = [[button('Any workplace', kind='draft', key=key, value='')]]
-                    for item in result.get('items', []):
-                        rows.append([button(item.get('name') or item['id'], kind='draft', key=key, value=item['id'])])
+                    # Only what is connected right now: a rule bound to a PC that
+                    # is switched off would look armed and be unable to fire. A
+                    # previously chosen one stays reachable, marked as offline.
+                    current = str(panel.draft.get(key) or '')
+                    for item in items:
+                        if item.get('connected'):
+                            rows.append([button(item.get('name') or item['id'], kind='draft',
+                                                key=key, value=item['id'])])
+                    for item in items:
+                        if str(item.get('id')) == current and not item.get('connected'):
+                            rows.append([button('Offline · ' + str(item.get('name') or item['id']),
+                                                kind='draft', key=key, value=item['id'])])
+                    if not any(item.get('connected') for item in items):
+                        text += '\n\nNo computer is connected right now; a rule that names one will wait for it.'
+                    rows.append(self._back(panel, 'alert_draft'))
+                elif value_type == 'home':
+                    named = {**self._home_options(), **(await self._homes_of_workplaces(panel))}
+                    rows = [[button('Every home', kind='draft', key=key, value='')]]
+                    for home_id, label in sorted(named.items()):
+                        rows.append([button(label, kind='draft', key=key, value=home_id)])
+                    text += ('\n\nA home is the room that owns people, memories and rules '
+                             '(ТЗ F-701); a workplace is one computer inside it.')
                     rows.append(self._back(panel, 'alert_draft'))
                 elif isinstance(value_type, tuple):
                     rows = [[button(self._field_label(key, value), kind='draft', key=key, value=value)]
