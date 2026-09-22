@@ -164,6 +164,10 @@ def test_a_connection_routes_its_jobs_under_its_own_room(monkeypatch):
 def test_a_connection_without_a_room_still_gets_a_slot(monkeypatch):
     recording = _RecordingQueue()
     monkeypatch.setattr(hub_app, "_gpu", recording)
+    # ``default_home_id`` reads the live config's ``homes`` list; the owner's
+    # config names a room, so the test states the "no rooms" case explicitly
+    # instead of inheriting whatever an earlier test left behind.
+    monkeypatch.setattr(hub_app, "_config", _config())
     connection = hub_app.Connection.__new__(hub_app.Connection)
 
     async def job():
