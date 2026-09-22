@@ -61,6 +61,16 @@ from typing import Any
 from client.body_crops import CropSchedule, encode_crop
 from client.privacy import PrivacyMode
 from client.tracking import TrackRegistry, write_tracker_config
+from common.attention_objects import attention_group
+from common.frame_zones import (
+    FrameZone,
+    mask_polygons,
+    masked_at,
+    masks_rev,
+    parse_zones,
+    zone_at,
+    zones_rev,
+)
 from common.ids import new_ulid
 from common.protocol import (
     CAMERA_BURST_MAX,
@@ -72,6 +82,7 @@ from common.protocol import (
     MSG_CAMERA_FRAME,
     MSG_CAMERA_REQUEST,
     MSG_CAMERA_STATE,
+    MSG_OBJECT_EVENT,
     MSG_TRACKS,
 )
 
@@ -120,6 +131,7 @@ SendBytes = Callable[[bytes], Awaitable[None]]
 
 __all__ = [
     "MSG_CAMERA_STATE",
+    "MSG_OBJECT_EVENT",
     "MSG_TRACKS",
     "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
@@ -234,6 +246,10 @@ class CameraService:
         #: ТЗ F-303: пока privacy-режим включён, кадры не уходят вообще —
         #: проверяется в каждой точке, где клиент отдаёт картинку.
         self._privacy_mode = PrivacyMode(str(_attr(cfg_camera, 'language', 'en') or 'en'))
+        #: ТЗ F-309: зоны кадра дома. Маска закрашивается ЗДЕСЬ, до JPEG,
+        #: поэтому кадр уходит в хаб уже без неё; хаб сверяет отпечаток масок
+        #: (``zones_rev`` в заголовке) со своим конфигом.
+        self._zones: list[FrameZone] = parse_zones(_attr(cfg_camera, 'zones', None))
         self.model_name = str(_attr(cfg_camera, "model", "yolo11n.pt") or "yolo11n.pt")
         self.face_check_interval_s = max(
             0.5, _as_float(_attr(cfg_camera, "face_check_interval_s", 0.5), 0.5)
@@ -279,12 +295,30 @@ class CameraService:
         self._detect_errors = 0
         self._send_errors = 0
         self._frame_seq = 0
+        #: ТЗ F-311: (группа, зона) объектов внимания, о которых комната уже
+        #: сказала хабу. Событие рождается на ПЕРЕХОДЕ, иначе «посылка у
+        #: двери» приходило бы каждые полсекунды, пока посылка стоит.
+        self._attention_seen: set[tuple[str, str]] = set()
+        #: Находки внимания последнего кадра (ТЗ F-311): их читает
+        #: ``_publish_attention`` сразу после ``_publish_state``.
+        self._attention_found: list[dict[str, Any]] = []
         self._sent_state: tuple[int, tuple[tuple[str, int], ...]] | None = None
         self._sent_state_at = 0.0
         self._last_presence_push = 0.0
+        #: ТЗ F-306: необязательный слушатель кадров (жесты руки). Он получает
+        #: кадр ПОСЛЕ отправки и не может ни задержать, ни сломать камеру.
+        self._on_frame: Any = None
         #: ``event_id`` of the request being answered (ТЗ 4.5); empty for an
         #: unsolicited presence push, which mints its own id.
         self._request_event_id = ''
+
+    def set_frame_listener(self, listener: Any) -> None:
+        """Подписаться на каждый обработанный кадр (ТЗ F-306: жесты руки).
+
+        Вызывается из потока YOLO, поэтому обработчик обязан быть быстрым и
+        не бросать исключений: любая его ошибка глушится (см. `_infer_loop`).
+        """
+        self._on_frame = listener
 
     # ------------------------------------------------------------------
     # state
@@ -314,6 +348,39 @@ class CameraService:
     @privacy.setter
     def privacy(self, mode: PrivacyMode) -> None:
         self._privacy_mode = mode
+
+    # ------------------------------------------------------------------
+    # frame zones (ТЗ F-309)
+    # ------------------------------------------------------------------
+    @property
+    def zones(self) -> list[FrameZone]:
+        """Зоны кадра, которые комната сейчас применяет (ТЗ F-309)."""
+        return list(getattr(self, "_zones", ()))
+
+    @property
+    def masked_rev(self) -> str:
+        """Отпечаток масок этого клиента; ``""`` — масок нет.
+
+        Именно его хаб сверяет со своим конфигом: кадр считается
+        замаскированным, только если комната закрасила те же области.
+        """
+        return masks_rev(getattr(self, "_zones", ()))
+
+    def set_zones(self, raw: Any) -> bool:
+        """Зоны кадра от хаба (``config_update``, ТЗ F-309).
+
+        :returns: ``True``, если набор зон реально изменился (тогда следующий
+            кадр уже понесёт новый отпечаток масок и хаб не откажет).
+        """
+        fresh = parse_zones(raw)
+        current = list(getattr(self, "_zones", ()))
+        if zones_rev(fresh) == zones_rev(current):
+            return False
+        self._zones = fresh
+        masks = [zone for zone in fresh if zone.mask]
+        log.info("Camera frame zones updated: %d zone(s), %d mask(s), rev %s",
+                 len(fresh), len(masks), self.masked_rev or "-")
+        return True
 
     @property
     def running(self) -> bool:
@@ -887,8 +954,17 @@ class CameraService:
                     self._inferred_count += 1
                     self._cache_detection(frame, frame_ts)
                     self._publish_state(persons, objects)
+                    self._publish_attention(getattr(self, '_attention_found', []))
                     self._publish_tracks()
                     self._publish_body_crops(frame)
+                    listener = getattr(self, '_on_frame', None)
+                    if listener is not None:
+                        # ТЗ F-306: жесты руки считаются на этом же кадре, но их
+                        # ошибка не имеет права уронить камеру или ход.
+                        try:
+                            listener(frame)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("Frame listener failed (%s)", exc)
                     if persons >= 1:
                         if self._frame_recorder is not None:
                             self._frame_recorder.submit(frame, time.time() - (time.monotonic() - frame_ts),
@@ -901,8 +977,16 @@ class CameraService:
             if remaining > 0:
                 self._stop_event.wait(remaining)
 
-    def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int]]:
-        """Count people and objects in one frame by YOLO class name."""
+    def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int], list[dict[str, Any]]]:
+        """Count people and objects in one frame by YOLO class name.
+
+        Возвращает ещё и объекты внимания (ТЗ F-311) с зоной кадра: ``label``
+        — каноническая группа (кошка/собака/посылка), ``zone`` — имя зоны
+        дома, в которую попал центр находки. Объект, попавший в область «не
+        анализировать» (F-309), сюда не попадает: маску закрашивают, чтобы её
+        не смотрели, и сообщать о находке внутри неё было бы тем же
+        смотрением, только словами.
+        """
         tracker = getattr(self, 'tracker_path', None) or str(
             Path(__file__).with_name('room-tracker.yaml'))
         results = model.track(
@@ -917,6 +1001,7 @@ class CameraService:
         )
         counts: dict[str, int] = {}
         detections = []
+        attention: list[dict[str, Any]] = []
         for result in results or []:
             names = getattr(result, "names", None) or {}
             boxes = getattr(result, "boxes", None)
@@ -944,6 +1029,17 @@ class CameraService:
                         'bbox': [max(0., min(1., float(v))) for v in positions[box_index]],
                         'conf': float(confidence),
                     })
+                    continue
+                group = attention_group(label)
+                if not group or box_index >= len(positions):
+                    continue
+                x1, y1, x2, y2 = (max(0., min(1., float(v))) for v in positions[box_index][:4])
+                centre = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                zones = getattr(self, '_zones', ())
+                if masked_at(zones, *centre):
+                    continue
+                attention.append({'label': group, 'zone': zone_at(zones, *centre),
+                                  'conf': float(confidence)})
         # ТЗ F-201: the registry keeps the id of a person who stepped out of
         # the frame for thirty seconds, so coming back is a re-association.
         self._track_reports = self.tracks.observe(detections, now=time.monotonic())
@@ -951,6 +1047,10 @@ class CameraService:
                          'box': [float(value) for value in report.bbox]}
                         for report in self._track_reports]
         persons = counts.pop("person", 0)
+        # ТЗ F-311: находки внимания читает `_publish_attention`; отдельным
+        # полем, а не третьим значением, чтобы `_detect` остался тем же
+        # вызовом, что и раньше (клиенты и тесты зовут его как пару).
+        self._attention_found = attention
         return int(persons), counts
 
     def _report_performance(self):
@@ -1059,6 +1159,51 @@ class CameraService:
         except Exception as exc:  # noqa: BLE001 - a full buffer is not a crash
             log.debug("Could not buffer the unsent %s (%s)", payload.get("type"), exc)
 
+    def _publish_attention(self, attention: list[dict[str, Any]]) -> None:
+        """ТЗ F-311: сказать хабу о ПОЯВИВШЕМСЯ объекте внимания и его зоне.
+
+        Событие рождается на переходе «пары (объект, зона) не было — пара
+        появилась», поэтому правило дома не срабатывает каждые полсекунды.
+        Комната не выдумывает зону: её посчитал `_detect` по полигонам дома
+        (F-309), а объект, попавший в маску, сюда вообще не доходит.
+        """
+        if not self.privacy.allows_frames:
+            # ТЗ F-303: приватный режим — камера не смотрит, и событий нет.
+            return
+        try:
+            current = {(str(item.get('label') or ''), str(item.get('zone') or ''))
+                       for item in attention or [] if str(item.get('label') or '')}
+        except (TypeError, AttributeError):
+            return
+        previous = getattr(self, '_attention_seen', set())
+        self._attention_seen = current
+        for item in attention or []:
+            label = str(item.get('label') or '')
+            key = (label, str(item.get('zone') or ''))
+            if not label or key in previous:
+                continue
+            self._submit(self._send_object_event(label, key[1], item.get('conf')))
+
+    async def _send_object_event(self, label: str, zone: str, confidence: Any) -> None:
+        """One ``object_event`` frame (ТЗ F-311): что, где и насколько уверенно."""
+        send_json = self._send_json
+        if send_json is None:
+            return
+        payload = {
+            "type": MSG_OBJECT_EVENT,
+            "label": str(label)[:40],
+            "zone": str(zone or "")[:120],
+            "conf": round(_as_float(confidence, 0.0), 3),
+            "at_ms": int(time.time() * 1000),
+            "event_id": new_ulid(),
+        }
+        try:
+            await send_json(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dead socket is normal here
+            self._note_send_failure("object_event", exc)
+
     def _publish_tracks(self) -> None:
         """ТЗ F-201: the room's own person tracks, in their own message.
 
@@ -1099,6 +1244,14 @@ class CameraService:
             return
         if not self.privacy.allows_frames:
             return
+        try:
+            # ТЗ F-309: кроп — та же картинка комнаты, поэтому маска
+            # закрашивается до вырезки: иначе область «не анализировать»
+            # уехала бы в хаб внутри кропа.
+            frame = self._mask_frame(frame, self._cv2)
+        except CameraUnavailable as exc:
+            log.warning("Not sending body crops from this frame: %s", exc)
+            return
         now = time.monotonic()
         for report in list(getattr(self, '_track_reports', [])):
             x1, y1, x2, y2 = report.bbox
@@ -1122,8 +1275,11 @@ class CameraService:
             # audio. The next two-second window carries the same person.
             log.debug("Skipping a body crop - the socket is busy")
             return
+        masked_rev = self.masked_rev
         header = {"type": MSG_BODY_CROP, "track_id": track_id, "kind": "body",
-                  "w": int(width), "h": int(height)}
+                  "w": int(width), "h": int(height),
+                  # ТЗ F-309: маска закрашена до вырезки, хаб это проверяет.
+                  "masked": bool(masked_rev), "zones_rev": masked_rev}
         try:
             if lock is None:
                 await send_json(header)
@@ -1188,15 +1344,53 @@ class CameraService:
         finally:
             self._presence_pending.clear()
 
+    @staticmethod
+    def _frame_size(frame: Any) -> tuple[int, int]:
+        """``(width, height)`` кадра OpenCV; ``(0, 0)`` — если это не картинка."""
+        try:
+            return int(frame.shape[1]), int(frame.shape[0])
+        except (AttributeError, IndexError, TypeError):
+            return 0, 0
+
+    def _mask_frame(self, frame: Any, cv2: Any) -> Any:
+        """ТЗ F-309: закрасить области «не анализировать» ДО JPEG.
+
+        Копия обязательна: кадр приходит из кэша камеры, и затирание «на
+        месте» испортило бы следующую картинку (и кадр трекера). Если масок
+        нет, кадр возвращается как есть — без лишней копии и без изменений.
+
+        Закрашивание в чёрное, а не «вырезание»: JPEG не умеет дырок, а
+        чёрный прямоугольник гарантирует, что пикселей области в кадре нет.
+        Ошибка тут не «мелкая»: не закрасив маску, комната прислала бы то,
+        что владелец просил не смотреть, поэтому кадр не отправляется вовсе.
+        """
+        width, height = self._frame_size(frame)
+        polygons = mask_polygons(getattr(self, "_zones", ()), width, height)
+        if not polygons:
+            return frame
+        try:
+            import numpy as np
+
+            masked = frame.copy()
+            for polygon in polygons:
+                cv2.fillPoly(masked, [np.array(polygon, dtype=np.int32)], (0, 0, 0))
+            return masked
+        except Exception as exc:  # noqa: BLE001 - молчать о маске нельзя
+            raise CameraUnavailable(f"could not paint the frame mask: {exc}") from exc
+
     def _encode(self, frame: Any, full: bool = False) -> tuple[bytes, int, int]:
         """Downscale to :data:`MAX_SIDE_PX` and encode as JPEG q80.
 
         :param full: v1.6 -- skip the downscale entirely for this frame
             (``find_object`` wants the detector to see native resolution).
+
+        ТЗ F-309: области «не анализировать» закрашиваются ЗДЕСЬ, до JPEG, —
+        иначе маска осталась бы обещанием, а не свойством кадра.
         """
         cv2 = self._cv2
         if cv2 is None:  # pragma: no cover - only reachable before the first frame
             raise CameraUnavailable("OpenCV is not loaded")
+        frame = self._mask_frame(frame, cv2)
         height, width = int(frame.shape[0]), int(frame.shape[1])
         if width <= 0 or height <= 0:
             raise CameraUnavailable("the camera returned an empty frame")
@@ -1240,6 +1434,10 @@ class CameraService:
             log.debug("Skipping a %s burst %s - the socket is busy", reason, frame_id)
             return
         total = len(pairs)
+        # ТЗ F-309: кадр уходит уже с закрашенными масками, и заголовок несёт
+        # отпечаток этих масок — хаб сверяет его со своим конфигом и
+        # отказывается анализировать кадр без маски.
+        masked_rev = self.masked_rev
         log.debug(
             "Sending a %s frame burst %s: %d frame(s)", reason, frame_id, total
         )
@@ -1250,7 +1448,7 @@ class CameraService:
                     frame_tracks = pair[3] if len(pair) > 3 else tracks
                     await self._send_pair(
                         send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
-                        frame_tracks, event_id
+                        frame_tracks, event_id, masked=bool(masked_rev), zones_rev=masked_rev
                     )
             else:
                 async with lock:
@@ -1259,7 +1457,7 @@ class CameraService:
                         frame_tracks = pair[3] if len(pair) > 3 else tracks
                         await self._send_pair(
                             send_json, send_bytes, frame_id, reason, seq, total, jpeg, width, height,
-                            frame_tracks, event_id
+                            frame_tracks, event_id, masked=bool(masked_rev), zones_rev=masked_rev
                         )
         except asyncio.CancelledError:
             raise
@@ -1279,6 +1477,8 @@ class CameraService:
         height: int,
         tracks=None,
         event_id: str = "",
+        masked: bool = False,
+        zones_rev: str = "",
     ) -> None:
         """Send one ``camera_frame`` header plus its single binary frame."""
         header = {
@@ -1291,6 +1491,10 @@ class CameraService:
             "seq": int(seq),
             "of": int(total),
             "tracks": tracks,
+            # ТЗ F-309: маска уже закрашена в самом JPEG; заголовок говорит
+            # хабу, что именно проверять.
+            "masked": bool(masked),
+            "zones_rev": str(zones_rev or ""),
         }
         if event_id:
             # ТЗ 4.5: the background camera event keeps the id the server minted

@@ -203,12 +203,15 @@ def test_the_hud_channel_puts_a_caption_on_the_room(tmp_path):
         try:
             alerts.save_rule(dict(enabled=True, event='object', name='посылка',
                                   channel='hud', media='photo'))
-            alerts.observe_event('object', label='посылка', source_id='living', home_id='livingroom')
+            alerts.observe_event('object', label='package', zone='дверь',
+                                 source_id='living', home_id='livingroom')
             await alerts.drain()
             assert provider.sent == []          # канал HUD не трогает Telegram
             assert len(room.captions) == 1
             assert room.captions[0]['type'] == 'status'
-            assert 'посылка' in room.captions[0]['text']
+            # ТЗ F-311 и TG-08: фраза английская, а имя зоны — слова владельца,
+            # как имя человека: «package at дверь».
+            assert 'package at дверь' in room.captions[0]['text']
             assert alerts.status()['deliveries'][0]['status'] == 'sent'
         finally:
             await alerts.close()

@@ -32,6 +32,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from common.object_labels import LABEL_GROUPS, normalize_label
+
 log = logging.getLogger("jarvis.server.object_memory")
 
 #: ТЗ F-305: вопрос ищет по последним 48 часам.
@@ -68,16 +70,6 @@ class ObjectSighting(BaseModel):
     dim: int = 0
 
 
-def normalize_label(text: Any) -> str:
-    """«ключи» / «keys» / «llaves» — сравнимая форма (без числа и регистра)."""
-    word = re.sub(r"[^\w\s]", " ", str(text or "").casefold())
-    word = " ".join(word.split())
-    for suffix in ("ами", "ями", "ов", "ев", "ей", "es", "s", "ы", "и", "а", "я"):
-        if len(word) > len(suffix) + 2 and word.endswith(suffix):
-            return word[: -len(suffix)].strip()
-    return word.strip()
-
-
 def where_question(text: Any) -> str:
     """Спросили ли, где лежит вещь; и что именно за вещь (ТЗ F-305)."""
     value = " ".join(str(text or "").split())
@@ -101,8 +93,11 @@ def where_question(text: Any) -> str:
 class ObjectMemoryStore:
     """``objects_index`` как память объектов дома (ТЗ F-305, схема 14)."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, *, mirror_vectors: bool = True) -> None:
         self._conn = conn
+        #: ТЗ 4.6: строка `objects_index` — источник истины, `vec_objects_index`
+        #: только ускоряет поиск. Индекс недоступен — строку это не отменяет.
+        self.mirror_vectors = bool(mirror_vectors)
 
     def record(self, sighting: ObjectSighting) -> ObjectSighting:
         """Записать то, что индексатор действительно увидел."""
@@ -113,7 +108,18 @@ class ObjectMemoryStore:
              json.dumps(list(sighting.bbox)), str(sighting.zone or ""),
              sighting.vector, int(sighting.dim or 0), str(sighting.media_ref or "")))
         self._conn.commit()
+        if sighting.vector is not None and self.mirror_vectors:
+            self._mirror(sighting)
         return sighting
+
+    def _mirror(self, sighting: ObjectSighting) -> None:
+        """Best effort: the metadata row is what the answer is built from."""
+        from hub import vectors
+
+        try:
+            vectors.store(self._conn, "objects", sighting.id, sighting.vector or b"")
+        except Exception as exc:  # noqa: BLE001 - без индекса объект всё равно найден словами
+            log.debug("Object index unavailable for %s (%s)", sighting.id, exc)
 
     def sightings(self, home_id: str, *, label: str = "", since_hours: float = WINDOW_HOURS,
                   limit: int = 50) -> list[ObjectSighting]:
@@ -229,6 +235,7 @@ def _clock(ts: float, tz: Any, moment: float | None) -> str:
 
 
 __all__ = [
+    "LABEL_GROUPS",
     "ObjectMemoryStore",
     "ObjectSighting",
     "WINDOW_HOURS",

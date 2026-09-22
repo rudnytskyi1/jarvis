@@ -23,6 +23,8 @@ RUNTIME_FILES = (
     "client/tracking.py",
     "client/body_crops.py",
     "client/privacy.py",
+    "client/gestures.py",
+    "client/posture.py",
     "client/ota.py",
     "client/vision_profile.py",
     "client/camera.py", "client/camera_clips.py", "client/frame_recording.py", "client/room-tracker.yaml",
@@ -36,6 +38,9 @@ RUNTIME_FILES = (
     "common/__init__.py", "common/client_config.py", "common/ids.py", "common/protocol.py",
     "common/voice_commands.py", "common/recording.py",
     "common/body_crops.py",
+    "common/frame_zones.py",
+    "common/attention_objects.py",
+    "common/object_labels.py",
 )
 TEMPLATE_FILES = (
     "README.md", ".gitignore", "config.example.yaml", "setup-client.bat", "start-client.bat",

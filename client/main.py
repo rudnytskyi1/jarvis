@@ -78,6 +78,7 @@ from client.audio import (
 )
 from client.barge_in import BargeInAvailability, BargeInStop, SpeechGate
 from client.devices.registry import build_registry
+from client.gestures import GestureService
 from client.local_commands import LocalOutcome, LocalRunner, parse_local_command
 from client.local_stt import LocalStt
 from client.offline import (
@@ -87,6 +88,7 @@ from client.offline import (
     offline_notice,
     prefetch_phrases,
 )
+from client.posture import PostureService
 from client.presence_buffer import PresenceBuffer
 from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
 from client.tts_cache import PhraseCache
@@ -312,6 +314,17 @@ def _opt_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _clock_minutes(value: Any) -> int:
+    """``"23:00"`` → минуты суток (ТЗ F-302: тихие часы дома). ``ValueError`` иначе."""
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 2:
+        raise ValueError(f"not a clock: {value!r}")
+    hours, minutes = int(parts[0]), int(parts[1])
+    if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+        raise ValueError(f"not a clock: {value!r}")
+    return hours * 60 + minutes
 
 
 def _int_or_zero(value: Any) -> int:
@@ -558,6 +571,18 @@ class JarvisClient:
         else:
             self.camera = CameraService(camera_cfg)
 
+        # -- ТЗ F-306: жесты руки (MediaPipe Hands на CPU комнаты) ---------
+        gestures_cfg = _attr(self.ccfg, "gestures")
+        self.gestures = GestureService(gestures_cfg, on_event=self._on_gesture)
+        if self.camera is not None:
+            # Кадр уже пойман камерой: жесты считаются на нём, а не на втором
+            # потоке захвата (второй поток дрался бы за ту же камеру).
+            self.camera.set_frame_listener(self._on_camera_frame)
+
+        # -- ТЗ F-307: поза и сон (YOLO11-pose, 1 кадр в 5 с) ---------------
+        self.posture = PostureService(_attr(self.ccfg, "posture"),
+                                      on_event=self._on_posture_event)
+
         # -- v1.6: detections photo (find_object's image_show) -------------
         self.viewer: Any | None = ImageViewer() if ImageViewer is not None else None
         if self.viewer is None:
@@ -736,6 +761,9 @@ class JarvisClient:
     async def run(self) -> None:
         self._install_signal_handler()
         try:
+            # ТЗ F-306: жесты приходят из потока камеры, а уходят в сеть здесь,
+            # поэтому цикл клиента сохранён явно (см. `_submit_to_loop`).
+            self._loop = asyncio.get_running_loop()
             await self._setup_wakeword()
             self._start_ota()
             self.audio_in.start()
@@ -1340,6 +1368,31 @@ class JarvisClient:
             return
         self.room_config_rev = revision
         self.room_config = dict(patch)
+        # ТЗ F-309: зоны кадра приезжают тем же патчем. Маску закрашивает
+        # комната, поэтому новый набор надо применить к камере сразу — иначе
+        # следующий кадр ушёл бы со старым отпечатком и хаб его отклонил.
+        camera = getattr(self, "camera", None)
+        if camera is not None and "zones" in self.room_config:
+            try:
+                camera.set_zones(self.room_config.get("zones"))
+            except Exception as exc:  # noqa: BLE001 - патч комнаты не стоит потока
+                log.warning("Could not apply the frame zones from the hub (%s)", exc)
+        # ТЗ F-306: жесты включаются НА ДОМ отдельно, флагом
+        # ``homes[].settings.gestures`` — он приезжает тем же патчем.
+        gestures = getattr(self, "gestures", None)
+        settings = self.room_config.get("settings")
+        if gestures is not None and isinstance(settings, Mapping) and "gestures" in settings:
+            try:
+                gestures.set_enabled(settings.get("gestures"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not apply the gesture flag from the hub (%s)", exc)
+        # ТЗ F-307: поза и сон — тоже флаг дома.
+        posture = getattr(self, "posture", None)
+        if posture is not None and isinstance(settings, Mapping) and "posture" in settings:
+            try:
+                posture.set_enabled(settings.get("posture"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not apply the posture flag from the hub (%s)", exc)
         log.info(
             "Room settings updated by the hub (rev %d): %s",
             revision,
@@ -2070,6 +2123,157 @@ class JarvisClient:
         if overlay is not None:
             overlay.followup_window(seconds)
 
+    def _on_camera_frame(self, frame: Any) -> None:
+        """ТЗ F-306: каждый кадр камеры может нести жест руки.
+
+        Здесь же считается и поза (ТЗ F-307): тот же кадр, низкая частота
+        задаётся сервисом. Кадр остаётся в комнате — наружу уходят только
+        события. Обе функции выключены флагами дома: тогда это пустой вызов,
+        и CPU не тратится.
+        """
+        gestures = getattr(self, "gestures", None)
+        if gestures is not None:
+            gestures.submit(frame)
+        posture = getattr(self, "posture", None)
+        if posture is not None:
+            posture.submit(frame, quiet=self._quiet_now())
+
+    def _quiet_now(self) -> bool:
+        """Тихие часы ЭТОГО дома по настройкам, которые прислал хаб (F-302).
+
+        Часы комнаты и есть часы дома: клиент стоит в той же комнате, а пояс
+        дома хаб присылает в `config_update`. Настроек нет — тихих часов нет.
+        """
+        settings = getattr(self, "room_config", None)
+        quiet = settings.get("quiet_hours") if isinstance(settings, Mapping) else None
+        if not isinstance(quiet, Mapping):
+            return False
+        start, end = str(quiet.get("start") or ""), str(quiet.get("end") or "")
+        if not start or not end:
+            return False
+        try:
+            start_minutes = _clock_minutes(start)
+            end_minutes = _clock_minutes(end)
+        except ValueError:
+            return False
+        now = time.localtime()
+        minutes = now.tm_hour * 60 + now.tm_min
+        if start_minutes == end_minutes:
+            return False
+        if start_minutes < end_minutes:
+            return start_minutes <= minutes < end_minutes
+        return minutes >= start_minutes or minutes < end_minutes
+
+    def _on_posture_event(self, kind: str) -> None:
+        """ТЗ F-307: «уснул» и «встал» уходят хабу как состояние, а не кадр."""
+        state = "sleep" if kind == "sleep" else "awake" if kind == "awake" else ""
+        if not state:
+            return
+        log.info("The room says the person %s", "fell asleep" if state == "sleep" else "got up")
+        self._submit_to_loop(self._send_posture_event(state))
+
+    async def _send_posture_event(self, state: str) -> None:
+        try:
+            await self.ws.send_json({
+                "type": _protocol.MSG_POSTURE_EVENT,
+                "state": state,
+                "at_ms": int(time.time() * 1000),
+                "event_id": new_ulid(),
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - поза не стоит реконнекта
+            log.debug("Could not send the posture event (%s)", exc)
+
+    def _on_gesture(self, kind: str) -> None:
+        """ТЗ F-306: открытая ладонь дольше секунды — остановить TTS.
+
+        Подтверждение большим пальцем (F-113) и указание (P5-10) подключаются
+        своими задачами: здесь обрабатывается только «стоп». Флаг гасит
+        ОСТАЛЬНЫЕ кадры потока синтеза (иначе следующая порция PCM снова
+        зазвучала бы), а очередь динамика чистится сразу — «стоп» рукой не
+        должен требовать слов и не ждёт конца фразы.
+        """
+        if kind != "palm":
+            if kind == "thumb_up":
+                self._confirm_with_gesture()
+            elif kind == "point":
+                self._send_point_hint()
+            return
+        self._stopped_by_gesture = True
+        idle_cut = self._interrupt_idle_playback()
+        dropped = self.audio_out.cancel_pending()
+        log.info("Open palm: stopping the voice (%d audio chunk(s) dropped%s)",
+                 dropped, ", greeting cut" if idle_cut else "")
+
+    def _confirm_with_gesture(self) -> None:
+        """ТЗ F-306/F-113: большой палец вверх подтверждает вместо устного «да».
+
+        Подтверждается ТОЛЬКО то, что хаб уже спросил: жест не придумывает
+        согласие из воздуха. Если ничего не ждёт ответа, жест молчит (и это
+        видно в логе) — «подтвердил неизвестно что» было бы опаснее отказа.
+        """
+        confirm = getattr(self, "_confirmation_resolve", None)
+        if confirm is None:
+            log.debug("Thumb up with nothing waiting for confirmation - ignored")
+            return
+        log.info("Thumb up: confirming the pending request")
+        confirm(True)
+
+    def _send_point_hint(self) -> None:
+        """ТЗ F-306: указание пальцем уходит хабу как НАПРАВЛЕНИЕ, не картинка.
+
+        Жест приходит из потока камеры, а сеть живёт в цикле клиента, поэтому
+        отправка передаётся в цикл (`_submit_to_loop`). Точки нет (палец
+        указывает за кадр, `mediapipe` не поднялся) — молчим: «наверное,
+        вон туда» хаб бы не понял.
+        """
+        hint = getattr(getattr(self, "gestures", None), "last_point", None)
+        if not isinstance(hint, dict):
+            return
+        try:
+            x, y = float(hint["x"]), float(hint["y"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            return
+        self._submit_to_loop(self._send_point_event(x, y))
+
+    async def _send_point_event(self, x: float, y: float) -> None:
+        """Один ``point_event``: куда показывает палец (ТЗ F-306)."""
+        try:
+            await self.ws.send_json({
+                "type": _protocol.MSG_POINT_EVENT,
+                "x": round(float(x), 4),
+                "y": round(float(y), 4),
+                "at_ms": int(time.time() * 1000),
+                "event_id": new_ulid(),
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - жест не стоит реконнекта
+            log.debug("Could not send the pointed direction (%s)", exc)
+
+    def _submit_to_loop(self, coro: Any) -> bool:
+        """Отправить корутину в цикл клиента из чужого потока (жесты).
+
+        Цикл сохраняется в :meth:`run`; клиент без запущенного цикла (тесты,
+        ранний старт) корутину просто закрывает, чтобы она не осталась
+        необработанной.
+        """
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as exc:  # noqa: BLE001 - цикл может уже останавливаться
+            log.debug("Could not hand the gesture to the event loop: %s", exc)
+            return False
+        return True
+
     def _speech_barge_in(self) -> bool:
         """May a real interruption cut the playback on this machine (F-102)?
 
@@ -2399,6 +2603,9 @@ class JarvisClient:
         self._tts_bytes = 0
         self._reply_pcm = b""
         self._reply_rate = sample_rate
+        # ТЗ F-306: «стоп» рукой гасит остаток ЭТОГО потока; новая фраза
+        # снова звучит.
+        self._stopped_by_gesture = False
         try:
             await self.audio_out.open(sample_rate)
         except Exception as exc:
@@ -2412,7 +2619,7 @@ class JarvisClient:
         if not self._tts_active:
             log.debug("Binary frame outside of a TTS stream (%d bytes) - skipping", len(data))
             return
-        if self._barged:
+        if self._barged or getattr(self, "_stopped_by_gesture", False):
             return  # interrupted: swallow the rest of the stream silently
         self._tts_bytes += len(data)
         self._remember_reply_audio(data)
@@ -2670,6 +2877,10 @@ class JarvisClient:
         def callback(approved):
             if not loop.is_closed():
                 loop.call_soon_threadsafe(resolve, approved)
+        # ТЗ F-306/F-113: к тому же ответу ведёт большой палец вверх. Хаб об
+        # этом не знает — жест читает комната, и он отвечает за то же
+        # подтверждение, что и кнопка на HUD, уже в потоке цикла.
+        self._confirmation_resolve = callback
         approved = False
         try:
             details = ({'old_name': str(msg.get('old_name') or '')[:100],
@@ -2680,6 +2891,7 @@ class JarvisClient:
         except TimeoutError:
             pass
         finally:
+            self._confirmation_resolve = None
             self.overlay.cancel_voice_confirmation()
         await self.ws.send_json({'type': _protocol.MSG_VOICE_CONFIRMATION_RESULT,
                                  'id': msg.get('id'), 'approved': approved})

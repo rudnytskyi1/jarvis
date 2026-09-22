@@ -504,7 +504,11 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Remember what somebody LOOKS like, so the camera recognizes them "
                 "later. Ask them to look at the camera for a second, then call it with "
-                "their name; the largest face in the current camera frame is stored. "
+                "their name; the person's face is stored from a burst of shots taken "
+                "right away and for the next ten seconds, so they should keep facing "
+                "the camera and turn their head slowly. If the camera sees more than "
+                "one person, nothing is stored: the result asks which numbered face is "
+                "theirs, and that answer is what finishes the enrollment. "
                 "Offer it right after their voice enrollment finished, and only with "
                 "their consent. Anyone may be enrolled, including a guest. If the "
                 "result says no face was visible, ask them to face the camera and try "

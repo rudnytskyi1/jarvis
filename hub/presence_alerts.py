@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from common.attention_objects import attention_group, attention_line
 from common.protocol import CAMERA_CLIP_MAX_BYTES, DEFAULT_STATUS_TTL_S, MSG_STATUS
 from hub.video_transcode import phone_ready_mp4
 
@@ -396,8 +397,13 @@ class PresenceAlerts:
         if rule.get('event') != kind:
             return False
         label = str(event.get('label') or '')
-        if kind == 'object' and rule.get('name', '').casefold() != label.casefold():
-            return False
+        if kind == 'object':
+            # ТЗ F-311: правило владельца написано словами ЕГО языка
+            # («посылка»), а детектор подписывает находки по-английски
+            # («box»/«package»); сверить их можно только по группе.
+            wanted = attention_group(rule.get('name', '')) or str(rule.get('name', '')).casefold()
+            if wanted != (attention_group(label) or label.casefold()):
+                return False
         if kind in {'person_entered', 'person_left', 'unknown_appeared'} and rule.get('target') == 'person':
             wanted = rule.get('name', '').casefold()
             if wanted and wanted not in {str(name).casefold() for name in (event.get('names') or ())}:
@@ -630,6 +636,13 @@ class PresenceAlerts:
                                             'Quiet hours started before delivery')
                     return
                 # ТЗ F-702: «выбор канала (Telegram, пуш на телефон, HUD)».
+                # ТЗ F-307: спящий дом не звонит и не толкает — уведомление
+                # приходит беззвучной подписью на экран комнаты.
+                if home.get('asleep') and rule['channel'] != 'hud':
+                    log.info('Home %s is asleep: alert delivered silently on the HUD',
+                             home.get('home_id') or delivery['event'].get('home_id') or '?')
+                    await self._deliver_hud(delivery)
+                    return
                 if rule['channel'] == 'hud':
                     await self._deliver_hud(delivery)
                     return
@@ -722,7 +735,14 @@ class PresenceAlerts:
         if kind == 'sound_event':
             return f'sound: {label or "an event"}.'
         if kind == 'object':
-            return f'the camera sees: {label or name}.'
+            # ТЗ F-311: «посылка у двери» — зона названа словами владельца
+            # (свои имена зон не переводятся), а рамка фразы — английская,
+            # как и остальные уведомления. Объект без группы (старый клиент)
+            # показывается как есть, чтобы правило не потеряло событие.
+            group = attention_group(label or name)
+            if not group:
+                return f'the camera sees: {label or name}.'
+            return f'the camera sees: {attention_line(group, zone, "en")}.'
         target = ('an unknown person' if rule['target'] == 'unknown'
                   else rule['name'] if rule['target'] == 'person' else 'a person')
         return f'the camera spotted {target}.'

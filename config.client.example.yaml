@@ -42,6 +42,19 @@ client:
       tensorrt: {model: yolo11x.engine, fps: 20, half: true, budget_ms: 30}
       gpu: {model: yolo11x.pt, fps: 10, half: true, budget_ms: 90}
       weak: {model: yolo11s.pt, fps: 10, half: false, budget_ms: 200}
+    # ТЗ F-309: зоны кадра дома. Обычно их присылает хаб (config_update), но
+    # здесь можно держать свои — комната применит их до первого патча.
+    # Маска (mask: true) закрашивается ДО JPEG, и хаб сверяет её отпечаток.
+    #   zones:
+    #     - name: маска
+    #       mask: true
+    #       points: [[0.0, 0.85], [0.3, 0.85], [0.3, 1.0], [0.0, 1.0]]
+    zones: []
+  # --- ТЗ F-306: жесты руки (MediaPipe Hands на CPU комнаты) ---
+  gestures:
+    enabled: false             # включается НА ДОМ: дома флаг homes[].settings.gestures
+    hold_s: 1.0                # открытая ладонь дольше секунды — остановить TTS
+    interval_s: 0.2            # не чаще 5 распознаваний в секунду (CPU делится с YOLO)
   overlay:
     enabled: true
     position: bottom_right

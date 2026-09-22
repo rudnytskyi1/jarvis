@@ -10,6 +10,8 @@ import json
 import sqlite3
 from typing import Any
 
+from common.frame_zones import zones_rev as frame_zones_rev
+
 
 def ensure_home(conn: sqlite3.Connection, home_id: str, *, name: str | None = None,
                 tz: str = "America/Chicago", owner_person_id: str = "",
@@ -42,28 +44,36 @@ def sync_homes_from_config(conn: sqlite3.Connection, homes: Any) -> list[str]:
     Only fields a room owner can change at runtime are refreshed; a room that
     disappears from the config is kept in the database (its data must not be
     silently orphaned).
+
+    ТЗ F-309: сюда же входит отпечаток зон кадра (``zones_rev``). Без него
+    владелец, поправивший только маску, не получил бы нового ``config_update``
+    — комната маскировала бы старые области, а хаб отказывался бы смотреть её
+    кадры.
     """
     changed: list[str] = []
     for home in homes or []:
         home_id = home.home_id
-        row = conn.execute("SELECT name, tz, owner_person_id, settings_json, quiet_hours_json "
-                           "FROM homes WHERE home_id=?", (home_id,)).fetchone()
+        row = conn.execute(
+            "SELECT name, tz, owner_person_id, settings_json, quiet_hours_json, zones_rev "
+            "FROM homes WHERE home_id=?", (home_id,)).fetchone()
         quiet = json.dumps({"start": home.quiet_hours.start, "end": home.quiet_hours.end})
         settings = json.dumps(home.settings or {})
         owner = _existing_person(conn, home.owner_person_id)
+        zones_rev = frame_zones_rev(getattr(home, "zones", ()) or ())
         if row is None:
             conn.execute(
-                "INSERT INTO homes(home_id, name, tz, quiet_hours_json, owner_person_id, settings_json) "
-                "VALUES (?,?,?,?,?,?)",
-                (home_id, home.name, home.tz, quiet, owner, settings),
+                "INSERT INTO homes(home_id, name, tz, quiet_hours_json, owner_person_id, "
+                "settings_json, zones_rev) VALUES (?,?,?,?,?,?,?)",
+                (home_id, home.name, home.tz, quiet, owner, settings, zones_rev),
             )
             changed.append(home_id)
             continue
-        if (row[0], row[1], row[2], row[3], row[4]) != (home.name, home.tz, owner, settings, quiet):
+        if (row[0], row[1], row[2], row[3], row[4], row[5]) != (
+                home.name, home.tz, owner, settings, quiet, zones_rev):
             conn.execute(
-                "UPDATE homes SET name=?, tz=?, owner_person_id=?, settings_json=?, quiet_hours_json=?, "
-                "config_rev=config_rev+1 WHERE home_id=?",
-                (home.name, home.tz, owner, settings, quiet, home_id),
+                "UPDATE homes SET name=?, tz=?, owner_person_id=?, settings_json=?, "
+                "quiet_hours_json=?, zones_rev=?, config_rev=config_rev+1 WHERE home_id=?",
+                (home.name, home.tz, owner, settings, quiet, zones_rev, home_id),
             )
             changed.append(home_id)
     conn.commit()

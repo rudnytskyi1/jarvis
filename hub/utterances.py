@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -172,12 +173,18 @@ def record_dialog_turns(
     person_id: str | None = None,
     speaker: str = "",
     model: str | None = None,
+    degraded: Sequence[str] = (),
 ) -> list[str]:
     """Store both halves of one turn in ``dialog_turns`` (ТЗ section 14).
 
     The rows are keyed by the utterance: idempotent by construction, so a retry
     or a replayed archive cannot duplicate a turn. Unknown rooms are skipped —
     a turn must never fail because its room row is missing.
+
+    ТЗ F-704: ``degraded`` — стадии, которые в этом ходу не успели
+    (``Connection._degrade``). Они пишутся в строку хода, потому что
+    ежедневный отчёт обязан перечислить неполные ходы, а не только удачи;
+    пустое значение значит «ход дошёл целиком».
     """
     if not home_id or not utterance_id:
         return []
@@ -189,6 +196,7 @@ def record_dialog_turns(
     if person_id and conn.execute("SELECT 1 FROM persons WHERE person_id=?",
                                   (person_id,)).fetchone() is None:
         person_id = None
+    skipped = ",".join(str(stage) for stage in degraded or ())
     rows = (("user", question), ("assistant", answer))
     stored: list[str] = []
     for role, text in rows:
@@ -197,9 +205,9 @@ def record_dialog_turns(
         turn_id = f"{utterance_id}:{role}"
         conn.execute(
             "INSERT OR IGNORE INTO dialog_turns"
-            "(turn_id, home_id, person_id, utterance_id, role, text, ts, model)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (turn_id, home_id, person_id, utterance_id, role, text, float(ts), model),
+            "(turn_id, home_id, person_id, utterance_id, role, text, ts, model, degraded)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (turn_id, home_id, person_id, utterance_id, role, text, float(ts), model, skipped),
         )
         stored.append(turn_id)
     conn.commit()

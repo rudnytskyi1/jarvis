@@ -80,6 +80,11 @@ class ApiBudget:
             # assign the old rate to pending reservations across an upgrade.
             if 'model' not in {row[1] for row in db.execute('PRAGMA table_info(requests)')}:
                 db.execute("ALTER TABLE requests ADD COLUMN model TEXT NOT NULL DEFAULT 'gpt-5.4-mini'")
+            # ТЗ F-704: the owner's daily digest asks "what did we spend today".
+            # The month column cannot answer that, and a row without a stated
+            # moment is honestly left out of every day (see hub.digest).
+            if 'created_at' not in {row[1] for row in db.execute('PRAGMA table_info(requests)')}:
+                db.execute("ALTER TABLE requests ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def _connect(self):
@@ -105,9 +110,20 @@ class ApiBudget:
             used = db.execute("SELECT COALESCE(SUM(amount), 0) FROM requests WHERE month=?", (month,)).fetchone()[0]
             if used + amount > self.limit:
                 raise BudgetExceeded("Monthly API allowance reached; local commands remain available.")
-            db.execute("INSERT INTO requests(id, month, amount, model) VALUES (?, ?, ?, ?)",
-                       (request_id, month, amount, self.model))
+            db.execute("INSERT INTO requests(id, month, amount, model, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (request_id, month, amount, self.model, self.now()))
         return request_id
+
+    @staticmethod
+    def now() -> str:
+        """The moment of a request, in the same shape the digest compares.
+
+        ``datetime.now(UTC).isoformat(timespec='seconds')`` is used instead of
+        SQLite's ``datetime('now')`` because that one has no ``T`` separator and
+        no offset, and two spellings of the same moment must not compare as
+        different days (ТЗ F-704).
+        """
+        return datetime.now(UTC).isoformat(timespec="seconds")
 
     def settle(self, request_id: str, input_tokens: int, output_tokens: int,
                *, input_tokens_details: dict | None = None,

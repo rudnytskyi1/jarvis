@@ -48,6 +48,10 @@ def home_patch(home: HomeConfig) -> dict[str, Any]:
         "tz": home.tz,
         "quiet_hours": {"start": home.quiet_hours.start, "end": home.quiet_hours.end},
         "settings": dict(home.settings or {}),
+        # ТЗ F-309: зоны кадра едут к комнате тем же патчем — маску клиент
+        # закрашивает до отправки кадра, и хаб должен знать, что она совпадает
+        # с его конфигом, а не с прошлым релизом.
+        "zones": [zone.model_dump() for zone in (home.zones or [])],
     }
 
 
@@ -81,7 +85,9 @@ def reload_home_settings(
     return config, changed_rooms(conn, config)
 
 
-def current_room_frame(conn: sqlite3.Connection, home_id: str) -> dict[str, Any] | None:
+def current_room_frame(
+    conn: sqlite3.Connection, home_id: str, zones: Any = None
+) -> dict[str, Any] | None:
     """The ``config_update`` frame describing a room as it is right now.
 
     Sent right after ``hello`` so a client that was offline during a reload
@@ -89,6 +95,10 @@ def current_room_frame(conn: sqlite3.Connection, home_id: str) -> dict[str, Any]
     frame also carries the room's SCENES (ТЗ F-117/4.8): a room whose brain is
     unreachable must still be able to run the scenes it already knows about,
     and it cannot ask the hub for a list it cannot reach.
+
+    ``zones`` (ТЗ F-309) — полигоны кадра из конфига хаба в виде словарей
+    (``FrameZone.model_dump``/``FrameZones.describe``): их в таблице ``homes``
+    нет, потому что источник истины для зон — ``config.yaml`` владельца.
     """
     row = conn.execute(
         "SELECT name, tz, quiet_hours_json, settings_json FROM homes WHERE home_id=?", (home_id,)
@@ -96,6 +106,14 @@ def current_room_frame(conn: sqlite3.Connection, home_id: str) -> dict[str, Any]
     if row is None:
         return None
     name, tz, quiet_json, settings_json = row
+    zone_items: list[dict[str, Any]] = []
+    for item in zones or ():
+        if isinstance(item, Mapping):
+            zone_items.append(dict(item))
+        else:
+            dump = getattr(item, "model_dump", None)
+            if callable(dump):
+                zone_items.append(dict(dump()))
     return HomeConfigChange(
         home_id=home_id,
         config_rev=home_config_rev(conn, home_id),
@@ -105,6 +123,7 @@ def current_room_frame(conn: sqlite3.Connection, home_id: str) -> dict[str, Any]
             "quiet_hours": _json_object(quiet_json),
             "settings": _json_object(settings_json),
             "scenes": _scenes_of(conn, home_id),
+            "zones": zone_items,
         },
     ).frame()
 

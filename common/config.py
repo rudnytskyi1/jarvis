@@ -54,6 +54,7 @@ from common.client_config import (
     VADConfig,
     WakewordConfig,
 )
+from common.frame_zones import FrameZone
 from common.openai_models import OPENAI_TEXT_RATES
 
 #: ТЗ F-113: the default list of dangerous calls the room has to confirm with a
@@ -96,6 +97,7 @@ __all__ = [
     "AudioConfig",
     "VADConfig",
     "CameraConfig",
+    "FrameZone",
     "OverlayConfig",
     "DeviceConfig",
     "load_config",
@@ -828,6 +830,8 @@ class HomeConfig(_Strict):
     #: ТЗ F-421: the place this room asks the weather skill about ("Chicago").
     #: Empty means the skill has to ask which city to look at.
     weather_location: str = Field(default="", max_length=120)
+    #: ТЗ F-309: полигоны кадра — «дверь», «стол», «маска (не анализировать)».
+    zones: list[FrameZone] = Field(default_factory=list)
     #: ТЗ F-507 (открытый вопрос раздела 17): разрешена ли разблокировка ПК по
     #: лицу и голосу. По умолчанию — нет: это безопасность, а не удобство.
     pc_unlock: bool = False
@@ -846,6 +850,17 @@ class HomeConfig(_Strict):
             ZoneInfo(value)
         except (ZoneInfoNotFoundError, ValueError):
             raise ValueError(f"tz must be a valid IANA time zone, got {value!r}") from None
+        return value
+
+    @field_validator("zones")
+    @classmethod
+    def _unique_zones(cls, value: list[FrameZone]) -> list[FrameZone]:
+        seen: set[str] = set()
+        for zone in value:
+            name = " ".join(str(zone.name).split()).casefold()
+            if name in seen:
+                raise ValueError(f"duplicate zone name: {zone.name!r}")
+            seen.add(name)
         return value
 
 
@@ -1070,6 +1085,38 @@ class DigestConfig(_Strict):
         if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(value or "")):
             raise ValueError("the daily digest uses HH:MM on the home's clock")
         return value
+
+
+class MetricsConfig(_Strict):
+    """Метрики Prometheus (``server.metrics``, ТЗ F-707).
+
+    ``/metrics`` живёт на том же порту и с той же видимостью, что и
+    ``/health`` (то есть внутри сети хаба, а не в интернете), а ``enabled:
+    false`` честно отвечает 404: пустой ответ читался бы как «всё по нулям».
+    """
+
+    enabled: bool = True
+
+
+class ObjectsConfig(_Strict):
+    """Память объектов (``server.objects``, ТЗ F-305).
+
+    Индексация кадров — это работа видеокарты и приватность комнаты, поэтому
+    по умолчанию ВЫКЛЮЧЕНА: владелец комнаты включает её сам. ``interval_s``
+    — как часто проходить по комнатам, ``model``/``confidence`` — что именно
+    считать объектом; без установленного детектора хаб честно говорит, что
+    смотреть нечем, вместо пустой таблицы, выданной за «ничего нет».
+    """
+
+    enabled: bool = False
+    interval_s: float = Field(default=600.0, ge=30.0, le=86400.0)
+    model: str = Field(default="yolo11n.pt", max_length=120)
+    confidence: float = Field(default=0.35, ge=0.05, le=0.95)
+    max_objects: int = Field(default=50, ge=1, le=500)
+    #: Считать CLIP-вектор региона (ТЗ F-305). Пакета нет — объекты пишутся
+    #: без вектора, и это честно называется в отчёте, а не молча пустеет.
+    embed: bool = True
+    embed_model: str = Field(default="ViT-B/32", max_length=80)
 
 
 class PresenceConfig(_Strict):
@@ -1382,6 +1429,8 @@ class ServerConfig(_Strict):
     intercom: IntercomConfig = Field(default_factory=IntercomConfig)
     push: PushConfig = Field(default_factory=PushConfig)
     digest: DigestConfig = Field(default_factory=DigestConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    objects: ObjectsConfig = Field(default_factory=ObjectsConfig)
     greeting: GreetingConfig = Field(default_factory=GreetingConfig)
     web_admin: WebAdminConfig = Field(default_factory=WebAdminConfig)
     #: Release tag the room clients should run (ТЗ 4.9 OTA). Empty = не трогать.

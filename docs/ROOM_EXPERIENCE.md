@@ -64,8 +64,13 @@ See [image-generation reference behavior](IMAGE_GENERATION.md).
 - A request without a name asks for one. Placeholder names are rejected in voice
   and face storage. Asking “who am I” uses the recognized speaker and needs no
   permission to list other users.
-- **Rowan, remember my face** starts face registration. If several faces are
-  visible, the screen displays numbered boxes with position descriptions.
+- **Rowan, remember my face** starts face registration: one burst of three
+  frames right away and three more bursts over the next ten seconds, and every
+  frame that holds the person's face becomes a sample (up to twelve, the F-211
+  limit), so the profile ends up with real angles instead of a single shot. A
+  face is only kept when it belongs to the same person as the first good frame.
+  If several faces are visible in ANY frame of the first burst, nothing is
+  stored: the screen displays numbered boxes with position descriptions and
   **Rowan, number two** selects the reference face. A fresh frame must match that
   face before the first write; every later sample must match the same fixed
   reference with a clear margin. A larger face cannot take over registration.

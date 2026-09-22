@@ -56,6 +56,10 @@ def room(tmp_path, monkeypatch):
     connection.utterance_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
     connection._utterance_actions = []
     connection._run_client_action = AsyncMock(return_value={"ok": True})
+    # ``_remember_scene_turn`` tells the room to reload its scene list, and a
+    # connection's ``send_json`` refuses to write to a socket that is not
+    # CONNECTED (there is no socket in this test).
+    connection.send_json = AsyncMock()
     return connection, scenes, adapter
 
 

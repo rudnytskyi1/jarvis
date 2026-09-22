@@ -61,6 +61,20 @@ Server -> Client
   v2 (ТЗ F-109): one sound the client's own detector heard (knock, bell,
   alarm, breaking glass, cough). No audio leaves the room; the hub turns the
   label into an alert-rule event (F-702).
+* ``{"type": MSG_OBJECT_EVENT, "label": "cat" | "dog" | "package",
+  "zone": str, "conf": 0..1, "at_ms": int, "event_id": str}`` -- v2 (ТЗ
+  F-311): an object of attention appeared in the room. The client names the
+  class by its canonical group and adds the ZONE of the detection (F-309),
+  because the room's own frame zones live on the room PC; the hub turns it
+  into an alert-rule event that can be limited to that zone.
+* ``{"type": MSG_POINT_EVENT, "x": 0..1, "y": 0..1, "at_ms": int,
+  "event_id": str}`` -- v2 (ТЗ F-306): the person points at something and the
+  client sends WHERE, not WHAT it sees. The hub keeps the point for a few
+  seconds and answers "what is this?" about that part of the frame.
+* ``{"type": MSG_POSTURE_EVENT, "state": "sleep" | "awake", "at_ms": int,
+  "event_id": str}`` -- v2 (ТЗ F-307): the room watched the person's posture
+  (YOLO11-pose, one frame in five seconds) and says the person FELL ASLEEP
+  lying still in quiet hours, or GOT UP. The frame never leaves the room.
 * ``{"type": MSG_OFFLINE_HINT, "reason": str, "eta_s": float}`` (ТЗ 4.8) -- the
   hub is going away on purpose (restart, maintenance), so the client switches
   to its local mode before the socket breaks.
@@ -137,6 +151,25 @@ MSG_CAMERA_STATE = "camera_state"
 #: alarm, breaking glass, cough). The hub turns it into an alert-rule event
 #: (F-702); the client never sends audio for it, only the label and confidence.
 MSG_SOUND_EVENT = "sound_event"
+#: v2 (ТЗ F-311): один объект внимания (кот, собака, посылка), который
+#: появился в кадре, вместе с зоной дома (F-309): ``{"type", "label", "zone",
+#: "conf", "at_ms", "event_id"}``. Клиент считает зону сам, потому что
+#: ``camera_state`` несёт только счётчики по меткам, а ТЗ хочет «посылка у
+#: двери». ``label`` — каноническая группа (``cat``/``dog``/``package``) из
+#: ``common.attention_objects``; чужие метки сюда не попадают вовсе.
+MSG_OBJECT_EVENT = "object_event"
+#: v2 (ТЗ F-306): куда показывает указательный палец, в нормализованных
+#: координатах кадра комнаты — ``{"type", "x", "y", "at_ms", "event_id"}``.
+#: Точка нужна вопросу «что это?»: человек показывает на предмет, и хаб
+#: смотрит именно туда, а не на всю комнату. Кадр при этом остаётся в комнате:
+#: уходит только направление.
+MSG_POINT_EVENT = "point_event"
+#: v2 (ТЗ F-307): комната заметила, что человек уснул или встал —
+#: ``{"type", "state": "sleep" | "awake", "at_ms", "event_id"}``. Поза
+#: считается на клиенте, кадр остаётся в комнате; хаб по этому событию
+#: включает режим сна дома (свет на минимум, беззвучные уведомления) или
+#: утреннюю рутину F-420.
+MSG_POSTURE_EVENT = "posture_event"
 #: v2 (ТЗ F-201): the live person TRACKS of one client - each person in the
 #: frame keeps its ``track_id`` while it is visible, and a lost track is
 #: remembered for up to 30 s so the same person comes back as the same track.
@@ -299,6 +332,9 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_CAMERA_ERROR,
         MSG_CAMERA_CLIP,
         MSG_CAMERA_CLIP_ERROR,
+        MSG_OBJECT_EVENT,
+        MSG_POINT_EVENT,
+        MSG_POSTURE_EVENT,
         MSG_TTS_PREFETCH,
     }
 )
@@ -351,6 +387,9 @@ PHONE_FORBIDDEN_INPUTS = frozenset(
         MSG_CAMERA_ERROR,
         MSG_CAMERA_CLIP,
         MSG_CAMERA_CLIP_ERROR,
+        MSG_OBJECT_EVENT,
+        MSG_POINT_EVENT,
+        MSG_POSTURE_EVENT,
         MSG_SCREENSHOT,
         MSG_SCREENSHOT_ERROR,
     }
@@ -382,6 +421,9 @@ __all__ = [
     "MSG_CAMERA_CLIP_ERROR",
     "MSG_CAMERA_CLIP_REQUEST",
     "MSG_SOUND_EVENT",
+    "MSG_OBJECT_EVENT",
+    "MSG_POINT_EVENT",
+    "MSG_POSTURE_EVENT",
     "MSG_PRIVACY",
     "MSG_OFFLINE_HINT",
     "MSG_TTS_PREFETCH",

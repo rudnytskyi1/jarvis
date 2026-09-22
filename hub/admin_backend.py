@@ -430,9 +430,16 @@ class AdminBackend:
                 raise ValueError('Home ownership is unavailable.')
             names = {str(getattr(home, 'home_id', '')): str(getattr(home, 'name', '') or '')
                      for home in (getattr(self.cfg, 'homes', None) or [])}
+            # ТЗ F-309: владелец видит, какие зоны кадра настроены в его доме.
+            from hub.zones import FrameZones
+
+            zones = {str(getattr(home, 'home_id', '')):
+                     FrameZones(getattr(home, 'zones', ()) or ()).describe()
+                     for home in (getattr(self.cfg, 'homes', None) or [])}
             if action == 'homes.list':
                 return {'ok': True, 'items': [
-                    {'home_id': home_id, 'name': names.get(home_id) or home_id, 'owners': list(ids)}
+                    {'home_id': home_id, 'name': names.get(home_id) or home_id,
+                     'owners': list(ids), 'zones': zones.get(home_id, [])}
                     for home_id, ids in owners.owners().items()]}
             if action == 'homes.grant':
                 home_id = str(payload.get('home_id') or '')

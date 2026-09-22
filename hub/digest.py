@@ -1,10 +1,13 @@
 """Ежедневный отчёт владельцу (ТЗ F-704).
 
-Отчёт собирается из НАСТОЯЩИХ таблиц хаба — `presence_events` (кто заходил),
-`audit` (что делали и что не получилось), `api_usage` (расход бюджета) и
-`dialog_turns` (сколько было разговоров). Ни одной выдуманной строки: пустой
-источник говорит «записей нет», а не «всё хорошо», и раздел «что не удалось»
-перечисляет отказы и провалы, даже когда их много.
+Отчёт собирается из НАСТОЯЩИХ источников хаба — `presence_events` (кто
+заходил), `audit` (что делали и что не получилось), `dialog_turns` (сколько
+было разговоров и какие ходы деградировали) и журнал бюджета
+`data/api_usage.sqlite3` (сколько денег ушло; `amount` — консервативная сумма
+вместе с ещё не подтверждёнными резервациями, как и в `ApiBudget.status`).
+Таблица `api_usage` схемы 14 читается, когда журнала нет. Ни одной выдуманной
+строки: пустой источник говорит «записей нет», а не «всё хорошо», и раздел
+«что не удалось» перечисляет отказы и провалы, даже когда их много.
 
 ``DigestTask`` — задача планировщика: время берётся по ЧАСАМ ДОМА (у Чикаго и
 Киева оно разное), а «ровно один отчёт в день» держит строка
@@ -15,9 +18,12 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta, time as clock
-from typing import Any, Callable
+from datetime import UTC, datetime, timedelta
+from datetime import time as clock
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 log = logging.getLogger("jarvis.server.digest")
@@ -26,14 +32,19 @@ log = logging.getLogger("jarvis.server.digest")
 SECTION_TITLES = ("presence", "events", "api", "problems")
 SECTION_LABELS = {
     "ru": {"presence": "Кто заходил", "events": "Что происходило", "api": "Расход API",
-           "problems": "Что не удалось"},
+           "problems": "Что не удалось", "month": "месяц", "degraded": "Неполные ходы",
+           "and_more": "и ещё {n}"},
     "en": {"presence": "Who came", "events": "What happened", "api": "API spend",
-           "problems": "What did not get done"},
+           "problems": "What did not get done", "month": "month", "degraded": "Incomplete turns",
+           "and_more": "and {n} more"},
     "es": {"presence": "Quién vino", "events": "Qué pasó", "api": "Gasto de API",
-           "problems": "Qué no se pudo hacer"},
+           "problems": "Qué no se pudo hacer", "month": "mes", "degraded": "Turnos incompletos",
+           "and_more": "y {n} más"},
 }
 _NO_RECORDS = {"ru": "за сутки записей нет", "en": "no records for the day",
                "es": "no hay registros del día"}
+_NO_PROBLEMS = {"ru": "неудач не записано", "en": "no failures were recorded",
+                "es": "no se registraron fallos"}
 _MISSING = {"ru": "источник недоступен: {what}", "en": "source unavailable: {what}",
             "es": "fuente no disponible: {what}"}
 
@@ -72,10 +83,17 @@ class DigestData:
     audit_ok: int = 0
     audit_denied: int = 0
     audit_failed: int = 0
+    audit_problems: int = 0
     turns: int = 0
+    degraded_turns: int = 0
+    #: Which stages were skipped in those turns: ``"stt,diarization"`` → count.
+    degraded: list[tuple[str, int]] = field(default_factory=list)
     api_requests: int = 0
     api_amount_micro: int = 0
+    api_month_micro: int = 0
     api_models: list[tuple[str, int]] = field(default_factory=list)
+    #: Where the money numbers came from: ``ledger``, ``api_usage`` or ``''``.
+    api_source: str = ""
     problems: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
 
@@ -86,12 +104,14 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[A
 
 def collect(conn: sqlite3.Connection, *, home_id: str, tz: Any,
             moment: datetime | None = None, language: str = "ru",
-            history_limit: int = 5) -> DigestData:
-    """Read one home's day out of the real tables; a broken source is named."""
+            history_limit: int = 5, ledger_path: str | Path | None = None,
+            month: str = "") -> DigestData:
+    """Read one home's day out of the real sources; a broken source is named."""
     home = str(home_id or "")
     if not home:
         raise DigestError("a home_id is required")
-    start, end, day = day_window(tz, moment=moment or datetime.now(UTC))
+    now = moment or datetime.now(UTC)
+    start, end, day = day_window(tz, moment=now)
     data = DigestData(home_id=home, day=day, language=language)
     lo, hi = start.timestamp(), end.timestamp()
 
@@ -132,22 +152,14 @@ def collect(conn: sqlite3.Connection, *, home_id: str, tz: Any,
     except sqlite3.Error as exc:
         log.warning("Could not read audit of %s (%s)", home, exc)
         data.missing.append("audit")
+    data.audit_problems = data.audit_denied + data.audit_failed
 
-    try:
-        rows = _rows(conn, "SELECT COUNT(*), COALESCE(SUM(amount_micro), 0) FROM api_usage"
-                           " WHERE created_at >= ? AND created_at < ?",
-                     (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")))
-        if rows:
-            data.api_requests = int(rows[0][0] or 0)
-            data.api_amount_micro = int(rows[0][1] or 0)
-        models = _rows(conn, "SELECT model, COUNT(*) FROM api_usage"
-                             " WHERE created_at >= ? AND created_at < ?"
-                             " GROUP BY model ORDER BY COUNT(*) DESC",
-                       (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")))
-        data.api_models = [(str(row[0]), int(row[1])) for row in models]
-    except sqlite3.Error as exc:
-        log.warning("Could not read api_usage (%s)", exc)
-        data.missing.append("api_usage")
+    window = (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))
+    if ledger_path:
+        _read_ledger(data, ledger_path, window=window,
+                     month=month or now.astimezone(UTC).strftime("%Y-%m"))
+    else:
+        _read_api_usage(data, conn, window=window)
 
     try:
         rows = _rows(conn, "SELECT COUNT(*) FROM dialog_turns WHERE home_id=? AND ts >= ? AND ts < ?"
@@ -156,7 +168,78 @@ def collect(conn: sqlite3.Connection, *, home_id: str, tz: Any,
     except sqlite3.Error as exc:
         log.warning("Could not read dialog_turns of %s (%s)", home, exc)
         data.missing.append("dialog_turns")
+
+    # ТЗ F-704/15.1: деградации хода пишет `Connection._degrade` в
+    # `dialog_turns.degraded` (миграция 0027); день без этой колонки честно
+    # называет её недоступной, а не делает вид, что неполных ходов не было.
+    try:
+        rows = _rows(conn, "SELECT degraded, COUNT(*) FROM dialog_turns"
+                           " WHERE home_id=? AND ts >= ? AND ts < ? AND role='user'"
+                           " AND COALESCE(degraded, '') != ''"
+                           " GROUP BY degraded ORDER BY COUNT(*) DESC", (home, lo, hi))
+        data.degraded = [(str(row[0]), int(row[1])) for row in rows]
+        data.degraded_turns = sum(count for _stages, count in data.degraded)
+    except sqlite3.Error:
+        data.missing.append("dialog_turns.degraded")
+
     return data
+
+
+def _read_api_usage(data: DigestData, conn: sqlite3.Connection, *,
+                    window: tuple[str, str]) -> None:
+    """The hub's own ``api_usage`` table (ТЗ section 14)."""
+    try:
+        rows = _rows(conn, "SELECT COUNT(*), COALESCE(SUM(amount_micro), 0) FROM api_usage"
+                           " WHERE created_at >= ? AND created_at < ?", window)
+        if rows:
+            data.api_requests = int(rows[0][0] or 0)
+            data.api_amount_micro = int(rows[0][1] or 0)
+        models = _rows(conn, "SELECT model, COUNT(*) FROM api_usage"
+                             " WHERE created_at >= ? AND created_at < ?"
+                             " GROUP BY model ORDER BY COUNT(*) DESC", window)
+        data.api_models = [(str(row[0]), int(row[1])) for row in models]
+        if data.api_requests:
+            data.api_source = "api_usage"
+    except sqlite3.Error as exc:
+        log.warning("Could not read api_usage (%s)", exc)
+        data.missing.append("api_usage")
+
+
+def _read_ledger(data: DigestData, path: str | Path, *,
+                 window: tuple[str, str], month: str) -> None:
+    """The real budget journal: what the hub actually reserved and spent.
+
+    A row without a moment (one written before the journal had a timestamp) is
+    left out of the day and appears only in the month total, because the day it
+    belongs to is unknown. That is the honest answer, not a guess.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        log.warning("Could not open the API ledger %s (%s)", path, exc)
+        data.missing.append("api_usage.ledger")
+        return
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM requests"
+            " WHERE created_at >= ? AND created_at < ?", window).fetchall()
+        if rows:
+            data.api_requests = int(rows[0][0] or 0)
+            data.api_amount_micro = int(rows[0][1] or 0)
+        models = conn.execute(
+            "SELECT model, COUNT(*) FROM requests WHERE created_at >= ? AND created_at < ?"
+            " GROUP BY model ORDER BY COUNT(*) DESC", window).fetchall()
+        data.api_models = [(str(row[0]), int(row[1])) for row in models]
+        if month:
+            total = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM requests WHERE month=?",
+                                 (str(month),)).fetchone()
+            data.api_month_micro = int(total[0] or 0) if total else 0
+        data.api_source = "ledger"
+    except sqlite3.Error as exc:
+        log.warning("Could not read the API ledger %s (%s)", path, exc)
+        data.missing.append("api_usage.ledger")
+    finally:
+        conn.close()
 
 
 def _short_detail(detail: Any) -> str:
@@ -177,23 +260,39 @@ def digest_lines(data: DigestData, *, max_chars: int = 3000) -> list[str]:
         lines.append(f"{labels['presence']}: {names}")
     else:
         lines.append(f"{labels['presence']}: {nothing}")
-    lines.append(f"{labels['events']}: {data.turns} request(s),"
-                 f" audit {data.audit_total} ({data.audit_ok} ok, {data.audit_denied} denied,"
-                 f" {data.audit_failed} failed)")
+    events = (f"{labels['events']}: {data.turns} request(s),"
+              f" audit {data.audit_total} ({data.audit_ok} ok, {data.audit_denied} denied,"
+              f" {data.audit_failed} failed)")
+    if data.degraded_turns:
+        events += f", degraded {data.degraded_turns}"
+    lines.append(events)
     if data.api_requests:
         models = ", ".join(f"{name} ({count})" for name, count in data.api_models)
         lines.append(f"{labels['api']}: {data.api_requests} request(s),"
                      f" ${data.api_amount_micro / 1_000_000:.4f} ({models})")
     else:
         lines.append(f"{labels['api']}: {nothing}")
+    if data.api_month_micro:
+        # The journal is monthly as well as daily: the owner wants to see what
+        # this month has cost even on a day with no cloud request at all.
+        lines.append(f"{labels['api']} ({labels['month']}):"
+                     f" ${data.api_month_micro / 1_000_000:.4f}")
 
     problems = list(data.problems)
+    problems.extend(f"{labels['degraded']}: {stages} ({count})"
+                    for stages, count in data.degraded)
     problems.extend(missing.format(what=name) for name in data.missing)
     if problems:
-        lines.append(f"{labels['problems']}:")
+        # Сколько всего плохого записано за день, а не только сколько влезло в
+        # список примеров: усечённый перечень обязан сказать, что он усечён.
+        total = data.audit_problems + len(data.degraded) + len(data.missing)
+        lines.append(f"{labels['problems']} ({total}):")
         lines.extend(f"- {item}" for item in problems)
+        hidden = max(0, total - len(problems))
+        if hidden:
+            lines.append(f"- {labels['and_more'].format(n=hidden)}")
     else:
-        lines.append(f"{labels['problems']}: {nothing}")
+        lines.append(f"{labels['problems']}: {_NO_PROBLEMS.get(language, _NO_PROBLEMS['ru'])}")
 
     clipped: list[str] = []
     used = 0
