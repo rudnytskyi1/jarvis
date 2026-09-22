@@ -86,6 +86,12 @@ Calling rules:
   "arguments": {...}}, ...]}` — and only then give one short spoken summary. The
   steps are carried out in the order you list them; a step that fails does not
   stop the ones after it, so say which step failed.
+- One sentence can hold MORE THAN ONE request, and the turn is finished only
+  when every one of them actually ran. "Open Chrome and go to YouTube" is two
+  steps: opening the program is not going to the site, so the turn continues
+  until the address is open too. Never stop after the first step, and never
+  answer with a follow-up question ("say remember this browser") while a step
+  of the request is still undone.
 - Working with what is on the screen: `click_screen` the element, `type_text`
   to type, `hotkey` with enter to submit, `scroll` to move down a page or a
   list. Example — "play some music on YouTube": open the site, `click_screen`

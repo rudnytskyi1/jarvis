@@ -23,7 +23,11 @@ DEFAULT_RULE = dict(enabled=False, target='any', name='', media='photo', destina
                     # ТЗ F-702: правило слушает событие, а не только «человек в
                     # кадре»; канал доставки выбирается; дом может дать свои
                     # тихие часы и свой минимум кулдауна.
-                    event='presence', channel='telegram', home_id='', zone='')
+                    event='presence', channel='telegram', home_id='', zone='',
+                    # «Снимать, пока человек не выйдет из кадра»: одно срабатывание
+                    # шлёт видео подряд, пока комната не опустеет. Одно видео —
+                    # не длиннее ``clip_seconds``.
+                    record_until_clear=False)
 #: ТЗ F-702: события F-301 (`person_entered`…), F-109 (`sound_event`), F-311
 #: (`object`) плюс прежнее `presence` — «человек стабильно в кадре».
 EVENT_KINDS = ('presence', 'person_entered', 'person_left', 'unknown_appeared',
@@ -35,6 +39,17 @@ CHANNELS = ('telegram', 'push', 'hud')
 #: The cooldown floor is 1 s (it used to be 10 s): short rules are legitimate,
 #: and a room panel should not force a ten-second minimum.
 RULE_RANGES = {'cooldown_s': (1.0, 86400.0), 'min_stable_s': (0.0, 300.0), 'absence_s': (0.0, 3600.0)}
+#: ТЗ F-702: one alert video (and therefore one Telegram message) is at most
+#: this long; a longer visit arrives as several of these, one after another.
+CLIP_SECONDS_RANGE = (3, 60)
+#: How many videos one episode may send before it stops on its own. A person
+#: who never leaves must not fill the disk or the chat, so the ceiling is the
+#: rule's own safety net, not a guess about how long a visit lasts.
+EPISODE_MAX_PARTS = 20
+#: The room counts as empty when its last presence frame is older than this.
+#: Presence frames arrive every second or so; a gap means the camera stopped
+#: telling us anything, which is not the same as "somebody is still there".
+EPISODE_IDLE_S = 6.0
 _ID = re.compile(r'alert-[0-9a-f]{32}')
 _CLOCK = re.compile(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]')
 #: ТЗ F-702: a rule's destination is either the private chats that have access
@@ -104,8 +119,11 @@ def validate_rule(patch, existing=None):
         value = rule[key]
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
             raise ValueError(f'{key} must be between {low:g} and {high:g}.')
-    if type(rule['clip_seconds']) is not int or not 3 <= rule['clip_seconds'] <= 10:
-        raise ValueError('clip_seconds must be between 3 and 10.')
+    if type(rule['record_until_clear']) is not bool:
+        raise ValueError('record_until_clear must be a boolean.')
+    low, high = CLIP_SECONDS_RANGE
+    if type(rule['clip_seconds']) is not int or not low <= rule['clip_seconds'] <= high:
+        raise ValueError(f'clip_seconds must be between {low} and {high}.')
     for key in ('quiet_start', 'quiet_end'):
         if not isinstance(rule[key], str) or (rule[key] and not _CLOCK.fullmatch(rule[key])):
             raise ValueError('Quiet hours must use HH:MM.')
@@ -199,6 +217,8 @@ class PresenceAlerts:
                          'state TEXT NOT NULL, PRIMARY KEY(rule_id,source_id))')
         self._db.execute('CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, rule_id TEXT NOT NULL, '
                          'at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT \'\')')
+        self._db.execute('CREATE TABLE IF NOT EXISTS source_presence (source_id TEXT PRIMARY KEY, '
+                         'people INTEGER NOT NULL, seen REAL NOT NULL)')
         # An interrupted upload may have reached Telegram: never retry it.
         self._db.execute("UPDATE deliveries SET status='uncertain', detail='Server stopped before delivery acknowledgement' "
                          "WHERE status='pending'")
@@ -214,6 +234,18 @@ class PresenceAlerts:
         with self._lock:
             return [dict(id=row[0], **{**DEFAULT_RULE, **json.loads(row[1])}, last_attempt=json.loads(row[2]).get('last_attempt'))
                     for row in self._db.execute('SELECT id, settings, state FROM rules ORDER BY rowid')]
+
+    def _people_now(self, source_id):
+        """``(people, when)`` of a room's last presence frame (ТЗ F-702).
+
+        "Keep recording until the person leaves" needs one fact: is somebody
+        still in that room? The presence frames already say so, so they are
+        kept per room rather than re-derived from the rules.
+        """
+        with self._lock:
+            row = self._db.execute('SELECT people, seen FROM source_presence WHERE source_id=?',
+                                   (str(source_id or ''),)).fetchone()
+        return (int(row[0]), float(row[1])) if row else (0, 0.0)
 
     def _private_recipients(self):
         """ТЗ F-702: every account the 'Private chat (everyone)' rule writes to.
@@ -375,6 +407,15 @@ class PresenceAlerts:
         with self._lock:
             self._db.execute('BEGIN IMMEDIATE')
             try:
+                if str(event.get('kind') or 'presence') == 'presence':
+                    # ТЗ F-702: «снимать, пока человек не выйдет из кадра» — вот
+                    # откуда берётся «вышел». Пишется по комнате, а не по правилу:
+                    # присутствие не зависит от того, кто его слушает.
+                    self._db.execute(
+                        'INSERT INTO source_presence(source_id,people,seen) VALUES (?,?,?)'
+                        ' ON CONFLICT(source_id) DO UPDATE SET people=excluded.people,'
+                        ' seen=excluded.seen WHERE excluded.seen >= source_presence.seen',
+                        (str(event.get('source_id') or ''), int(event.get('persons') or 0), now))
                 rows = self._db.execute('SELECT id,settings,state FROM rules').fetchall()
                 for rule_id, raw, saved in rows:
                     rule, global_state = {**DEFAULT_RULE, **json.loads(raw)}, json.loads(saved)
@@ -521,6 +562,43 @@ class PresenceAlerts:
             raise RuntimeError('The camera did not return usable alert media.')
         return data
 
+    async def _camera_video(self, delivery, rule):
+        """One alert video from the room, at most ``clip_seconds`` long."""
+        room = self._room(delivery['event']['source_id'])
+        if room is None:
+            raise RuntimeError('The observed room is no longer connected.')
+        result = await asyncio.wait_for(
+            room._request_camera_clip('alert-' + delivery['id'], seconds=rule['clip_seconds'], fps=8),
+            rule['clip_seconds'] + 20)
+        data = result.get('data') if isinstance(result, dict) else result
+        if not isinstance(data, bytes) or not 0 < len(data) <= CAMERA_CLIP_MAX_BYTES:
+            raise RuntimeError('The camera did not return usable alert media.')
+        return data
+
+    async def _next_episode_video(self, delivery, *, part):
+        """The next video of one episode, or ``None`` when the room is clear.
+
+        ТЗ F-702, «снимать, пока человек не выйдет из кадра»: one video is
+        ``clip_seconds`` long (at most a minute) and the next one starts while
+        somebody is still in the room, so a long visit arrives as a series of
+        chunks instead of one file Telegram would refuse. It stops when the
+        room reports nobody, when the camera goes quiet, when the rule is
+        edited mid-episode, or at the safety ceiling.
+        """
+        rule = delivery['rule']
+        if not rule.get('record_until_clear') or rule['media'] != 'video':
+            return None
+        if part >= EPISODE_MAX_PARTS:
+            log.info('Alert episode stopped at its ceiling of %d videos', EPISODE_MAX_PARTS)
+            return None
+        people, seen = await asyncio.to_thread(self._people_now, delivery['event']['source_id'])
+        if people <= 0 or time.time() - seen > EPISODE_IDLE_S:
+            return None
+        if not await asyncio.to_thread(self._unchanged, delivery):
+            return None
+        data = await self._camera_video(delivery, rule)
+        return data, self._caption(rule, delivery['event'], part=part + 1)
+
     async def _deliver(self, delivery):
         attempted = False
         try:
@@ -565,25 +643,39 @@ class PresenceAlerts:
                                             'No destination for this rule')
                     return
                 delivered: list[int] = []
-                for target in targets:
-                    if rule['media'] == 'video':
-                        ack = await provider.send_video(data, 'video/mp4', caption, 'presence.mp4', **target)
-                    else:
-                        ack = await provider.send_image(data, 'image/jpeg', caption, 'presence.jpg', **target)
-                    if (not isinstance(ack, dict) or ack.get('ok') is not True
-                            or ack.get('chat_id') != next(iter(target.values()))
-                            or type(ack.get('message_id')) is not int or ack['message_id'] <= 0):
-                        # One recipient is unconfirmed: the rest are not sent,
-                        # because a retry would duplicate what may already have
-                        # arrived (see the delivery rules of the module).
-                        await asyncio.to_thread(
-                            self._finish, delivery, 'uncertain',
-                            f'{len(delivered)} of {len(targets)} delivered; acknowledgement was missing')
-                        return
-                    delivered.append(int(ack['message_id']))
-                await asyncio.to_thread(
-                    self._finish, delivery, 'sent',
-                    'Telegram message ' + ', '.join(str(value) for value in delivered))
+                parts = 0
+                while True:
+                    parts += 1
+                    for target in targets:
+                        if rule['media'] == 'video':
+                            ack = await provider.send_video(data, 'video/mp4', caption, 'presence.mp4', **target)
+                        else:
+                            ack = await provider.send_image(data, 'image/jpeg', caption, 'presence.jpg', **target)
+                        if (not isinstance(ack, dict) or ack.get('ok') is not True
+                                or ack.get('chat_id') != next(iter(target.values()))
+                                or type(ack.get('message_id')) is not int or ack['message_id'] <= 0):
+                            # One recipient is unconfirmed: the rest are not sent,
+                            # because a retry would duplicate what may already have
+                            # arrived (see the delivery rules of the module).
+                            await asyncio.to_thread(
+                                self._finish, delivery, 'uncertain',
+                                f'{len(delivered)} of {len(targets) * parts} delivered; acknowledgement was missing')
+                            return
+                        delivered.append(int(ack['message_id']))
+                    # ТЗ F-702: «снимать, пока человек не выйдет из кадра».
+                    try:
+                        following = await self._next_episode_video(delivery, part=parts)
+                    except Exception as exc:  # noqa: BLE001 - what went out stays sent
+                        log.warning('Alert episode stopped after %d video(s) (%s)',
+                                    parts, type(exc).__name__)
+                        following = None
+                    if following is None:
+                        break
+                    data, caption = following
+                detail = 'Telegram message ' + ', '.join(str(value) for value in delivered)
+                if parts > 1:
+                    detail = f'{parts} videos: ' + ', '.join(str(value) for value in delivered)
+                await asyncio.to_thread(self._finish, delivery, 'sent', detail)
         except asyncio.CancelledError:
             await asyncio.to_thread(self._finish, delivery, 'uncertain' if attempted else 'cancelled', 'Delivery interrupted; no automatic retry')
             raise
@@ -594,35 +686,43 @@ class PresenceAlerts:
             log.warning('Presence alert %s (%s); no automatic retry', status, type(exc).__name__)
 
     def _event_text(self, rule, event):
-        """Что случилось, словами (ТЗ F-702: у каждого вида события своя фраза)."""
+        """What happened, in words (ТЗ F-702: every kind of event has its own line).
+
+        The owner reads these in Telegram, so they are English like the rest of
+        the notification. The person's name is a name and never translated.
+        """
         kind = str(event.get('kind') or 'presence')
         name = str(rule.get('name') or '')
         label = str(event.get('label') or '')
         zone = str(event.get('zone') or '')
         if kind == 'person_entered':
-            who = name or ', '.join(str(item) for item in (event.get('names') or ())) or 'человек'
-            return f'пришёл — {who}.'
+            who = name or ', '.join(str(item) for item in (event.get('names') or ())) or 'someone'
+            return f'{who} arrived.'
         if kind == 'person_left':
-            who = name or ', '.join(str(item) for item in (event.get('names') or ())) or 'человек'
-            return f'ушёл — {who}.'
+            who = name or ', '.join(str(item) for item in (event.get('names') or ())) or 'someone'
+            return f'{who} left.'
         if kind == 'unknown_appeared':
-            return 'появился незнакомый человек.'
+            return 'an unknown person appeared.'
         if kind == 'zone_entered':
-            return f'человек в зоне: {zone}.' if zone else 'человек перешёл в другую зону.'
+            return f'someone entered the zone: {zone}.' if zone else 'someone moved to another zone.'
         if kind == 'sound_event':
-            return f'звук: {label or "событие"}.'
+            return f'sound: {label or "an event"}.'
         if kind == 'object':
-            return f'камера видит: {label or name}.'
-        target = ('неопознанный человек' if rule['target'] == 'unknown'
-                  else rule['name'] if rule['target'] == 'person' else 'человек')
-        return f'камера заметила — {target}.'
+            return f'the camera sees: {label or name}.'
+        target = ('an unknown person' if rule['target'] == 'unknown'
+                  else rule['name'] if rule['target'] == 'person' else 'a person')
+        return f'the camera spotted {target}.'
 
-    def _caption(self, rule, event):
+    def _caption(self, rule, event, part=1):
+        """The caption of one message; ``part`` numbers the videos of an episode."""
         when = datetime.fromtimestamp(event['at'], ZoneInfo(rule['timezone'])).strftime('%Y-%m-%d %H:%M:%S %Z')
         source_id = event['source_id']
         room = self._room(source_id)
-        workplace = ' '.join(str(getattr(room, 'workplace_name', '') or source_id or 'Комната').split())[:100]
-        return f'Rowan · {workplace}: {self._event_text(rule, event)}\n{when}'
+        workplace = ' '.join(str(getattr(room, 'workplace_name', '') or source_id or 'Room').split())[:100]
+        text = self._event_text(rule, event)
+        if part > 1:
+            text += f' (part {part})'
+        return f'Rowan · {workplace}: {text}\n{when}'
 
     async def _deliver_hud(self, delivery):
         """ТЗ F-702: канал HUD — подпись на экране комнаты, без медиа.

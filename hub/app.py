@@ -78,6 +78,7 @@ from hub import (
     profile_names,
     room_state,
     speaker_context,
+    telegram_audit,
 )
 from hub import greetings as greeting_mod
 from hub import privacy as privacy_mod
@@ -115,6 +116,7 @@ from hub.decision_points import (
     claim_guard_heuristic,
     continuation_heuristic,
     looks_like_injection,
+    site_step_unfinished,
     untrusted_text,
 )
 from hub.dialog_turns import DialogTurns
@@ -2114,6 +2116,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             REPO_ROOT / 'data' / 'telegram' / 'admin.sqlite3', cfg.server.telegram.control_user_id,
             getattr(cfg.server.telegram, 'admin_user_ids', ()) or ())
         await asyncio.to_thread(restore_overrides, cfg, _telegram_access)
+        # ТЗ F-706: who changed what in the panel, in a file the owner can read
+        # without opening the access database (data/telegram/audit.log).
+        await asyncio.to_thread(telegram_audit.configure, REPO_ROOT / 'data' / 'telegram')
     log.info("Starting the Jarvis brain: %s:%s", cfg.server.host, cfg.server.port)
 
     _memory = Memory()
@@ -2509,6 +2514,10 @@ class Connection(CameraClipReceiver):
         self._untrusted_reads: list[dict[str, Any]] = []
         #: decision type -> decision_id of this turn's judgement (ТЗ 5.4).
         self._decision_records: dict[str, str] = {}
+        #: The words of the request the tools of this turn are serving. A tool
+        #: that must behave differently inside a longer sentence ("open chrome
+        #: and go to youtube") reads it instead of guessing from its arguments.
+        self._utterance_text = ''
         self._task: asyncio.Task | None = None
         self._last_room_speech_at = 0.0
         self._roleplay_modes = RoleplayModes()
@@ -9432,6 +9441,9 @@ class Connection(CameraClipReceiver):
             self._finish_utterance(note='stt_failed', ok=False)
             return
         stt_ms = int((time.perf_counter() - t_start) * 1000)
+        #: D-04 and the app-choice offer both need the request itself, not only
+        #: the tool arguments.
+        self._utterance_text = text
         # P2-41: the final transcript is in. Either it confirms the draft the
         # speculative round answered, or the early answer is dropped and the
         # ordinary turn runs.
@@ -9935,17 +9947,29 @@ class Connection(CameraClipReceiver):
             # something with no tool behind it. Both go through the Decider
             # with the verdicts the pipeline always used as the rules answer.
             judge_type = 'action_result'
+            # ТЗ 5.3 (D-04): a request can hold more than one step, and the
+            # step that reaches a site is the one that gets lost - "open chrome
+            # and go to youtube" came back as "Chrome is open". That is not a
+            # judgement call, so it is not left to the decider: the request
+            # named an address and no action of this turn reached one.
+            unfinished_step = site_step_unfinished(text, self._utterance_actions)
             judge_needed = await self._decide(
                 'action_result',
                 question='Does the result of this action match what was asked?',
                 context={'text': text, 'actions': len(self._utterance_actions),
-                         'tools': [rec.get('tool') for rec in self._utterance_actions]},
+                         'tools': [rec.get('tool') for rec in self._utterance_actions],
+                         'unfinished_step': unfinished_step},
                 heuristic=action_result_heuristic(
                     changed_state=self._turn_changed_state(),
                     imperative_without_tool=bool(is_imperative_request(text)
                                                  and not self._utterance_actions),
+                    unfinished_step=unfinished_step,
                 ),
             )
+            if unfinished_step and not judge_needed:
+                log.info("Self-check forced: the request named a site and no action "
+                         "of this turn reached one")
+                judge_needed = True
             if not judge_needed and not self._utterance_actions:
                 judge_type = 'sight_claim'
                 judge_needed = await self._decide(
@@ -9960,7 +9984,11 @@ class Connection(CameraClipReceiver):
             if judge_type == 'action_result' and not judge_needed:
                 self._observe('action_result',
                               correct=not action_result_failed(self._utterance_actions))
-            if not shortcut and getattr(self.cfg.server.llm, "verify_actions", True) and judge_needed:
+            # ``verify_actions`` switches off the ROUTINE self-check; a request
+            # with a step that provably did not run is not routine, so it is
+            # checked even on a hub that turned the routine one off.
+            if (not shortcut and judge_needed
+                    and (unfinished_step or getattr(self.cfg.server.llm, "verify_actions", True))):
                 try:
                     verified = await asyncio.wait_for(
                         self._gpu(PRIORITY_UTTERANCE, "llm-verify",

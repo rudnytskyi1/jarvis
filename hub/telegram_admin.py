@@ -46,12 +46,16 @@ _ALERT_FIELDS = {
     'quiet_start': ('Quiet hours start: HH:MM or -', 'str'),
     'quiet_end': ('Quiet hours end: HH:MM or -', 'str'),
     'timezone': ('IANA time zone', 'str'),
-    'clip_seconds': ('Video duration, seconds', 'int'),
+    'clip_seconds': ('Video length, seconds', 'int'),
+    # ТЗ F-702: «снимать, пока человек не выйдет из кадра». Одно видео всё
+    # равно ограничено (clip_seconds), а следующее начинается, пока человек
+    # ещё в комнате.
+    'record_until_clear': ('Keep recording while the person stays', 'bool'),
 }
 _ALERT_DEFAULTS = dict(enabled=False, workplace_id='', target='any', name='', media='photo', destination='owner',
                        cooldown_s=300, min_stable_s=2, absence_s=15, quiet_start='', quiet_end='',
                        timezone='America/Chicago', clip_seconds=5, event='presence',
-                       channel='telegram', home_id='', zone='')
+                       channel='telegram', home_id='', zone='', record_until_clear=False)
 #: One-tap values for the numeric alert settings, so a rule no longer needs a
 #: reply-based text input for the common cases. The ranges come from
 #: hub.presence_alerts.RULE_RANGES, so a preset can never be rejected.
@@ -59,7 +63,7 @@ _ALERT_PRESETS = {
     'cooldown_s': (1, 5, 15, 30, 60, 300),
     'min_stable_s': (0, 0.5, 1, 2, 5, 10),
     'absence_s': (0, 5, 15, 30, 60, 300),
-    'clip_seconds': (3, 5, 8, 10),
+    'clip_seconds': (5, 10, 30, 60),
 }
 
 
@@ -780,6 +784,16 @@ class TelegramAdmin:
                 elif isinstance(value_type, tuple):
                     rows = [[button(self._field_label(key, value), kind='draft', key=key, value=value)]
                             for value in value_type]
+                    rows.append(self._back(panel, 'alert_draft'))
+                elif value_type == 'bool':
+                    # On/Off carry real booleans, so the draft cannot turn a
+                    # setting into the string "False" and fail validation later.
+                    rows = [[button('On', kind='draft', key=key, value=True),
+                             button('Off', kind='draft', key=key, value=False)]]
+                    if key == 'record_until_clear':
+                        text += ('\n\nOn keeps one video after another going while '
+                                 'somebody is still in the room; each video is '
+                                 '"Video length" seconds long.')
                     rows.append(self._back(panel, 'alert_draft'))
                 else:
                     presets = _ALERT_PRESETS.get(key)

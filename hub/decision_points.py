@@ -140,9 +140,110 @@ def continuation_heuristic(since_last_turn_s: float, window_s: float) -> bool:
     return 0.0 <= since_last_turn_s <= max(0.0, window_s)
 
 
-def action_result_heuristic(*, changed_state: bool, imperative_without_tool: bool) -> bool:
-    """D-04: the pipeline's own rule for when a turn is worth the self-check."""
-    return bool(changed_state) or bool(imperative_without_tool)
+def action_result_heuristic(*, changed_state: bool, imperative_without_tool: bool,
+                            unfinished_step: bool = False) -> bool:
+    """D-04: the pipeline's own rule for when a turn is worth the self-check.
+
+    ``unfinished_step`` is a clause of the request that no action of this turn
+    could have satisfied (see :func:`site_step_unfinished`). It is deliberately
+    part of the same question — "does the result match what was asked?" — and
+    not a new decision point: the answer is simply that it does not.
+    """
+    return bool(changed_state) or bool(imperative_without_tool) or bool(unfinished_step)
+
+
+#: An address or a host in the request: "youtube.com", "https://netflix.com",
+#: "www.google.com". The lookarounds keep a dotted word from matching inside
+#: a longer token, while still allowing the full stop of a sentence after it.
+_ADDRESS = re.compile(
+    r"(?:https?://|www\.)[^\s,;]+"
+    r"|(?<![\w.-])[\w-]{2,63}\.(?:com|net|org|ru|io|tv|app|dev|me|co|uk|de|fr|pl|"
+    r"edu|gov|info|xyz|gg|to|link|online|site|ai|us|ca|live)(?![\w-])",
+    re.IGNORECASE,
+)
+
+#: Services that are reached on the web. A request that names one of these
+#: after an "open"/"go to" is asking for the SITE, not for an installed
+#: program — including when the transcript spells the name in Cyrillic.
+_SITE_NAMES = (
+    "youtube", "ютуб", "google", "гугл", "gmail", "netflix", "нетфликс",
+    "twitch", "твич", "facebook", "instagram", "инстаграм", "tiktok", "тикток",
+    "twitter", "reddit", "wikipedia", "википеди", "github", "spotify", "спотифай",
+    "telegram web", "whatsapp", "discord", "steam community", "яндекс", "yandex",
+    "vk.com", "вконтакте", "kinopoisk", "кинопоиск", "ozon", "озон",
+)
+
+#: "Reach it" verbs, English and Russian: "go to", "зайди на", "открой".
+_REACH_VERB = re.compile(
+    r"\b(?:go|goto|visit|load|browse|navigate|head|switch)\s+(?:to|on|into|up)?"
+    r"|\bopen\b|\b(?:зай\w+|перейд\w+|откр\w+|загруз\w+|открывай)\b",
+    re.IGNORECASE,
+)
+
+#: The browser commands that actually move the page. A read is not a visit.
+_REACHING_BROWSER_COMMANDS = frozenset(
+    {"navigate", "open", "open_url", "goto", "new_tab", "search", "go_to"})
+
+
+def names_a_site_step(text: str | None) -> bool:
+    """True when the request asks to REACH something online (D-04).
+
+    "Open Chrome" is a program; "open Chrome and go to youtube.com" is a
+    program and a site. The second step is the one that keeps getting dropped,
+    so it is worth naming precisely. Never raises, safe on ``None``.
+    """
+    value = str(text or "")
+    if not value:
+        return False
+    if _ADDRESS.search(value):
+        return True
+    return names_in_text(value) and bool(_REACH_VERB.search(value))
+
+
+def _reached_a_site(actions: Sequence[dict[str, Any]] | None) -> bool:
+    """Did any action of this turn open an address or a site?"""
+    #: Tools whose arguments can name a site without carrying its address —
+    #: a click described as "the YouTube tab", a command that starts a shortcut.
+    #: Deliberately NOT ``pc_control``: ``open_app youtube`` is the very call
+    #: that looks like progress and reaches nothing.
+    nameable = frozenset({"click_screen", "run_command", "browser", "type_text"})
+    for record in actions or ():
+        tool = str(record.get("tool") or "")
+        args = record.get("args")
+        values = list(args.values()) if isinstance(args, dict) else []
+        blob = " ".join(str(value) for value in values)
+        if tool == "browser_control":
+            command = str((args or {}).get("command") or "").casefold() if isinstance(args, dict) else ""
+            if command in _REACHING_BROWSER_COMMANDS or _ADDRESS.search(blob):
+                return True
+            continue
+        if tool == "pc_control":
+            if str((args or {}).get("command") or "").casefold() in {"open_url", "open_website"}:
+                return True
+            continue
+        if _ADDRESS.search(blob) or (tool in nameable and names_in_text(blob)):
+            return True
+    return False
+
+
+def names_in_text(text: str) -> bool:
+    """True when ``text`` names a web service (see :data:`_SITE_NAMES`)."""
+    folded = str(text or "").casefold()
+    return any(name in folded for name in _SITE_NAMES)
+
+
+def site_step_unfinished(text: str | None,
+                         actions: Sequence[dict[str, Any]] | None) -> bool:
+    """A step the owner asked for that no action of this turn carried out.
+
+    The concrete case that bit the owner: "open chrome and go to youtube" was
+    answered by opening Chrome, because the second half of the sentence is the
+    easy thing to lose - the model reads the browser tool's own offer to
+    remember the choice and treats the turn as finished. Nothing here guesses
+    at the model's intent: the request names a site, no action of the turn
+    reached one, so the turn is not finished.
+    """
+    return names_a_site_step(text) and not _reached_a_site(actions)
 
 
 def action_result_failed(actions: Sequence[dict[str, Any]] | None) -> bool:
@@ -227,5 +328,8 @@ __all__ = [
     "hallucination_heuristic",
     "identity_heuristic",
     "looks_like_injection",
+    "names_a_site_step",
+    "names_in_text",
+    "site_step_unfinished",
     "untrusted_text",
 ]

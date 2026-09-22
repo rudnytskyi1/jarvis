@@ -15,7 +15,8 @@ class CameraClipReceiver:
     async def _request_camera_clip(self, identifier, seconds=5, fps=8):
         if not getattr(self, '_can_camera_clip', False):
             return 'The room client does not support short video clips.'
-        if (type(seconds) not in (int, float) or not 3 <= seconds <= 10
+        # ТЗ F-702: one video of an alert episode may be up to a minute long.
+        if (type(seconds) not in (int, float) or not 3 <= seconds <= 60
                 or type(fps) is not int or not 5 <= fps <= 10):
             return 'Invalid clip length or frame rate.'
         if getattr(self, '_clip_future', None) is not None:

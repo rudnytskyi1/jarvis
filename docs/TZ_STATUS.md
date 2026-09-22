@@ -292,3 +292,42 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   Группа заказчика `-1003570242441` («RowanAI Notifications», подтверждена
   `getChat`) внесена в список. Проверено: `pytest tests/test_telegram_chat.py
   tests/test_alert_rules.py -q` → 68 passed.
+
+## Обращения заказчика 22.09.2026 (вторая часть)
+
+- **TG-04 — фото/экран по имени ПК в самой просьбе: сделано.** `_named_workplace`
+  ищет в тексте id рабочего места, его имя или имя камеры (регистр и пробелы
+  не важны), `_selected_telegram_room` уводит на него весь ход, не меняя
+  сохранённый выбор; названный и выключенный ПК получает ответ
+  `the computer "…" is not connected`. Домашний селектор «Home» собран из
+  конфига и домов подключённых ПК, а не из базы с тестовыми домами.
+  Проверено: `pytest tests/test_telegram_admin.py tests/test_admin_workplaces.py
+  tests/test_presence_alerts.py -q` → 120 passed (полный прогон
+  `pytest tests -q` → 4398 passed, 10 skipped; `ruff check .` и `mypy common`
+  чисто).
+- **TG-05 — «снимать, пока человек не выйдет из кадра» кусками по ≤60 с:
+  сделано.** Новое поле правила `record_until_clear` (панель: *Keep recording
+  while the person stays*), потолок `EPISODE_MAX_PARTS` = 20 видео на
+  срабатывание, комната считается пустой после 6 с без кадров присутствия
+  (`source_presence` пишется на каждом кадре, `_people_now` читает). Длина
+  одного видео `clip_seconds` поднята до 3…60 в протоколе
+  (`CameraClipRequest`, `CameraRequest`), в клиенте (`client/camera_clips.py`)
+  и в правиле. Проверено: `pytest tests/test_alert_episode.py
+  tests/test_camera_clips.py tests/test_presence_alerts.py -q` → 60 passed.
+- **TG-06 — половина многошаговой просьбы больше не теряется: сделано.**
+  `site_step_unfinished` (ТЗ 5.3, D-04) видит, что в просьбе назван сайт или
+  адрес, а ни одно действие хода до него не дошло, и включает self-check даже
+  при `verify_actions: false`; предложение запомнить браузер
+  (`remember_offer`) молчит, пока в той же фразе есть шаг с сайтом. В промпте
+  добавлено правило про «одна фраза — несколько шагов». Проверено:
+  `pytest tests/test_site_step.py tests/test_browser_choice_memory.py -q` →
+  64 passed.
+- **TG-07 — журнал «кто что менял»: сделано.** `hub/telegram_audit.py` пишет
+  `data/telegram/audit.log` (ID аккаунта, имя, действие, дом, значения,
+  результат) рядом с прежними SQLite-записями; `_audit` панели теперь
+  сохраняет и **значения**, а не только имена полей. Проверено:
+  `pytest tests/test_telegram_audit_log.py tests/test_admin_backend.py -q` →
+  49 passed.
+- **TG-08 — уведомления на английском: сделано.** `_event_text` и подпись
+  целиком переведены (`the camera spotted a person`), имя человека не
+  переводится. Проверено: `pytest tests/test_alert_rules.py -q`.

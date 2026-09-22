@@ -11,10 +11,18 @@ from client.camera_clips import clip_settings, record_clip, serve_clip
 from common.protocol import MSG_CAMERA_CLIP, MSG_CAMERA_CLIP_ERROR
 
 
-@pytest.mark.parametrize('seconds,fps', [(2, 8), (11, 8), (True, 8), (float('nan'), 8), (5, 4), (5, 11), (5, 8.)])
+@pytest.mark.parametrize('seconds,fps', [(2, 8), (61, 8), (True, 8), (float('nan'), 8), (5, 4), (5, 11), (5, 8.)])
 def test_clip_request_bounds(seconds, fps):
     with pytest.raises(ValueError):
         clip_settings(seconds, fps)
+
+
+def test_a_minute_long_video_is_allowed_and_a_longer_one_is_not():
+    """ТЗ F-702: one alert video is capped at a minute, not at ten seconds."""
+    assert clip_settings(60, 8) == (60.0, 8)
+    assert clip_settings(10, 8) == (10.0, 8)
+    with pytest.raises(ValueError):
+        clip_settings(61, 8)
 
 
 def test_encoder_uses_existing_fresh_frames_and_cleans_temporary_mp4(monkeypatch):

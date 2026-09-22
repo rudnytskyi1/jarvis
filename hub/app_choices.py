@@ -4,6 +4,8 @@ import json
 import re
 import time
 
+from hub.decision_points import names_a_site_step
+
 BROWSERS = {'google chrome': {'chrome', 'google chrome', 'хром'},
             'microsoft edge': {'edge', 'microsoft edge', 'эдж'},
             'mozilla firefox': {'firefox', 'mozilla firefox', 'файрфокс'},
@@ -38,7 +40,16 @@ class ApplicationChoices:
         self.last = {}
 
     def remember_offer(self, connection, name):
-        """Offer explicit preference saving using the existing speaker policy."""
+        """Offer explicit preference saving using the existing speaker policy.
+
+        Never in the middle of a longer request. "Open chrome and go to
+        youtube" is two steps, and this one sentence - "say Rowan, remember
+        this browser" - was what the model read back instead of going to the
+        site: it looks like a finished turn. When the same utterance still asks
+        for a page that has to be reached, staying silent is the whole fix.
+        """
+        if names_a_site_step(getattr(connection, '_utterance_text', '')):
+            return ''
         owner = connection._known_speaker_name().casefold()
         open_access = not connection._permissions_enabled
         if not owner and not open_access:

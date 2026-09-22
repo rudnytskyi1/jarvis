@@ -86,7 +86,8 @@ def test_an_unknown_face_reaches_the_owner_in_telegram_with_a_photo():
     delivery = report["deliveries"][0]
     assert delivery["kind"] == "image"
     assert delivery["chat_id"] == presence_mod.OWNER, "фото уходит владельцу"
-    assert "неопознанный человек" in delivery["caption"]
+    # TG-08: notifications are English; the person's name stays a name.
+    assert "the camera spotted an unknown person" in delivery["caption"]
     assert delivery["bytes"] > 0
     assert report["within_budget"] is True
 

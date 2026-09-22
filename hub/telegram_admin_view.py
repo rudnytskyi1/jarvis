@@ -91,6 +91,8 @@ def rule_value(key, value, *, private_to=0, chats=None):
                   'zone_entered': 'Zone changed', 'sound_event': 'Sound event',
                   'object': 'Object of interest'},
         'channel': {'telegram': 'Telegram', 'push': 'Phone push', 'hud': 'HUD caption'},
+        # ТЗ F-702: «снимать, пока человек в кадре» — переключатель, а не число.
+        'record_until_clear': {True: 'On', False: 'Off'},
     }
     if key in options:
         if key != 'destination':

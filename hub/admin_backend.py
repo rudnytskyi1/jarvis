@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 
+from hub import telegram_audit
 from hub.admin_settings import CATEGORIES, LIVE, apply_live, catalogue, validated_value
 from hub.telegram_admin_state import contains_secret
 
@@ -492,17 +493,38 @@ class AdminBackend:
         Reads are not audited — ``.list`` actions and ``status`` only look — and
         a panel that cannot reach the audit table still does its job: the log is
         a record, not a gate.
+
+        Two records are written, of the same change: the row in the hub's
+        ``audit`` table, and a line in ``data/telegram/audit.log`` with the
+        account, the values it changed and the outcome, so the owner can read
+        who changed what without opening a database.
         """
-        audit = self.get_audit()
-        if audit is None or action.endswith('.list') or action == 'status':
+        if action.endswith('.list') or action == 'status':
             return
         if not str(action).startswith(self.AUDITED):
             return
         target = str(payload.get('id') or payload.get('device_id') or payload.get('scene_id')
                      or payload.get('user_id') or payload.get('key') or '')
-        audit.record(action=action, actor=actor, target=target,
-                     home_id=payload.get('home_id') or self._home_of(action, payload),
-                     result=result, detail=detail or {'fields': sorted(payload)})
+        home_id = payload.get('home_id') or self._home_of(action, payload)
+        # The chat the panel is being used from is not a change; everything
+        # else the account sent is what "what" means in "who changed what".
+        values = {str(key): value for key, value in payload.items() if key != 'chat_id'}
+        audit = self.get_audit()
+        if audit is not None:
+            audit.record(action=action, actor=actor, target=target,
+                         home_id=home_id, result=result,
+                         detail=detail or {'fields': sorted(payload), 'values': values})
+        telegram_audit.record(actor, action, values, result,
+                              label=self._actor_label(actor), home_id=str(home_id or ''),
+                              error=str((detail or {}).get('error') or ''))
+
+    def _actor_label(self, actor):
+        """How the account that made the change is called, when it is known."""
+        lookup = getattr(self.access, 'label', None)
+        try:
+            return str(lookup(actor) or '') if callable(lookup) else ''
+        except Exception:  # noqa: BLE001 - a nameless audit line is still a line
+            return ''
 
     def _home_of(self, action, payload):
         """Which home a panel action belongs to, when it can be told."""

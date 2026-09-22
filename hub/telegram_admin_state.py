@@ -164,6 +164,11 @@ class TelegramAdminState:
                 people.add(user_id)
         return tuple(sorted(people))
 
+    def label(self, user_id):
+        """How this account is called, when the bot has seen it (ТЗ F-706)."""
+        row = self._users_cache.get(user_id) or {}
+        return str(row.get('label') or '')
+
     def users(self):
         with self._db() as db:
             rows = db.execute('SELECT * FROM telegram_access ORDER BY explicit DESC,label,user_id').fetchall()

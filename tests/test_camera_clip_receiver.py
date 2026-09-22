@@ -32,7 +32,7 @@ def test_capability_is_required_before_sending_request():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('seconds,fps', [(2, 8), (11, 8), (float('nan'), 8), (True, 8), (5, 4), (5, 11), (5, False)])
+@pytest.mark.parametrize('seconds,fps', [(2, 8), (61, 8), (float('nan'), 8), (True, 8), (5, 4), (5, 11), (5, False)])
 def test_invalid_bounds_do_not_start_capture(seconds, fps):
     async def run():
         value = receiver()

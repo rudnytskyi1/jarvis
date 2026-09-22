@@ -451,7 +451,7 @@ def test_panel_status_and_rule_use_readable_text_without_json(tmp_path):
 
 def test_alert_presets_are_inside_the_real_ranges():
     """Every preset the panel offers must pass the real validator."""
-    from hub.presence_alerts import RULE_RANGES, validate_rule
+    from hub.presence_alerts import CLIP_SECONDS_RANGE, RULE_RANGES, validate_rule
     from hub.telegram_admin import _ALERT_FIELDS, _ALERT_PRESETS
 
     assert set(_ALERT_PRESETS) <= set(_ALERT_FIELDS), "a preset without a panel field is dead code"
@@ -464,8 +464,11 @@ def test_alert_presets_are_inside_the_real_ranges():
                 assert low <= value <= high, f"{key} preset {value} is outside {low}..{high}"
     # clip_seconds has its own integer rule instead of a RULE_RANGES entry.
     assert 'clip_seconds' in _ALERT_PRESETS
+    low, high = CLIP_SECONDS_RANGE
+    for value in _ALERT_PRESETS['clip_seconds']:
+        assert low <= value <= high and validate_rule({'clip_seconds': value})['clip_seconds'] == value
     with pytest.raises(ValueError):
-        validate_rule({'clip_seconds': 11})
+        validate_rule({'clip_seconds': high + 1})
 
 
 def test_notification_cooldown_floor_is_one_second():

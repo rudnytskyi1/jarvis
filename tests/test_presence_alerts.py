@@ -21,7 +21,8 @@ def engine(tmp_path, service=None, room=None):
 @pytest.mark.parametrize('patch', [
     {'enabled': 'yes'}, {'chat_id': 999}, {'target': 'all'}, {'destination': 'other'},
     {'target': 'person', 'name': ''}, {'cooldown_s': 0}, {'min_stable_s': float('nan')},
-    {'absence_s': False}, {'media': 'audio'}, {'clip_seconds': 11},
+    {'absence_s': False}, {'media': 'audio'}, {'clip_seconds': 61},
+    {'record_until_clear': 'yes'},
     {'quiet_start': '22:00'}, {'quiet_start': '22:00', 'quiet_end': '22:00'},
     {'quiet_start': '25:00', 'quiet_end': '07:00'}, {'timezone': '../etc/passwd'},
 ])

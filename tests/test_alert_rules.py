@@ -131,7 +131,7 @@ def test_an_event_rule_fires_on_the_event_with_its_own_words(tmp_path):
             alerts.observe_event('person_entered', name='Макс', source_id='living', home_id='livingroom')
             await alerts.drain()
             assert len(provider.sent) == 1
-            assert 'пришёл' in provider.sent[0]['caption'] and 'Макс' in provider.sent[0]['caption']
+            assert 'arrived' in provider.sent[0]['caption'] and 'Макс' in provider.sent[0]['caption']
             deliveries = alerts.status()['deliveries']
             assert [(row['status'], row['detail']) for row in deliveries][0][0] == 'sent'
         finally:
