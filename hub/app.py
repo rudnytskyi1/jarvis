@@ -1404,7 +1404,10 @@ def _workplaces():
             camera_name=getattr(connection, 'camera_name', 'Camera'),
             # ТЗ F-701: рабочее место принадлежит дому — по этому полю /tools
             # владельца дома показывает только его комнаты.
-            home_id=connection.session.home_id,
+            # The home lives on the CONNECTION (the v2 hello sets it from the
+            # token); ``Session`` is the room state and has no such field, which
+            # is what made every owner-panel ``workplaces.list`` fail.
+            home_id=getattr(connection, 'home_id', '') or '',
             connected=_telegram_room(identifier) is not None)
     return list(values.values())
 
