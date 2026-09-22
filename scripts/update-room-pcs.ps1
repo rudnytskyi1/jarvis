@@ -90,7 +90,7 @@ if (-not $DryRun) {
 
 foreach ($pc in $pcs) {
     if ($Only.Count -and ($Only -notcontains $pc.name)) { continue }
-    $entry = [ordered]@{ pc = $pc.name; host = "$($pc.user)@$($pc.host)"; result = ''; camera = ''; task = '' }
+    $entry = [ordered]@{ pc = $pc.name; host = "$($pc.user)@$($pc.host)"; result = ''; camera = ''; task = ''; window = '' }
 
     $probe = Invoke-Remote -Pc $pc -Script '"PROBE=ok"'
     if ($probe.code -ne 0 -or (Get-Line $probe.lines 'PROBE') -ne 'ok') {
@@ -133,9 +133,30 @@ if ('KIND_HERE' -eq 'git') {
     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
     Expand-Archive -Path $zip -DestinationPath $dest -Force
     Copy-Item -Path (Join-Path $dest '*') -Destination $root -Recurse -Force
-    "RESULT=files"
+"RESULT=files"
 }
 "CAMERA_HASH=$((Get-FileHash (Join-Path $root 'client\camera.py') -Algorithm SHA256).Hash)"
+# The room PC needs no PowerShell window on the TV: run-client.ps1 keeps its
+# own log file (data\logs), and the HUD is drawn by the client itself. The
+# action is edited in place so triggers, principal and settings survive.
+try {
+    $registered = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    if (-not $registered) { "WINDOW=task missing" }
+    else {
+        $first = @($registered.Actions)[0]
+        $arguments = [string]$first.Arguments
+        if ($arguments -match '(?i)-WindowStyle') { "WINDOW=hidden" }
+        else {
+            $hidden = $arguments -replace '(?i)(-File\b)', '-WindowStyle Hidden $1'
+            $splat = @{ Execute = [string]$first.Execute; Argument = $hidden }
+            if ([string]$first.WorkingDirectory) { $splat['WorkingDirectory'] = [string]$first.WorkingDirectory }
+            Set-ScheduledTask -TaskName $task -Action (New-ScheduledTaskAction @splat) | Out-Null
+            $arguments = $hidden
+            "WINDOW=fixed"
+        }
+        "TASK_ACTION=$arguments"
+    }
+} catch { "WINDOW=не удалось ($($_.Exception.GetType().Name))" }
 Start-ScheduledTask -TaskName $task
 Start-Sleep -Seconds 12
 "TASK_STATE=$((Get-ScheduledTask -TaskName $task).State)"
@@ -146,6 +167,7 @@ Start-Sleep -Seconds 12
     $hash = Get-Line $run.lines 'CAMERA_HASH'
     $entry.camera = if ($hash -eq $localCamera) { 'совпадает' } elseif ($hash) { "ДРУГОЙ ($($hash.Substring(0, 12)))" } else { 'неизвестно' }
     $entry.task = Get-Line $run.lines 'TASK_STATE'
+    $entry.window = Get-Line $run.lines 'WINDOW'
     $entry.result = if ($run.code -ne 0) { "ОШИБКА (код $($run.code))" }
         elseif ((Get-Line $run.lines 'RESULT') -eq 'files') { 'обновлён и перезапущен' }
         elseif ((Get-Line $run.lines 'RESULT') -eq 'git') { 'обновлён через git и перезапущен' }

@@ -9034,6 +9034,8 @@ class Connection(CameraClipReceiver):
             return await self._run_generate_image(args, purpose)
         if name == 'telegram_send':
             return await self._run_telegram_send(args)
+        if name == 'say_in_room':
+            return await self._run_say_in_room(args)
         if name == 'inspect_photo':
             return {'ok': False, 'error': 'Attach a photo in Telegram and ask what to do with it.'}
         if name == 'browser_control':
@@ -12497,6 +12499,33 @@ class Connection(CameraClipReceiver):
             await self.send_json({"type": proto.MSG_SAY, "text": line})
             await self._stream_tts(voice, line, cache=True)
         return True
+
+    async def _run_say_in_room(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Say a phrase OUT LOUD in this room (tool ``say_in_room``).
+
+        The voice path already speaks its own answer, so this tool exists for
+        the requests where the answer goes somewhere else - above all Telegram:
+        the owner writes "say TEST HELLO on the anton PC" and the room has to
+        hear exactly those words. The text goes out the same way a proactive
+        line does (``say`` + TTS through ``_say_proactive``), so a missing
+        speech engine is reported as a failure instead of pretending the room
+        heard something (ТЗ раздел 4.5, F-417).
+        """
+        text = " ".join(str(args.get("text") or "").split())
+        if not text:
+            return {"ok": False, "error": "Nothing to say: the request carried no text."}
+        person = " ".join(str(args.get("person") or "").split())
+        try:
+            spoken = await self._say_proactive(text, name=person)
+        except Exception as exc:  # noqa: BLE001 - the tool reports what happened
+            log.warning("Could not say anything in the room (%s)", exc)
+            return {"ok": False, "error": f"The room could not be reached: {type(exc).__name__}."}
+        if not spoken:
+            return {"ok": False,
+                    "error": ("The room has no voice right now (speech synthesis is "
+                              "unavailable), so nothing was said.")}
+        log.info("Said in the room: %r", text)
+        return {"ok": True, "note": "The room heard the text out loud."}
 
     async def _flush_push_outbox(self, person_id: str) -> int:
         """ТЗ F-712: hand a person the messages that waited for their phone.

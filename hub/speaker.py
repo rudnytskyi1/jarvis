@@ -186,6 +186,9 @@ _TRUSTED_TOOLS = frozenset(
         "generate_image",
         "telegram_send",
         "set_wallpaper",
+        # Making the room itself speak is a room action like the rest: a
+        # stranger's voice does not get to put words in the house's mouth.
+        "say_in_room",
         # Who holds admin is security-relevant: a stranger must not be able to
         # enumerate the room's people and find out whom to imitate.
         "list_people",

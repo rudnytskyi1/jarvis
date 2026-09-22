@@ -52,6 +52,7 @@ def test_every_tool_exposed():
         "telegram_send",
         "set_wallpaper",
         "list_people",
+        "say_in_room",
         "run_skill",
         "computer_use",
     }
@@ -84,6 +85,7 @@ def test_matrix_split():
         "telegram_send",
         "set_wallpaper",
         "list_people",
+        "say_in_room",
         "run_skill",
         "computer_use",
     }

@@ -115,7 +115,9 @@ def test_a_guard_sighting_marks_the_room_active_and_marks_a_burst_due():
     service._tracks = []
     service._last_person_seen = 0.0
     pushed: list = []
-    service._maybe_push_presence = lambda frame=None: pushed.append(frame)
+    # The guard pushes with frame_prefix='q' so its burst id cannot collide
+    # with the heavy detector's own 'p' ids (see _maybe_push_presence).
+    service._maybe_push_presence = lambda frame=None, frame_prefix='p': pushed.append(frame)
     frame = object()
     service._note_quick_persons(frame, [{"id": "quick:1:0", "box": [0.1, 0.2, 0.4, 0.8]}])
     assert pushed == [frame]

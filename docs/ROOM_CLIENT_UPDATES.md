@@ -45,7 +45,10 @@ pwsh -File scripts/update-room-pcs.ps1 -DryRun           # только пров
 * **AntonDorm (`C:\Users\Anton\Desktop\jarvis`)** — копия проекта без `.git`,
   поэтому только файлами. Задача `JarvisRoomClient` запускает
   `scripts\run-client.ps1`; она обязана быть `Interactive`, иначе HUD не
-  появится на экране.
+  появится на экране, и запускать её надо с `-WindowStyle Hidden` — окно
+  PowerShell на телевизоре не нужно, HUD клиент рисует своим окном, а лог
+  ведёт в `data\logs`. `scripts\update-room-pcs.ps1` правит действие задачи
+  на месте (`Set-ScheduledTask`) и печатает `WINDOW=hidden|fixed`.
 * **buro / BROANXL (`C:\Users\user\Desktop\rowanai`)** — клон публичного
   релиза `rowanai`, но `git pull` из SSH-сессии падает: Git Credential Manager
   не может сохранить креды без интерактивного сеанса
@@ -63,3 +66,4 @@ pwsh -File scripts/update-room-pcs.ps1 -DryRun           # только пров
 | Когда | Что сделано |
 |---|---|
 | 2026-09-22 | Введён скрипт и инвентарь; обновлены и перезапущены `AntonDorm` и `buro` (бёрст присутствия + сторож быстрого прохода) |
+| 2026-09-22 | Задача клиента переводится на `-WindowStyle Hidden` (окно на ТВ не нужно); FP16 передаётся как `quantize` для ultralytics 8.4 — предупреждение `'half' is deprecated` больше не забивает лог |

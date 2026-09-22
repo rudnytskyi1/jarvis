@@ -55,6 +55,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -168,6 +169,7 @@ __all__ = [
     "CONF_THRESHOLD",
     "FACE_BURST",
     "BURST_FRAME_INTERVAL_S",
+    "precision_kwargs",
     "CameraUnavailable",
     "CameraService",
 ]
@@ -200,6 +202,36 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+@lru_cache(maxsize=1)
+def _fp16_arg_name() -> str:
+    """The keyword the installed Ultralytics wants for FP16 inference.
+
+    Ultralytics 8.4 replaced ``half`` with ``quantize`` (16 = FP16, ``None`` =
+    FP32). The old name still works, but it prints a deprecation line for EVERY
+    prediction - the room PC's console filled with "WARNING 'half' is deprecated
+    and will be removed in the future. Use 'quantize' instead." and nothing else
+    could be read on it. Older builds only understand ``half``, so the name is
+    taken from the build that is actually installed.
+    """
+    try:
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+    except Exception as exc:  # noqa: BLE001 - no ultralytics: keep the old name
+        log.debug("Ultralytics precision argument unknown (%s); using 'half'", exc)
+        return "half"
+    return "quantize" if "quantize" in DEFAULT_CFG_DICT else "half"
+
+
+def precision_kwargs(half: bool) -> dict[str, Any]:
+    """The FP16 switch as ``{"quantize": 16}`` or ``{"half": True}`` (see F-201).
+
+    ``half=False`` must clear the precision instead of inheriting a higher one,
+    and the new name spells that as ``quantize=None`` rather than ``False``.
+    """
+    if _fp16_arg_name() == "quantize":
+        return {"quantize": 16 if half else None}
+    return {"half": bool(half)}
 
 
 def yolo_placement() -> tuple[Any, bool]:
@@ -901,9 +933,10 @@ class CameraService:
                 loaded[profile.name] = model
                 return measure_ms(lambda: model.predict(source=frame, imgsz=640,
                                                         device=self.device,
-                                                        half=bool(profile.half) and self.half,
                                                         conf=CONF_THRESHOLD,
-                                                        verbose=False),
+                                                        verbose=False,
+                                                        **precision_kwargs(
+                                                            bool(profile.half) and self.half)),
                                   frames=self.profile_measure_frames)
             except Exception as exc:  # noqa: BLE001 - записанная причина важнее трейсбека
                 self.profile_attempts.append(
@@ -1131,7 +1164,7 @@ class CameraService:
         """Person boxes the light model sees in one frame, as wire tracks."""
         results = model.predict(
             source=frame, conf=QUICK_PASS_CONF, imgsz=QUICK_PASS_IMGSZ,
-            device=self.device, half=self.half, verbose=False,
+            device=self.device, verbose=False, **precision_kwargs(self.half),
         )
         return self._person_boxes(results, prefix=f'quick:{int(frame_ts * 1000)}')
 
@@ -1216,7 +1249,7 @@ class CameraService:
             verbose=False,
             device=self.device,
             imgsz=640,
-            half=self.half,
+            **precision_kwargs(self.half),
         )
         counts: dict[str, int] = {}
         detections = []

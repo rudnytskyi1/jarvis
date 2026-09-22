@@ -3,7 +3,8 @@
 #   powershell -ExecutionPolicy Bypass -File deploy\windows\install-rowan.ps1 -Hub
 #   powershell -ExecutionPolicy Bypass -File deploy\windows\install-rowan.ps1 -Client
 #
-# Хаб: скрытая задача, перезапуск при падении. Клиент: обычное окно (там HUD),
+# Хаб: скрытая задача, перезапуск при падении. Клиент: интерактивная задача
+# без окна PowerShell (HUD клиент рисует сам, лог ведёт в data\logs),
 # запуск при входе пользователя в систему.
 param(
     [switch]$Hub,
@@ -22,10 +23,18 @@ $logs = Join-Path $Repo 'data\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
 function Install-RowanTask {
-    param([string]$Name, [string]$Module, [switch]$Interactive)
+    param([string]$Name, [string]$Module, [switch]$Interactive, [switch]$HiddenWindow)
 
-    $arguments = "-m $Module --config `"$Config`""
-    $action = New-ScheduledTaskAction -Execute $Python -Argument $arguments -WorkingDirectory $Repo
+    if ($HiddenWindow) {
+        # Окно PowerShell на телевизоре в комнате не нужно: HUD — отдельное
+        # окно клиента, а вывод уходит в data\logs через сам client.main.
+        $runClient = Join-Path $Repo 'scripts\run-client.ps1'
+        $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runClient`" -Config `"$(Join-Path $Repo $Config)`""
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments -WorkingDirectory $Repo
+    } else {
+        $arguments = "-m $Module --config `"$Config`""
+        $action = New-ScheduledTaskAction -Execute $Python -Argument $arguments -WorkingDirectory $Repo
+    }
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 0)
     if ($Interactive) {
@@ -62,7 +71,7 @@ if ($Hub) {
 }
 if ($Client) {
     if (-not (Install-WithNssm -Name 'RowanClient' -Module 'client.main' -LogName 'client')) {
-        Install-RowanTask -Name 'RowanClient' -Module 'client.main' -Interactive
+        Install-RowanTask -Name 'RowanClient' -Module 'client.main' -Interactive -HiddenWindow
     }
 }
 Write-Host 'Done. Start now with: schtasks /Run /TN RowanHub'

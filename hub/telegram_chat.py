@@ -243,6 +243,10 @@ class TelegramChat:
         self.system_prompt = PROMPT.read_text(encoding='utf-8')
         self._task = None
         self._process_lock = asyncio.Lock()
+        #: Independent messages run side by side (owner's rule, DECISIONS
+        #: TG-PARALLEL-01): one slow answer must not hold up the next request.
+        self._pending: set[asyncio.Task] = set()
+        self._slots = asyncio.Semaphore(max(1, int(getattr(self.cfg, 'max_parallel_requests', 4) or 4)))
         self._initialized = False
         self._started_at = time.time()
         self.bot_id, self.username = None, ''
@@ -611,6 +615,12 @@ class TelegramChat:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._task = None
+        pending = list(self._pending)
+        for item in pending:
+            item.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._pending.clear()
 
     async def initialize(self):
         """Read identity and acknowledge startup backlog without any replies."""
@@ -652,7 +662,7 @@ class TelegramChat:
                 delay = 1.0
                 self.last_error = None
                 for update in updates:
-                    await self.process_update(update)
+                    self._dispatch(update)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -663,6 +673,34 @@ class TelegramChat:
                 wait = retry_after if _integer(retry_after) and retry_after > 0 else delay
                 await asyncio.sleep(min(30.0, max(1.0, wait)))
                 delay = min(30.0, delay * 2)
+
+    def _dispatch(self, update):
+        """Hand one update to its own task instead of waiting for the last one.
+
+        Every message is an independent request: a photo generation, a room
+        action and a plain question used to run strictly one after another, so
+        the second request only started when the first had finished (and a slow
+        one looked like a switched-off bot). The task itself takes a slot from
+        ``server.telegram.max_parallel_requests``, so a burst of messages cannot
+        start an unbounded number of room actions or model calls.
+        """
+        task = asyncio.create_task(self._process_in_slot(update))
+        self._pending.add(task)
+        task.add_done_callback(self._finished)
+
+    async def _process_in_slot(self, update):
+        async with self._slots:
+            await self.process_update(update)
+
+    def _finished(self, task):
+        """Forget a finished update; a failure is logged, never silent."""
+        self._pending.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.last_error = type(error).__name__
+            log.warning('Telegram update failed (%s)', self.last_error)
 
     def _group_message(self, update):
         message = update.get('message')
@@ -741,8 +779,11 @@ class TelegramChat:
             message, text = selected
             if not await asyncio.to_thread(self._claim, update_id, message):
                 return False
-            await self._answer(update_id, message, text)
-            return True
+        # А claim/offset/память — короткие и остаются под замком; сама
+        # обработка (модель, инструменты, генерация изображения) идёт вне
+        # него, поэтому следующее сообщение не ждёт конца предыдущего.
+        await self._answer(update_id, message, text)
+        return True
 
     async def _answer(self, update_id, message, text):
         if not self._can_chat(message):

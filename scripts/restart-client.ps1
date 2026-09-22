@@ -16,8 +16,11 @@ Get-Process python -ErrorAction SilentlyContinue | ForEach-Object {
 Start-Sleep -Seconds 2
 
 Write-Host "== (re)registering the interactive task =="
+# -WindowStyle Hidden: run-client.ps1 keeps its own log file, and the owner
+# does not want a PowerShell window parked on the room TV (the HUD is a
+# separate window the client draws itself).
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument ("-NoProfile -ExecutionPolicy Bypass -File `"{0}\scripts\run-client.ps1`"" -f $Root) `
+    -Argument ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"{0}\scripts\run-client.ps1`"" -f $Root) `
     -WorkingDirectory $Root
 $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\Anton" -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)

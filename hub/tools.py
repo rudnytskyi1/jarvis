@@ -436,6 +436,44 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "say_in_room",
+            "description": (
+                "Say a sentence OUT LOUD in this room: the room's speaker plays "
+                "exactly this text. Use it whenever somebody asks you to say, "
+                "speak or read something out in the room, including a Telegram "
+                "request aimed at a room computer ('say TEST HELLO on the anton "
+                "PC', 'tell the room it is time to go'). The room says the text "
+                "in the language you write it in, so write the words to be "
+                "spoken, not a description of them, and never add a note like "
+                "'I will say'. This is an action, not an answer: the tool result "
+                "comes back to you and your reply to the requester stays "
+                "separate. " + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "The exact words the room should hear, in the room's "
+                            "language, without quotes or commentary."
+                        ),
+                    },
+                    "person": {
+                        "type": "string",
+                        "description": (
+                            "Optional: the person the sentence is for. When the "
+                            "room knows that person's voice, it is used."
+                        ),
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "enroll_voice",
             "description": (
                 "Start guided recording of the CURRENT speaker's voice. "
@@ -875,6 +913,7 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "telegram_send", "inspect_photo",
         "set_wallpaper",
         "list_people",
+        "say_in_room",
         "run_skill",
         "computer_use",
     }

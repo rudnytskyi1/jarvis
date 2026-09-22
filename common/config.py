@@ -291,6 +291,9 @@ class TelegramConfig(_Strict):
     timeout_s: float = Field(default=30, ge=5, le=120)
     respond_to_mentions: bool = False
     poll_timeout_s: int = Field(default=25, ge=1, le=50)
+    #: Independent messages are answered side by side (DECISIONS.md
+    #: TG-PARALLEL-01); this caps how many requests run at the same time.
+    max_parallel_requests: int = Field(default=4, ge=1, le=16)
 
     @field_validator("admin_user_ids", mode="after")
     @classmethod
