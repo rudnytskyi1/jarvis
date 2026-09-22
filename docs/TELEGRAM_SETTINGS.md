@@ -40,7 +40,7 @@
 ```yaml
   telegram:
     control_user_id: 8322835915
-    admin_user_ids: [8928749210, 6617808228, 1328190425]
+    admin_user_ids: [8928749210, 6617808228, 1328190425, 8869605079]
     enabled: true
     chat_id: -5442466420
     respond_to_mentions: true
