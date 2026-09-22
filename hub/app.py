@@ -1521,6 +1521,32 @@ async def _say_in_home(home_id: str, line: str, *, name: str = "") -> bool:
     return await connection._say_proactive(line, name=name)
 
 
+async def _say_game_line(connection: Any, line: str) -> bool:
+    """Сказать строку партии F-608 в конкретной комнате.
+
+    ``_say_proactive`` честно молчит, когда TTS не загружен: это важное
+    свойство очереди F-712 (непроизнесённое сообщение не считается
+    доставленным). Игре этого мало — без TTS задание и счёт всё равно уходят
+    комнате ТЕКСТОМ: деградация вместо тишины (раздел 4.5 ТЗ), а сам факт
+    виден в логе.
+    """
+    text = " ".join(str(line or "").split())
+    if not text:
+        return False
+    try:
+        if await connection._say_proactive(text):
+            return True
+    except Exception as exc:  # noqa: BLE001 - строка важнее трассировки
+        log.info("Could not speak the game line (%s)", exc)
+    log.warning("The game line has no voice; the room gets it as text only")
+    try:
+        await connection.send_json({"type": proto.MSG_SAY, "text": text})
+    except Exception as exc:  # noqa: BLE001 - комната не отменяет игру
+        log.info("Could not even show the game line (%s)", exc)
+        return False
+    return True
+
+
 def _live_connection(home_id: str) -> Any:
     """Живое подключение комнаты, или ``None`` (для игры нужно именно оно)."""
     wanted = str(home_id or "")
@@ -7609,7 +7635,7 @@ class Connection(CameraClipReceiver):
             return True
         self._mystery_arm = 0.0
         try:
-            start, prompt = engine.start(
+            start, prompt = await engine.start(
                 speaker_id=person, speaker_name=name, home_id=home,
                 home_ids=_game_homes(), audio_pcm=bytes(pcm),
                 sample_rate=int(getattr(self, "sample_rate", 0) or 16000),
@@ -7659,7 +7685,7 @@ class Connection(CameraClipReceiver):
                 log.info("No live client in %s to hear the mystery voice", other)
                 continue
             try:
-                await connection._say_proactive(prompt)
+                await _say_game_line(connection, prompt)
                 await connection._send_play_audio(
                     pcm, rate, seconds=float(round_.audio_s or 0.0),
                     title=guess_who_mod.prompt_line(round_, language=language))
@@ -7674,8 +7700,12 @@ class Connection(CameraClipReceiver):
         for other in home_ids or ():
             if str(other) == str(home):
                 continue
+            connection = _live_connection(str(other))
+            if connection is None:
+                log.info("No live client in %s to hear the game line", other)
+                continue
             try:
-                await _say_in_home(str(other), line)
+                await _say_game_line(connection, line)
             except Exception as exc:  # noqa: BLE001 - одна комната не отменяет игру
                 log.info("Could not speak the voice-game line in %s (%s)", other, exc)
 
@@ -11730,7 +11760,12 @@ class Connection(CameraClipReceiver):
                     faces = [(item['name'], item['score']) for item in resolved if not item.get('stale')]
                     if _presence_alerts is not None and self.session is not None:
                         direct = [item for item in resolved if not item.get('stale') and item.get('source') == 'direct']
+                        # A rule that watches "anybody in the frame" needs the
+                        # person count on the BURST as well: a fast pass-by is
+                        # exactly one burst, and without this count its frames
+                        # never reached a "person in frame" rule at all.
                         _presence_alerts.observe(names=[item['name'] for item in direct if item.get('name')],
+                            persons=len(faces) or len(valid_tracks(frame.tracks)),
                             unknown_count=sum(not item.get('name') for item in resolved if not item.get('stale')),
                             jpeg=frame.jpeg, source_id=self.session.client_id,
                             observed_at=time.time() - max(0, time.monotonic() - received_at),
@@ -11756,7 +11791,8 @@ class Connection(CameraClipReceiver):
                         for row, face in observations:
                             try:
                                 await asyncio.to_thread(self.gallery.observe, frame.jpeg, row, face,
-                                                        manual_profiles, faces=located)
+                                                        manual_profiles, faces=located,
+                                                        frame_id=str(getattr(frame, 'id', '') or ''))
                             except Exception as exc:
                                 log.warning('Could not archive appearance (%s)', type(exc).__name__)
                 else:
@@ -11769,6 +11805,7 @@ class Connection(CameraClipReceiver):
                     faces = [engine.match(face['embedding'], profiles) for face in located]
                     if _presence_alerts is not None and self.session is not None:
                         _presence_alerts.observe(names=[name for name, _ in faces if name],
+                            persons=len(faces),
                             unknown_count=sum(not name for name, _ in faces), jpeg=frame.jpeg,
                             source_id=self.session.client_id,
                             observed_at=time.time() - max(0, time.monotonic() - received_at),

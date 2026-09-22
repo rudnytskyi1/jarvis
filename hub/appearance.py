@@ -87,6 +87,13 @@ class AppearanceGallery:
     MIN_SHARPNESS = 30.0
     MIN_INTERVAL = 60.0
     ACTIVE_LIMIT = 12
+    #: How many distinct frames must agree before a sighting is kept. The count
+    #: is frames, not seconds: the owner asked for exactly that after walking
+    #: past the camera quickly and never being learned ("stable presence of one
+    #: second" missed him). Three frames of one burst are three observations of
+    #: the same person, and every identity, size, sharpness and body-ownership
+    #: gate below still has to pass for each of them.
+    MIN_CONFIRMATION_FRAMES = 3
     #: An identity reference is the person's newest usable photograph: the owner
     #: asked for today's clothes, not the best frame of the week. A frame has to
     #: clear these bars to be preferred by recency; weaker frames are still used
@@ -135,14 +142,16 @@ class AppearanceGallery:
         tiny = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (9, 8))
         return "".join("1" if v else "0" for v in (tiny[:, 1:] > tiny[:, :-1]).ravel())
 
-    def observe(self, jpeg, row, face, profiles, *, faces=None, now=None):
+    def observe(self, jpeg, row, face, profiles, *, faces=None, now=None, frame_id=None):
         """Admit a high-quality face after repeated manual-anchor confirmation.
 
         Boxes are normalized xyxy. ``row['body_unambiguous']=False`` excludes
         a body overlapping another YOLO person. Missing ``faces`` excludes
-        body capture. ``now`` is Unix seconds (mainly injectable for tests).
+        body capture. ``now`` is Unix seconds (mainly injectable for tests);
+        ``frame_id`` names the frame a sighting came from, so one burst of
+        frames can confirm a person who is only in the room for a moment.
         """
-        return self._observe(jpeg, row, face, profiles, faces=faces, now=now)
+        return self._observe(jpeg, row, face, profiles, faces=faces, now=now, frame_id=frame_id)
 
     def enroll(self, jpeg, name, face, *, faces=None, now=None):
         """Retain an explicitly confirmed enrollment, never an inferred identity.
@@ -157,7 +166,8 @@ class AppearanceGallery:
         return self._observe(jpeg, row, face, {name: [face.get("embedding")]},
                              faces=faces, now=now, enrollment=True)
 
-    def _observe(self, jpeg, row, face, profiles, *, faces=None, now=None, enrollment=False):
+    def _observe(self, jpeg, row, face, profiles, *, faces=None, now=None,
+                 enrollment=False, frame_id=None):
         now = time.time() if now is None else float(now)
         name = str(row.get("name") or "").strip()
         key = (str(row.get("id", "")), name.casefold())
@@ -230,15 +240,20 @@ class AppearanceGallery:
                     return self._store(name, vector, face_crop, body, quality, now, force=True)
                 for stale in [k for k, p in self._pending.items() if now - p["last"] > 10]:
                     del self._pending[stale]
+                #: Distinct frames (not clock time) are the confirmation unit:
+                #: a burst of frames from one quick pass-by is enough, while
+                #: the same frame repeated a hundred times is still one frame.
+                frame_key = str(frame_id or '') or f'{now:.4f}'
                 pending = self._pending.get(key)
                 if (pending is None or pending["anchors"] != anchor_fingerprint
                         or not 0 < now - pending["last"] <= 5
                         or pending["vector"].shape != vector.shape
                         or float(pending["vector"] @ vector) < .65):
-                    pending = dict(first=now, count=0, anchors=anchor_fingerprint)
+                    pending = dict(first=now, count=0, anchors=anchor_fingerprint, frames=set())
                 pending.update(last=now, count=pending["count"] + 1, vector=vector)
+                pending.setdefault("frames", set()).add(frame_key)
                 self._pending[key] = pending
-                if pending["count"] < 3 or now - pending["first"] < 1.0:
+                if len(pending["frames"]) < self.MIN_CONFIRMATION_FRAMES:
                     return None
                 return self._store(name, vector, face_crop, body, quality, now)
         except Exception:

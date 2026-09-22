@@ -86,6 +86,42 @@ def test_stale_image_cannot_revive_presence_or_save_portrait(monkeypatch):
     conn.gallery.observe.assert_not_called()
 
 
+class _AlertRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def observe(self, **payload):
+        self.calls.append(payload)
+        return True
+
+
+def test_a_quick_burst_reaches_the_person_in_frame_rule(monkeypatch):
+    """Owner's report (2026-09-22): a quick pass-by never alerted.
+
+    A rule that watches "anybody in the frame" reads the person count, and for
+    a half-second pass the burst is the only place that count comes from: those
+    frames carried names only, so the rule never saw a person.
+    """
+    monkeypatch.setattr(app, '_face', SimpleNamespace(located_faces=lambda jpeg: [face([1, 0])],
+                                                    match=lambda emb, _: ('Anton', .8)))
+    monkeypatch.setattr(app, '_voices', SimpleNamespace(face_profiles=lambda: {'Anton': [[1, 0]]}))
+    alerts = _AlertRecorder()
+    monkeypatch.setattr(app, '_presence_alerts', alerts)
+    conn = connection()
+    conn.session = SimpleNamespace(client_id='room-1')
+    frames = [app.ImageFrame(b'f1', 640, 480, 640, 480, source='camera', tracks=[BODY], id='p1'),
+              app.ImageFrame(b'f2', 640, 480, 640, 480, source='camera', tracks=[BODY], id='p2'),
+              app.ImageFrame(b'f3', 640, 480, 640, 480, source='camera', tracks=[BODY], id='p3')]
+
+    asyncio.run(conn._match_presence(frames))
+
+    assert [call['persons'] for call in alerts.calls] == [1, 1, 1]
+    assert all(call['source_id'] == 'room-1' for call in alerts.calls)
+    # The three frames of the burst stay three frames for the appearance
+    # gallery, which is what lets it confirm a person who is only passing by.
+    assert [call.kwargs['frame_id'] for call in conn.gallery.observe.call_args_list] == ['p1', 'p2', 'p3']
+
+
 def picture(color):
     out = BytesIO()
     Image.new('RGB', (40, 30), color).save(out, 'JPEG')

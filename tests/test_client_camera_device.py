@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from types import SimpleNamespace
 
 from client import camera as client_camera
@@ -52,3 +53,24 @@ def test_the_service_keeps_fp16_when_the_card_is_there(monkeypatch):
     service = client_camera.CameraService(SimpleNamespace(enabled=True, half=True))
     assert service.device == 0
     assert service.half is True
+
+
+def test_the_detector_spends_no_fps_budget_while_somebody_is_visible():
+    """Owner's report (2026-09-22): a quick pass-by was not caught.
+
+    The configured FPS is a budget for an empty room. While a person is visible
+    the loop must take every frame the model can produce, otherwise the few
+    frames of a fast pass-by are exactly the ones dropped.
+    """
+    service = client_camera.CameraService.__new__(client_camera.CameraService)
+    interval = 1 / 10
+    service._tracks = []
+    service._last_person_seen = 0.0
+    assert service._detection_budget(interval) == interval
+    service._tracks = [{"track_id": "room:1"}]
+    assert service._detection_budget(interval) == 0.0
+    service._tracks = []
+    service._last_person_seen = time.monotonic()
+    assert service._detection_budget(interval) == 0.0
+    service._last_person_seen = time.monotonic() - client_camera.ACTIVE_DETECTION_HOLD_S - 1
+    assert service._detection_budget(interval) == interval

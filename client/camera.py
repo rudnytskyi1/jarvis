@@ -111,6 +111,11 @@ MIN_FPS = 0.2
 MAX_FPS = 240.0
 #: A frame older than this is not worth sending to the server any more.
 STALE_FRAME_S = 10.0
+#: While somebody is in the room - and this long after the last sighting -
+#: the detector runs frame by frame instead of at the configured FPS cap. The
+#: cap is a budget for an empty room; a fast pass-by is exactly the moment the
+#: next frames decide whether the person is seen at all (ТЗ F-201).
+ACTIVE_DETECTION_HOLD_S = 3.0
 #: How many consecutive failed ``VideoCapture.read()`` calls mean the device is
 #: gone (a C920 briefly stumbles when another app grabs it).
 MAX_READ_FAILURES = 30
@@ -305,6 +310,13 @@ class CameraService:
         self._sent_state: tuple[int, tuple[tuple[str, int], ...]] | None = None
         self._sent_state_at = 0.0
         self._last_presence_push = 0.0
+        #: ТЗ F-201: поднят, когда трек только что появился — такой проход
+        #: нельзя ждать до следующего периодического кадра, он уходит сразу
+        #: и целиком бёрстом (см. ``_maybe_push_presence``).
+        self._burst_due = False
+        #: Когда человека видели в последний раз (monotonic): пока он в
+        #: комнате, детектор не ждёт лимит кадров (``_detection_budget``).
+        self._last_person_seen = 0.0
         #: ТЗ F-306: необязательный слушатель кадров (жесты руки). Он получает
         #: кадр ПОСЛЕ отправки и не может ни задержать, ни сломать камеру.
         self._on_frame: Any = None
@@ -952,6 +964,8 @@ class CameraService:
                 else:
                     self._detect_errors = 0
                     self._inferred_count += 1
+                    if persons >= 1:
+                        self._last_person_seen = time.monotonic()
                     self._cache_detection(frame, frame_ts)
                     self._publish_state(persons, objects)
                     self._publish_attention(getattr(self, '_attention_found', []))
@@ -973,9 +987,22 @@ class CameraService:
                                  'model': self.model_name}, stop_event=self._stop_event)
                         self._maybe_push_presence(frame)
                     self._report_performance()
-            remaining = interval - (time.monotonic() - started)
+            remaining = self._detection_budget(interval) - (time.monotonic() - started)
             if remaining > 0:
                 self._stop_event.wait(remaining)
+
+    def _detection_budget(self, interval: float) -> float:
+        """Seconds to wait before the next detection: none while people are here.
+
+        ``interval`` comes from the configured/measured FPS. Spending it while a
+        person is visible drops the very frames that identify them, so the
+        detector runs flat out from a sighting until ``ACTIVE_DETECTION_HOLD_S``
+        after the last one.
+        """
+        active = (bool(getattr(self, '_tracks', None))
+                  or time.monotonic() - float(getattr(self, '_last_person_seen', 0.0))
+                  <= ACTIVE_DETECTION_HOLD_S)
+        return 0.0 if active else interval
 
     def _detect(self, model: Any, frame: Any) -> tuple[int, dict[str, int], list[dict[str, Any]]]:
         """Count people and objects in one frame by YOLO class name.
@@ -1217,6 +1244,12 @@ class CameraService:
         if not self.privacy.allows_frames:
             return
         reports = list(getattr(self, '_track_reports', []))
+        if any(report.event in {'entered', 'returned'} for report in reports):
+            # Somebody just walked in. A quick pass-by is over before the
+            # periodic presence push would carry a second frame, so the very
+            # next push goes out at once and carries the whole burst (see
+            # ``_maybe_push_presence``).
+            self._burst_due = True
         ids = tuple(sorted(report.track_id for report in reports))
         now = time.monotonic()
         if ids == self._sent_track_ids and now - self._sent_tracks_at < STATE_DEBOUNCE_S:
@@ -1301,12 +1334,17 @@ class CameraService:
 
         JPEG encoding runs off the YOLO thread. At most one presence update is
         pending; its track boxes are captured together with its source frame.
+        A track that just appeared is not held back by the periodic interval:
+        somebody who crosses the room in half a second gets their frames taken
+        right then, and that push carries the whole :data:`FACE_BURST`.
         """
         now = time.monotonic()
         if not self.privacy.allows_frames:
             # ТЗ F-303: в приватном режиме не уходит даже «присутствие».
             return
-        if self._presence_pending.is_set() or now - self._last_presence_push < self.face_check_interval_s:
+        burst = bool(getattr(self, '_burst_due', False))
+        if self._presence_pending.is_set() or (
+                not burst and now - self._last_presence_push < self.face_check_interval_s):
             return
         lock = self._send_lock
         if lock is not None and lock.locked():
@@ -1317,6 +1355,7 @@ class CameraService:
             log.debug("Skipping a presence burst - the socket is busy")
             return
         self._last_presence_push = now
+        self._burst_due = False
         self._frame_seq += 1
         frame_id = f'p{self._frame_seq}'
         # ТЗ 4.5: an unprompted presence push is a background camera event too,
@@ -1324,17 +1363,25 @@ class CameraService:
         event_id = new_ulid()
         self._presence_pending.set()
         if self._submit(self._encode_and_push_presence(frame, frame_id, list(self._tracks),
-                                                       event_id)) is None:
+                                                       event_id, burst=burst)) is None:
             self._presence_pending.clear()
 
-    async def _encode_and_push_presence(self, frame, frame_id, tracks, event_id=''):
+    async def _encode_and_push_presence(self, frame, frame_id, tracks, event_id='', burst=False):
         try:
             # full=True: face recognition needs a CRISP face. The old 1280px /
             # quality-80 presence frame made the owner's own face score around
             # the match threshold; a native-resolution frame fixes that at the
             # source instead of lowering the bar.
-            pairs = ([await asyncio.to_thread(self._encode, frame, full=True)] if frame is not None
-                     else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
+            if burst:
+                # A person who just appeared may be gone in half a second: the
+                # first push carries the whole burst the module promises, so
+                # the hub gets the several frames its identity and appearance
+                # confirmation asks for instead of one.
+                pairs = await asyncio.to_thread(self._capture_burst_sync, FACE_BURST, full=True)
+            else:
+                pairs = ([await asyncio.to_thread(self._encode, frame, full=True)]
+                         if frame is not None
+                         else await asyncio.to_thread(self._capture_burst_sync, 1, full=True))
             if pairs:
                 await self._send_burst(frame_id, CAMERA_REASON_PRESENCE, pairs, skip_if_busy=True,
                                        tracks=tracks, event_id=event_id)

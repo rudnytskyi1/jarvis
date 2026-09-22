@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -277,3 +278,82 @@ def test_a_presence_push_mints_its_own_event_id():
         assert is_ulid(coro.cr_frame.f_locals["event_id"])
     finally:
         coro.close()
+
+
+def _presence_camera(**attributes):
+    from client.camera import CameraService
+
+    camera = CameraService.__new__(CameraService)
+    camera.face_check_interval_s = 0.5
+    camera._presence_pending = __import__("threading").Event()
+    camera._last_presence_push = 0.0
+    camera._send_lock = None
+    camera._frame_seq = 0
+    camera._tracks = []
+    camera._burst_due = False
+    camera.privacy = SimpleNamespace(allows_frames=True)
+    for name, value in attributes.items():
+        setattr(camera, name, value)
+    return camera
+
+
+def test_a_track_that_just_appeared_pushes_its_burst_at_once():
+    """Owner's report (2026-09-22): a quick pass-by was never noticed.
+
+    The periodic push waits ``face_check_interval_s`` and carries one frame, so
+    somebody who crosses the room in half a second could be gone before the
+    hub ever saw a second frame. A new track clears the wait and takes the
+    whole burst.
+    """
+    camera = _presence_camera()
+    camera._last_presence_push = time.monotonic()  # inside the periodic interval
+    camera._burst_due = True
+    submitted = {}
+
+    def _submit(coro):
+        submitted["coro"] = coro
+        return object()
+
+    camera._submit = _submit
+    CameraService = type(camera)
+    CameraService._maybe_push_presence(camera, frame=object())
+
+    coro = submitted.get("coro")
+    assert coro is not None, "a new track must not wait for the periodic push"
+    try:
+        assert coro.cr_frame.f_locals["burst"] is True
+    finally:
+        coro.close()
+    assert camera._burst_due is False
+
+
+def test_the_periodic_push_still_waits_and_stays_one_frame():
+    camera = _presence_camera()
+    camera._last_presence_push = time.monotonic()
+    submitted = {}
+    camera._submit = lambda coro: submitted.setdefault("coro", coro)
+
+    type(camera)._maybe_push_presence(camera, frame=object())
+
+    assert "coro" not in submitted
+
+
+def test_a_presence_burst_takes_the_whole_face_burst_of_frames():
+    from client.camera import FACE_BURST, CameraService
+
+    camera = _presence_camera()
+    camera._encode = Mock(return_value=(b"one", 4, 4))
+    camera._capture_burst_sync = Mock(return_value=[(b"a", 4, 4), (b"b", 4, 4), (b"c", 4, 4)])
+    camera._send_burst = AsyncMock()
+
+    asyncio.run(CameraService._encode_and_push_presence(
+        camera, object(), "p1", [], event_id=new_ulid(), burst=True))
+
+    camera._capture_burst_sync.assert_called_once_with(FACE_BURST, full=True)
+    camera._encode.assert_not_called()
+    assert len(camera._send_burst.await_args.args[2]) == 3
+
+    asyncio.run(CameraService._encode_and_push_presence(
+        camera, object(), "p2", [], event_id=new_ulid()))
+    camera._encode.assert_called_once()
+    assert [pair[0] for pair in camera._send_burst.await_args.args[2]] == [b"one"]

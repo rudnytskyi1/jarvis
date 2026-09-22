@@ -47,15 +47,34 @@ def test_constructor_and_empty_reads_are_lazy(tmp_path):
     assert not root.exists()
 
 
-def test_confirmation_needs_separate_frames_and_second_of_consistency(tmp_path):
+def test_confirmation_counts_distinct_frames_not_seconds(tmp_path):
+    """Owner's report (2026-09-22): a quick pass-by was never learned.
+
+    Requiring a full second of presence meant somebody who crossed the room in
+    half a second was seen but never kept. Three distinct frames of one burst
+    are three observations of the same person; the same frame repeated is not.
+    """
     gallery = AppearanceGallery(tmp_path)
     jpeg, row, detected, profiles = scene(), track(), face(), {"Anton": [[1, 0, 0]]}
-    for now in (10, 10.1, 10.2):
-        assert gallery.observe(jpeg, row, detected, profiles, now=now) is None
-    accepted = gallery.observe(jpeg, row, detected, profiles, now=11)
+    first = gallery.observe(jpeg, row, detected, profiles, now=10, frame_id='p1')
+    assert first is None
+    assert gallery.observe(jpeg, row, detected, profiles, now=10.05, frame_id='p1') is None
+    assert gallery.observe(jpeg, row, detected, profiles, now=10.2, frame_id='p2') is None
+    accepted = gallery.observe(jpeg, row, detected, profiles, now=10.45, frame_id='p3')
     assert accepted["name"] == "Anton"
     assert accepted["quality"]["identity_score"] == pytest.approx(1)
     assert sample_count(gallery) == 1
+
+
+def test_a_frames_gap_restarts_the_confirmation(tmp_path):
+    gallery = AppearanceGallery(tmp_path)
+    profiles = {"Anton": [[1, 0, 0]]}
+    assert gallery.observe(scene(), track(), face(), profiles, now=10, frame_id='p1') is None
+    assert gallery.observe(scene(), track(), face(), profiles, now=10.5, frame_id='p2') is None
+    # Six seconds later this is a new sighting, not the third frame.
+    assert gallery.observe(scene(), track(), face(), profiles, now=16.5, frame_id='p3') is None
+    assert gallery.observe(scene(), track(), face(), profiles, now=17, frame_id='p4') is None
+    assert gallery.observe(scene(), track(), face(), profiles, now=17.5, frame_id='p5')
 
 
 def test_repeated_same_timestamp_does_not_confirm(tmp_path):
