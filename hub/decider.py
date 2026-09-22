@@ -11,7 +11,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, Protocol, TypeVar
 
@@ -229,12 +229,19 @@ class DecisionChain:
 
     def __init__(self, providers: Iterable[Decider], order: dict[str, Sequence[str]], *,
                  timeout_s: float = 0.4,
+                 provider_timeout_s: Mapping[str, float] | None = None,
                  recorder: Callable[[Decision[Any], str, str], Awaitable[None] | None] | None = None,
                  policies: dict[str, Policy] | None = None,
                  cache: Any = None) -> None:
         self.providers = {provider.name: provider for provider in providers}
         self.order = {key: tuple(value) for key, value in order.items()}
         self.timeout_s = timeout_s
+        #: ТЗ 15.1: 400 ms covers the whole decision for the local providers. A
+        #: cloud provider is reached over the network and gets its own budget
+        #: (``server.decider.providers.<name>.timeout_ms``) instead; otherwise
+        #: it would always be cut off before it could answer.
+        self.provider_timeout_s = {str(name): float(value)
+                                   for name, value in dict(provider_timeout_s or {}).items()}
         self.recorder = recorder
         #: ``hub.decider_cache.DecisionCache`` or ``None`` (ТЗ 5.4).
         self.cache = cache
@@ -260,8 +267,9 @@ class DecisionChain:
                 return hit
         for provider in self._chain(decision_type):
             call = getattr(provider, method)
+            budget = self.provider_timeout_s.get(provider.name, self.timeout_s)
             try:
-                result = await asyncio.wait_for(call(*args, decision_type=decision_type, **kwargs), self.timeout_s)
+                result = await asyncio.wait_for(call(*args, decision_type=decision_type, **kwargs), budget)
             except NotImplementedError:
                 continue
             except DecisionUnavailable as exc:

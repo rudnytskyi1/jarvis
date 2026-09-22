@@ -954,6 +954,7 @@ def _decision_chain(wake_words):
                 _decision_providers(order, wake_words, timeout_s),
                 order,
                 timeout_s=timeout_s,
+                provider_timeout_s=_provider_timeouts(),
                 policies={name: Policy(**values) for name, values in DECISION_POLICIES.items()},
                 recorder=recorder.record if recorder is not None else None,
                 cache=_decision_cache(),
@@ -997,6 +998,26 @@ def _decision_settings() -> tuple[dict[str, tuple[str, ...]], float]:
     return order, timeout_s
 
 
+def _provider_timeouts() -> dict[str, float]:
+    """Own time budget of each remote provider (ТЗ 5.2, 15.1).
+
+    The 400 ms budget of ТЗ 15.1 is the local path; a provider reached over the
+    network names its own budget in ``server.decider.providers.<name>.timeout_ms``,
+    or it would be cut off before its answer could arrive.
+    """
+    settings = getattr(getattr(get_config().server, "decider", None), "providers", None)
+    budgets: dict[str, float] = {}
+    for name in ("jev",):
+        provider = getattr(settings, name, None)
+        if provider is None:
+            continue
+        try:
+            budgets[name] = max(0.05, int(getattr(provider, "timeout_ms", 1500)) / 1000.0)
+        except (TypeError, ValueError):
+            continue
+    return budgets
+
+
 def _jev_provider(timeout_s: float = DECISION_TIMEOUT_S):
     """ТЗ 5.2/5.5: ``JevDecider``, если он включён флагом и есть ключ.
 
@@ -1020,9 +1041,14 @@ def _jev_provider(timeout_s: float = DECISION_TIMEOUT_S):
         return None
     from hub.jev_decider import JevDecider
 
+    # Видно в логе при старте: какой адрес и модель отвечают за решения.
+    log.info("Jev decisions are available: %s%s (model %s, budget %.2f s)",
+             base_url, str(getattr(jev, "path", "") or ""),
+             str(getattr(jev, "model", "") or ""), float(timeout_s))
     return JevDecider(
         base_url=base_url, api_key=key,
-        path=str(getattr(jev, "path", "/v1/decide") or "/v1/decide"),
+        path=str(getattr(jev, "path", "/v1/systemone") or "/v1/systemone"),
+        model=str(getattr(jev, "model", "jev-latest") or "jev-latest"),
         timeout_s=float(timeout_s),
         # ТЗ 5.5: флаг дома ``cloud_decisions`` решает, уходит ли текст наружу.
         allowed_for=_home_allows_cloud_decisions)
@@ -1036,7 +1062,7 @@ def _decision_providers(order: dict[str, tuple[str, ...]], wake_words,
     providers: list[Any] = [RulesDecider(wake_phrases=tuple(wake_words))]
     names = {name for chain in order.values() for name in chain}
     if "jev" in names:
-        jev = _jev_provider(timeout_s)
+        jev = _jev_provider(_provider_timeouts().get("jev", timeout_s))
         if jev is not None:
             providers.append(jev)
     if "local_llm" in names:

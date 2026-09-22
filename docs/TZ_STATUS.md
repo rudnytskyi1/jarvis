@@ -572,6 +572,28 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   запроса/ответа собрана по интерфейсу ТЗ и уточняется по документации после
   получения доступа (открытый вопрос раздела 17, `DECISIONS.md`).
 
+- **P3-38 (JevDecider) — уточнено 22.09.2026: доступ получен, форма реальная.**
+  Ключ раннего доступа пришёл, и провайдер переписан на настоящий System One
+  (`typesafe-sdk` 0.7.1): `POST {base_url}/v1/systemone`, тело
+  `{state, model, questions}` с типизированными вопросами `noul` / `choice` /
+  `score`, ответ `{"answers": {...}}` — придуманная ручка `/v1/decide` убрана.
+  Работает и через OpenRouter (`base_url: https://openrouter.ai/api`, ключ
+  `JEV_API_KEY` в `.env`), и напрямую с TypeSafe. У облачного провайдера теперь
+  **свой бюджет** времени (`providers.jev.timeout_ms`, по умолчанию 1500 мс):
+  400 мс таблицы 15.1 остаются локальному пути, иначе облако обрезалось бы
+  таймаутом всегда. Порядок в конфигах — `[rules, jev]`: правила отвечают
+  мгновенно, Jev подхватывает те вопросы, где правил нет (тип вне
+  `HEURISTIC_TYPES`, а `score` правилам недоступен вовсе). Живой замер:
+  `addressed` 612 мс / `route` 475 мс / `score` 448 мс на вопрос через
+  OpenRouter (модель под именем `jev-latest` отвечает `typesafe/jev-1.13`).
+  Проверено: `pytest tests/test_jev_decider.py -q` → 31 passed;
+  `pytest tests/test_decider.py tests/test_decider_config.py
+  tests/test_decider_local.py tests/test_metrics.py tests/test_grafana_dashboard.py
+  tests/test_config.py -q` → 60 passed.
+  **Чего нет:** batching — System One умеет задавать несколько вопросов одним
+  запросом, а интерфейс `Decider` спрашивает по одному (стоит один сетевой
+  круг на вопрос); это задел на будущее, а не ошибка.
+
 - **P3-39 (F-305, сценарий 6) — память объектов: сделано наполовину, честно.**
   Чтение и ответ реализованы по-настоящему: `hub/object_memory.py` —
   `ObjectMemoryStore` над таблицей `objects_index` схемы 14 (`record`,

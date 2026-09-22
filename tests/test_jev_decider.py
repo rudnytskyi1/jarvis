@@ -1,4 +1,10 @@
-"""P3-38: JevDecider за флагом, порядок цепочки, таймаут и флаг дома."""
+"""JevDecider: за флагом, порядок цепочки, свой таймаут и флаг дома.
+
+Форма запроса — System One из SDK ``typesafe-sdk`` 0.7.1: POST
+``{base_url}/v1/systemone`` с ``{state, model, questions}`` и ответ
+``{"answers": {name: {"type": "noul"|"choice"|"score", ...}}}``. Провайдер
+работает и напрямую с TypeSafe, и через OpenRouter — меняется только base_url.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,8 +17,8 @@ import pytest
 
 from common.config import Config, DeciderConfig, HomeConfig, load_config
 from hub import app as hub_app
-from hub.decider import DecisionChain, DecisionUnavailable
-from hub.jev_decider import JevDecider, _privacy_context
+from hub.decider import DecisionChain, DecisionUnavailable, RulesDecider
+from hub.jev_decider import DEFAULT_MODEL, DEFAULT_PATH, JevDecider, _privacy_context
 from hub.session import Session
 from hub.utterances import UtteranceMetrics
 
@@ -23,9 +29,29 @@ def _provider(handler, *, allowed: bool = True, key: str = "secret-key") -> JevD
                       timeout_s=0.4, allowed_for=lambda home: allowed)
 
 
-def _answer(value, confidence=0.9):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"value": value, "confidence": confidence})
+def _body(**answer) -> dict:
+    return {"answers": {"answer": answer}}
+
+
+def _noul(probability: float):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_body(type="noul", noul=probability))
+
+    return handler
+
+
+def _choice(choice: str, confidence: float = 0.9):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_body(type="choice", choice=choice,
+                                              confidence=confidence))
+
+    return handler
+
+
+def _score(score: float, confidence: float = 0.9):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_body(type="score", score=score,
+                                              confidence=confidence))
 
     return handler
 
@@ -36,15 +62,26 @@ def _answer(value, confidence=0.9):
 def test_jev_is_off_by_default():
     assert DeciderConfig().providers.jev.enabled is False
     assert DeciderConfig().providers.jev.api_key_env == "JEV_API_KEY"
+    assert DeciderConfig().providers.jev.path == DEFAULT_PATH
+    assert DeciderConfig().providers.jev.model == DEFAULT_MODEL
     assert HomeConfig(home_id="a", name="A").cloud_decisions is False
 
 
-@pytest.mark.parametrize("name", ["config.yaml", "config.example.yaml"])
-def test_both_configs_declare_the_jev_provider(name):
-    cfg = load_config(name)
-    assert cfg.server.decider.providers.jev.enabled is False
-    # ТЗ 5.2: пример порядка — jev, потом локальная модель, потом правила.
-    assert cfg.server.decider.order["addressed"] == ["jev", "local_llm", "rules"]
+def test_the_example_config_declares_the_jev_provider():
+    """The template ships Jev off, with the real path and its own budget.
+
+    ``config.yaml`` and ``config.openai.yaml`` are the owner's own files (not in
+    git), so the template is what a new hub starts from.
+    """
+    cfg = load_config("config.example.yaml")
+    jev = cfg.server.decider.providers.jev
+    assert jev.enabled is False
+    assert jev.path == "/v1/systemone"
+    assert jev.model == "jev-latest"
+    assert jev.timeout_ms > cfg.server.decider.timeout_ms
+    # Локальные правила идут первыми: облако зовётся только там, где их нет.
+    assert cfg.server.decider.order["addressed"][0] == "rules"
+    assert "jev" in cfg.server.decider.order["addressed"]
 
 
 def test_an_unknown_provider_key_is_rejected():
@@ -90,6 +127,18 @@ def test_the_key_comes_from_the_environment(monkeypatch):
     assert provider._api_key == "secret"
 
 
+def test_the_provider_gets_its_own_budget_from_the_config(monkeypatch):
+    cfg = Config(server={"decider": {
+        "timeout_ms": 400,
+        "providers": {"jev": {"enabled": True, "base_url": "https://jev.example",
+                              "timeout_ms": 2500}}}})
+    monkeypatch.setattr(hub_app, "_config", cfg)
+    monkeypatch.setenv("JEV_API_KEY", "secret")
+    assert hub_app._provider_timeouts()["jev"] == pytest.approx(2.5)
+    provider = hub_app._jev_provider(hub_app._provider_timeouts()["jev"])
+    assert provider is not None and provider.timeout_s == pytest.approx(2.5)
+
+
 # --- три операции -----------------------------------------------------------
 
 
@@ -98,7 +147,7 @@ def test_yes_no_becomes_a_typed_decision():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json={"value": True, "confidence": 0.87})
+        return httpx.Response(200, json=_body(type="noul", noul=0.87))
 
     decision = asyncio.run(_provider(handler).yes_no(
         "Is this addressed to Rowan?", {"text": "rowan, lights off", "home_id": "livingroom"},
@@ -106,39 +155,89 @@ def test_yes_no_becomes_a_typed_decision():
     assert decision.value is True and decision.provider == "jev"
     assert decision.confidence == pytest.approx(0.87)
     sent = json.loads(seen[0].content)
-    assert sent["mode"] == "yes_no" and sent["decision_type"] == "addressed"
-    assert sent["question"] == "Is this addressed to Rowan?"
+    assert sent["model"] == DEFAULT_MODEL
+    assert sent["questions"]["answer"]["type"] == "noul"
+    assert sent["questions"]["answer"]["instructions"] == "Is this addressed to Rowan?"
+    assert sent["state"]["text"] == "rowan, lights off"
+    assert sent["state"]["decision"] == "addressed"
+    assert seen[0].url.path == "/v1/systemone"
     assert seen[0].headers["authorization"] == "Bearer secret-key"
 
 
+def test_a_coin_toss_is_an_unsure_yes():
+    """The value is the side of the coin; the confidence says how close it was."""
+    decision = asyncio.run(_provider(_noul(0.51)).yes_no(
+        "addressed?", {"text": "x", "home_id": "livingroom"}, decision_type="addressed"))
+    assert decision.value is True
+    assert decision.confidence == pytest.approx(0.51)
+    decision = asyncio.run(_provider(_noul(0.49)).yes_no(
+        "addressed?", {"text": "x", "home_id": "livingroom"}, decision_type="addressed"))
+    assert decision.value is False
+
+
 def test_choose_only_accepts_an_offered_option():
-    good = _provider(_answer("fast_command"))
+    good = _provider(_choice("fast_command"))
     decision = asyncio.run(good.choose("route?", ["fast_command", "llm"],
                                        {"text": "volume 30", "home_id": "livingroom"},
                                        decision_type="route"))
     assert decision.value == "fast_command"
-    bad = _provider(_answer("something else"))
+    bad = _provider(_choice("something else"))
     with pytest.raises(DecisionUnavailable):
         asyncio.run(bad.choose("route?", ["fast_command", "llm"],
                                {"text": "x", "home_id": "livingroom"}, decision_type="route"))
 
 
+def test_choice_carries_the_offered_labels_as_criteria():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_body(
+            type="choice", choice="llm", confidence=0.8,
+            probabilities={"fast_command": 0.2, "llm": 0.8}))
+
+    asyncio.run(_provider(handler).choose("route?", ["fast_command", "llm"],
+                                          {"text": "x", "home_id": "livingroom"},
+                                          decision_type="route"))
+    question = json.loads(seen[0].content)["questions"]["answer"]
+    assert question["criteria"] == {"fast_command": None, "llm": None}
+
+
 def test_score_stays_inside_the_scale():
-    good = _provider(_answer(7))
+    good = _provider(_score(7))
     decision = asyncio.run(good.score("how loud?", {"text": "x", "home_id": "livingroom"},
                                       scale=(0, 10), decision_type="noise"))
     assert decision.value == 7
-    bad = _provider(_answer(99))
+    bad = _provider(_score(99))
     with pytest.raises(DecisionUnavailable):
         asyncio.run(bad.score("how loud?", {"text": "x", "home_id": "livingroom"},
                               scale=(0, 10), decision_type="noise"))
 
 
+def test_a_scale_that_does_not_start_at_zero_is_shifted_back():
+    """The rubric index starts at zero; the caller's scale may not."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_body(type="score", score=1.0, confidence=0.9))
+
+    decision = asyncio.run(_provider(handler).score(
+        "how urgent?", {"text": "x", "home_id": "livingroom"},
+        scale=(3, 5), decision_type="urgency"))
+    assert decision.value == 4
+    assert json.loads(seen[0].content)["questions"]["answer"]["criteria"] == [
+        "score 3", "score 4", "score 5"]
+
+
 @pytest.mark.parametrize("response", [
     httpx.Response(500, text="boom"),
     httpx.Response(200, text="<html>not json</html>"),
-    httpx.Response(200, json={"value": True}),
-    httpx.Response(200, json={"value": True, "confidence": 7}),
+    httpx.Response(200, json={"answers": {}}),
+    httpx.Response(200, json=_body(type="noul")),
+    httpx.Response(200, json=_body(type="noul", noul=7)),
+    httpx.Response(200, json=_body(type="choice", choice="yes", confidence=0.9)),
+    httpx.Response(200, json=_body(type="score", score=4, confidence=7)),
 ])
 def test_a_bad_answer_is_an_honest_refusal(response):
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -182,7 +281,7 @@ def test_a_home_without_cloud_decisions_never_reaches_the_network():
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        return httpx.Response(200, json={"value": True, "confidence": 0.9})
+        return httpx.Response(200, json=_body(type="noul", noul=0.9))
 
     provider = _provider(handler, allowed=False)
     with pytest.raises(DecisionUnavailable):
@@ -196,15 +295,35 @@ def test_a_home_without_cloud_decisions_never_reaches_the_network():
     assert calls == []
 
 
-def test_the_chain_falls_back_to_the_rules_when_the_home_forbids_cloud():
-    from hub.decider import RulesDecider
+# --- место Jev в цепочке ----------------------------------------------------
 
+
+def test_the_rules_answer_first_and_the_cloud_is_not_called():
+    """Правила отвечают мгновенно: облако не должно стоить задержки зря."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=_body(type="noul", noul=0.1))
+
+    chain = DecisionChain(
+        [RulesDecider(), _provider(handler)],
+        {"addressed": ["rules", "jev"]}, timeout_s=0.4)
+    decision = asyncio.run(chain.yes_no(
+        "addressed?", {"text": "rowan, lights off", "home_id": "livingroom",
+                       "heuristic": True},
+        decision_type="addressed"))
+    assert decision.provider == "rules" and decision.value is True
+    assert calls == [], "на готовом правиле облако не зовётся"
+
+
+def test_the_chain_falls_back_to_the_rules_when_the_home_forbids_cloud():
     def handler(_request: httpx.Request) -> httpx.Response:
         raise AssertionError("the cloud must not be asked")
 
     chain = DecisionChain(
         [RulesDecider(), _provider(handler, allowed=False)],
-        {"addressed": ["jev", "rules"]}, timeout_s=0.4)
+        {"addressed": ["rules", "jev"]}, timeout_s=0.4)
     decision = asyncio.run(chain.yes_no(
         "addressed?", {"text": "rowan, lights off", "home_id": "livingroom",
                        "heuristic": True},
@@ -212,16 +331,60 @@ def test_the_chain_falls_back_to_the_rules_when_the_home_forbids_cloud():
     assert decision.provider == "rules" and decision.value is True
 
 
-def test_the_cloud_answer_wins_when_the_home_allows_it():
-    from hub.decider import RulesDecider
+def test_the_cloud_answers_where_the_rules_are_silent():
+    """score и незнакомые правила типы решает Jev: правил для них нет вовсе."""
+    chain = DecisionChain(
+        [RulesDecider(), _provider(_score(2))],
+        {"noise": ["rules", "jev"]}, timeout_s=0.4)
+    decision = asyncio.run(chain.score(
+        "how urgent?", {"text": "x", "home_id": "livingroom"},
+        scale=(0, 3), decision_type="noise"))
+    assert decision.provider == "jev" and decision.value == 2
 
     chain = DecisionChain(
-        [RulesDecider(), _provider(_answer(False))],
-        {"addressed": ["jev", "rules"]}, timeout_s=0.4)
+        [RulesDecider(), _provider(_noul(0.9))],
+        {"urgency": ["rules", "jev"]}, timeout_s=0.4)
     decision = asyncio.run(chain.yes_no(
-        "addressed?", {"text": "rowan", "home_id": "livingroom", "heuristic": True},
-        decision_type="addressed"))
-    assert decision.provider == "jev" and decision.value is False
+        "is this urgent?", {"text": "x", "home_id": "livingroom"},
+        decision_type="urgency"))
+    assert decision.provider == "jev" and decision.value is True
+
+
+def test_a_cloud_provider_gets_its_own_budget():
+    """400 мс локального бюджета облаку мало: у провайдера свой."""
+    async def slow(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.2)
+        return httpx.Response(200, json=_body(type="noul", noul=0.9))
+
+    async def run():
+        provider = JevDecider(base_url="https://jev.example", api_key="k",
+                              timeout_s=5.0, allowed_for=lambda home: True,
+                              transport=httpx.MockTransport(slow))
+        chain = DecisionChain([RulesDecider(), provider],
+                              {"urgency": ["rules", "jev"]}, timeout_s=0.05,
+                              provider_timeout_s={"jev": 1.0})
+        return await chain.yes_no("urgent?", {"text": "x", "home_id": "livingroom"},
+                                  decision_type="urgency")
+
+    decision = asyncio.run(run())
+    assert decision.provider == "jev"
+
+
+def test_the_cloud_answers_only_when_the_rules_have_nothing():
+    """Порядок [rules, jev]: правила решают сами, Jev подхватывает остаток."""
+    chain = DecisionChain([RulesDecider(), _provider(_noul(0.1))],
+                          {"action_result": ["rules", "jev"],
+                           "urgency": ["rules", "jev"]}, timeout_s=0.4)
+    # Правило знает ответ (готовую эвристику ему передали) — облако молчит.
+    ready = asyncio.run(chain.yes_no(
+        "did the action work?", {"text": "x", "home_id": "livingroom", "heuristic": True},
+        decision_type="action_result"))
+    assert ready.provider == "rules" and ready.value is True
+    # Правило молчит (в HEURISTIC_TYPES его нет) — отвечает облако.
+    alone = asyncio.run(chain.yes_no(
+        "is it urgent?", {"text": "x", "home_id": "livingroom"},
+        decision_type="urgency"))
+    assert alone.provider == "jev" and alone.value is False
 
 
 def test_the_hub_puts_the_home_into_every_decision(monkeypatch):

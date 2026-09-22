@@ -908,7 +908,14 @@ class JevProviderConfig(_Strict):
 
     enabled: bool = False
     base_url: str = Field(default="", max_length=300)
-    path: str = Field(default="/v1/decide", max_length=120)
+    path: str = Field(default="/v1/systemone", max_length=120)
+    #: The model name the server answers for (``jev-latest``; the server knows
+    #: which version is behind it).
+    model: str = Field(default="jev-latest", max_length=80)
+    #: ТЗ 15.1's 400 ms budget is for the whole decision; a cloud provider needs
+    #: its own budget, or it would never be reached in time. Measured against
+    #: OpenRouter, three typed questions take about 300 ms.
+    timeout_ms: int = Field(default=1500, ge=100, le=10000)
     #: Name of the environment variable holding the API key.
     api_key_env: str = Field(default="JEV_API_KEY", max_length=80)
 

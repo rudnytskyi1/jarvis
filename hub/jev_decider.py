@@ -1,11 +1,19 @@
 """JevDecider — провайдер решений TypeSafe AI Jev (ТЗ 5.2, 5.5).
 
 ТЗ описывает три операции интерфейса ``Decider``, и у Jev им соответствуют три
-режима: ``yes_no`` с вероятностью, ``choose`` из вариантов и ``score`` по
-шкале. Провайдер тонкий: он собирает запрос, зовёт HTTP-ручку и превращает
-ответ в ``Decision``; логики решений здесь нет — она в цепочке
-(``DecisionChain``), которая даёт каждому провайдеру свой таймаут и уходит к
-следующему при отказе.
+примитива System One: ``noul`` (вероятность «да»), ``choice`` (выбор из
+вариантов) и ``score`` (оценка по рубрике). Провайдер тонкий: он собирает
+запрос, зовёт HTTP-ручку и превращает ответ в ``Decision``; логики решений
+здесь нет — она в цепочке (``DecisionChain``), которая даёт каждому
+провайдеру свой таймаут и уходит к следующему при отказе.
+
+Ручка и форма тела взяты из официального SDK ``typesafe-sdk`` 0.7.1
+(``SYSTEM_ONE_PATH = /v1/systemone``, тело ``{state, model, questions}``,
+ответ ``{"answers": {name: {"type": ..., ...}}}``); сам SDK сюда не тянуть не
+нужно — запрос тот же, а транспорт свой и подменяемый в тестах. Ключ может
+быть от TypeSafe напрямую (``base_url: https://api.typesafe.ai``) или от
+OpenRouter (``base_url: https://openrouter.ai/api``): модель всё равно
+называет сервер, а имя провайдера остаётся ``jev``.
 
 Честность важнее вида:
 
@@ -16,12 +24,8 @@
 * в облако уходит только текст и метаданные: ``_privacy_context`` пропускает
   скаляры и выбрасывает кадры, звук и эмбеддинги (ТЗ 5.5);
 * любой отказ (нет сети, таймаут, не 200, битый JSON, значение вне вариантов,
-  нет уверенности) — это ``DecisionUnavailable`` с причиной словами, а не
-  решение «на глазок».
-
-Форма запроса собрана в ОДНОМ месте (:meth:`JevDecider._payload`) и правится
-там же, когда появится доступ: точные имена полей раннего доступа TypeSafe
-исполнителю неизвестны (открытый вопрос раздела 17).
+  тип ответа не тот, что спросили) — это ``DecisionUnavailable`` с причиной
+  словами, а не решение «на глазок».
 """
 from __future__ import annotations
 
@@ -36,6 +40,10 @@ from hub.decider import Decision, DecisionUnavailable, _decision
 
 log = logging.getLogger("jarvis.server.jev")
 
+#: Путь System One в API TypeSafe (typesafe-sdk 0.7.1: ``/v1/systemone``).
+DEFAULT_PATH = "/v1/systemone"
+#: Модель по умолчанию: сервер сам решает, какая версия Jev за ней стоит.
+DEFAULT_MODEL = "jev-latest"
 #: Ключи, которые в облако не уходят никогда (ТЗ 5.5: только текст и метаданные).
 _PRIVATE_KEYS = ("jpeg", "image", "frame", "photo", "audio", "pcm", "vector",
                  "embedding", "face", "crop", "clip")
@@ -64,11 +72,13 @@ class JevDecider:
 
     name = "jev"
 
-    def __init__(self, *, base_url: str, api_key: str, path: str = "/v1/decide",
-                 timeout_s: float = 0.4, transport: Any = None,
+    def __init__(self, *, base_url: str, api_key: str, path: str = DEFAULT_PATH,
+                 model: str = DEFAULT_MODEL,
+                 timeout_s: float = 1.5, transport: Any = None,
                  allowed_for: Callable[[str], bool] | None = None) -> None:
         self.base_url = str(base_url or "").rstrip("/")
-        self.path = str(path or "/v1/decide")
+        self.path = str(path or DEFAULT_PATH)
+        self.model = str(model or DEFAULT_MODEL)
         self._api_key = str(api_key or "")
         self.timeout_s = max(0.05, float(timeout_s))
         self._transport = transport
@@ -119,18 +129,105 @@ class JevDecider:
     def _payload(self, mode: str, question: str, context: Mapping[str, Any], *,
                  options: list[str] | None = None, scale: list[int] | None = None,
                  decision_type: str = "") -> dict[str, Any]:
-        """The one place the early-access request shape lives (ТЗ 5.2)."""
-        payload: dict[str, Any] = {
-            "mode": str(mode),
-            "question": str(question or ""),
-            "context": _privacy_context(context),
-            "decision_type": str(decision_type or ""),
+        """The one place the request shape lives (ТЗ 5.2, System One).
+
+        ``state`` carries the text to judge; the question itself is typed:
+        ``noul`` for yes/no, ``choice`` with named criteria, ``score`` with an
+        ordered rubric. ``decision_type`` is not sent — the server answers the
+        question it is given, and our own calibration lives in the chain.
+        """
+        return {
+            "state": self._state(question, context, decision_type=decision_type),
+            "model": self.model,
+            "questions": {"answer": self._question(mode, question, options, scale)},
         }
-        if options is not None:
-            payload["options"] = [str(option) for option in options]
-        if scale is not None:
-            payload["scale"] = [int(scale[0]), int(scale[1])]
-        return payload
+
+    def _state(self, question: str, context: Mapping[str, Any], *, decision_type: str = "") -> Any:
+        """Текст и метаданные: то, из чего Jev делает вывод (ТЗ 5.5)."""
+        clean = _privacy_context(context)
+        text = str(clean.pop("text", "") or question or "")
+        if decision_type and "decision" not in clean:
+            clean["decision"] = str(decision_type)
+        return {**clean, "text": text} if clean else text
+
+    @staticmethod
+    def _question(mode: str, question: str, options: list[str] | None,
+                  scale: list[int] | None) -> dict[str, Any]:
+        """The typed question of one Decider operation."""
+        if mode == "yes_no":
+            return {"type": "noul", "instructions": str(question or "")}
+        if mode == "choose":
+            offered = {str(option): None for option in (options or [])}
+            if not offered:
+                raise DecisionUnavailable("a choice question needs options")
+            return {"type": "choice", "instructions": str(question or ""),
+                    "criteria": offered}
+        # score: the rubric runs from the low end of the scale to the high end,
+        # one label per level; the answer comes back as a rubric index, so the
+        # label carries the caller's own level number.
+        low, high = int((scale or [0, 0])[0]), int((scale or [0, 0])[1])
+        if high < low:
+            raise DecisionUnavailable(f"a score question needs a scale, got {scale!r}")
+        return {"type": "score", "instructions": str(question or ""),
+                "criteria": [f"score {level}" for level in range(low, high + 1)]}
+
+    def _answer_of(self, mode: str, body: Mapping[str, Any], *,
+                   options: list[str] | None, scale: list[int] | None) -> tuple[Any, float]:
+        """Turn the typed answer into ``(value, confidence)``, or refuse."""
+        answers = body.get("answers")
+        if not isinstance(answers, Mapping):
+            raise DecisionUnavailable("jev answered without answers")
+        answer = answers.get("answer")
+        if not isinstance(answer, Mapping):
+            raise DecisionUnavailable("jev did not answer the question")
+        kind = str(answer.get("type") or "")
+        if mode == "yes_no":
+            if kind != "noul":
+                raise DecisionUnavailable(f"jev answered {kind or 'nothing'} to a yes/no question")
+            try:
+                probability = float(answer["noul"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DecisionUnavailable("jev sent a noul answer without a probability") from exc
+            if not 0.0 <= probability <= 1.0:
+                raise DecisionUnavailable(f"jev reported a probability of {probability}")
+            # The answer is yes above one half; the confidence is how far the
+            # probability is from a coin toss, so 0.51 is honestly unsure.
+            return probability >= 0.5, max(probability, 1.0 - probability)
+        if mode == "choose":
+            if kind != "choice":
+                raise DecisionUnavailable(f"jev answered {kind or 'nothing'} to a choice question")
+            chosen = str(answer.get("choice") or "")
+            if chosen not in {str(option) for option in (options or [])}:
+                raise DecisionUnavailable(f"jev chose {chosen!r}, which was not offered")
+            probabilities = answer.get("probabilities")
+            fallback = probabilities.get(chosen, 0.0) if isinstance(probabilities, Mapping) else 0.0
+            try:
+                confidence = float(answer.get("confidence", fallback))
+            except (TypeError, ValueError):
+                confidence = float(fallback)
+            return chosen, self._checked_confidence(confidence)
+        if kind != "score":
+            raise DecisionUnavailable(f"jev answered {kind or 'nothing'} to a score question")
+        try:
+            scored = float(answer["score"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DecisionUnavailable("jev sent a score answer without a score") from exc
+        low, high = int((scale or [0, 0])[0]), int((scale or [0, 0])[1])
+        # The API reports the rubric level, and the rubric starts at ``low``.
+        offset = int(round(scored))
+        if not 0 <= offset <= high - low:
+            raise DecisionUnavailable(f"jev scored {scored}, outside the rubric {low}..{high}")
+        try:
+            confidence = float(answer.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return low + offset, self._checked_confidence(confidence)
+
+    @staticmethod
+    def _checked_confidence(confidence: float) -> float:
+        if not 0.0 <= confidence <= 1.0:
+            raise DecisionUnavailable(f"jev reported confidence {confidence}, outside 0..1")
+        return confidence
 
     async def _ask(self, mode: str, question: str, context: Mapping[str, Any], *,
                    options: list[str] | None = None, scale: list[int] | None = None,
@@ -152,20 +249,19 @@ class JevDecider:
                 response = await client.post(
                     url, json=payload,
                     headers={"Authorization": f"Bearer {self._api_key}",
-                             "Accept": "application/json"})
+                             "Accept": "application/json",
+                             "Content-Type": "application/json"})
         except httpx.HTTPError as exc:
             raise DecisionUnavailable(f"jev is unreachable: {type(exc).__name__}") from exc
         if response.status_code != 200:
             raise DecisionUnavailable(f"jev answered HTTP {response.status_code}")
         try:
             body = response.json()
-            value = body["value"]
-            confidence = float(body["confidence"])
-        except (ValueError, KeyError, TypeError) as exc:
+        except ValueError as exc:
             raise DecisionUnavailable("jev answered something that is not a decision") from exc
-        if not 0.0 <= confidence <= 1.0:
-            raise DecisionUnavailable(f"jev reported confidence {confidence}, outside 0..1")
-        return value, confidence
+        if not isinstance(body, Mapping):
+            raise DecisionUnavailable("jev answered something that is not a decision")
+        return self._answer_of(mode, body, options=options, scale=scale)
 
 
-__all__ = ["JevDecider"]
+__all__ = ["DEFAULT_MODEL", "DEFAULT_PATH", "JevDecider"]

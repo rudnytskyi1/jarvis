@@ -255,11 +255,14 @@ server:
     # остаётся со встроенной цепочкой (сейчас — rules).
     #   rules      — эвристики, всегда доступны, работают без GPU
     #   local_llm  — локальная модель (нужен openai-совместимый сервер, F-402)
+    #   jev        — облачные типизированные решения TypeSafe (ТЗ 5.2/5.5).
+    #                Он зовётся только там, где правила не отвечают: сам вызов
+    #                идёт по сети и получает свой бюджет (timeout_ms ниже).
     order:
-      route: [rules]          # fast_command или запрос к модели
-      model_level: [rules]    # local_fast или local_strong (F-401)
-      addressed: [jev, local_llm, rules]  # ТЗ 5.2: обращались ли к Rowan
-      hallucination: [rules]  # похож ли транскрипт на галлюцинацию Whisper
+      route: [rules, jev]     # fast_command или запрос к модели
+      model_level: [rules, jev]    # local_fast или local_strong (F-401)
+      addressed: [rules, jev, local_llm]  # ТЗ 5.2: обращались ли к Rowan
+      hallucination: [rules, jev]  # похож ли транскрипт на галлюцинацию Whisper
       # С включённым vLLM порядок можно перевести на модель, например:
       # route: [local_llm, rules]
       # Провайдеры, которых нет в работе (модель не загружена, Jev выключен),
@@ -267,8 +270,10 @@ server:
     providers:                # ТЗ 5.2/5.5: облачный провайдер решений (Jev)
       jev:
         enabled: false        # ранний доступ TypeSafe: по умолчанию выключено
-        base_url: ""          # адрес развёртывания TypeSafe, например https://api.typesafe.ai
-        path: /v1/decide      # путь решения; правится по документации доступа
+        base_url: ""          # https://api.typesafe.ai напрямую или https://openrouter.ai/api
+        path: /v1/systemone   # System One API (так же, как в SDK typesafe-sdk)
+        model: jev-latest     # сервер сам знает, какая версия Jev за именем
+        timeout_ms: 1500      # бюджет одного облачного решения (сеть + модель)
         api_key_env: JEV_API_KEY  # ключ только в переменной окружения (раздел 1)
 
   skills:                    # скиллы: манифест + skill.py в своей папке (ТЗ F-405)
