@@ -299,6 +299,33 @@
   .camera-off.visible { opacity: 1; }
   .camera-off svg { width: 16px; height: 16px; display: block; }
 
+  /* -- Rowan is in control (ТЗ F-512): while the agent drives the mouse and
+        the keyboard, the room must SEE that. An amber badge under the camera
+        one, up for the whole run (not a moment), so it is never a surprise
+        that words appear in a window on their own. -- */
+  .control {
+    position: absolute;
+    top: 54px;
+    right: 22px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 190, 96, .55);
+    background: rgba(40, 26, 6, .55);
+    font-family: "Segoe UI", "Segoe UI Light", -apple-system, sans-serif;
+    font-weight: 300;
+    font-size: 12px;
+    letter-spacing: .06em;
+    color: rgba(255, 214, 150, .96);
+    text-shadow: 0 0 16px rgba(255, 168, 64, .45);
+    opacity: 0;
+    transition: opacity 320ms ease;
+  }
+  .control.visible { opacity: 1; }
+  .control svg { width: 16px; height: 16px; display: block; }
+
   /* -- ТЗ F-708: строка живого транскрипта — что хаб услышал прямо сейчас.
         Показывается только для ТЕКУЩЕЙ реплики; черновой текст курсивом. -- */
   .transcript {
@@ -502,6 +529,13 @@
     </svg>
     <span id="camera-off-label"></span>
   </div>
+  <div id="control" class="control">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" aria-hidden="true">
+      <path d="M4 4l7 16 2-6 6-2z"></path>
+    </svg>
+    <span id="control-label"></span>
+  </div>
   <div id="scan" class="scan"></div>
   <div id="shot" class="shot"></div>
   <div id="shot-frame" class="shot-frame"></div>
@@ -527,6 +561,8 @@
   var trackLayerEl = document.getElementById("track-layer");
   var cameraOffEl = document.getElementById("camera-off");
   var cameraOffLabelEl = document.getElementById("camera-off-label");
+  var controlEl = document.getElementById("control");
+  var controlLabelEl = document.getElementById("control-label");
   var shotEl = document.getElementById("shot");
   var shotFrameEl = document.getElementById("shot-frame");
   var STATES = ["idle", "listening", "thinking", "speaking"];
@@ -569,6 +605,12 @@
     var cameraOff = typeof opts.camera_off === "string" ? opts.camera_off : "";
     cameraOffLabelEl.textContent = cameraOff;
     cameraOffEl.classList.toggle("visible", cameraOff.length > 0);
+
+    // ТЗ F-512: «Rowan управляет» — значок держится весь прогон агента,
+    // а не BADGE_HOLD_S, и гаснет, когда прогон закончился или сказано «стоп».
+    var control = typeof opts.control === "string" ? opts.control : "";
+    controlLabelEl.textContent = control;
+    controlEl.classList.toggle("visible", control.length > 0);
 
     typingEl.classList.toggle("visible", !!opts.typing);
 

@@ -75,6 +75,11 @@ Server -> Client
   "event_id": str}`` -- v2 (ТЗ F-307): the room watched the person's posture
   (YOLO11-pose, one frame in five seconds) and says the person FELL ASLEEP
   lying still in quiet hours, or GOT UP. The frame never leaves the room.
+* ``{"type": MSG_COMPUTER_USE_STEP, "id": str, "run_id": str, "ok": bool,
+  "index": int, "step": str, "reason": str, "stopped": bool, "at_ms": int}``
+  -- v2 (ТЗ F-512): the room reports one computer-use step it ran, refused or
+  stopped. ``stopped`` is true when the room itself stopped the run (palm
+  gesture or the word «стоп»): the hub closes the run on both ends.
 * ``{"type": MSG_OFFLINE_HINT, "reason": str, "eta_s": float}`` (ТЗ 4.8) -- the
   hub is going away on purpose (restart, maintenance), so the client switches
   to its local mode before the socket breaks.
@@ -97,6 +102,10 @@ Server -> Client
 * ``{"type": MSG_STATUS, "text": str, "ttl_s": float}`` -- v1.7: a HUD caption
   for something slow happening in the background (face enrollment photos);
   empty ``text`` clears it. May arrive at any time, nothing is spoken.
+* ``{"type": MSG_COMPUTER_USE, "active": bool, "text": str, "run_id": str}``
+  -- v2 (ТЗ F-512): the visible «Rowan is in control» badge. While ``active``
+  is true the room keeps the overlay badge up; an empty/``false`` message
+  clears it at once (the run finished, or the person stopped it).
 * ``{"type": MSG_ERROR, "message": str}``
 
 Order per utterance: transcript -> zero or more rounds of actions and/or
@@ -170,6 +179,16 @@ MSG_POINT_EVENT = "point_event"
 #: включает режим сна дома (свет на минимум, беззвучные уведомления) или
 #: утреннюю рутину F-420.
 MSG_POSTURE_EVENT = "posture_event"
+#: v2 (ТЗ F-512): the client reports one computer-use step it executed (or
+#: stopped): ``{"type", "id", "run_id", "ok", "index", "step", "reason",
+#: "stopped", "at_ms"}``. The hub keeps the trace and, when ``stopped`` is
+#: true, closes the run — the person's palm or the word «стоп» must stop the
+#: agent on BOTH ends, not only where it was heard.
+MSG_COMPUTER_USE_STEP = "computer_use_step"
+#: v2 (ТЗ F-512): the «Rowan is in control» badge — ``{"type", "active": bool,
+#: "text": str, "run_id": str}``. While ``active`` is true the room shows the
+#: overlay badge and keeps it up; the hub clears it the moment the run stops.
+MSG_COMPUTER_USE = "computer_use"
 #: v2 (ТЗ F-201): the live person TRACKS of one client - each person in the
 #: frame keeps its ``track_id`` while it is visible, and a lost track is
 #: remembered for up to 30 s so the same person comes back as the same track.
@@ -335,6 +354,7 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_OBJECT_EVENT,
         MSG_POINT_EVENT,
         MSG_POSTURE_EVENT,
+        MSG_COMPUTER_USE_STEP,
         MSG_TTS_PREFETCH,
     }
 )
@@ -373,6 +393,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_TTS_PHRASE,
         MSG_ERROR,
         MSG_CONFIG_UPDATE,
+        MSG_COMPUTER_USE,
     }
 )
 
@@ -390,6 +411,7 @@ PHONE_FORBIDDEN_INPUTS = frozenset(
         MSG_OBJECT_EVENT,
         MSG_POINT_EVENT,
         MSG_POSTURE_EVENT,
+        MSG_COMPUTER_USE_STEP,
         MSG_SCREENSHOT,
         MSG_SCREENSHOT_ERROR,
     }
@@ -424,6 +446,8 @@ __all__ = [
     "MSG_OBJECT_EVENT",
     "MSG_POINT_EVENT",
     "MSG_POSTURE_EVENT",
+    "MSG_COMPUTER_USE",
+    "MSG_COMPUTER_USE_STEP",
     "MSG_PRIVACY",
     "MSG_OFFLINE_HINT",
     "MSG_TTS_PREFETCH",

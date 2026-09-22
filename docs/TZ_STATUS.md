@@ -1335,3 +1335,159 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   → 5689 passed, 11 skipped; `ruff check .` и `mypy common` чисто. **Чего
   нет:** живого MediaPipe/YOLO (модель подставная) и переключателя по
   человеку вместо дома.
+
+- **P5-11 (F-307) — поза: «лежит неподвижно» без капризов поворота:
+  сделано.** `client/posture.py`: `PoseDetector` (ленивый импорт
+  `ultralytics`, `yolo11n-pose.pt`), `posture_of` (лежит/сидит/стоит по
+  ТУЛОВИЩУ и ноге, а не по «прямоугольник выше, чем шире»), `StillnessWatch`
+  (10 минут без смещения центра тела → `sleep` один раз; переход из лежачего
+  положения в сидя/стоя → `awake`; пропажа из кадра подъёмом НЕ считается),
+  `PostureService` (1 кадр в 5 с, флаг дома `homes[].settings.posture` плюс
+  секция `client.posture`). Кадр берётся тот же, что у жестов и YOLO, и
+  никуда не уходит. Режим сна рождается только в тихие часы дома; подъём
+  замечается всегда. Проверено: `pytest tests/test_posture_sleep.py -q` →
+  10 passed; `pytest tests -q` → 5739 passed, 11 skipped; `ruff check .` →
+  All checks passed; `mypy common` → Success; `python -c "import client.main"`
+  → ok. **Чего нет:** живого `ultralytics` и камеры в песочнице (весов нет,
+  разбор позы проверен на настоящих числах 17 COCO-точек) — названо в
+  `DECISIONS.md` (P5-11).
+
+- **P5-12 (F-307/F-420) — режим сна дома и утренний подъём: сделано.**
+  `migrations/0029_home_modes.py` (`home_modes`, `home_wakeups`) и
+  `hub/home_modes.py::HomeModes`: режим сна переживает рестарт хаба, подъёмы
+  помнятся по дням. `Connection._on_posture_event` → `_sleep_home` (режим
+  `asleep` + сцена `homes[].settings.sleep_scene` настоящим `SceneRunner`;
+  сцены нет — устройства не трогаются) и `_wake_home` (режим `awake` +
+  подъём за узнанным человеком F-201; безымянный подъём честно назван в
+  логе). Спящий дом не звонит в Telegram: уведомление идёт подписью на HUD,
+  а `_briefing_entries` делает сегодняшние подъёмы поводом утренней рутины
+  F-420. Проверено: `pytest tests/test_posture_sleep.py -q` → 10 passed;
+  `pytest tests -q` → 5739 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app"` → ok. **Чего
+  нет:** живого сценария на настоящем железе (устройства/Telegram
+  подставные) — названо в `DECISIONS.md` (P5-12).
+
+- **P5-13 (F-308) — OCR экрана вместе с vision-моделью: сделано.**
+  `hub/ocr.py`: `OcrEngine` (RapidOCR — пакеты `rapidocr`/`rapidocr_onnxruntime`
+  — или PaddleOCR; ленивая сборка, названный отказ без пакета/весов, один
+  движок на хаб), `rapidocr_lines`/`paddleocr_lines` (обе настоящие формы
+  ответов, включая `rec_texts` из PaddleOCR 3.x), `ScreenText`/`OcrLine`.
+  `Connection._read_screen_text` читает ТУ ЖЕ область, что уходит
+  vision-модели, в отдельном потоке (OCR CPU-шный, слот GPU-очереди 4.5 не
+  занимает), а `_run_look_at_screen` возвращает `ocr_text`/`ocr_lines` вместе
+  с описанием модели и укладывает строки в запрос к ней обёрнутыми
+  `<<<UNTRUSTED … UNTRUSTED>>>`. Текст со скрина недоверенный (F-411/D-09):
+  результат `look_at_screen` уже помечен внешним, поэтому D-09 сканирует и
+  строки OCR, а инструменты по ним не запускаются. Флаг `server.ocr`
+  (`enabled: false` по умолчанию). Проверено: `pytest tests/test_screen_ocr.py
+  -q` → 13 passed; `pytest tests -q` → 5752 passed, 11 skipped; `ruff check .`
+  → All checks passed; `mypy common` → Success; `python -c "import hub.app"` →
+  ok. **Чего нет:** живых `rapidocr`/`paddleocr` и весов в песочнице (нет
+  ни того, ни другого) — разбор проверен на настоящих формах ответов, отказ —
+  на настоящем отсутствии пакета; названо в `DECISIONS.md` (P5-13).
+
+- **P5-14 (F-512) — ограничения computer-use: сделано.** Правила лежат в
+  `common/computer_use.py` (одна копия на хаб и клиента): `MAX_STEPS` = 15,
+  allow-list приложений (пустой — запрещено всё), запрет ввода паролей,
+  одноразовых кодов, карт, банковских реквизитов, сид-фраз и PIN словами
+  ru/en/es, строгая модель шага. `hub/computer_use.py` ведёт прогон
+  (`ComputerUseRun`/`ComputerUseRuns`): отказы видны в отчёте, отказ не
+  занимает шаг, один живой прогон на дом, `stop` закрывает все.
+  `client/actions/computer_use.py::ComputerUseExecutor` — ленивый `pyautogui`,
+  повторная проверка каждого шага перед действием, сверка активного окна с
+  allow-list (неизвестное окно = отказ), счётчик реально выполненных шагов.
+  Флаг `server.computer_use` (выключен, allow-list пуст по умолчанию).
+  Проверено: `pytest tests/test_computer_use.py -q` → 21 passed;
+  `pytest tests -q` → 5773 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app"` и
+  `import client.main` → ok. **Чего нет:** живого `pyautogui` и рабочего стола
+  в песочнице (исполнитель проверен на подставном `pyautogui`); стоп-слово,
+  ладонь и оверлей — P5-15, аудит и F-113 — P5-16; названо в `DECISIONS.md`
+  (P5-14).
+
+- **P5-15 (F-512/F-306) — «стоп» словом и ладонью, оверлей «Rowan управляет»:
+  сделано.** Новые кадры `computer_use` (значок, хаб→комната) и
+  `computer_use_step` (отчёт о шаге и о стопе, комната→хаб; телефону
+  запрещён). `hub/computer_use.py::is_stop_command` узнаёт «стоп»/«stop»/
+  «detente» и вежливые формы трёх языков, но не считает стопом вопрос со
+  словом внутри; `Connection._computer_use_stop_turn` стоит до wake-проверки,
+  закрывает прогон, снимает значок, говорит «Остановил.» и пишет аудит. Ладонь
+  (F-306) останавливает прогон в комнате и отправляет `stopped` хабу, поэтому
+  стоп слышен на обоих концах. Значок — новый стоячий бейдж `OverlayHUD.control`
+  (не гаснет по `BADGE_HOLD_S`, держится весь прогон) с янтарным элементом в
+  `hud.html`. Шаги ходят действием `computer_use_step` с политикой от хаба.
+  Проверено: `pytest tests/test_computer_use_stop.py -q` → 17 passed;
+  `pytest tests -q` → 5790 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app"` и
+  `import client.main` → ok. **Чего нет:** живого `pyautogui`/камеры (жест и
+  исполнитель на подставных); запуск прогона моделью и F-113 — P5-16; названо
+  в `DECISIONS.md` (P5-15).
+
+- **P5-16 (F-512/F-113/F-706) — аудит шага и подтверждение опасного:
+  сделано.** Инструмент `computer_use` (один вызов = один шаг, `finish`
+  закрывает задачу) объявлен модели и живёт на сервере; прогон стартует
+  первым шагом, а выключенный дом честно отказывает. КАЖДЫЙ шаг — строка
+  `computer_use.step` в `audit` (ok/denied, run_id, index, причина). Шаги,
+  меняющие систему (Alt+F4, Ctrl+Alt+Del, Win+L/R, Ctrl+Shift+Esc),
+  распознаются `common/computer_use.changes_system` и ждут голосового «да» по
+  F-113: до ответа команда в комнату не уходит, «да» выполняет ровно
+  отложенный шаг, «нет» ничего не трогает. `computer_use` добавлен в
+  `GUARDED_TOOLS`, поэтому команда из кадра/страницы/чата агента не запускает.
+  Проверено: `pytest tests/test_computer_use_audit.py -q` → 11 passed;
+  `pytest tests/test_tools_contract.py tests/test_decision_points.py
+  tests/test_injection_guard.py -q` → 51 passed; `pytest tests -q` → 5803
+  passed, 11 skipped; `ruff check .` → All checks passed; `mypy common` →
+  Success; python-импорты `hub.app`/`client.main` → ok. **Чего нет:** живого
+  `pyautogui`/рабочего стола (исполнитель проверен на подставном) — названо в
+  `DECISIONS.md` (P5-16).
+
+- **P5-17 (F-111) — клонированный голос владельца: сделано (провайдер
+  недоступен и назван).** `hub/voice_clone.py`: согласие человека по дому
+  (`ConsentStore`, переживает рестарт), окно референса 10–20 с по настоящему
+  WAV, ленивый провайдер F5-TTS/Chatterbox с названным отказом, кэш синтеза на
+  диске с уборкой, `snapshot()` для `/health.voice_clone`. Флаг
+  `server.voice_clone` (выключен по умолчанию), без согласия владельца клон не
+  синтезирует ничего. Проверено: `pytest tests/test_voice_clone.py -q` → 15
+  passed; `pytest tests -q` → 5818 passed, 11 skipped; `ruff check .` → All
+  checks passed; `mypy common` → Success; `python -c "import hub.app"` → ok.
+  **Чего нет:** ни F5-TTS, ни Chatterbox, ни GPU в песочнице нет — синтез
+  проверен на подставном провайдере, а настоящий провайдер честно отвечает
+  `VoiceCloneUnavailable` (подмена обычным голосом запрещена правилом «никаких
+  фейков»); живой прогон — задача стенда, названо в `DECISIONS.md` (P5-17).
+
+- **P5-18 (F-112) — эмоция в голосе: сделано (веса недоступны и названы).**
+  `hub/emotions.py`: метки IEMOCAP с синонимами, превращение настоящего PCM
+  (48 кГц) в 16 кГц float32, ленивый `SpeechBrainEmotion` с ЛОКАЛЬНОЙ папкой
+  весов (HF id — только по `server.emotion.allow_download`), бюджет
+  `timeout_ms` и порог уверенности. Эмоция едет в персональный префикс хода
+  (`SpeakerProfile.emotion`) строкой «how the person sounds: … (… it never
+  changes what you do)», то есть меняет СТИЛЬ ответа и не читается ни одним
+  инструментом. Классификация идёт через GPU-очередь 4.5; опоздала,
+  недоступна или упала — ход продолжается. `/health.emotion` показывает флаг,
+  модель и счётчики. Проверено: `pytest tests/test_emotions.py -q` → 13
+  passed; `pytest tests -q` → 5831 passed, 11 skipped; `ruff check .` → All
+  checks passed; `mypy common` → Success; `python -c "import hub.app"` → ok.
+  **Чего нет:** локальных весов `emotion-wav2vec2-IEMOCAP` и GPU в песочнице
+  (`speechbrain` 1.1.1 есть, весов нет — хаб не качает их сам) — названо в
+  `DECISIONS.md` (P5-18).
+
+- **P5-19 (F-605) — общий календарь группы: сделано.** Migration
+  `0030_shared_events` (событие и отметка «напомнили» переживают рестарт),
+  `hub/shared_events.py` — `SharedEvent`/`SharedEventStore` (`create`,
+  `upcoming`, `between`, `due_for_reminder`, `mark_reminded`, `cancel`), разбор
+  речи `parse_shared_event` со словами события по ГРАНИЦАМ слов (встреча, игра,
+  поход и их варианты), время берётся тем же парсером, что у напоминаний F-417;
+  ответы `created_answer`/`missing_time_answer`/`list_answer`/`reminder_line`
+  на ru/en/es, `SharedEventReminderTask` напоминает в каждой комнате участника и
+  пишет аудит. Хаб: `_shared_events_store`, `_shared_events_task` в планировщике,
+  `_calendar_question`/`_calendar_homes` (участники — дома названных людей по
+  журналу присутствия, иначе все дома), `Connection._shared_event_turn` до
+  wake-проверки и `_speak_calendar`. **Найдено и исправлено по пути:**
+  подстрочный поиск «trip» ловил «the strip» и крал обычную реплику — заменено
+  на границы слов; `_shared_events_store` через `_hub_gateway()` подменял уже
+  открытое соединение и уводил запись в другую базу. Секция
+  `server.shared_events` в `common/config.py`, `config.yaml` и
+  `config.example.yaml`. Проверено: `pytest tests/test_shared_events.py -q` →
+  13 passed; `pytest tests -q` → 5844 passed, 11 skipped; `ruff check .` → All
+  checks passed; `mypy common` → Success. **Чего нет:** живого Telegram/голоса в
+  песочнице (комнаты подставные); названо в `DECISIONS.md` (P5-19).

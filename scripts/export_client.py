@@ -31,6 +31,7 @@ RUNTIME_FILES = (
     "client/screen.py", "client/viewer.py", "client/overlay.py", "client/overlay_web/chat.html",
     "client/actions/__init__.py", "client/actions/app_control.py", "client/actions/apps.py",
     "client/actions/browser.py", "client/actions/browser_desktop.py", "client/actions/dispatcher.py", "client/actions/photos.py", "client/actions/wallpaper.py",
+    "client/actions/computer_use.py",
     "client/actions/pc.py", "client/devices/__init__.py", "client/devices/base.py",
     "client/devices/registry.py", "client/devices/magichome.py", "client/devices/tuya.py",
     "client/devices/switchbot.py", "client/requirements.txt", "client/requirements-audio.txt",
@@ -41,6 +42,7 @@ RUNTIME_FILES = (
     "common/frame_zones.py",
     "common/attention_objects.py",
     "common/object_labels.py",
+    "common/computer_use.py",
 )
 TEMPLATE_FILES = (
     "README.md", ".gitignore", "config.example.yaml", "setup-client.bat", "start-client.bat",

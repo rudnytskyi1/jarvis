@@ -350,6 +350,50 @@ server:
     embed: true              # CLIP-вектор региона (open_clip ViT-B/32, лениво)
     embed_model: ViT-B/32    # модель эмбеддера; без пакета объект пишется без вектора
 
+  ocr:                       # ТЗ F-308: OCR скриншота рядом с vision-моделью
+    enabled: false           # ставится владельцем: модель OCR весит сотни мегабайт
+    engine: rapidocr         # rapidocr | paddleocr (пакет грузится лениво)
+    min_confidence: 0.5      # ниже этого строка не показывается: лучше «текста не видно»
+    max_chars: 4000          # сколько знаков с экрана вообще отдавать
+    max_lines: 200
+    languages: [en]          # первый язык идёт в PaddleOCR как lang
+
+  computer_use:              # ТЗ F-512: агент с мышью и клавиатурой
+    enabled: false           # самая опасная функция: включается владельцем
+    max_steps: 15            # предел самого ТЗ, выше поднять нельзя
+    allowed_apps: []         # пустой список = агент не трогает ни одного приложения
+    allow_typing: true       # пароли и платёжные данные запрещены всегда
+
+  voice_clone:               # ТЗ F-111: клон голоса владельца
+    enabled: false           # GPU-провайдер и согласие владельца обязательны
+    provider: f5_tts         # f5_tts | chatterbox
+    language: en
+    model: ""                # пусто — модель по умолчанию провайдера
+    cache_dir: data/voice_clone
+    max_cache_entries: 200
+
+  emotion:                   # ТЗ F-112: эмоция в голосе говорящего
+    enabled: false           # GPU-классификатор занимает очередь: включает владелец
+    model: models/emotion-wav2vec2-IEMOCAP   # локальные веса; HF id — только с allow_download
+    device: cuda
+    allow_download: false    # сеть по умолчанию выключена: веса кладёт владелец
+    timeout_ms: 400          # опоздал — ход идёт без эмоции (стиль, не действие)
+    min_confidence: 0.0      # ниже этого эмоция в контекст не попадает
+
+  shared_events:             # ТЗ F-605: общий календарь группы
+    enabled: true
+    reminder_min_before: 10  # за сколько минут до начала напоминать
+    check_interval_s: 60     # как часто задача проверяет календарь
+    list_limit: 5            # сколько ближайших событий называть в ответе
+
+  games:                     # ТЗ F-608: игры между комнатами (квиз по темам)
+    enabled: false           # вопросы пишет модель, поэтому флаг у владельца
+    homes: []                # комнаты-участники; пусто — все комнаты хаба
+    topics: ["история", "фильмы", "наука"]   # темы, которые можно назвать
+    max_questions: 5         # сколько вопросов в партии
+    answer_window_s: 45      # сколько секунд даётся на ответ
+    points: 1                # сколько очков даёт верный ответ
+
   tts:
     engine: silero
     language: en

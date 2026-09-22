@@ -1,0 +1,8 @@
+name: games
+description: Quiz between the rooms of this hub - the model writes the questions, people answer out loud, every room keeps its score.
+scope: hub
+role: user
+caps: []
+version: 0.1.0
+enabled: true
+reads_internet: false

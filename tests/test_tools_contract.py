@@ -53,6 +53,7 @@ def test_every_tool_exposed():
         "set_wallpaper",
         "list_people",
         "run_skill",
+        "computer_use",
     }
 
 
@@ -84,6 +85,7 @@ def test_matrix_split():
         "set_wallpaper",
         "list_people",
         "run_skill",
+        "computer_use",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command", "browser_control"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")

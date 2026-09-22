@@ -62,6 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from client.actions.computer_use import ComputerUseSession, ComputerUseUnavailable
 from client.actions.dispatcher import Dispatcher
 from client.attention import followup_seconds
 from client.audio import (
@@ -485,7 +486,8 @@ class JarvisClient:
                                           pre_roll_ms=pre_roll_ms, min_speech_ms=250)
 
         self.registry = build_registry(self.ccfg)
-        self.dispatcher = Dispatcher(self.ccfg, self.registry)
+        self.dispatcher = Dispatcher(self.ccfg, self.registry,
+                                     computer_use=self._computer_use_step)
         #: ТЗ 4.8: how long a broken link may last before the room is told, and
         #: how the client comes back (exponential, capped).
         offline_cfg = _attr(self.ccfg, "offline")
@@ -582,6 +584,10 @@ class JarvisClient:
         # -- ТЗ F-307: поза и сон (YOLO11-pose, 1 кадр в 5 с) ---------------
         self.posture = PostureService(_attr(self.ccfg, "posture"),
                                       on_event=self._on_posture_event)
+
+        # -- ТЗ F-512: computer-use (одна задача за раз, политику даёт хаб) --
+        self._computer_run: ComputerUseSession | None = None
+        self._computer_step_id = ""
 
         # -- v1.6: detections photo (find_object's image_show) -------------
         self.viewer: Any | None = ImageViewer() if ImageViewer is not None else None
@@ -1235,6 +1241,8 @@ class JarvisClient:
             self._on_card_message(msg, in_conversation=False)
         elif mtype == MSG_SPEAKER:
             self._on_speaker_message(msg)
+        elif mtype == _protocol.MSG_COMPUTER_USE:
+            self._on_computer_use(msg)
         elif mtype == MSG_CONFIG_UPDATE:
             self._apply_room_config(msg)
         elif mtype == "release":
@@ -2076,6 +2084,8 @@ class JarvisClient:
                     self._on_card_message(msg, in_conversation=True)
                 elif mtype == MSG_SPEAKER:
                     self._on_speaker_message(msg)
+                elif mtype == _protocol.MSG_COMPUTER_USE:
+                    self._on_computer_use(msg)
                 else:
                     log.warning("Unknown message type from the server: %r", mtype)
         except _Dismissed:
@@ -2201,10 +2211,94 @@ class JarvisClient:
                 self._send_point_hint()
             return
         self._stopped_by_gesture = True
+        # ТЗ F-512: ладонь останавливает не только речь, но и агента, который
+        # сейчас водит мышью и печатает. Жест приходит из потока камеры.
+        if getattr(self, "_computer_run", None) is not None:
+            self._submit_to_loop(self._stop_computer_use("palm"))
         idle_cut = self._interrupt_idle_playback()
         dropped = self.audio_out.cancel_pending()
         log.info("Open palm: stopping the voice (%d audio chunk(s) dropped%s)",
                  dropped, ", greeting cut" if idle_cut else "")
+
+    # -- computer use (ТЗ F-512) --------------------------------------------
+
+    def _on_computer_use(self, msg: dict[str, Any]) -> None:
+        """Хаб сообщает, что агент работает (или закончил) — видимый значок.
+
+        ТЗ F-512 требует оверлей «Rowan управляет»: пока он горит, комната
+        видит, что слова и клики в окнах — не её собственные. Снятие значка
+        совпадает с концом прогона и НЕ обсуждается: пустое ``active`` гасит
+        и значок, и прогон в комнате.
+        """
+        active = bool(msg.get("active"))
+        text = str(msg.get("text") or "").strip()
+        if active:
+            run_id = str(msg.get("run_id") or "")
+            self.overlay.control(text or "Rowan is in control")
+            log.info("Computer use is active in this room (run %s)", run_id or "?")
+            return
+        run = getattr(self, "_computer_run", None)
+        if run is not None:
+            run.stop(str(msg.get("reason") or "the hub finished the run"))
+        self._computer_run = None
+        self.overlay.control("")
+
+    async def _computer_use_step(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Один шаг агента из ``actions`` (ТЗ F-512) — последняя линия защиты.
+
+        Политику присылает хаб, но решает здесь и исполнитель: ``pyautogui``
+        может отсутствовать, окно может оказаться чужим, а прогон — уже
+        остановленным ладонью. Отчёт уходит назад и как результат действия, и
+        отдельным ``computer_use_step`` — чтобы «стоп» был слышен и на хабе.
+        """
+        run_id = str(args.get("run_id") or "")
+        self._computer_step_id = str(args.get("id") or "")
+        run = getattr(self, "_computer_run", None)
+        if run is None or not run.matches(run_id):
+            run = ComputerUseSession.from_hub(args)
+            self._computer_run = run
+        step = args.get("step")
+        if not isinstance(step, Mapping):
+            return {"ok": False, "reason": "the step is missing", "index": run.steps}
+        try:
+            report = await asyncio.to_thread(run.execute, dict(step))
+        except ComputerUseUnavailable as exc:
+            report = {"ok": False, "reason": str(exc), "index": run.steps,
+                      "unavailable": True}
+        await self._notify_computer_step(run, step, report)
+        return report
+
+    async def _stop_computer_use(self, reason: str) -> None:
+        """Остановить прогон в комнате: значок гаснет, шагов больше не будет."""
+        run = getattr(self, "_computer_run", None)
+        if run is None:
+            return
+        run.stop(reason)
+        self._computer_run = None
+        self.overlay.control("")
+        await self._notify_computer_step(run, None, {
+            "ok": False, "stopped": True, "index": run.steps,
+            "reason": f"the room stopped the run ({reason})"})
+
+    async def _notify_computer_step(self, run: ComputerUseSession, step: Any,
+                                    report: Mapping[str, Any]) -> None:
+        """Рассказать хабу, что случилось с шагом (ТЗ F-512)."""
+        try:
+            await self.ws.send_json({
+                "type": _protocol.MSG_COMPUTER_USE_STEP,
+                "id": str(getattr(self, "_computer_step_id", "") or ""),
+                "run_id": run.run_id,
+                "ok": bool(report.get("ok")),
+                "index": int(report.get("index") or 0),
+                "step": str(report.get("step") or ""),
+                "reason": str(report.get("reason") or ""),
+                "stopped": bool(report.get("stopped")),
+                "at_ms": int(time.time() * 1000),
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - отчёт не стоит прогона
+            log.debug("Could not send the computer-use step (%s)", exc)
 
     def _confirm_with_gesture(self) -> None:
         """ТЗ F-306/F-113: большой палец вверх подтверждает вместо устного «да».

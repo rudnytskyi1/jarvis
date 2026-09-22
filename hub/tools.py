@@ -809,6 +809,35 @@ TOOLS.append({'type': 'function', 'function': {
     }, 'required': ['skill']},
 }})
 
+#: ТЗ F-512: computer-use. One CALL is one step; the multi-step task is the
+#: loop the model runs (screenshot -> decide -> one step -> screenshot again).
+TOOLS.append({'type': 'function', 'function': {
+    'name': 'computer_use',
+    'description': (
+        'Drive the room PC with the mouse and the keyboard for a multi-step task '
+        "such as 'find Max's message in Discord and reply ok'. Call it once per "
+        'step and call look_at_screen again between steps to see what changed. '
+        'It only works where the owner enabled computer use and only inside the '
+        'allowed applications; typing passwords, card numbers and other secrets '
+        'is refused, and closing windows or locking the PC asks the person first. '
+        'At most 15 steps per task: when the task is done, send finish=true.'),
+    'parameters': {'type': 'object', 'properties': {
+        'goal': {'type': 'string', 'description': 'The multi-step task in one short sentence; repeated on every step of the same task.'},
+        'action': {'type': 'string', 'enum': ['click', 'type', 'key', 'scroll', 'app', 'wait', 'finish'],
+                   'description': "This step: click / type / key / scroll / app (open or focus) / wait / finish (close the task)."},
+        'app': {'type': 'string', 'description': 'The application this step belongs to (open it with action=app). It must be on the allowed list.'},
+        'text': {'type': 'string', 'description': 'Text to type with action=type. Secrets are refused.'},
+        'x': {'type': 'number', 'description': 'Click position: fraction of the screen width, 0 to 1.'},
+        'y': {'type': 'number', 'description': 'Click position: fraction of the screen height, 0 to 1.'},
+        'key': {'type': 'string', 'description': "Key or combination for action=key, e.g. 'enter' or 'ctrl+c'."},
+        'button': {'type': 'string', 'enum': ['left', 'right', 'double'], 'description': 'Mouse button for action=click.'},
+        'direction': {'type': 'string', 'enum': ['up', 'down'], 'description': 'Scroll direction for action=scroll.'},
+        'amount': {'type': 'integer', 'description': 'How many scroll clicks for action=scroll (1-50).'},
+        'seconds': {'type': 'number', 'description': 'Mouse move duration or wait length in seconds.'},
+        'finish': {'type': 'boolean', 'description': 'True closes the computer-use task (also hides the overlay badge).'},
+    }, 'required': ['goal']},
+}})
+
 TOOL_NAMES: tuple[str, ...] = tuple(tool["function"]["name"] for tool in TOOLS)
 for _tool in TOOLS:
     _tool['function']['parameters']['properties']['purpose'] = {
@@ -847,6 +876,7 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "set_wallpaper",
         "list_people",
         "run_skill",
+        "computer_use",
     }
 )
 

@@ -77,6 +77,8 @@ class SpeakerProfile(BaseModel):
     preferences: dict[str, str] = Field(default_factory=dict)
     #: The newest facts about this person, oldest of the three first.
     facts: list[str] = Field(default_factory=list)
+    #: ТЗ F-112: как звучит голос человека; влияет только на стиль ответа.
+    emotion: str = Field(default="", max_length=40)
 
 
 class HomeDevice(BaseModel):
@@ -117,12 +119,14 @@ class HomeState(BaseModel):
 
 
 def profile_from(*, name: Any, role: Any, language: Any, memory: Any,
-                 recent_facts: int = RECENT_FACTS) -> SpeakerProfile:
+                 recent_facts: int = RECENT_FACTS, emotion: Any = "") -> SpeakerProfile:
     """Build the speaker's profile out of the hub's own stores (F-412).
 
     ``memory`` is :class:`hub.storage.Memory` or ``None``. Only an explicitly
     named person has personal facts and preferences; an unrecognised voice gets
     the name it was measured as (usually ``unknown``) and nothing personal.
+    ``emotion`` (ТЗ F-112) is the tone of THIS utterance; it rides in the
+    profile so the model can match the style, and nothing else reads it.
     """
     person = _one_line(name, limit=120)
     facts = [_one_line(fact) for fact in (memory.facts(person) if memory is not None and person else [])]
@@ -152,6 +156,7 @@ def profile_from(*, name: Any, role: Any, language: Any, memory: Any,
         language=_one_line(language, limit=12),
         preferences=preferences,
         facts=facts,
+        emotion=_one_line(emotion, limit=40),
     )
 
 
@@ -222,7 +227,7 @@ def local_time(moment: Any = None, timezone: Any = "") -> str:
 def render_profile(profile: SpeakerProfile) -> str:
     """The speaker half of the prefix, or ``""`` when there is nothing to say."""
     if not (profile.name or profile.role or profile.language
-            or profile.preferences or profile.facts):
+            or profile.preferences or profile.facts or profile.emotion):
         return ""
     parts = [f"speaker: {profile.name or 'unknown'}",
              f"role: {profile.role or 'unknown'}"]
@@ -235,6 +240,11 @@ def render_profile(profile: SpeakerProfile) -> str:
     if profile.facts:
         parts.append("recent facts: " + "; ".join(
             json.dumps(_one_line(fact), ensure_ascii=False) for fact in profile.facts))
+    if profile.emotion:
+        # ТЗ F-112: тон меняет СТИЛЬ ответа и никогда — действия.
+        from hub.emotions import STYLE_NOTE
+
+        parts.append(STYLE_NOTE.format(emotion=profile.emotion))
     return " | ".join(parts)
 
 

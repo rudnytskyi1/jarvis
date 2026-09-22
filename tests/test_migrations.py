@@ -31,10 +31,10 @@ def _tables(conn):
 def test_fresh_database_reaches_the_full_schema(tmp_path):
     conn = runner.connect(str(tmp_path / "hub.db"))
     try:
-        assert runner.migrate(conn) == list(range(1, 30))
+        assert runner.migrate(conn) == list(range(1, 31))
         assert REQUIRED_TABLES <= _tables(conn)
         assert [row[0] for row in conn.execute("SELECT version FROM schema_version")] == \
-            list(range(1, 30))
+            list(range(1, 31))
         # ТЗ F-704: отчёт дня перечисляет неполные ходы, а не только удачи.
         assert "degraded" in {row[1] for row in conn.execute(
             "PRAGMA table_info(dialog_turns)")}
@@ -102,7 +102,7 @@ def test_migrate_is_idempotent(tmp_path):
     try:
         runner.migrate(conn)
         assert runner.migrate(conn) == []
-        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 29
+        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 30
     finally:
         conn.close()
 

@@ -55,6 +55,11 @@ client:
     enabled: false             # включается НА ДОМ: дома флаг homes[].settings.gestures
     hold_s: 1.0                # открытая ладонь дольше секунды — остановить TTS
     interval_s: 0.2            # не чаще 5 распознаваний в секунду (CPU делится с YOLO)
+  # --- ТЗ F-307: поза и сон (YOLO11-pose на CPU комнаты, кадры не уходят) ---
+  posture:
+    enabled: false             # включается НА ДОМ: дома флаг homes[].settings.posture
+    interval_s: 5.0            # один кадр в 5 секунд, как просит ТЗ
+    still_s: 600.0             # «лежит неподвижно дольше 10 минут» в тихие часы
   overlay:
     enabled: true
     position: bottom_right

@@ -1119,6 +1119,120 @@ class ObjectsConfig(_Strict):
     embed_model: str = Field(default="ViT-B/32", max_length=80)
 
 
+class OcrConfig(_Strict):
+    """Экранный OCR рядом с vision-моделью (``server.ocr``, ТЗ F-308).
+
+    ТЗ просит RapidOCR или PaddleOCR: модель весит сотни мегабайт и её выбор —
+    дело владельца хаба, поэтому по умолчанию выключено. Когда OCR включён,
+    ``look_at_screen`` получает и точные строки с экрана, и описание
+    vision-модели; текст с экрана остаётся НЕДОВЕРЕННЫМ (F-411, D-09) и
+    инструменты по нему не запускаются.
+    """
+
+    enabled: bool = False
+    engine: Literal["rapidocr", "paddleocr"] = "rapidocr"
+    #: Ниже этой уверенности строку не показываем: лучше «текста не видно»,
+    #: чем выдуманная строка с иконки.
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    #: Сколько знаков и строк вообще отдавать (промпт не должен раздуваться).
+    max_chars: int = Field(default=4000, ge=100, le=20000)
+    max_lines: int = Field(default=200, ge=1, le=2000)
+    #: Языки распознавания: первый идёт в PaddleOCR как ``lang``.
+    languages: list[str] = Field(default_factory=lambda: ["en"])
+
+
+class ComputerUseConfig(_Strict):
+    """Computer-use агент под ограничениями (``server.computer_use``, ТЗ F-512).
+
+    Самая опасная функция ТЗ: агент с мышью и клавиатурой. Поэтому выключено по
+    умолчанию, allow-list пуст (ни одного приложения), а ``max_steps`` нельзя
+    поднять выше пятнадцати — это предел самого ТЗ.
+    """
+
+    enabled: bool = False
+    max_steps: int = Field(default=15, ge=1, le=15)
+    #: ТЗ F-512: «allow-list приложений». Пустой список — агент не трогает
+    #: ни одного приложения: безопасное умолчание, а не «разрешено всё».
+    allowed_apps: list[str] = Field(default_factory=list)
+    #: Набор текста разрешён (пример ТЗ — «ответь ок»); пароли и платёжные
+    #: данные запрещены всегда и конфигом не снимаются.
+    allow_typing: bool = True
+
+
+class VoiceCloneConfig(_Strict):
+    """Клонированный голос владельца (``server.voice_clone``, ТЗ F-111).
+
+    Провайдер клона — GPU-модель (F5-TTS или Chatterbox), поэтому по умолчанию
+    выключено, и НИЧЕГО не синтезируется без согласия владельца дома. Референс
+    ТЗ — 10–20 с; окно проверяет не конфиг, а сам сервис по настоящему WAV.
+    """
+
+    enabled: bool = False
+    provider: Literal["f5_tts", "chatterbox"] = "f5_tts"
+    language: str = Field(default="en", max_length=10)
+    model: str = Field(default="", max_length=200)
+    #: Куда складывать синтез; пусто — без кэша на диске.
+    cache_dir: str = Field(default="data/voice_clone", max_length=200)
+    max_cache_entries: int = Field(default=200, ge=0, le=10000)
+
+
+class EmotionConfig(_Strict):
+    """Эмоция в голосе говорящего (``server.emotion``, ТЗ F-112).
+
+    GPU-классификатор (SpeechBrain wav2vec2) идёт через очередь 4.5, поэтому по
+    умолчанию выключен: он не должен отнимать слот у реплики. Эмоция влияет
+    только на стиль ответа — инструменты её не читают.
+    """
+
+    enabled: bool = False
+    #: Локальная папка весов (по умолчанию) или HF id; сеть — только по
+    #: ``allow_download``.
+    model: str = Field(default="models/emotion-wav2vec2-IEMOCAP", max_length=200)
+    device: str = Field(default="cuda", max_length=20)
+    #: Скачивать веса из сети. По умолчанию НЕТ: хаб не тянет гигабайтную
+    #: модель сам, владелец кладёт её в ``models/`` или разрешает загрузку.
+    allow_download: bool = False
+    #: Сколько хаб ждёт классификатор; опоздал — ход идёт без эмоции.
+    timeout_ms: int = Field(default=400, ge=50, le=5000)
+    #: Ниже этой уверенности эмоция не попадает в контекст вовсе.
+    min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class SharedEventsConfig(_Strict):
+    """Общий календарь группы (``server.shared_events``, ТЗ F-605).
+
+    Событие создаётся голосом в любой комнате, напоминание звучит в каждой
+    комнате участника. ``reminder_min_before`` — за сколько минут до начала
+    говорить; ``check_interval_s`` — как часто просыпается задача.
+    """
+
+    enabled: bool = True
+    reminder_min_before: float = Field(default=10.0, ge=0.0, le=1440.0)
+    check_interval_s: float = Field(default=60.0, ge=10.0, le=3600.0)
+    #: Сколько ближайших событий показывать в ответе «что у нас в календаре».
+    list_limit: int = Field(default=5, ge=1, le=20)
+
+
+class GamesConfig(_Strict):
+    """Игры между комнатами (``server.games``, ТЗ F-608).
+
+    Вопросы пишет модель, поэтому флаг по умолчанию выключен: без него хаб
+    не тратит реплики на игру. ``homes`` — комнаты-участники; пусто значит
+    «все комнаты хаба», как и у общего календаря (F-605).
+    """
+
+    enabled: bool = False
+    #: Комнаты-участники; пусто — все дома хаба.
+    homes: list[str] = Field(default_factory=list)
+    #: Темы, которые человек может назвать («история», «фильмы», …).
+    topics: list[str] = Field(default_factory=list)
+    max_questions: int = Field(default=5, ge=1, le=20)
+    #: Сколько секунд даётся на ответ (таймер F-407/F-608).
+    answer_window_s: float = Field(default=45.0, ge=5.0, le=600.0)
+    #: Сколько очков даёт верный ответ.
+    points: int = Field(default=1, ge=1, le=10)
+
+
 class PresenceConfig(_Strict):
     """Состояние присутствия дома (``server.presence``, ТЗ F-301).
 
@@ -1431,6 +1545,18 @@ class ServerConfig(_Strict):
     digest: DigestConfig = Field(default_factory=DigestConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     objects: ObjectsConfig = Field(default_factory=ObjectsConfig)
+    #: ТЗ F-308: OCR скриншота рядом с vision-моделью (выключен по умолчанию).
+    ocr: OcrConfig = Field(default_factory=OcrConfig)
+    #: ТЗ F-512: агент с мышью и клавиатурой (выключен,allow-list пуст).
+    computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
+    #: ТЗ F-111: клон голоса владельца (выключен; согласие обязательно).
+    voice_clone: VoiceCloneConfig = Field(default_factory=VoiceCloneConfig)
+    #: ТЗ F-112: эмоция в голосе (влияет только на стиль ответа).
+    emotion: EmotionConfig = Field(default_factory=EmotionConfig)
+    #: ТЗ F-605: общий календарь группы (встречи, игры, походы).
+    shared_events: SharedEventsConfig = Field(default_factory=SharedEventsConfig)
+    #: ТЗ F-608: игры между комнатами (квиз по темам, вопросы пишет модель).
+    games: GamesConfig = Field(default_factory=GamesConfig)
     greeting: GreetingConfig = Field(default_factory=GreetingConfig)
     web_admin: WebAdminConfig = Field(default_factory=WebAdminConfig)
     #: Release tag the room clients should run (ТЗ 4.9 OTA). Empty = не трогать.
