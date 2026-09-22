@@ -879,10 +879,20 @@ _tts_cache = TtsCache()
 #: F-702). Живёт в lifespan: пустой планировщик там же, где его циклы.
 _scheduler: Any = None
 
+#: Where the hub keeps its database. The deployment leaves it alone; the test
+#: suite sets it, so a test run cannot write into the owner's live hub.
+HUB_DB_ENV = "ROWAN_HUB_DB"
+
 
 def _hub_db_path() -> Path:
-    """The hub's SQLite file (ТЗ 4.6), the one ``_hub_gateway`` opens."""
-    return REPO_ROOT / "data" / "hub.db"
+    """The hub's SQLite file (ТЗ 4.6), the one ``_hub_gateway`` opens.
+
+    ``ROWAN_HUB_DB`` moves it: the test suite points this at its own sandbox,
+    because the trace of every turn is written through this connection and a
+    test run must never touch the owner's live ``data/hub.db``.
+    """
+    override = str(os.environ.get(HUB_DB_ENV) or "").strip()
+    return Path(override) if override else REPO_ROOT / "data" / "hub.db"
 
 #: Counters and stage traces of the utterances the hub processed (ТЗ 4.5/15.1).
 #: One registry for the whole hub: a turn is counted once, whichever room it

@@ -215,6 +215,7 @@ class WebAdminData:
         conn = self._connect()
         try:
             rows = turn_trace.TurnTraceStore(conn).recent(limit)
+            lines = self._request_lines(conn, [str(row["turn_id"]) for row in rows])
         except sqlite3.Error as exc:
             log.warning("The panel could not read the request chain (%s)", exc)
             return []
@@ -222,6 +223,8 @@ class WebAdminData:
             conn.close()
         return [{**row,
                  "when": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["finished"])),
+                 "request": lines.get(str(row["turn_id"]), {}).get("text", ""),
+                 "reply": lines.get(str(row["turn_id"]), {}).get("reply", ""),
                  "href": quote(str(row["turn_id"]), safe="")} for row in rows]
 
     def turn_events(self, turn_id: str) -> list[dict[str, Any]]:
@@ -235,9 +238,37 @@ class WebAdminData:
         finally:
             conn.close()
         for event in events:
-            event["detail"] = json.dumps(event.get("payload") or {}, ensure_ascii=False,
-                                         default=str)[:1200]
+            payload = event.get("payload") or {}
+            event["summary"] = _step_summary(event.get("kind", ""), event.get("name", ""), payload)
+            event["detail"] = json.dumps(payload, ensure_ascii=False, indent=2, default=str)[:6000]
         return events
+
+    @staticmethod
+    def _request_lines(conn: sqlite3.Connection,
+                       turn_ids: list[str]) -> dict[str, dict[str, str]]:
+        """What each request asked and what came back, from its own turn rows."""
+        if not turn_ids:
+            return {}
+        placeholders = ",".join("?" * len(turn_ids))
+        rows = conn.execute(
+            "SELECT turn_id, payload_json FROM turn_events WHERE kind='turn'"
+            f" AND turn_id IN ({placeholders}) ORDER BY event_id", tuple(turn_ids)).fetchall()
+        lines: dict[str, dict[str, str]] = {}
+        for turn_id, payload_json in rows:
+            try:
+                payload = json.loads(payload_json or "{}")
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            found = lines.setdefault(str(turn_id), {})
+            text = payload.get("transcript") or payload.get("text") or ""
+            if isinstance(text, str) and text and not found.get("text"):
+                found["text"] = text
+            reply = payload.get("reply") or ""
+            if isinstance(reply, str) and reply:
+                found["reply"] = reply
+        return lines
 
     # --- manual labelling (ТЗ F-216) ---------------------------------------
 
@@ -308,6 +339,91 @@ def _shares(identity: Any, presence: Any) -> str:
     if presence:
         words.append("presence")
     return ", ".join(words) or "nothing shared"
+
+
+def _short(value: Any, limit: int = 200) -> str:
+    """One readable piece of a payload: never the whole base64 blob."""
+    if isinstance(value, str):
+        text = " ".join(value.split())
+        return text[:limit] + ("…" if len(text) > limit else "")
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)[:limit]
+    except (TypeError, ValueError):
+        return str(value)[:limit]
+
+
+def _message_line(message: Any, limit: int = 140) -> str:
+    """One message of a prompt as ``role: text`` (tool calls named, not dumped)."""
+    if not isinstance(message, dict):
+        return _short(message, limit)
+    role = str(message.get("role") or "?")
+    parts = []
+    content = message.get("content")
+    if isinstance(content, list):  # Responses-style content blocks
+        content = " ".join(_short(block.get("text", block), limit) for block in content
+                           if isinstance(block, dict))
+    if content:
+        parts.append(_short(content, limit))
+    calls = message.get("tool_calls")
+    if isinstance(calls, list) and calls:
+        names = []
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            names.append(str((function or {}).get("name") or call.get("name") or "tool")
+                         if isinstance(call, dict) else "tool")
+        parts.append("→ " + ", ".join(names))
+    if message.get("name"):
+        role = f"{role} {message['name']}"
+    return f"{role}: " + " ".join(part for part in parts if part)
+
+
+def _step_summary(kind: str, name: str, payload: Any) -> str:
+    """One human line per step: what happened, without reading the JSON below."""
+    if not isinstance(payload, dict):
+        return _short(payload)
+    if kind == "turn":
+        if payload.get("text"):
+            where = payload.get("room") or payload.get("chat") or ""
+            return f"Telegram {payload.get('from', '')} {where}: {_short(payload['text'], 300)}"
+        if payload.get("transcript"):
+            return (f"{payload.get('speaker', 'unknown')}: {_short(payload['transcript'], 300)}"
+                    f" → {_short(payload.get('reply', ''), 300)}")
+        if payload.get("reply"):
+            return f"answer: {_short(payload['reply'], 300)}"
+        if payload.get("durations_ms"):
+            stages = payload["durations_ms"]
+            degraded = ", ".join(payload.get("degraded") or []) or "none"
+            return (f"stt {stages.get('stt', 0)} ms, llm {stages.get('llm', 0)} ms,"
+                    f" tts {stages.get('tts', 0)} ms, total {stages.get('total', 0)} ms;"
+                    f" degraded: {degraded}")
+        return "home " + _short(payload.get("home") or "—", 40) + \
+               f", client {_short(payload.get('client') or '—', 40)}"
+    if kind == "decision":
+        return (f"{payload.get('type', '?')} = {_short(payload.get('value'), 120)}"
+                f" (p {payload.get('confidence', '?')}) → {payload.get('outcome', '')}")
+    if kind == "tool":
+        return (f"{_short(payload.get('args'), 240)} → {_short(payload.get('result'), 300)}")
+    if kind == "llm":
+        text = _short(payload.get("text"), 300)
+        tools = payload.get("tools") or []
+        calls = (" called " + ", ".join(str(tool) for tool in tools)) if tools else " no tool call"
+        return f"round {payload.get('round', '?')}/{payload.get('of', '?')}{calls}: {text}"
+    if kind == "prompt":
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            shown = " | ".join(_message_line(message) for message in messages[:6])
+            more = f" (+{len(messages) - 6} more)" if len(messages) > 6 else ""
+            return f"{payload.get('provider', 'llm')} ← {shown}{more}"
+        return (f"{payload.get('provider', 'llm')} {payload.get('model', '')} ←"
+                f" {_short(payload.get('prompt'), 300)}")
+    if kind == "say":
+        return f"said out loud ({name}): {_short(payload.get('text'), 300)}"
+    if kind == "image":
+        return (f"the image model refused ({payload.get('reason', '?')},"
+                f" {payload.get('model', '')})")
+    return _short(payload, 300)
 
 
 def build_router(*, cfg: Any, data: WebAdminData | None, auth: WebAdminAuth) -> APIRouter:

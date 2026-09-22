@@ -5,20 +5,73 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rowan · owner panel</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #ddd; }
-    nav a { margin-right: 1rem; }
-    .note { color: #666; }
+    :root {
+      --ink: #16181d; --dim: #6b7280; --line: #e5e7eb; --bg: #f7f8fa;
+      --card: #fff; --accent: #2f5bd7; --good: #127c4a; --bad: #b4232c;
+      --turn: #2f5bd7; --decision: #7a5af8; --tool: #0b7285; --llm: #b8860b;
+      --prompt: #6b7280; --say: #127c4a; --image: #b4232c;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink);
+      background: var(--bg); margin: 0 auto; max-width: 68rem; padding: 1.5rem 1rem 3rem; }
+    h1 { font-size: 1.4rem; margin: 0 0 .75rem; }
+    h2 { font-size: 1.15rem; margin: 1.5rem 0 .5rem; }
+    nav { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: 1.25rem; }
+    nav a { text-decoration: none; color: var(--accent); padding: .35rem .7rem;
+      border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+    nav a:hover { border-color: var(--accent); }
+    .note { color: var(--dim); font-size: .88rem; line-height: 1.45; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: .6rem;
+      padding: .8rem 1rem; margin-bottom: .9rem; }
+    table { border-collapse: collapse; width: 100%; background: var(--card);
+      border: 1px solid var(--line); border-radius: .6rem; overflow: hidden; }
+    th { text-align: left; font-size: .8rem; text-transform: uppercase;
+      letter-spacing: .03em; color: var(--dim); }
+    th, td { padding: .5rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    a { color: var(--accent); }
+    code, pre { font-family: "Cascadia Mono", Consolas, monospace; font-size: .8rem; }
+    pre { background: #0f1115; color: #e6e8ec; padding: .7rem .8rem; border-radius: .45rem;
+      overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: .45rem 0 0; }
+    details summary { cursor: pointer; color: var(--dim); font-size: .82rem; }
+    .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+      font-size: .75rem; font-weight: 600; color: #fff; background: var(--dim); }
+    .pill.turn { background: var(--turn); }
+    .pill.decision { background: var(--decision); }
+    .pill.tool { background: var(--tool); }
+    .pill.llm { background: var(--llm); }
+    .pill.prompt { background: var(--prompt); }
+    .pill.say { background: var(--say); }
+    .pill.image { background: var(--image); }
+    .ok { color: var(--good); font-weight: 600; }
+    .fail { color: var(--bad); font-weight: 600; }
+    .step { border-left: 4px solid var(--dim); }
+    .step.turn { border-left-color: var(--turn); }
+    .step.decision { border-left-color: var(--decision); }
+    .step.tool { border-left-color: var(--tool); }
+    .step.llm { border-left-color: var(--llm); }
+    .step.prompt { border-left-color: var(--prompt); }
+    .step.say { border-left-color: var(--say); }
+    .step.image { border-left-color: var(--image); }
+    .step-head { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline;
+      font-size: .82rem; color: var(--dim); }
+    .step-head .who { color: var(--ink); font-weight: 600; }
+    .summary { margin-top: .35rem; line-height: 1.45; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .6rem; }
+    input[type=search], input[type=date], select { padding: .35rem .5rem; font: inherit;
+      border: 1px solid var(--line); border-radius: .4rem; background: var(--card); }
+    button { padding: .35rem .8rem; font: inherit; border-radius: .4rem; cursor: pointer;
+      border: 1px solid var(--accent); background: var(--accent); color: #fff; }
   </style>
 </head>
 <body>
   <h1>Rowan · owner panel</h1>
   <nav>
+    <a href="/admin/turns">Requests</a>
     <a href="/admin/homes">Homes</a>
     <a href="/admin/clients">Clients</a>
     <a href="/admin/people">People</a>
-    <a href="/admin/turns">Requests</a>
     <a href="/admin/tracks">Tracks</a>
     <a href="/admin/audit">Audit</a>
     <a href="/admin/logout">Sign out</a>

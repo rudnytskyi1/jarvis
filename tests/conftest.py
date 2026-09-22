@@ -23,6 +23,10 @@ if sys.platform == "win32":
     # ``PYTEST_DEBUG_TEMPROOT`` is read lazily by pytest when the first tmp_path
     # fixture is requested, so setting it here is early enough.
     os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", str(_sandbox_tmp))
+    # ``hub.app`` opens ``data/hub.db`` for the audit, decision and turn traces.
+    # Without this, every test that touches the hub gateway would write into the
+    # owner's live database (it did: the trace of a turn lands there).
+    os.environ.setdefault("ROWAN_HUB_DB", str(_sandbox_tmp / "hub.db"))
 
 _original_mkdir = os.mkdir
 

@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from hub import app as hub_app
 from hub import migrations_runner, turn_trace
 from hub.decider import Decision
 from hub.decision_log import DecisionLog
@@ -18,6 +21,16 @@ def migrated(tmp_path):
     conn = migrations_runner.connect(str(tmp_path / "hub.db"))
     migrations_runner.migrate(conn)
     return conn
+
+
+def test_a_test_run_never_writes_into_the_live_hub_database():
+    """The trace goes through ``hub.app``'s gateway: it must not be the real DB."""
+    repo_root = Path(__file__).resolve().parents[1]
+    live = repo_root / "data" / "hub.db"
+    sandbox = Path(os.environ["ROWAN_HUB_DB"])
+    assert hub_app._hub_db_path() == sandbox, "пишем в песочницу, а не в живую базу"
+    assert hub_app._hub_db_path() != live
+    assert sandbox.parent.name == ".pytest-tmp" or str(sandbox).startswith(str(repo_root))
 
 
 def a_decision(**overrides) -> Decision[str]:

@@ -227,9 +227,14 @@ def test_one_request_shows_its_steps_in_order(tmp_path, monkeypatch):
 
     page = browser.get("/admin/turns/u-1")
     assert page.status_code == 200
+    # Every step is a card with a readable line, not only raw JSON.
+    assert page.text.count('class="summary"') == 3, "у каждого шага своя строка"
     assert "ты тут" in page.text, "что услышали"
+    assert "→ тут" in page.text, "и что ответили"
     assert "jev" in page.text and "0.91" in page.text, "кто решил и с какой уверенностью"
+    assert "route = chat" in page.text, "решение читается словами"
     assert "generate_image" in page.text and "no key" in page.text, "что вернул инструмент"
+    assert 'class="card step algorithm"' not in page.text, "класс шага — это его вид"
     assert page.text.index("decision") < page.text.index("generate_image"), "шаги по порядку"
 
 
