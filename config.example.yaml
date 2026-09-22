@@ -490,6 +490,8 @@ client:
       max_gb: 0
       min_free_gb: 5
     model: yolo11x.pt        # ultralytics model (auto-downloaded on first run)
+    quick_model: yolo11n.pt  # light guard: first sign of a person between the heavy frames ("" = off)
+    quick_fps: 8             # how often the guard may look; it reuses captured frames
     face_check_interval_s: 0.5 # one aligned face/tracking frame while someone is visible
 
   overlay:                 # sci-fi HUD on the TV (Tkinter, transparent, click-through)

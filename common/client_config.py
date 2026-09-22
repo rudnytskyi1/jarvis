@@ -131,6 +131,17 @@ class CameraConfig(_Strict):
     frame_recording: RecordingConfig = Field(default_factory=RecordingConfig)
     #: Ultralytics model file (downloaded automatically on first run).
     model: str = "yolo11n.pt"
+    #: ТЗ F-201: a light guard that watches for the FIRST sign of a person
+    #: between the heavy detector's frames. ``yolo11x`` needs ~300 ms per frame,
+    #: so on its own it samples the room about three times a second - and a
+    #: person who crosses it in half a second can be gone before the next
+    #: sample. The light model turns that first sighting into the presence burst
+    #: that carries the person's faces to the hub; the heavy model still owns
+    #: the tracks, the objects and the identity. ``""`` turns the guard off.
+    quick_model: str = Field(default="yolo11n.pt", max_length=120)
+    #: How often the guard may look. It runs on the frames the capture thread
+    #: already has, so this is an upper bound, not an extra camera read.
+    quick_fps: float = Field(default=8.0, ge=0.5, le=240.0)
     #: ТЗ F-312: pick the detection profile by MEASURED latency at startup.
     #: Off by default: a shipped client keeps exactly the profile its config
     #: names, and a machine that wants the automatic choice turns it on.
