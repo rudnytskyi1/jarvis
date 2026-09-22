@@ -443,6 +443,11 @@ class TelegramController:
                     'the user need not repeat the word Telegram. For a newly requested room photo, use '
                     'telegram_send kind=image source=camera fresh=true. Use fresh=false only for an explicitly '
                     'existing/cached image. Camera photography does not use generate_image. '
+                    'A request to EDIT a room photo - adding or changing people, clothes or the scene - is an '
+                    'image edit OF THAT ROOM: take a fresh frame with generate_image source=camera fresh=true. '
+                    'If the requester follows up on a picture you sent here ("and make them ...") without '
+                    'attaching one, redo the edit from the same room camera. NEVER ask the requester to attach '
+                    'a photo while a camera of the named or selected computer is reachable. '
                     'For who is currently in the room, use the fresh camera observation supplied below or '
                     'look_at_camera. Only current face matches can supply names. Never use prior chat or presence '
                     'history as evidence that someone is currently present; report unknown or unavailable identities honestly.')

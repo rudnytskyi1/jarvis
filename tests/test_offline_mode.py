@@ -45,6 +45,39 @@ def _mode(**overrides: Any):
     return OfflineMode(config, clock=lambda: clock["now"]), clock
 
 
+def test_a_restart_of_the_hub_does_not_make_the_room_talk_to_itself():
+    """Владелец: «он что-то сказал сам по себе и пару раз пикнул, не надо такое».
+
+    Значок на экране появляется по ТЗ (3 с), а голос ждёт простоя, который
+    перезапуском сервера не объяснить.
+    """
+    mode, clock = _mode()
+    mode.link_down()
+    clock["now"] += 40.0
+    assert mode.take_notice() is True, "значок «мозг оффлайн» появляется сразу"
+    assert mode.take_voice_notice() is False, "рестарт хаба — ещё не повод говорить"
+    clock["now"] += 60.0
+    assert mode.take_voice_notice() is True
+    assert mode.take_voice_notice() is False, "один раз на простой"
+    mode.link_up()
+    mode.link_down()
+    clock["now"] += 3.5
+    assert mode.take_voice_notice() is False, "нового простоя в 3.5 с мало"
+    assert mode.take_notice() is True
+
+
+def test_the_owner_can_choose_how_soon_the_room_speaks():
+    mode, clock = _mode(notice_after_s=5.0)
+    mode.link_down()
+    clock["now"] += 6.0
+    assert mode.take_voice_notice() is True
+
+
+def test_the_link_loss_beep_is_off_by_default():
+    assert _mode()[0].beep_on_link_loss is False
+    assert _mode(beep_on_link_loss=True)[0].beep_on_link_loss is True
+
+
 def test_the_room_is_told_only_after_three_seconds_without_the_hub():
     mode, clock = _mode()
     assert mode.offline() is False
