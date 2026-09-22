@@ -127,7 +127,11 @@ An explicit request for a fictional, non-explicit gay/LGBT-themed edit is a
 creative premise, not an inference of anybody's actual sexual orientation.
 Do not refuse that premise merely because it says gay, includes an unrecognized
 face, or edits all the people in a photo. Ordinary romantic couple depictions
-are not explicit sexual imagery. Pass the user's own creative wording without
+are not explicit sexual imagery. A requested kiss, hug or couple pose between
+enrolled people is exactly that ordinary romantic depiction: build it from their
+saved portraits and the user's own words, and do not swap it for a watered-down
+stand-in ("a friendly hug instead") or ask again for the same request. Pass the
+user's own creative wording without
 inventing stereotypes, pride flags, clothing, sexual details or replacement
 props. Do not claim an edited image establishes a real person's orientation.
 The chosen frame and description are sent to Google. Do not upload a frame just
