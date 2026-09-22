@@ -416,6 +416,26 @@ class TelegramController:
                     'transcript': text, 'images': [], 'actions': [],
                     'telegram_chat_id': message['chat']['id'], 'telegram_message_id': message['message_id']}
             token = self.recording_turn.set(turn)
+            # Панель владельца (/admin/turns): у Telegram-запроса свой turn_id,
+            # поэтому решения, вызовы инструментов и раунды модели ложатся в
+            # одну цепочку с этим сообщением, а не теряются между ходами.
+            from hub import turn_trace
+
+            trace_turn = f'telegram:{message["chat"]["id"]}:{message["message_id"]}'
+            trace_home = str(getattr(room, 'home_id', '') or '')
+            trace_turn_token = turn_trace.CURRENT_TURN.set(trace_turn)
+            trace_home_token = turn_trace.CURRENT_HOME.set(trace_home)
+            turn_trace.record('turn', 'telegram-control', payload={
+                'chat': message['chat']['id'], 'message': message['message_id'],
+                'from': message['from']['id'], 'text': text,
+                'room': _room_name(room) if room is not None else '',
+                'home': trace_home})
+
+            def finish(reply: str) -> str:
+                """The answer, recorded in the chain before it leaves."""
+                turn_trace.record('turn', 'answered', payload={'reply': reply})
+                return reply
+
             facade = None
             try:
                 def check():
@@ -437,15 +457,16 @@ class TelegramController:
                 if followup is not None and self._allows(message, 'pc'):
                     reply = await followup.followup(facade, text)
                     if reply:
-                        return str(reply)
+                        return finish(str(reply))
                 if (not people_request and getattr(facade, '_face_selection', None)
                         and self._allows(message, 'profiles') and self._allows(message, 'camera')):
                     reply = await facade._choose_enrollment_face(text)
                     if reply:
                         sampled = await self._finish_face_sampling(facade, str(reply), check)
                         if sampled:
-                            return 'The selected face was saved. Additional photo sampling finished; see the result above.'
-                        return str(reply)
+                            return finish('The selected face was saved. Additional photo sampling'
+                                          ' finished; see the result above.')
+                        return finish(str(reply))
 
                 # Discard the normal Telegram system prompt, which explicitly
                 # has no tools. Prior group turns are quoted reference data;
@@ -542,13 +563,15 @@ class TelegramController:
                     return result
 
                 result = await brain.generate(prepared, execute)
-                return str(result.text or '').strip() or 'The request finished without a text response.'
+                return finish(str(result.text or '').strip()
+                              or 'The request finished without a text response.')
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning('Telegram controller failed (%s)', type(exc).__name__)
-                return _message(text, 'The room action did not finish. I did not automatically retry it.',
-                    'Действие в комнате не завершилось. Автоматически повторять его не буду.')
+                return finish(_message(text,
+                    'The room action did not finish. I did not automatically retry it.',
+                    'Действие в комнате не завершилось. Автоматически повторять его не буду.'))
             finally:
                 if facade is not None:
                     # Scoped face sampling must not outlive the authorization
@@ -564,6 +587,8 @@ class TelegramController:
                 if getattr(room, '_telegram_control_task', None) is current_task:
                     room._telegram_control_task = None
                 self._active_tasks.discard(current_task)
+                turn_trace.CURRENT_TURN.reset(trace_turn_token)
+                turn_trace.CURRENT_HOME.reset(trace_home_token)
 
     @staticmethod
     def _turn_key(message, room):

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import secrets
@@ -27,7 +28,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from hub import labelling
+from hub import labelling, turn_trace
 from hub.audit import AuditLog
 
 log = logging.getLogger(__name__)
@@ -103,6 +104,38 @@ def overlay_only(allowed: list[str]):
     return allowed_from
 
 
+def panel_names(allowed: list[str]):
+    """The second gate: the panel answers under its own names, not a public one.
+
+    The hub also answers on a public tunnel (ngrok and the like). There the
+    request arrives *from loopback* with the tunnel's public name in ``Host``,
+    so the peer address alone would let the whole internet reach the login form.
+    The name therefore has to belong to the machine as well: an IP literal inside
+    the allowed networks, or ``localhost``.
+    """
+    networks = [ipaddress.ip_network(str(item), strict=False) for item in allowed]
+
+    def allowed_name(host_header: str | None) -> bool:
+        value = str(host_header or "").strip().lower()
+        if not value:
+            return False
+        if value.startswith("["):  # an IPv6 literal: [::1]:8770
+            value = value[1:].split("]", 1)[0]
+        elif value.count(":") == 1:  # a name or IPv4 with its port
+            value = value.split(":", 1)[0]
+        if value in {"localhost", "localhost.localdomain"}:
+            return True
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        return any(address in network for network in networks)
+
+    return allowed_name
+
+
 class WebAdminData:
     """Read-only views of the hub database for the panel (ТЗ F-705).
 
@@ -169,6 +202,42 @@ class WebAdminData:
                  "actor": row[1] or "—", "home_id": row[2] or "—", "action": row[3],
                  "target": row[4] or "—", "result": row[5] or "ok",
                  "detail": row[6] or "{}"} for row in rows]
+
+    # --- the chain of one request -----------------------------------------
+
+    def turns(self, limit: int = turn_trace.RECENT_TURNS) -> list[dict[str, Any]]:
+        """Every recent request with a one-line summary of its chain.
+
+        A turn is one request: a spoken turn in a room (the client's utterance
+        id) or a Telegram message. This is the list the owner opens when they
+        ask "what did the request actually do".
+        """
+        conn = self._connect()
+        try:
+            rows = turn_trace.TurnTraceStore(conn).recent(limit)
+        except sqlite3.Error as exc:
+            log.warning("The panel could not read the request chain (%s)", exc)
+            return []
+        finally:
+            conn.close()
+        return [{**row,
+                 "when": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["finished"])),
+                 "href": quote(str(row["turn_id"]), safe="")} for row in rows]
+
+    def turn_events(self, turn_id: str) -> list[dict[str, Any]]:
+        """The steps of one request, in the order they happened."""
+        conn = self._connect()
+        try:
+            events = turn_trace.TurnTraceStore(conn).events(turn_id)
+        except sqlite3.Error as exc:
+            log.warning("The panel could not read the steps of %s (%s)", turn_id, exc)
+            return []
+        finally:
+            conn.close()
+        for event in events:
+            event["detail"] = json.dumps(event.get("payload") or {}, ensure_ascii=False,
+                                         default=str)[:1200]
+        return events
 
     # --- manual labelling (ТЗ F-216) ---------------------------------------
 
@@ -245,12 +314,15 @@ def build_router(*, cfg: Any, data: WebAdminData | None, auth: WebAdminAuth) -> 
     """The panel's routes; every one of them sits behind the overlay gate."""
     settings = cfg.server.web_admin
     allowed_from = overlay_only(list(settings.allowed_networks))
+    allowed_name = panel_names(list(settings.allowed_networks))
     templates = Jinja2Templates(directory=str(TEMPLATES))
     router = APIRouter()
 
     def denied(request: Request):
-        if not allowed_from(request.client.host if request.client else None):
-            log.warning("The web panel refused %s", request.client.host if request.client else "?")
+        peer = request.client.host if request.client else None
+        if not allowed_from(peer) or not allowed_name(request.headers.get("host")):
+            log.warning("The web panel refused %s (host %r)",
+                        peer or "?", request.headers.get("host"))
             return HTMLResponse("<h1>404</h1><p>This panel is only reachable from the "
                                 "overlay network.</p>", status_code=404)
         return None
@@ -318,6 +390,34 @@ def build_router(*, cfg: Any, data: WebAdminData | None, auth: WebAdminAuth) -> 
                                               lambda: data.audit(50) if data else []),
                          methods=["GET"], response_class=HTMLResponse)
 
+    def turns_page(request: Request):
+        """Every recent request, newest first, with the shape of its chain."""
+        if (blocked := denied(request)) is not None:
+            return blocked
+        if not signed_in(request):
+            return RedirectResponse("/admin", status_code=303)
+        return templates.TemplateResponse(request, "admin/turns.html", {
+            "turns": data.turns() if data is not None else [],
+            "counts": data.counts() if data is not None else {}})
+
+    router.add_api_route("/admin/turns", turns_page, methods=["GET"],
+                         response_class=HTMLResponse)
+
+    def turn_page(request: Request, turn_id: str):
+        """One request: every step of its chain in the order it happened."""
+        if (blocked := denied(request)) is not None:
+            return blocked
+        if not signed_in(request):
+            return RedirectResponse("/admin", status_code=303)
+        events = data.turn_events(turn_id) if data is not None else []
+        return templates.TemplateResponse(request, "admin/turn.html", {
+            "turn_id": turn_id, "events": events,
+            "counts": data.counts() if data is not None else {}})
+
+    # ``:path`` keeps a Telegram turn id (chat and message ids, colons) intact.
+    router.add_api_route("/admin/turns/{turn_id:path}", turn_page, methods=["GET"],
+                         response_class=HTMLResponse)
+
     def tracks_page(request: Request, day: str = ""):
         """ТЗ F-216: the unrecognized tracks of a day, with crops and numbers."""
         if (blocked := denied(request)) is not None:
@@ -377,10 +477,13 @@ def mount(app: Any, *, cfg: Any, data: WebAdminData | None) -> Any:
         log.warning("The web panel is enabled but %s is not set: nobody can sign in",
                     settings.password_env)
     app.include_router(build_router(cfg=cfg, data=data, auth=auth))
-    log.info("The owner web panel listens on http://%s:%s/admin (overlay only)",
-             settings.host, settings.port)
+    # The router is part of the hub's own app, so the panel answers on the hub's
+    # own port (``server.host``/``server.port``); the panel settings only name
+    # the overlay address the deployment expects.
+    log.info("The owner web panel serves /admin on the hub's own port (overlay names only;"
+             " expected at http://%s:%s/admin)", settings.host, settings.port)
     return auth
 
 
 __all__ = ["COOKIE", "PANEL_ACTOR", "TEMPLATES", "WebAdminAuth", "WebAdminData", "build_router",
-           "mount", "overlay_only", "quote"]
+           "mount", "overlay_only", "panel_names", "quote"]

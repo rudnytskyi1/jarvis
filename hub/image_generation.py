@@ -285,6 +285,14 @@ class ImageGenerator:
         self.check_ready()
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode('utf-8')) > 12000:
             raise CloudUnavailable('Use a nonempty image description shorter than 12 KB.')
+        # Панель владельца (/admin/turns): что именно уходит в модель картинок,
+        # какие кадры приложены и с какими подписями. Отказ Google отличается от
+        # отказа чат-модели, и по цепочке это видно.
+        from hub import turn_trace
+
+        turn_trace.record('prompt', 'image', payload={
+            'provider': 'gemini', 'model': self.cfg.model, 'prompt': prompt,
+            'reference': bool(reference), 'references': len(list(references or ()))})
         parts = [{'text': prompt}]
         image_config = {'imageSize': self.cfg.image_size}
         scene_label = _scene_subject_label(scene_subject, reference)
@@ -349,9 +357,16 @@ class ImageGenerator:
                 raise CloudUnavailable('Google returned an invalid image response.')
             self._settle(reservation, data)
             if (data.get('promptFeedback') or {}).get('blockReason'):
+                turn_trace.record('image', 'declined', ok=False, payload={
+                    'reason': str((data.get('promptFeedback') or {}).get('blockReason')),
+                    'model': self.cfg.model, 'prompt': prompt})
                 raise CloudUnavailable('Google declined this image request. No image was created. Do not retry or rephrase it automatically.')
             candidates = data.get('candidates') or []
             if not candidates or candidates[0].get('finishReason') != 'STOP':
+                turn_trace.record('image', 'declined', ok=False, payload={
+                    'reason': str((candidates[0] if candidates else {}).get('finishReason')
+                                  or 'no candidates'),
+                    'model': self.cfg.model, 'prompt': prompt})
                 raise CloudUnavailable('Google did not complete this image request. No image is ready; do not retry automatically.')
             for part in (candidates[0].get('content') or {}).get('parts', []):
                 if part.get('thought'):

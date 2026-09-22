@@ -1009,7 +1009,17 @@ class LlmClient:
     async def _chat(
         self, messages: list[dict[str, Any]], with_tools: bool
     ) -> tuple[str, list[ToolCall]]:
-        """One completion, executed in a worker thread."""
+        """One completion, executed in a worker thread.
+
+        Every round goes through here, so this is also where the owner's panel
+        (``/admin/turns``) sees the exact prompt that left the hub: the system
+        prompt, the room facts, the tool results and the current request, with
+        long texts clipped (``hub.turn_trace``).
+        """
+        from hub import turn_trace
+
+        turn_trace.record("prompt", str(getattr(self, "model", "") or "llm"), payload={
+            "provider": str(self.provider), "tools": bool(with_tools), "messages": messages})
         if self.provider == PROVIDER_OLLAMA_NATIVE:
             return await asyncio.to_thread(self._chat_native, messages, with_tools)
         if self.provider == PROVIDER_RESPONSES:
@@ -1208,6 +1218,16 @@ class LlmClient:
                 ", ".join(call.name for call in calls) or "-",
                 self._timing_note(),
             )
+            # Панель владельца: раунд большой модели — что спросили, какие
+            # инструменты она выбрала и что ответила. Имя модели то же, что в
+            # логе старта (luna/gpt/qwen), поэтому видно, кто именно работал.
+            from hub import turn_trace
+
+            turn_trace.record(
+                "llm", str(getattr(self, "model", "") or "llm"),
+                payload={"round": int(round_index), "of": int(self.max_tool_rounds),
+                         "text": text,
+                         "tools": [call.name for call in calls]})
             if not calls:
                 if browser_recovery.pending:
                     if not browser_recovery.requested and round_index < self.max_tool_rounds + 2:

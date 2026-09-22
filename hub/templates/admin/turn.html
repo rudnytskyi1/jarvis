@@ -1,0 +1,27 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>Request {{ turn_id }}</h2>
+  <p><a href="/admin/turns">← All requests</a></p>
+  {% if events %}
+  <table>
+    <tr><th>#</th><th>Time</th><th>Step</th><th>Who</th><th>OK</th><th>ms</th>
+      <th>Detail</th></tr>
+    {% for event in events %}
+    <tr>
+      <td>{{ loop.index }}</td>
+      <td>{{ event.when }}</td>
+      <td>{{ event.kind }}</td>
+      <td>{{ event.name or "—" }}</td>
+      <td>{{ "yes" if event.ok else "no" }}</td>
+      <td>{{ event.latency_ms }}</td>
+      <td><code>{{ event.detail }}</code></td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="note">Steps in order: <code>turn</code> (the request, its transcript
+    and the answer), <code>decision</code> (rules or Jev, with confidence),
+    <code>tool</code> (arguments and result), <code>llm</code> (model rounds) and
+    <code>say</code> (what the room heard). Text is clipped; secrets never reach
+    this table.</p>
+  {% else %}<p>This request has no recorded steps.</p>{% endif %}
+{% endblock %}

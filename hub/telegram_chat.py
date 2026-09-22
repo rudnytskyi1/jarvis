@@ -796,6 +796,17 @@ class TelegramChat:
         recent = await asyncio.to_thread(self._recent_group_context, message)
         turn = await asyncio.to_thread(self._begin_group_turn, message, stamp, text)
         sending = False
+        # Панель владельца (/admin/turns): у Telegram-хода свой turn_id — по
+        # нему видно раунды модели, генерацию картинки и то, что ответили.
+        from hub import turn_trace
+
+        trace_turn = f'telegram:{message["chat"]["id"]}:{message["message_id"]}'
+        turn_trace.CURRENT_TURN.set(trace_turn)
+        turn_trace.CURRENT_HOME.set('')
+        turn_trace.record('turn', 'telegram-chat', payload={
+            'chat': message['chat']['id'], 'message': message['message_id'],
+            'from': message['from']['id'], 'text': text,
+            'photo': bool(message.get('photo'))})
         try:
             system_prompt = self.system_prompt
             if message['chat']['type'] == 'private':
@@ -843,6 +854,7 @@ class TelegramChat:
                     answer = "I couldn't produce an answer to that message."
                 sending = True
                 await self.provider.send_text(answer, **self._delivery_kwargs(message))
+            turn_trace.record('turn', 'answered', payload={'reply': answer})
             await asyncio.to_thread(self.history.finish, turn, answer)
             await asyncio.to_thread(self._state, update_id, 'sent')
         except asyncio.CancelledError:
@@ -864,6 +876,7 @@ class TelegramChat:
                     await self.provider.send_text(line, **self._delivery_kwargs(message))
                 except Exception:
                     state = 'delivery_uncertain'
+            turn_trace.record('turn', 'answered', payload={'reply': answer}, ok=False)
             await asyncio.to_thread(self.history.finish, turn, answer)
             await asyncio.to_thread(self._state, update_id, state)
 

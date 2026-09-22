@@ -338,3 +338,33 @@ def test_provider_refusal_cannot_be_retried_by_model_or_display_an_old_image(tmp
         finally:
             await client.close()
     asyncio.run(run())
+
+
+def test_the_image_prompt_and_a_google_refusal_reach_the_owner_panel(tmp_path, monkeypatch):
+    """The owner sees what went to Nano Banana and why Google said no."""
+    from hub import migrations_runner, turn_trace
+    conn = migrations_runner.connect(str(tmp_path / 'hub.db'))
+    migrations_runner.migrate(conn)
+    store = turn_trace.configure(conn)
+    handler = Mock(return_value=httpx.Response(
+        200, json=response_image(promptFeedback={'blockReason': 'PROHIBITED_CONTENT'}, candidates=[])))
+
+    async def run():
+        client = generator(tmp_path, monkeypatch, handler)
+        try:
+            with turn_trace.turn('u-42', 'livingroom'):
+                with pytest.raises(CloudUnavailable):
+                    await client.generate('make them kiss')
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(run())
+        steps = store.events('u-42')
+    finally:
+        turn_trace.configure(None)
+    assert [step['kind'] for step in steps] == ['prompt', 'image']
+    assert steps[0]['payload']['prompt'] == 'make them kiss'
+    assert steps[0]['payload']['model'] == 'gemini-3.1-flash-image'
+    assert steps[1]['ok'] is False
+    assert steps[1]['payload']['reason'] == 'PROHIBITED_CONTENT'

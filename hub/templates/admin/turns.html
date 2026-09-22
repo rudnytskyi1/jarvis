@@ -1,0 +1,26 @@
+{% extends "admin/base.html" %}
+{% block content %}
+  <h2>Requests</h2>
+  <p class="note">Every request Rowan handled: a spoken turn in a room (the client's
+    utterance id) or a Telegram message. Open one to see its whole chain — which
+    decisions were taken (rules / Jev), which tools ran with which arguments and
+    what came back, which model rounds happened and what the room heard.</p>
+  {% if turns %}
+  <table>
+    <tr><th>Finished</th><th>Request</th><th>Home</th><th>Decided by</th>
+      <th>Chain</th><th>Took</th></tr>
+    {% for turn in turns %}
+    <tr>
+      <td>{{ turn.when }}</td>
+      <td><a href="/admin/turns/{{ turn.href }}">{{ turn.turn_id }}</a></td>
+      <td>{{ turn.home_id or "—" }}</td>
+      <td>{{ turn.providers or "—" }}</td>
+      <td>{{ turn.decisions }} decision(s), {{ turn.tools }} tool call(s),
+        {{ turn.rounds }} model round(s){% if turn.failed %} ·
+        <strong>{{ turn.failed }} failed</strong>{% endif %}</td>
+      <td>{{ turn.seconds }} s</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p>No requests have been recorded yet.</p>{% endif %}
+{% endblock %}

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from common.config import Config, load_config
 from hub import migrations_runner
 from hub.labelling import day_of, day_window
-from hub.web_admin import COOKIE, WebAdminAuth, WebAdminData, build_router, mount, overlay_only
+from hub.web_admin import COOKIE, WebAdminAuth, WebAdminData, build_router, mount, overlay_only, panel_names
 
 OVERLAY, LAN = ("100.64.0.7", 50000), ("192.168.1.50", 50000)
 PASSWORD = "dorm-owner-password"
@@ -43,7 +43,9 @@ def a_client(tmp_path, monkeypatch, *, client=OVERLAY, password=PASSWORD):
     database.close()
     app = FastAPI()
     app.include_router(build_router(cfg=cfg, data=WebAdminData(tmp_path / "hub.db"), auth=auth))
-    return TestClient(app, client=client), auth
+    # The panel also checks the name it was called by, so the browser in these
+    # tests asks for it as the overlay address it really has.
+    return TestClient(app, base_url="http://127.0.0.1", client=client), auth
 
 
 # --- the gate ---------------------------------------------------------------
@@ -58,10 +60,36 @@ def test_only_the_overlay_network_may_look(host, expected):
     assert overlay_only(["127.0.0.0/8", "100.64.0.0/10"])(host) is expected
 
 
+@pytest.mark.parametrize("name,expected", [
+    ("127.0.0.1:8770", True), ("localhost:8770", True), ("100.64.0.7", True),
+    ("[::ffff:100.64.0.9]:8770", True),
+    ("dorm-smart-un-iversity-of-nebr-omaha.ngrok.app", False),
+    ("rowan.example.com", False), ("8.8.8.8", False), ("", False), (None, False),
+])
+def test_the_panel_answers_under_its_own_names_only(name, expected):
+    allowed = panel_names(["127.0.0.0/8", "100.64.0.0/10"])
+    assert allowed(name) is expected, "публичное имя туннеля — не наш адрес"
+
+
+def test_the_public_tunnel_never_shows_the_panel(tmp_path, monkeypatch):
+    """The tunnel reaches the hub from loopback: only the name gives it away."""
+    monkeypatch.setenv("ROWAN_TEST_PASSWORD", PASSWORD)
+    cfg = Config()
+    cfg.server.web_admin.password_env = "ROWAN_TEST_PASSWORD"
+    auth = WebAdminAuth(password_env="ROWAN_TEST_PASSWORD", secret=b"test-key")
+    migrated(tmp_path).close()
+    app = FastAPI()
+    app.include_router(build_router(cfg=cfg, data=WebAdminData(tmp_path / "hub.db"), auth=auth))
+    tunnel = TestClient(app, base_url="http://dorm-smart-un-iversity-of-nebr-omaha.ngrok.app",
+                        client=OVERLAY)
+    assert tunnel.get("/admin").status_code == 404
+    assert tunnel.post("/admin/login", data={"password": PASSWORD}).status_code == 404
+
+
 def test_the_lan_never_sees_even_the_login_form(tmp_path, monkeypatch):
     client, _ = a_client(tmp_path, monkeypatch, client=LAN)
     for path in ("/admin", "/admin/homes", "/admin/clients", "/admin/people", "/admin/tracks",
-                 "/admin/crop/c1.jpg"):
+                 "/admin/turns", "/admin/crop/c1.jpg"):
         answer = client.get(path)
         assert answer.status_code == 404
         assert "overlay" in answer.text
@@ -69,9 +97,12 @@ def test_the_lan_never_sees_even_the_login_form(tmp_path, monkeypatch):
 
 
 def test_config_declares_the_panel_in_both_files():
-    for name in ("config.yaml", "config.example.yaml"):
-        settings = load_config(name).server.web_admin
-        assert settings.enabled is False
+    """This deployment switched the panel on; the example stays a safe default."""
+    live = load_config("config.yaml").server.web_admin
+    assert live.enabled is True, "владелец открывает /admin на своём хабе"
+    example = load_config("config.example.yaml").server.web_admin
+    assert example.enabled is False, "пример не включает панель сам по себе"
+    for settings in (live, example):
         assert settings.allowed_networks == ["127.0.0.0/8", "100.64.0.0/10"]
         assert settings.password_env == "ROWAN_ADMIN_PASSWORD"
 
@@ -156,6 +187,68 @@ def test_mounting_is_off_until_the_config_says_otherwise(tmp_path, monkeypatch):
     monkeypatch.setenv("ROWAN_ADMIN_PASSWORD", PASSWORD)
     assert mount(app, cfg=cfg, data=None) is not None
     assert [route for route in app.routes if getattr(route, "path", "") == "/admin/homes"]
+
+
+# --- цепочка запроса (панель) -----------------------------------------------
+
+
+def _seed_chain(tmp_path, turn_id="u-1", home="livingroom"):
+    """Two steps of one request: a decision and a failed tool call."""
+    conn = sqlite3.connect(str(tmp_path / "hub.db"))
+    rows = [
+        (turn_id, home, 1_700_000_000.0, "turn", "room", 1, 0,
+         '{"transcript": "\u0442\u044b \u0442\u0443\u0442", "reply": "\u0442\u0443\u0442"}'),
+        (turn_id, home, 1_700_000_000.4, "decision", "jev", 1, 475,
+         '{"type": "route", "value": "chat", "confidence": 0.91}'),
+        (turn_id, "", 1_700_000_001.2, "tool", "generate_image", 0, 2100,
+         '{"args": {"prompt": "a cat"}, "result": {"ok": false, "error": "no key"}}'),
+    ]
+    conn.executemany("INSERT INTO turn_events(turn_id, home_id, ts, kind, name, ok,"
+                     " latency_ms, payload_json) VALUES (?,?,?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def test_the_requests_page_lists_every_request_with_its_chain(tmp_path, monkeypatch):
+    browser = _signed_in(tmp_path, monkeypatch)
+    _seed_chain(tmp_path)
+
+    page = browser.get("/admin/turns")
+    assert page.status_code == 200
+    assert "u-1" in page.text and "/admin/turns/u-1" in page.text
+    assert "1 decision(s)" in page.text and "1 tool call(s)" in page.text
+    assert "failed" in page.text, "сломанный шаг виден в списке"
+    assert "Requests" in browser.get("/admin/homes").text, "в навигации есть запросы"
+
+
+def test_one_request_shows_its_steps_in_order(tmp_path, monkeypatch):
+    browser = _signed_in(tmp_path, monkeypatch)
+    _seed_chain(tmp_path)
+
+    page = browser.get("/admin/turns/u-1")
+    assert page.status_code == 200
+    assert "ты тут" in page.text, "что услышали"
+    assert "jev" in page.text and "0.91" in page.text, "кто решил и с какой уверенностью"
+    assert "generate_image" in page.text and "no key" in page.text, "что вернул инструмент"
+    assert page.text.index("decision") < page.text.index("generate_image"), "шаги по порядку"
+
+
+def test_a_telegram_request_opens_with_its_colons_intact(tmp_path, monkeypatch):
+    browser = _signed_in(tmp_path, monkeypatch)
+    turn_id = "telegram:-1003570242441:42"
+    _seed_chain(tmp_path, turn_id=turn_id, home="livingroom")
+
+    listing = browser.get("/admin/turns").text
+    assert "telegram%3A-1003570242441%3A42" in listing, "ссылка кодирует двоеточия"
+    detail = browser.get(f"/admin/turns/{turn_id}")
+    assert detail.status_code == 200 and "u-1" not in detail.text
+    assert "generate_image" in detail.text
+
+
+def test_the_requests_page_asks_for_a_session(tmp_path, monkeypatch):
+    browser, _auth = a_client(tmp_path, monkeypatch)
+    assert browser.get("/admin/turns", follow_redirects=False).headers["location"] == "/admin"
+    assert browser.get("/admin/turns/u-1", follow_redirects=False).headers["location"] == "/admin"
 
 
 # --- ручная разметка (ТЗ F-216) ---------------------------------------------

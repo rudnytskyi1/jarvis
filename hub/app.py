@@ -1098,6 +1098,11 @@ def _hub_gateway():
             migrations_runner.migrate(conn)
             _gateway = Gateway(ClientTokenStore(conn))
             _hub_conn = conn
+            # Панель владельца (/admin/turns): события ходов пишутся тем же
+            # соединением, что и решения. Сбой трассировки не влияет на хаб.
+            from hub import turn_trace
+
+            turn_trace.configure(conn)
             log.info("Client authentication is enabled (%s)", path)
         except Exception as exc:  # noqa: BLE001 - never block the classic setup
             log.warning("Client authentication is unavailable (%s)", exc)
@@ -6557,6 +6562,19 @@ class Connection(CameraClipReceiver):
         # so a turn is never anonymous in the logs.
         announced = str(payload.get('utterance_id') or '').strip()[:100]
         self.utterance_id = announced or new_ulid()
+        # Панель владельца: всё, что случится в этом ходу (решения, вызовы
+        # инструментов, раунды модели), попадёт в цепочку этого utterance_id.
+        from hub import turn_trace
+
+        turn_trace.CURRENT_TURN.set(self.utterance_id)
+        turn_trace.CURRENT_HOME.set(str(getattr(self, 'home_id', '') or ''))
+        # Первое событие цепочки (панель /admin/turns): кто и в какой комнате
+        # начал запрос. Дальше сюда лягут решения, инструменты, модель и речь.
+        turn_trace.record("turn", "room", payload={
+            "home": str(getattr(self, 'home_id', '') or ''),
+            "client": (self.session.client_id if self.session is not None else '') or '',
+            "peer": str(getattr(self, 'peer', '') or ''),
+        })
         now = time.monotonic()
         self._since_last_turn_s = (float('inf') if self._last_turn_at is None
                                    else max(0.0, now - self._last_turn_at))
@@ -8942,9 +8960,21 @@ class Connection(CameraClipReceiver):
         text that really arrived. The next call of the turn can then be refused
         with that payload still in hand.
         """
+        from hub import turn_trace
+
+        started = time.perf_counter()
         result = await self._execute_tool_now(name, args)
         if untrusted_source(name) is not None:
             self._note_untrusted(name, result)
+        # Панель владельца: какой инструмент, с какими аргументами, что вернул
+        # и сколько занял. Сюда же попадают картинки (generate_image), зрение
+        # (look_at_camera/find_object) и речь (say_in_room).
+        turn_trace.record(
+            "tool", name, payload={"args": dict(args or {}), "result": result},
+            ok=not (isinstance(result, dict) and result.get("ok") is False),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            turn_id=str(getattr(self, "utterance_id", "") or ""),
+            home_id=str(getattr(self, "home_id", "") or ""))
         return result
 
     async def _execute_tool_now(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -15810,6 +15840,16 @@ class Connection(CameraClipReceiver):
         if _dialogs is not None:
             await asyncio.to_thread(_dialogs.append, entry)
         await self._store_dialog_turns(started_at, transcript, reply)
+        # Панель владельца: последнее событие цепочки — что услышали, кто это
+        # был, что ответили и в какие сроки уложились стадии.
+        from hub import turn_trace
+
+        turn_trace.record("turn", "finished", payload={
+            "transcript": transcript, "reply": reply, "speaker": self._speaker_name,
+            "score": round(float(self._speaker_score), 3), "durations_ms": durations_ms,
+            "degraded": list(getattr(self, '_degradations', []) or []), "note": note or "",
+        }, ok=(note or '') not in {'failed', 'disconnected', 'cancelled'},
+            latency_ms=int(durations_ms.get('total', 0) or 0))
 
     async def _store_dialog_turns(self, started_at: datetime, transcript: str, reply: str) -> None:
         """Mirror one turn into ``dialog_turns`` in the hub database (ТЗ 4.5/14).
@@ -15888,6 +15928,11 @@ class Connection(CameraClipReceiver):
         turn = _recording_turn.get()
         if turn is not None:
             turn.setdefault('spoken_replies', []).append(text)
+        # Панель владельца: что именно комната услышала в этом ходу и с какой
+        # целью (ответ/уведомление). Событие вне хода не записывается.
+        from hub import turn_trace
+
+        turn_trace.record("say", str(purpose or 'reply'), payload={"text": text})
         async with self._audio_lock:
             await self._stream_tts_unlocked(voice, text, purpose, notice_id, cache)
 

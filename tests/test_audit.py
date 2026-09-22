@@ -153,7 +153,8 @@ def test_the_panel_shows_the_audit_trail(tmp_path, monkeypatch):
     app.include_router(build_router(cfg=cfg, data=WebAdminData(tmp_path / 'hub.db'),
                                     auth=WebAdminAuth(password_env='ROWAN_TEST_PASSWORD',
                                                       secret=b'k')))
-    client = TestClient(app, client=("100.64.0.7", 5000))
+    # The panel also checks the name it was called by: a real overlay browser.
+    client = TestClient(app, base_url="http://100.64.0.7", client=("100.64.0.7", 5000))
     client.post("/admin/login", data={"password": 'audit-password'}, follow_redirects=False)
     page = client.get("/admin/audit")
     assert "profiles.delete" in page.text and "Alice" in page.text
@@ -170,6 +171,6 @@ def test_an_empty_audit_page_says_so(tmp_path, monkeypatch):
     app.include_router(build_router(cfg=cfg, data=WebAdminData(tmp_path / 'hub.db'),
                                     auth=WebAdminAuth(password_env='ROWAN_TEST_PASSWORD',
                                                       secret=b'k')))
-    client = TestClient(app, client=("100.64.0.7", 5000))
+    client = TestClient(app, base_url="http://100.64.0.7", client=("100.64.0.7", 5000))
     client.post("/admin/login", data={"password": 'audit-password'}, follow_redirects=False)
     assert "Nothing has been recorded yet" in client.get("/admin/audit").text

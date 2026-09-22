@@ -59,10 +59,15 @@ class DecisionLog:
 
     def record(self, decision: Decision[Any], decision_type: str, outcome: str = "pending") -> None:
         """Store one decision; failures are logged, never raised."""
+        from hub import turn_trace
+
+        turn_id = turn_trace.current_turn()
+        home_id = turn_trace.CURRENT_HOME.get()
         try:
             self._conn.execute(
                 "INSERT OR REPLACE INTO decisions(decision_id, type, provider, input_hash,"
-                " value_json, confidence, latency_ms, outcome, at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " value_json, confidence, latency_ms, outcome, at, turn_id, home_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     decision.decision_id,
                     str(decision_type),
@@ -73,11 +78,22 @@ class DecisionLog:
                     int(decision.latency_ms),
                     str(outcome),
                     time.time(),
+                    str(turn_id),
+                    str(home_id),
                 ),
             )
             self._conn.commit()
         except sqlite3.Error as exc:
             log.warning("Could not record decision %s (%s)", decision.decision_id, exc)
+            return
+        # Панель владельца: тот же шаг, но с человекочитаемой подписью "кто
+        # решил" — rules/Jev, значение, уверенность и задержка.
+        turn_trace.record(
+            "decision", str(decision.provider),
+            payload={"type": str(decision_type), "value": decision.value,
+                     "confidence": round(float(decision.confidence), 3),
+                     "outcome": str(outcome), "decision_id": decision.decision_id},
+            latency_ms=int(decision.latency_ms))
 
     def recent(self, *, decision_type: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """The most recent decisions, newest first."""
