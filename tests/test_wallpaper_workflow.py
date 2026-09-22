@@ -103,6 +103,23 @@ def test_shown_guest_picture_survives_next_voice_match_only_in_open_room(monkeyp
     asyncio.run(run())
 
 
+def test_a_guest_picture_saved_in_the_same_clock_tick_still_wins(monkeypatch, tmp_path):
+    """Two saves inside one clock tick share a stamp; the shown one must win."""
+    async def run():
+        conn, _, store, picture = setup(monkeypatch, tmp_path)
+        old = BytesIO()
+        Image.new('RGB', (48, 32), 'red').save(old, 'PNG')
+        older = decode_image(old.getvalue(), 'image/png')
+        monkeypatch.setattr('hub.image_generation.time.time', lambda: 1000.0)
+        store.save('person:anton', older, 'test')
+        conn._speaker_name = 'unknown'
+        assert (await conn._run_generate_image({'source': 'none', 'prompt': 'Blue sky'}))['ok']
+        conn._speaker_name = 'Anton'
+        assert (await conn._run_set_wallpaper({'source': 'generated'}))['ok']
+        assert base64.b64decode(conn._run_client_action.call_args.args[1]['image_base64']) == picture.png
+    asyncio.run(run())
+
+
 def test_failed_edit_cannot_apply_save_or_show_an_older_image(monkeypatch, tmp_path):
     async def run():
         from hub.api_budget import CloudUnavailable

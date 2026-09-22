@@ -12,6 +12,8 @@ client:
   server_url: wss://hub.internal/ws   # legacy alias, used when hub_url is unset
   token_env: ROWAN_CLIENT_TOKEN # the token itself is never written to YAML
   caps: [mic, speaker, camera, screen, hud, actions]
+  # ТЗ F-711, телефон: kind: phone и caps: [mic, speaker] — без камеры, экрана
+  # и действий ПК; хаб отвергнет кадры камеры и команды ПК от такого клиента.
 
   # --- room behaviour ---
   workplace_name: "Living room"

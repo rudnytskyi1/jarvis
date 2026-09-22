@@ -61,7 +61,7 @@ from common.openai_models import OPENAI_TEXT_RATES
 #: on both machines and the client ships without the hub.
 DEFAULT_DANGEROUS_TOOLS: tuple[str, ...] = ("run_command",)
 DEFAULT_DANGEROUS_PC_COMMANDS: tuple[str, ...] = (
-    "sleep", "suspend", "hibernate", "shutdown", "power_off", "reboot",
+    "lock", "sleep", "suspend", "hibernate", "shutdown", "power_off", "reboot",
     "restart", "logoff", "logout", "close_app",
 )
 
@@ -576,6 +576,91 @@ class MemoryConfig(_Strict):
         return self
 
 
+class ReminderConfig(_Strict):
+    """Напоминания (``server.reminders``, ТЗ F-417).
+
+    Разбор времени и запись в таблицу ``reminders`` живут в ``hub/reminders.py``;
+    доставка — следующая задача (P3-22). ``default_hour`` отвечает на реплику
+    «напомни завтра», в которой времени нет: ТЗ не называет ни одного числа, и
+    выбранный вариант записан в ``DECISIONS.md`` (P3-21).
+    """
+
+    enabled: bool = True
+    #: Час, которым отвечает день без названного времени («напомни завтра»).
+    default_hour: int = Field(default=9, ge=0, le=23)
+    #: Сколько ненаступивших напоминаний терпит один человек: защита от
+    #: «напомни …» на каждую реплику. Сверх этого хаб честно отказывает.
+    max_pending_per_person: int = Field(default=100, ge=1, le=10000)
+    #: Как часто планировщик смотрит, не наступил ли чей-то срок, и сколько
+    #: наступивших напоминаний один проход отдаёт за раз (F-417).
+    check_interval_s: float = Field(default=30.0, gt=0, le=3600)
+    due_batch: int = Field(default=50, ge=1, le=500)
+
+
+class RulesConfig(_Strict):
+    """Правила и рутины (``server.rules``, ТЗ F-419).
+
+    Модель и таблица живут в ``hub/automation.py``; здесь — общий выключатель
+    и то, как часто планировщик проверяет правила по времени. Правило «в
+    07:30» срабатывает один раз в сутки по часам дома, поэтому интервал
+    влияет только на точность, а не на число срабатываний.
+    """
+
+    enabled: bool = True
+    check_interval_s: float = Field(default=60.0, gt=0, le=3600)
+    #: ТЗ F-419: правило можно попросить голосом («когда я приду после 22:00,
+    #: включи тёплый свет»). False оставляет только панель и таблицу.
+    voice_creation: bool = True
+
+
+class BriefingConfig(_Strict):
+    """Утренний брифинг (``server.briefing``, ТЗ F-420).
+
+    Часы — дома, а не хаба: в Чикаго и в Киеве «доброе утро» наступает в
+    разное время. По умолчанию брифинг ВЫКЛЮЧЕН: он говорит сам, без
+    приглашения, поэтому включается осознанно (решение P3-28 в
+    ``DECISIONS.md``). ``time`` — час, в который человек, уже находящийся
+    дома, слышит брифинг; ``window_start``/``window_end`` — границы утра, в
+    которых вход в комнату считается поводом «встал».
+    """
+
+    enabled: bool = False
+    time: str = "07:30"
+    window_start: str = "05:00"
+    window_end: str = "11:00"
+    max_chars: int = Field(default=700, ge=120, le=2000)
+    check_interval_s: float = Field(default=60.0, gt=0, le=3600)
+
+    @field_validator("time", "window_start", "window_end")
+    @classmethod
+    def _clock(cls, value: str) -> str:
+        if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(value or "")):
+            raise ValueError("the morning briefing uses HH:MM on the home's clock")
+        return str(value)
+
+    @model_validator(mode="after")
+    def _window_is_not_empty(self) -> BriefingConfig:
+        if self.window_start >= self.window_end:
+            raise ValueError("window_start must come before window_end")
+        return self
+
+
+class DeviceStateConfig(_Strict):
+    """Состояние устройств (``server.device_state``, ТЗ F-505).
+
+    Состояние приносят отчёты комнаты (клиент — тот, кто выполняет команду) и,
+    если владелец назвал интервал, опрос адаптеров хаба. ``stale_after_s`` —
+    сколько живёт право на «уже так и есть»: старая запись не мешает команде
+    никогда, иначе устаревшее состояние отменяло бы нужное действие.
+    """
+
+    enabled: bool = True
+    #: Сколько секунд запись о состоянии считается свежей для «уже выключено».
+    stale_after_s: float = Field(default=900.0, ge=0, le=86400)
+    #: Периодический опрос адаптеров, секунды; 0 — только отчёты комнаты.
+    poll_interval_s: float = Field(default=0.0, ge=0, le=3600)
+
+
 class GpuQueueConfig(_Strict):
     """The hub's single GPU queue (``server.gpu_queue``, ТЗ section 4.5).
 
@@ -740,6 +825,16 @@ class HomeConfig(_Strict):
     #: model. Off by default: a picture of the room leaving the house is the
     #: owner's decision, not a default.
     cloud_vision: bool = False
+    #: ТЗ F-421: the place this room asks the weather skill about ("Chicago").
+    #: Empty means the skill has to ask which city to look at.
+    weather_location: str = Field(default="", max_length=120)
+    #: ТЗ F-507 (открытый вопрос раздела 17): разрешена ли разблокировка ПК по
+    #: лицу и голосу. По умолчанию — нет: это безопасность, а не удобство.
+    pc_unlock: bool = False
+    #: ТЗ 5.5: уходит ли текст этого дома к облачному провайдеру решений (Jev).
+    #: По умолчанию нет — «в облачный провайдер уходит только текст», и это
+    #: решение владельца комнаты, а не общая настройка хаба.
+    cloud_decisions: bool = False
     settings: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("tz")
@@ -782,6 +877,30 @@ class StageTimeouts(_Strict):
     reply_ms: int = Field(default=20000, ge=1000, le=600000)
 
 
+class JevProviderConfig(_Strict):
+    """TypeSafe AI Jev as a decision provider (``server.decider.providers.jev``).
+
+    ТЗ 5.2: Jev is in early access, so it is behind ``enabled`` and needs a key;
+    without the key the hub keeps deciding on the local providers, honestly, and
+    the open question of раздел 17 stays open. The key lives in the environment
+    (раздел 1: secrets never in the config file) and the config only names the
+    variable. The base URL and path are configuration because the early-access
+    deployment decides them, not the code.
+    """
+
+    enabled: bool = False
+    base_url: str = Field(default="", max_length=300)
+    path: str = Field(default="/v1/decide", max_length=120)
+    #: Name of the environment variable holding the API key.
+    api_key_env: str = Field(default="JEV_API_KEY", max_length=80)
+
+
+class DeciderProvidersConfig(_Strict):
+    """The remote providers of the decision chain (``server.decider.providers``)."""
+
+    jev: JevProviderConfig = Field(default_factory=JevProviderConfig)
+
+
 class DeciderConfig(_Strict):
     """Which provider answers which decision, and how long it may think.
 
@@ -802,6 +921,8 @@ class DeciderConfig(_Strict):
     cache_max_entries: int = Field(default=256, ge=1, le=10000)
     #: ТЗ 5.4: how far back the weekly calibration report in the panel looks.
     report_days: int = Field(default=7, ge=1, le=90)
+    #: ТЗ 5.2/5.5: the cloud decision provider (Jev) and its switch.
+    providers: DeciderProvidersConfig = Field(default_factory=DeciderProvidersConfig)
 
     @field_validator("order")
     @classmethod
@@ -819,6 +940,51 @@ class DeciderConfig(_Strict):
         return value
 
 
+class CanvasConfig(_Strict):
+    """Canvas LMS (``server.skills.canvas``, ТЗ F-421).
+
+    Токен — секрет, поэтому в конфиге лежит только ИМЯ переменной окружения, а
+    не сам токен (правило раздела 1 ТЗ: секреты — только в окружении, никогда
+    в git и логах). ``person_tokens`` даёт каждому человеку свой токен: у
+    Canvas он выдаётся на пользователя, поэтому один общий токен на дом был бы
+    чужой учётной записью. Вопрос «кто и как вводит токены» из раздела 17
+    решён так: их кладёт в окружение хаба тот, кто ставит Rowan (P3-30).
+    """
+
+    base_url: str = Field(default="", max_length=200)
+    #: Имя переменной окружения с общим токеном (fallback).
+    token_env: str = Field(default="ROWAN_CANVAS_TOKEN", max_length=80)
+    #: ``person_id`` → имя переменной окружения с токеном ЭТОГО человека.
+    person_tokens: dict[str, str] = Field(default_factory=dict)
+    #: ТЗ F-421: у скилла есть таймаут, а не «ждать вечно».
+    timeout_s: float = Field(default=8.0, gt=0, le=60)
+    #: Сколько дней вперёд считается «на этой неделе».
+    days: int = Field(default=7, ge=1, le=60)
+
+
+class CalendarConfig(_Strict):
+    """Google Calendar (``server.skills.calendar``, ТЗ F-421).
+
+    ТЗ просит эту интеграцию «за флагом», и флаг по умолчанию ВЫКЛЮЧЕН: доступ
+    к чужому календарю выдаёт владелец, а не обновление. Секретов в конфиге
+    нет — только имена переменных окружения (раздел 1 ТЗ), и у каждого
+    человека может быть свой refresh-токен (``person_tokens``).
+    """
+
+    enabled: bool = False
+    client_id_env: str = Field(default="ROWAN_GOOGLE_CLIENT_ID", max_length=80)
+    client_secret_env: str = Field(default="ROWAN_GOOGLE_CLIENT_SECRET", max_length=80)
+    #: Имя переменной окружения с refresh-токеном (общий, если личного нет).
+    refresh_token_env: str = Field(default="ROWAN_GOOGLE_REFRESH_TOKEN", max_length=80)
+    #: ``person_id`` → имя переменной окружения с ЕГО refresh-токеном.
+    person_tokens: dict[str, str] = Field(default_factory=dict)
+    #: ``primary`` или адрес календаря Google.
+    calendar_id: str = Field(default="primary", max_length=200)
+    timeout_s: float = Field(default=8.0, gt=0, le=60)
+    #: Сколько дней вперёд смотрит брифинг, когда спрашивает про первую встречу.
+    days: int = Field(default=1, ge=1, le=60)
+
+
 class SkillReloadConfig(_Strict):
     """Hot reload of skill files (ТЗ F-405).
 
@@ -830,6 +996,80 @@ class SkillReloadConfig(_Strict):
 
     dev_reload: bool = False
     interval_s: float = Field(default=2.0, ge=0.25, le=60.0)
+    #: ТЗ F-421: интеграции данных, которые скиллы берут извне.
+    canvas: CanvasConfig = Field(default_factory=CanvasConfig)
+    calendar: CalendarConfig = Field(default_factory=CalendarConfig)
+
+
+class IntercomConfig(_Strict):
+    """Межкомнатные сообщения: интерком (F-601) и широковещание (F-603).
+
+    ТЗ даёт одно число: «не чаще раза в 10 минут на человека» (F-603). Оно и
+    стоит по умолчанию; окно и число сообщений в окне вынесены в конфиг,
+    потому что студенческая общага и одна комната на хабе требуют разного.
+    ``queue_limit`` — сколько сообщений дом держит невыданными (F-601: «когда
+    придёт»): без предела очередь росла бы вечно.
+    """
+
+    enabled: bool = True
+    #: Окно, в котором считается частота сообщений, секунды (10 минут ТЗ).
+    cooldown_s: float = Field(default=600.0, ge=0.0, le=86400.0)
+    #: Сколько межкомнатных сообщений человек может отправить за окно.
+    max_messages: int = Field(default=1, ge=1, le=100)
+    #: Сколько невыданных сообщений хранит один дом.
+    queue_limit: int = Field(default=50, ge=1, le=1000)
+    #: Как часто проверять, не пришёл ли получатель (задача доставки F-601).
+    check_interval_s: float = Field(default=30.0, ge=5.0, le=600.0)
+
+
+class PushConfig(_Strict):
+    """Пуш-уведомления телефона (``server.push``, ТЗ F-712).
+
+    ТЗ называет канал, но не провайдера и не формат: хаб обслуживает разные
+    общаги, и ключ провайдера — секрет. Поэтому транспорт ВЫКЛЮЧЕН по
+    умолчанию и включается только флагом с ключом из переменной окружения
+    (секреты не лежат в YAML). Без ключа сообщение не «отправляется» — оно
+    честно ложится в очередь телефона и выдаётся при его подключении.
+    """
+
+    enabled: bool = False
+    #: Пусто — транспорта нет; ``webpush`` — Web Push (нужна библиотека pywebpush).
+    provider: str = Field(default="", max_length=40)
+    #: Имя переменной окружения с ключом провайдера (секрет НЕ пишется в YAML).
+    key_env: str = Field(default="ROWAN_PUSH_KEY", max_length=100)
+    #: Имя переменной окружения с адресом/темой провайдера, если он их требует.
+    endpoint_env: str = Field(default="ROWAN_PUSH_ENDPOINT", max_length=100)
+    #: Заголовок уведомления на телефоне.
+    title: str = Field(default="Rowan", max_length=60)
+    #: Сколько невыданных сообщений хранит один человек.
+    max_queue: int = Field(default=200, ge=1, le=5000)
+
+
+class DigestConfig(_Strict):
+    """Ежедневный отчёт владельцу (``server.digest``, ТЗ F-704).
+
+    Отчёт говорит сам, без приглашения, поэтому по умолчанию ВЫКЛЮЧЕН — как и
+    утренний брифинг. ``time`` — время на часах ДОМА (у Чикаго и Киева оно
+    разное), ``channel`` — канал доставки: сейчас честно поддержан только
+    Telegram (именно его называет ТЗ F-704).
+    """
+
+    enabled: bool = False
+    time: str = "21:00"
+    channel: str = Field(default="telegram", max_length=40)
+    #: Язык отчёта: владелец читает его сам, а не слушает в комнате.
+    language: str = Field(default="ru", max_length=10)
+    #: Сколько примеров неудач и отказов показывать в отчёте.
+    history_limit: int = Field(default=5, ge=0, le=50)
+    max_chars: int = Field(default=3000, ge=300, le=4000)
+    check_interval_s: float = Field(default=300.0, gt=0, le=3600)
+
+    @field_validator("time")
+    @classmethod
+    def _clock(cls, value: str) -> str:
+        if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(value or "")):
+            raise ValueError("the daily digest uses HH:MM on the home's clock")
+        return value
 
 
 class PresenceConfig(_Strict):
@@ -845,6 +1085,14 @@ class PresenceConfig(_Strict):
     absence_s: float = Field(default=30.0, ge=1.0, le=3600.0)
     #: Сколько последних событий дома читают вопросы F-301.
     history_limit: int = Field(default=1000, ge=10, le=100000)
+    #: ТЗ F-507: столько секунд без единого живого трека — и дом «ушёл».
+    left_after_s: float = Field(default=600.0, ge=30.0, le=86400.0)
+    #: Какая сцена дома означает уход (имя сцены F-506); по умолчанию пресет.
+    left_scene: str = Field(default="ушёл", max_length=60)
+    #: ТЗ F-507: ставить дом в режим охраны, когда он опустел.
+    guard_enabled: bool = True
+    #: Как часто проверять «дом опустел», секунды.
+    check_interval_s: float = Field(default=30.0, ge=5.0, le=600.0)
 
 
 class WebAdminConfig(_Strict):
@@ -958,6 +1206,9 @@ class GuestConfig(_Strict):
     #: The whole flow, and the owner's confirmation window, in seconds.
     flow_ttl_s: float = Field(default=300.0, ge=30.0, le=3600.0)
     confirm_ttl_s: float = Field(default=900.0, ge=60.0, le=86400.0)
+    #: ТЗ F-606: how long the owner's spoken "allow him music" lasts. The
+    #: grant disappears by itself when the window ends.
+    grant_window_s: int = Field(default=1800, ge=60, le=86400)
 
     @model_validator(mode="after")
     def _frames_in_order(self) -> GuestConfig:
@@ -1116,6 +1367,10 @@ class ServerConfig(_Strict):
     media: MediaConfig = Field(default_factory=MediaConfig)
     vectors: VectorConfig = Field(default_factory=VectorConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    reminders: ReminderConfig = Field(default_factory=ReminderConfig)
+    rules: RulesConfig = Field(default_factory=RulesConfig)
+    briefing: BriefingConfig = Field(default_factory=BriefingConfig)
+    device_state: DeviceStateConfig = Field(default_factory=DeviceStateConfig)
     outbound: OutboundConfig = Field(default_factory=OutboundConfig)
     timeouts: StageTimeouts = Field(default_factory=StageTimeouts)
     decider: DeciderConfig = Field(default_factory=DeciderConfig)
@@ -1124,6 +1379,9 @@ class ServerConfig(_Strict):
     followup: FollowupConfig = Field(default_factory=FollowupConfig)
     confirmations: ConfirmationsConfig = Field(default_factory=ConfirmationsConfig)
     presence: PresenceConfig = Field(default_factory=PresenceConfig)
+    intercom: IntercomConfig = Field(default_factory=IntercomConfig)
+    push: PushConfig = Field(default_factory=PushConfig)
+    digest: DigestConfig = Field(default_factory=DigestConfig)
     greeting: GreetingConfig = Field(default_factory=GreetingConfig)
     web_admin: WebAdminConfig = Field(default_factory=WebAdminConfig)
     #: Release tag the room clients should run (ТЗ 4.9 OTA). Empty = не трогать.

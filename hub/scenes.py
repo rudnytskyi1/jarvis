@@ -346,6 +346,75 @@ REMEMBER_SCENE = re.compile(
     r"[«\"'„]?\s*([^»\"'“”.,!?]{1,40})",
     re.IGNORECASE)
 
+#: "как обычно" / "как всегда" / "моя любимая сцена" — ТЗ F-607: the person
+#: means the scene THEY call their own, and the hub looks that name up in the
+#: room it is standing in.
+USUAL_SCENE = re.compile(
+    r"^\s*(?:rowan[,! ]+)?(?:"
+    r"(?:включи\s+)?как\s+(?:обычно|всегда)"
+    r"|(?:включи\s+)?мою\s+любимую\s+сцену"
+    r"|моя\s+любимая\s+сцена"
+    r"|(?:the\s+)?usual(?:\s+scene)?"
+    r"|my\s+(?:favourite|favorite|usual)\s+scene"
+    r"|(?:pon\s+)?la\s+de\s+siempre"
+    r"|mi\s+escena\s+(?:favorita|de\s+siempre)"
+    r")\s*[.!]?\s*$",
+    re.IGNORECASE)
+
+
+def usual_scene_request(text: str) -> bool:
+    """"как обычно" / "my usual scene" — the person asks for THEIR scene."""
+    # Same normalisation as ``plain_scene_text``: the wake word is stripped
+    # case-insensitively, because people say "Rowan AI" as often as "rowan ai".
+    value = _WAKE_PREFIX.sub("", str(text or "").casefold().strip()).strip(" .!?,")
+    return bool(USUAL_SCENE.match(value))
+
+
+#: ТЗ F-607: what the hub says back about favourite scenes, in the person's
+#: language (ru/en/es, like every other spoken line). The name is the person's,
+#: the room is the room's — the hub never fabricates a scene it does not have.
+FAVOURITE_LINES: dict[str, dict[str, str]] = {
+    "ru": {
+        "unknown": "Сначала мне нужно узнать ваш голос, чтобы включить вашу сцену. "
+                   "Если я часто вас не узнаю, скажите: Rowan, обнови мой голос.",
+        "none": "Вы ещё не назвали мне любимую сцену. Включите её и скажите: "
+                "запомни эту сцену как любимую.",
+        "absent": "В этой комнате нет сцены «{name}», поэтому вашу любимую я здесь "
+                  "запустить не могу.",
+        "foreign": "В этом доме я не читаю ваш профиль: вы не разрешили делиться им. "
+                   "Скажите «разреши узнавать меня в других домах», и любимые сцены "
+                   "поедут с вами.",
+    },
+    "en": {
+        "unknown": "I need to recognize your voice before I can run your own scene. "
+                   "If I often fail to recognize you, say Rowan, update my voice.",
+        "none": "You have not told me a favourite scene yet. Run one and say: "
+                "remember this scene as my favourite.",
+        "absent": "This room has no scene called {name!r}, so I have nothing of yours "
+                  "to run here.",
+        "foreign": "I do not read your profile in this home - you have not allowed it "
+                   "to be shared. Say “share my identity with other homes”, and your "
+                   "favourite scenes travel.",
+    },
+    "es": {
+        "unknown": "Primero necesito reconocer tu voz para poner tu escena. "
+                   "Si a menudo no te reconozco, di: Rowan, actualiza mi voz.",
+        "none": "Todavía no me has dicho tu escena favorita. Ponla y di: "
+                "recuerda esta escena como mi favorita.",
+        "absent": "En esta habitación no hay una escena llamada {name!r}, así que no "
+                  "tengo nada tuyo que poner aquí.",
+        "foreign": "En esta casa no leo tu perfil: no has permitido compartirlo. "
+                   "Di «comparte mi identidad», y tus escenas favoritas viajarán contigo.",
+    },
+}
+
+
+def favourite_line(key: str, language: str = "ru", **fields: Any) -> str:
+    """A hub-authored line about favourite scenes, in the person's language."""
+    table = FAVOURITE_LINES.get(str(language or "").casefold(), FAVOURITE_LINES["ru"])
+    template = table.get(str(key or ""), FAVOURITE_LINES["ru"].get(str(key or ""), ""))
+    return template.format(**fields) if fields else template
+
 
 # --- running ----------------------------------------------------------------
 
@@ -416,6 +485,7 @@ class SceneRunner:
 
 __all__ = ["MAX_DELAY_S", "MAX_STEPS", "PRESET_ALIASES", "PRESET_NAMES", "PcRunner", "Sayer",
            "REMEMBER_SCENE", "SCENE_VERBS", "Scene", "SceneRunner", "SceneStore", "Step",
-           "StepKind", "cinema_request", "match_scene", "plain_scene_text", "preset_scenes",
-           "preset_steps",
+           "StepKind", "USUAL_SCENE", "cinema_request", "favourite_line", "match_scene",
+           "plain_scene_text",
+           "preset_scenes", "preset_steps", "usual_scene_request",
            "scene_id_for", "steps_from_actions"]

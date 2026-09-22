@@ -146,6 +146,30 @@ def audit_text(events):
     return '\n'.join(lines)
 
 
+def rules_text(result):
+    """ТЗ F-419: список правил словами — ни одного JSON-поля на экране."""
+    lines = ['Room rules · when the room does something by itself']
+    if result.get('ok') is False:
+        return lines[0] + '\n' + display(result.get('error'))
+    items = list(result.get('items') or [])
+    if not items:
+        lines += ['', 'No rules yet. Say, for example: when I come home after 22:00, '
+                      'turn on the warm light.']
+        return '\n'.join(lines)
+    lines.append(f'Rules: {len(items)}')
+    for item in items:
+        mark = '✓' if item.get('enabled') else '—'
+        lines.append(f'{mark} {display(item.get("words") or item.get("name") or item.get("id"))}')
+    lines += ['', '✓ means the rule is on; — means it is off.']
+    return '\n'.join(lines)
+
+
+def automation_rule_text(item):
+    """Одно правило словами: когда, если и что оно делает (ТЗ F-419)."""
+    mark = 'on' if item.get('enabled') else 'off'
+    return f'Rule ({mark})\n{display(item.get("words") or item.get("id"))}'
+
+
 def calibration_text(result):
     """The weekly calibration report of ТЗ 5.4: errors per type and provider."""
     days = result.get('days', 7)

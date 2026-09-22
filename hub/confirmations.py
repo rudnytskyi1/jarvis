@@ -89,6 +89,13 @@ def describe(tool: str, args: dict[str, Any] | None) -> str:
         return f"run the command {command!r}" if command else "run a command on the PC"
     if tool == "pc_control":
         command = str(values.get("command") or "").strip() or "an action"
+        words = {"lock": "lock the PC", "sleep": "put the PC to sleep",
+                 "suspend": "put the PC to sleep", "hibernate": "hibernate the PC",
+                 "shutdown": "shut the PC down", "power_off": "shut the PC down",
+                 "reboot": "restart the PC", "restart": "restart the PC",
+                 "logoff": "log the user out", "logout": "log the user out"}
+        if command.casefold() in words:
+            return words[command.casefold()]
         detail = str(values.get("value") or values.get("app") or "").strip()
         return f"{command} {detail}".strip()
     return tool.replace("_", " ")

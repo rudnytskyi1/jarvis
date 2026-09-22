@@ -194,6 +194,9 @@ _TRUSTED_TOOLS = frozenset(
 )
 #: Tools that need admin.
 _ADMIN_TOOLS = frozenset({"run_command", "set_role"})
+#: pc_control commands that need admin and nothing less: unlocking the room PC
+#: is the one action ТЗ F-507 lets a room allow only for its owner.
+_ADMIN_PC_COMMANDS = frozenset({"unlock"})
 #: ``rename_person`` (v1.6) is NOT in any tier above: its own admin-or-self
 #: rule lives directly in :func:`check_permission` because, unlike every other
 #: tool, it depends on WHO is speaking, not just their role.
@@ -289,6 +292,8 @@ def check_permission(
         command = str((args or {}).get("command") or "").strip().lower()
         if command in SAFE_PC_COMMANDS:
             return None
+        if command in _ADMIN_PC_COMMANDS:
+            return None if role == ROLE_ADMIN else deny("admin")
         if role in (ROLE_ADMIN, ROLE_TRUSTED):
             return None
         return deny("admin or trusted")

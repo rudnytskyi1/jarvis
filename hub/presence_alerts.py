@@ -19,7 +19,8 @@ from hub.video_transcode import phone_ready_mp4
 
 log = logging.getLogger(__name__)
 DEFAULT_RULE = dict(enabled=False, target='any', name='', media='photo', destination='owner',
-                    cooldown_s=300, min_stable_s=2, absence_s=15, quiet_start='', quiet_end='',
+                    cooldown_s=300, min_stable_s=0, min_frames=2, absence_s=15,
+                    quiet_start='', quiet_end='',
                     timezone='America/Chicago', clip_seconds=5, workplace_id='',
                     # ТЗ F-702: правило слушает событие, а не только «человек в
                     # кадре»; канал доставки выбирается; дом может дать свои
@@ -39,7 +40,8 @@ CHANNELS = ('telegram', 'push', 'hud')
 #: reads this too, so its presets and this validation can never drift apart.
 #: The cooldown floor is 1 s (it used to be 10 s): short rules are legitimate,
 #: and a room panel should not force a ten-second minimum.
-RULE_RANGES = {'cooldown_s': (1.0, 86400.0), 'min_stable_s': (0.0, 300.0), 'absence_s': (0.0, 3600.0)}
+RULE_RANGES = {'cooldown_s': (1.0, 86400.0), 'min_stable_s': (0.0, 300.0), 'min_frames': (1.0, 60.0),
+               'absence_s': (0.0, 3600.0)}
 #: ТЗ F-702: one alert video (and therefore one Telegram message) is at most
 #: this long; a longer visit arrives as several of these, one after another.
 CLIP_SECONDS_RANGE = (3, 60)
@@ -120,6 +122,8 @@ def validate_rule(patch, existing=None):
         value = rule[key]
         if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
             raise ValueError(f'{key} must be between {low:g} and {high:g}.')
+    if type(rule['min_frames']) is not int:
+        raise ValueError('min_frames must be a whole number of frames.')
     if type(rule['record_until_clear']) is not bool:
         raise ValueError('record_until_clear must be a boolean.')
     low, high = CLIP_SECONDS_RANGE
@@ -471,8 +475,13 @@ class PresenceAlerts:
                             state['since'] = now
                         state.update(last_match=now, source_id=event['source_id'],
                                      observations=state.get('observations', 0) + 1)
-                        stable = (now - state['since'] >= rule['min_stable_s']
-                                  and (rule['min_stable_s'] == 0 or state['observations'] >= 2))
+                        # Кадры, а не секунды, решают первыми: человек, быстро
+                        # прошедший перед камерой, успевает попасть в два
+                        # кадра, но не в целую секунду. `min_stable_s` — необязательный
+                        # второй порог для тех, кому нужна длинная стабильность.
+                        stable = (state['observations'] >= rule['min_frames']
+                                  and (rule['min_stable_s'] == 0
+                                       or now - state['since'] >= rule['min_stable_s']))
                         if (stable and not state.get('episode_sent')
                                 and now - global_state.get('last_attempt', 0) >= cooldown
                                 and not quiet_now(rule, now)

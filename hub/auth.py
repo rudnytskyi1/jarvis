@@ -39,6 +39,10 @@ class ClientIdentity:
     home_id: str
     kind: str
     caps: tuple[str, ...] = ()
+    #: ТЗ F-712: the person whose phone this is (empty for a room PC). The hub
+    #: sets it when it ISSUES the token, so the queue on ``hello`` is handed to
+    #: the person the hub bound the client to, never to a self-declared name.
+    person_id: str = ""
 
 
 class TokenError(RuntimeError):
@@ -52,13 +56,16 @@ class ClientTokenStore:
         self._db = conn
 
     def issue(self, *, home_id: str, client_id: str, kind: str = "room_pc",
-              caps: Iterable[str] = ()) -> str:
+              caps: Iterable[str] = (), person_id: str = "") -> str:
         token = secrets.token_urlsafe(TOKEN_BYTES)
         self._db.execute(
-            "INSERT INTO clients(client_id, home_id, kind, token_hash, caps_json) VALUES (?,?,?,?,?) "
+            "INSERT INTO clients(client_id, home_id, kind, token_hash, caps_json, person_id)"
+            " VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(client_id) DO UPDATE SET home_id=excluded.home_id, kind=excluded.kind, "
-            "token_hash=excluded.token_hash, caps_json=excluded.caps_json",
-            (client_id, home_id, kind, _hash(token), json.dumps(list(caps))),
+            "token_hash=excluded.token_hash, caps_json=excluded.caps_json, "
+            "person_id=excluded.person_id",
+            (client_id, home_id, kind, _hash(token), json.dumps(list(caps)),
+             str(person_id or "")),
         )
         self._db.commit()
         return token
@@ -67,29 +74,33 @@ class ClientTokenStore:
         if not isinstance(token, str) or not token:
             raise TokenError("a client token is required")
         row = self._db.execute(
-            "SELECT client_id, home_id, kind, caps_json FROM clients WHERE token_hash=?",
+            "SELECT client_id, home_id, kind, caps_json, person_id"
+            " FROM clients WHERE token_hash=?",
             (_hash(token),),
         ).fetchone()
         if row is None:
             raise TokenError("unknown or revoked client token")
-        client_id, home_id, kind, caps = row
+        client_id, home_id, kind, caps, person_id = row
         self._db.execute("UPDATE clients SET last_seen=? WHERE client_id=?", (_now(), client_id))
         self._db.commit()
         return ClientIdentity(client_id=client_id, home_id=home_id, kind=kind,
-                              caps=tuple(json.loads(caps or "[]")))
+                              caps=tuple(json.loads(caps or "[]")),
+                              person_id=str(person_id or ""))
 
     def rotate(self, client_id: str, **changes: object) -> str:
         """Issue a fresh token for an existing client; the old one stops working."""
         row = self._db.execute(
-            "SELECT home_id, kind, caps_json FROM clients WHERE client_id=?", (client_id,)
+            "SELECT home_id, kind, caps_json, person_id FROM clients WHERE client_id=?",
+            (client_id,)
         ).fetchone()
         if row is None:
             raise TokenError(f"unknown client {client_id!r}")
-        home_id, kind, caps = row
+        home_id, kind, caps, person_id = row
         return self.issue(home_id=str(changes.get("home_id") or home_id),
                           client_id=client_id,
                           kind=str(changes.get("kind") or kind),
-                          caps=json.loads(caps or "[]"))
+                          caps=json.loads(caps or "[]"),
+                          person_id=str(changes.get("person_id") or person_id or ""))
 
     def revoke(self, client_id: str) -> bool:
         """Remove the client: the next ``hello`` with its token is rejected."""
@@ -107,6 +118,11 @@ class ClientSession:
     @property
     def home_id(self) -> str:
         return self.identity.home_id
+
+    @property
+    def person_id(self) -> str:
+        """ТЗ F-712: whose phone this is, or ``""`` for a room PC."""
+        return self.identity.person_id
 
     def assert_home(self, declared: str | None) -> None:
         """A frame may repeat ``home_id``, but never contradict the session."""

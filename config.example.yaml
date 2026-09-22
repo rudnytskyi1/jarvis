@@ -64,6 +64,31 @@ server:
     fold_sources: true             # факт, вошедший в сводку дня, удаляется (его содержание в сводке)
     embed_batch: 256               # сколько недостающих векторов считать за проход
 
+  reminders:                # напоминания: «напомни через 20 минут», «в пятницу в 9» (ТЗ F-417)
+    enabled: true           # false — хаб не разбирает просьбы о напоминаниях вовсе
+    default_hour: 9         # «напомни завтра» без времени — 9 утра по часам ДОМА (решение P3-21)
+    max_pending_per_person: 100  # сколько ненаступивших напоминаний терпит один человек
+    check_interval_s: 30    # как часто планировщик смотрит, не наступил ли срок (P3-22)
+    due_batch: 50           # сколько наступивших напоминаний один проход отдаёт за раз
+
+  rules:                    # правила и рутины: триггер → условия → действия (ТЗ F-419)
+    enabled: true           # false — хаб не исполняет правила вовсе
+    check_interval_s: 60    # как часто проверяются правила по времени (час дома, не хаба)
+    voice_creation: true    # правило можно попросить голосом: «когда я приду после 22:00, включи тёплый свет»
+
+  briefing:                 # утренний брифинг: «встал» или час дома (ТЗ F-420)
+    enabled: false          # говорит сам, без приглашения: по умолчанию выключено
+    time: "07:30"           # час дома, в который человек, уже вставший, слышит брифинг
+    window_start: "05:00"   # раньше этого вход в комнату не считается «встал»
+    window_end: "11:00"     # позже этого утреннего брифинга уже нет
+    max_chars: 700          # сколько знаков терпит произнесённый брифинг
+    check_interval_s: 60    # как часто планировщик проверяет, кому пора
+
+  device_state:             # состояние устройств: БД, контекст LLM, «уже выключено» (ТЗ F-505)
+    enabled: true           # false — повтор команды не проверяется
+    stale_after_s: 900      # сколько секунд запись считается свежей для «уже так и есть»
+    poll_interval_s: 0      # опрос адаптеров хаба, секунды; 0 — только отчёты комнаты
+
   stt:
     model: large-v3          # faster-whisper
     device: cuda
@@ -166,6 +191,7 @@ server:
       min_voice_seconds: 3.0 # столько чистой речи нужно для вектора голоса гостя
       flow_ttl_s: 300        # незаконченная регистрация истекает
       confirm_ttl_s: 900     # и вопрос владельцу в Telegram (F-210: обязателен)
+      grant_window_s: 1800   # ТЗ F-606: «разреши ему музыку» действует 30 минут, потом само исчезает
     learning:                # ТЗ F-211: дообучение профиля только при p ≥ 0,9 и без конфликта
       enabled: true
       min_p: 0.9             # сильнее порога «узнан» 0,8 из F-207
@@ -218,7 +244,7 @@ server:
     window_s: 8               # сколько секунд ждём «да»; молчание или другой ответ — отмена
     tools: [run_command]      # инструменты целиком; read-only команды (dir, uptime, ...) не спрашивают
     pc_commands:              # pc_control, который может потерять работу
-      [sleep, suspend, hibernate, shutdown, power_off, reboot, restart, logoff, logout, close_app]
+      [lock, sleep, suspend, hibernate, shutdown, power_off, reboot, restart, logoff, logout, close_app]
 
   decider:                   # кто отвечает на какой вопрос и сколько ему на это дано (ТЗ 5.2)
     timeout_ms: 400           # бюджет «транскрипт → начало генерации» из таблицы 15.1
@@ -232,15 +258,37 @@ server:
     order:
       route: [rules]          # fast_command или запрос к модели
       model_level: [rules]    # local_fast или local_strong (F-401)
-      addressed: [rules]      # обращались ли к Rowan
+      addressed: [jev, local_llm, rules]  # ТЗ 5.2: обращались ли к Rowan
       hallucination: [rules]  # похож ли транскрипт на галлюцинацию Whisper
       # С включённым vLLM порядок можно перевести на модель, например:
       # route: [local_llm, rules]
-      # addressed: [local_llm, rules]
+      # Провайдеры, которых нет в работе (модель не загружена, Jev выключен),
+      # цепочка пропускает молча — правила остаются базовым ответом.
+    providers:                # ТЗ 5.2/5.5: облачный провайдер решений (Jev)
+      jev:
+        enabled: false        # ранний доступ TypeSafe: по умолчанию выключено
+        base_url: ""          # адрес развёртывания TypeSafe, например https://api.typesafe.ai
+        path: /v1/decide      # путь решения; правится по документации доступа
+        api_key_env: JEV_API_KEY  # ключ только в переменной окружения (раздел 1)
 
   skills:                    # скиллы: манифест + skill.py в своей папке (ТЗ F-405)
     dev_reload: false        # перечитывать скилл при изменении файла — только для разработки
     interval_s: 2            # как часто проверять файлы, секунды
+    canvas:                  # Canvas LMS (ТЗ F-421): токен живёт в ОКРУЖЕНИИ, не здесь
+      base_url: ""           # адрес школы, например https://school.instructure.com
+      token_env: ROWAN_CANVAS_TOKEN        # имя переменной окружения с общим токеном
+      person_tokens: {}      # у кого свой токен: person_id → имя переменной окружения
+      timeout_s: 8           # таймаут одного запроса, секунды
+      days: 7                # сколько дней вперёд считается «на этой неделе»
+    calendar:                # Google Calendar (ТЗ F-421): по умолчанию выключен
+      enabled: false         # доступ к календарю выдаёт владелец, а не обновление
+      client_id_env: ROWAN_GOOGLE_CLIENT_ID        # имя переменной с client id
+      client_secret_env: ROWAN_GOOGLE_CLIENT_SECRET  # имя переменной с client secret
+      refresh_token_env: ROWAN_GOOGLE_REFRESH_TOKEN  # общий refresh-токен
+      person_tokens: {}      # у кого свой календарь: person_id → имя переменной
+      calendar_id: primary   # или адрес календаря
+      timeout_s: 8           # таймаут одного запроса, секунды
+      days: 1                # на сколько дней вперёд смотрит «первая встреча»
 
   web_admin:                 # веб-админка владельца (ТЗ F-705)
     enabled: false           # включать только там, где есть overlay-сеть
@@ -254,6 +302,10 @@ server:
     enabled: true
     absence_s: 30.0          # сколько секунд без кадров — и человек считается вышедшим
     history_limit: 1000      # сколько событий дома читают вопросы «кто дома» и др.
+    left_after_s: 600.0      # ТЗ F-507: никого 10 минут → сцена «ушёл» (по умолчанию)
+    left_scene: "ушёл"       # какая сцена дома означает уход
+    guard_enabled: true      # ставить дом в режим охраны, когда он опустел
+    check_interval_s: 30.0   # как часто проверять, что дом опустел
 
   greeting:                  # приветствия и прощания (ТЗ F-302)
     enabled: true
@@ -261,6 +313,21 @@ server:
     quiet_start: ""          # «23:00» … «08:00» в местном времени дома; пусто = выключено
     quiet_end: ""
     farewell: true           # говорить «пока», когда человек вышел из комнаты
+
+  intercom:                  # сообщения между комнатами (ТЗ F-601, F-603)
+    enabled: true
+    cooldown_s: 600.0        # ТЗ F-603: не чаще раза в 10 минут на человека
+    max_messages: 1          # сколько сообщений человек может отправить за окно
+    queue_limit: 50          # сколько невыданных сообщений хранит один дом
+    check_interval_s: 30.0   # как часто проверять, не пришёл ли получатель
+
+  push:                      # ТЗ F-712: пуш на телефон, когда человек не дома
+    enabled: false           # транспорт включается только флагом с ключом
+    provider: ""             # "" = нет транспорта; "webpush" (нужна pywebpush)
+    key_env: ROWAN_PUSH_KEY  # секрет читается ТОЛЬКО из переменной окружения
+    endpoint_env: ROWAN_PUSH_ENDPOINT   # адрес/тема провайдера, если он их требует
+    title: Rowan             # заголовок уведомления на телефоне
+    max_queue: 200           # сколько невыданных сообщений хранит один человек
 
   tts:
     engine: silero
@@ -374,6 +441,7 @@ client:
     #   type: magichome
     #   area: room
     #   description: LED strip behind the TV
+    #   restricted: true     # ТЗ F-606: гостю это устройство не выдаётся
     #   host: 192.168.1.50
     # - name: garland        # Tuya / Smart Life strip
     #   type: tuya
@@ -400,6 +468,7 @@ client:
 #     tz: America/Chicago
 #     quiet_hours: {start: "23:00", end: "07:00"}   # ТЗ F-702: тихие часы дома
 #     alert_cooldown_s: 0        # минимум кулдауна уведомлений дома, 0 = как в правиле
+#     weather_location: Chicago  # F-421: город комнаты для скилла погоды (пусто — спросить)
 #     telegram_user_id: 8322835915   # 0 или без строки = владелец ещё не назван
 
 

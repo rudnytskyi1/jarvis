@@ -1,0 +1,8 @@
+name: calendar
+description: Google Calendar events for one person - the next meeting, the day ahead, or a new event.
+scope: hub
+role: user
+caps: []
+version: 0.1.0
+enabled: true
+reads_internet: true

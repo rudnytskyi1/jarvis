@@ -23,6 +23,9 @@ from typing import Any
 from hub.personality import BANTER_ANGLES, FIXED_PERSONALITY, banter_direction, banter_requested
 from hub.roleplay import roleplay_prompt
 
+#: ТЗ F-711: the client kinds the hub knows (``common.protocol.ClientKind``).
+_CLIENT_KINDS = frozenset({"room_pc", "phone", "sensor_node"})
+
 log = logging.getLogger("jarvis.server.session")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -224,6 +227,7 @@ class Session:
         prompt_path: Path | str | None = None,
         presence: Any = None,
         permissions_enabled: bool = True,
+        kind: str = "room_pc",
     ) -> None:
         self.client_id = (client_id or "unknown").strip() or "unknown"
         self.devices: list[Any] = list(devices or [])
@@ -237,6 +241,10 @@ class Session:
             self.history_turns = 8
         self.prompt_path = prompt_path
         self.permissions_enabled = permissions_enabled
+        #: ТЗ F-711: which kind of client this is (``room_pc`` / ``phone`` /
+        #: ``sensor_node``). A phone has no camera and no PC actions, and the
+        #: hub refuses those instead of pretending the room is there.
+        self.kind = kind if kind in _CLIENT_KINDS else "room_pc"
         #: String or callable rendering the ``{presence}`` block (SPEC v1.4).
         self.presence: Any = presence
         self._base_prompt = build_prompt_base(self.devices, self.memory_facts, prompt_path)

@@ -1,0 +1,8 @@
+name: canvas
+description: Canvas LMS assignments, deadlines, to-do list and grades for one person.
+scope: hub
+role: user
+caps: []
+version: 0.1.0
+enabled: true
+reads_internet: true

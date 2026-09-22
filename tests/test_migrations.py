@@ -17,6 +17,10 @@ REQUIRED_TABLES = {
     "devices", "scenes", "rules", "skills", "skill_state", "dialog_turns",
     "memories", "reminders", "polls", "poll_answers", "objects_index",
     "decisions", "api_usage", "audit", "media", "schema_version",
+    "device_state_events", "intercom_messages", "poll_asks", "guest_grants",
+    "person_preferences", "person_scene_favourites",
+    "push_subscriptions", "push_outbox",
+    "digest_runs",
 }
 
 
@@ -27,17 +31,62 @@ def _tables(conn):
 def test_fresh_database_reaches_the_full_schema(tmp_path):
     conn = runner.connect(str(tmp_path / "hub.db"))
     try:
-        assert runner.migrate(conn) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        assert runner.migrate(conn) == list(range(1, 27))
         assert REQUIRED_TABLES <= _tables(conn)
         assert [row[0] for row in conn.execute("SELECT version FROM schema_version")] == \
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            list(range(1, 27))
         columns = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
         assert "observed" in columns
         assert "preset" in {row[1] for row in conn.execute("PRAGMA table_info(scenes)")}
         reminder_columns = {row[1] for row in conn.execute("PRAGMA table_info(reminders)")}
         assert {"delivery_state", "delivery_note", "attempts", "trigger_kind"} <= reminder_columns
         rule_columns = {row[1] for row in conn.execute("PRAGMA table_info(rules)")}
-        assert {"name", "last_fired_at"} <= rule_columns
+        assert {"name", "last_fired_at", "author_person_id"} <= rule_columns
+        history_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(device_state_events)")}
+        assert {"event_id", "device_id", "home_id", "capability", "value_json",
+                "source", "ts"} <= history_columns
+        object_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(objects_index)")}
+        assert "zone" in object_columns
+        contact_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(contacts)")}
+        assert {"person_a", "person_b", "status", "created_at", "requested_by",
+                "confirmed_at", "blocked_by", "share_presence_a",
+                "share_presence_b"} <= contact_columns
+        intercom_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(intercom_messages)")}
+        assert {"message_id", "home_id", "origin_home", "from_person", "to_person",
+                "text", "kind", "status", "created_at", "delivered_at",
+                "reply_to", "pushed_at"} <= intercom_columns
+        poll_columns = {row[1] for row in conn.execute("PRAGMA table_info(polls)")}
+        assert {"options_json", "audience_json", "status", "closed_at",
+                "summarized_at"} <= poll_columns
+        answer_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(poll_answers)")}
+        assert "home_id" in answer_columns
+        ask_columns = {row[1] for row in conn.execute("PRAGMA table_info(poll_asks)")}
+        assert {"poll_id", "person_id", "asked_at"} <= ask_columns
+        grant_columns = {row[1] for row in conn.execute("PRAGMA table_info(guest_grants)")}
+        assert {"grant_id", "home_id", "guest_person_id", "capability", "granted_by",
+                "granted_at", "expires_at"} <= grant_columns
+        pref_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(person_preferences)")}
+        assert {"person_id", "language", "voice", "wake_word", "style",
+                "updated_at"} <= pref_columns
+        fav_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(person_scene_favourites)")}
+        assert {"person_id", "name", "created_at"} <= fav_columns
+        sub_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(push_subscriptions)")}
+        assert {"subscription_id", "person_id", "kind", "endpoint", "keys_json",
+                "created_at", "last_seen_at"} <= sub_columns
+        outbox_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(push_outbox)")}
+        assert {"message_id", "person_id", "home_id", "kind", "title", "body",
+                "created_at", "delivered_at", "state"} <= outbox_columns
+        client_columns = {row[1] for row in conn.execute("PRAGMA table_info(clients)")}
+        assert "person_id" in client_columns
     finally:
         conn.close()
 
@@ -47,7 +96,7 @@ def test_migrate_is_idempotent(tmp_path):
     try:
         runner.migrate(conn)
         assert runner.migrate(conn) == []
-        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 12
+        assert len(list(conn.execute("SELECT * FROM schema_version"))) == 26
     finally:
         conn.close()
 

@@ -54,6 +54,11 @@ SKILL_SOURCE = "a skill that reads the internet"
 TELEGRAM_CONTEXT = "telegram_context"
 SKILL_RESULT = "skill_result"
 
+#: The key a tool result uses to say where ITS OWN text came from. ``run_skill``
+#: answers for the skill it ran: a skill that declares ``reads_internet`` is
+#: marked, a local one stays the hub's own word (ТЗ F-411, F-405).
+RESULT_SOURCE_KEY = "untrusted_source"
+
 #: Every marked source, tools and pseudo-sources alike: one list for the prompt
 #: (what gets wrapped) and one for D-09 (what gets scanned).
 SOURCES: dict[str, str] = {**SOURCE_TOOLS, TELEGRAM_CONTEXT: TELEGRAM_SOURCE,
@@ -72,6 +77,34 @@ class UntrustedText(BaseModel):
 def source_of(tool: str) -> str | None:
     """Where the text of ``tool`` came from, or ``None`` when it is the hub's."""
     return SOURCES.get(str(tool))
+
+
+def mark_result(result: dict[str, Any], source: str | None) -> dict[str, Any]:
+    """Mark one tool result with the source of its text (ТЗ F-411).
+
+    A tool whose source depends on what it ran — ``run_skill`` — says so here,
+    and :func:`result_source` reads it back. The mark itself never reaches the
+    model: :func:`visible_result` removes it before the payload is rendered.
+    """
+    if source:
+        result[RESULT_SOURCE_KEY] = str(source)
+    return result
+
+
+def result_source(tool: str, result: Any) -> str | None:
+    """Where the text of one RESULT came from: its own mark first, else its tool."""
+    if isinstance(result, dict):
+        marked = result.get(RESULT_SOURCE_KEY)
+        if isinstance(marked, str) and marked in set(SOURCES.values()):
+            return marked
+    return source_of(tool)
+
+
+def visible_result(result: Any) -> Any:
+    """The result as the model should see it: without the hub's own mark."""
+    if isinstance(result, dict) and RESULT_SOURCE_KEY in result:
+        return {key: value for key, value in result.items() if key != RESULT_SOURCE_KEY}
+    return result
 
 
 def wrap(text: str, *, source: str) -> str:
@@ -153,6 +186,7 @@ def skill_source(reads_internet: bool) -> str | None:
 
 
 __all__ = [
+    "RESULT_SOURCE_KEY",
     "SKILL_SOURCE",
     "SKILL_RESULT",
     "SOURCES",
@@ -164,11 +198,14 @@ __all__ = [
     "UNTRUSTED_OPEN",
     "UntrustedText",
     "is_wrapped",
+    "mark_result",
     "payload_strings",
     "records",
     "records_for",
+    "result_source",
     "skill_source",
     "source_of",
     "strip",
+    "visible_result",
     "wrap",
 ]

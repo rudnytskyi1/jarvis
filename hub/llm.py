@@ -45,8 +45,9 @@ from hub.multi_step import find_plan, strip_plan
 from hub.openai_responses import ResponsesClient
 from hub.tool_args import MAX_ARGUMENT_RETRIES, validate_args
 from hub.tools import FIRST_TOOL_ARG, TOOL_NAMES, TOOLS
-from hub.untrusted import source_of as untrusted_source
+from hub.untrusted import result_source as untrusted_result_source
 from hub.untrusted import strip as strip_untrusted
+from hub.untrusted import visible_result as untrusted_visible_result
 from hub.untrusted import wrap as wrap_untrusted
 
 log = logging.getLogger("jarvis.server.llm")
@@ -1048,8 +1049,8 @@ class LlmClient:
         chat) is wrapped in the delimiters that say "this is data". The hub's own
         results travel as they are.
         """
-        content = _result_to_content(result)
-        source = untrusted_source(call.name)
+        content = _result_to_content(untrusted_visible_result(result))
+        source = untrusted_result_source(call.name, result)
         if source is not None:
             content = wrap_untrusted(content, source=source)
         message: dict[str, Any] = {

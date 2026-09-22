@@ -209,7 +209,7 @@ def test_the_models_are_strict():
     with pytest.raises(ValidationError):
         SpeakerProfile(name="Anton", bogus="x")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
-        HomeDevice(name="lamp", state="on")  # type: ignore[call-arg]
+        HomeDevice(name="lamp", bogus="on")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
         HomeState(unknown_people=-1)
     with pytest.raises(ValidationError):

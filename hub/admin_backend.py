@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import math
 
-from hub import telegram_audit
+from hub import automation, telegram_audit
 from hub.admin_settings import CATEGORIES, LIVE, apply_live, catalogue, validated_value
 from hub.telegram_admin_state import contains_secret
 
@@ -12,19 +12,21 @@ from hub.telegram_admin_state import contains_secret
 class AdminBackend:
     #: Actions worth a row in the hub's ``audit`` table (ТЗ F-706): privileged
     #: operations, settings changes and deleting data.
-    AUDITED = ('settings.', 'profiles.', 'memory.', 'devices.', 'scenes.', 'alerts.', 'users.')
+    AUDITED = ('settings.', 'profiles.', 'memory.', 'devices.', 'scenes.', 'alerts.', 'users.',
+               'rules.')
     #: Раздача домов владельцам (ТЗ F-701) — тоже привилегированное действие.
     AUDITED = AUDITED + ('homes.',)
     #: Что доступно владельцу дома (ТЗ F-701): его комнаты и привязанное к ним.
     #: Всё остальное — настройки хаба, люди, память, аккаунты Telegram, аудит,
     #: калибровка — относится ко всему хабу целиком: у этих данных нет дома, и
     #: «показать только своё» означало бы показать чужое под своим именем.
-    HOME_SCOPED = ('workplaces.', 'devices.', 'scenes.')
+    HOME_SCOPED = ('workplaces.', 'devices.', 'scenes.', 'rules.')
 
     def __init__(self, cfg, access, *, runtime, get_room, get_alerts, rename_profile=None,
                  get_workplaces=None, get_provider=None, get_decisions=None, get_switches=None,
                  get_wizard=None, get_scenes=None, get_tools=None, get_audit=None,
-                 get_scope=None, get_workplace_home=None, get_home_owners=None):
+                 get_scope=None, get_workplace_home=None, get_home_owners=None,
+                 get_rules=None):
         self.cfg, self.access = cfg, access
         self.runtime, self.get_room, self.get_alerts = runtime, get_room, get_alerts
         self.rename_profile = rename_profile
@@ -41,6 +43,8 @@ class AdminBackend:
         self.get_scope = get_scope or (lambda actor: None)
         self.get_workplace_home = get_workplace_home or (lambda client_id: None)
         self.get_home_owners = get_home_owners or (lambda: None)
+        #: ТЗ F-419: таблица ``rules`` для панели — словами, а не JSON-ом.
+        self.get_rules = get_rules or (lambda: None)
         self.get_rooms = lambda: [room for row in self.get_workplaces()
                                  if (room := self.get_room(row['id'])) is not None]
         self._lock = asyncio.Lock()
@@ -288,6 +292,37 @@ class AdminBackend:
             # this thread (see ``hub.decision_log.DecisionLog.calibration``).
             report = decisions.calibration(window_s=days * 86400.0)
             return {'ok': True, 'days': days, **report}
+        if action.startswith('rules.'):
+            # ТЗ F-419: правила в панели — списком, словами, с включением и
+            # удалением. JSON-поля читает и проверяет `hub/automation.py`.
+            rules = self.get_rules()
+            if rules is None:
+                raise ValueError('The rule store is unavailable.')
+            home_id = payload.get('home_id')
+            if action == 'rules.list':
+                items = [{'id': rule.rule_id, 'home_id': rule.home_id,
+                          'name': rule.name, 'enabled': rule.enabled,
+                          'words': automation.describe(rule, 'ru')}
+                         for rule in rules.all(home_id=home_id)]
+                return {'ok': True, 'items': items}
+            rule_id = str(payload.get('id') or '')
+            if not rule_id:
+                raise ValueError('Choose a rule first.')
+            if action == 'rules.update':
+                rule = rules.read(rule_id)
+                if rule is None:
+                    raise ValueError('That rule is gone.')
+                if home_id is not None and str(rule.home_id) != str(home_id):
+                    raise ValueError('That rule belongs to another home.')
+                enabled = bool(payload.get('enabled'))
+                if rules.set_enabled(rule_id, enabled) is False:
+                    raise ValueError('That rule is gone.')
+                return {'ok': True, 'message': 'Rule enabled.' if enabled else 'Rule disabled.'}
+            if action == 'rules.delete':
+                if rules.remove(rule_id) is False:
+                    raise ValueError('That rule is gone.')
+                return {'ok': True, 'message': 'Rule deleted.'}
+            raise ValueError('Unknown rule operation.')
         if action.startswith('devices.'):
             # ТЗ F-503: the ESP32 wall switches and the servo angles that make
             # "on" mean on. The panel is the only place they are calibrated.

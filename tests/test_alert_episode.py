@@ -1,4 +1,4 @@
-"""ТЗ F-702: record until the person leaves, in videos no longer than asked.
+﻿"""ТЗ F-702: record until the person leaves, in videos no longer than asked.
 The owner wants a visit covered end to end rather than one five-second clip:
 the rule keeps sending videos while somebody is in the room, and each video is
 ``clip_seconds`` long (up to a minute) so Telegram never gets a file it would
@@ -36,7 +36,7 @@ async def play_episode(tmp_path, monkeypatch, *, people, max_parts=3, clip_secon
                         lambda self, source_id: (people, presence_alerts.time.time()))
     monkeypatch.setattr(presence_alerts, 'EPISODE_MAX_PARTS', max_parts)
     alerts.save_rule({'enabled': True, 'media': 'video', 'record_until_clear': True,
-                      'clip_seconds': clip_seconds, 'min_stable_s': 0})
+                      'clip_seconds': clip_seconds, 'min_stable_s': 0, 'min_frames': 1})
     alerts.start()
     alerts.observe(persons=1, source_id='a', jpeg=b'jpeg')
     await alerts.drain()
@@ -125,3 +125,4 @@ def test_without_a_conversion_the_recording_still_arrives(tmp_path, monkeypatch)
         finally:
             await alerts.close()
     asyncio.run(run())
+

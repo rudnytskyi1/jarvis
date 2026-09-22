@@ -11,10 +11,12 @@ from hub.presence_alerts import RULE_RANGES
 from hub.telegram_admin_state import CAPABILITIES, ROLES, contains_secret
 from hub.telegram_admin_view import (
     audit_text,
+    automation_rule_text,
     calibration_text,
     profile_text,
     rule_text,
     rule_value,
+    rules_text,
     scenes_text,
     status_text,
     switches_text,
@@ -42,6 +44,7 @@ _ALERT_FIELDS = {
     'home_id': ('Home', 'home'),
     'cooldown_s': ('Notification cooldown, seconds', 'float'),
     'min_stable_s': ('Stable presence, seconds', 'float'),
+    'min_frames': ('Stable presence, frames', 'int'),
     'absence_s': ('Absence before a new entry, seconds', 'float'),
     'quiet_start': ('Quiet hours start: HH:MM or -', 'str'),
     'quiet_end': ('Quiet hours end: HH:MM or -', 'str'),
@@ -53,7 +56,10 @@ _ALERT_FIELDS = {
     'record_until_clear': ('Keep recording while the person stays', 'bool'),
 }
 _ALERT_DEFAULTS = dict(enabled=False, workplace_id='', target='any', name='', media='photo', destination='owner',
-                       cooldown_s=300, min_stable_s=2, absence_s=15, quiet_start='', quiet_end='',
+                       cooldown_s=300, min_stable_s=0, min_frames=2, absence_s=15,
+                       quiet_start='', quiet_end='',
+                       # Кадры вместо секунд по умолчанию: быстрый проход перед
+                       # камерой — это уже присутствие (см. hub/presence_alerts.py).
                        timezone='America/Chicago', clip_seconds=5, event='presence',
                        channel='telegram', home_id='', zone='', record_until_clear=False)
 #: One-tap values for the numeric alert settings, so a rule no longer needs a
@@ -62,6 +68,7 @@ _ALERT_DEFAULTS = dict(enabled=False, workplace_id='', target='any', name='', me
 _ALERT_PRESETS = {
     'cooldown_s': (1, 5, 15, 30, 60, 300),
     'min_stable_s': (0, 0.5, 1, 2, 5, 10),
+    'min_frames': (1, 2, 3, 5),
     'absence_s': (0, 5, 15, 30, 60, 300),
     'clip_seconds': (5, 10, 30, 60),
 }
@@ -512,10 +519,12 @@ class TelegramAdmin:
                     ('Telegram users', 'users'), ('Computers and cameras', 'workplaces'),
                     ('Notifications', 'alerts'), ('Audit log', 'audit'),
                     ('Calibration', 'calibration'), ('Wall switches', 'switches'),
-                    ('Scenes', 'scenes'), ('Homes and owners', 'homes')]
+                    ('Scenes', 'scenes'), ('Room rules', 'rules'),
+                    ('Homes and owners', 'homes')]
             if scope is not None:
                 # Домашняя панель: то, что относится к дому, и ничего чужого.
-                menu = [row for row in menu if row[1] in {'status', 'workplaces', 'switches', 'scenes'}]
+                menu = [row for row in menu
+                        if row[1] in {'status', 'workplaces', 'switches', 'scenes', 'rules'}]
             # Two buttons per row keeps the whole panel one screen tall on a phone.
             for index in range(0, len(menu), 2):
                 rows.append([button(label, kind='page', page=name) for label, name in menu[index:index + 2]])
@@ -708,6 +717,30 @@ class TelegramAdmin:
                     rows.append([button('Remove granted access', kind='confirm', label='Remove granted access? Basic member permissions will remain in the group. Choose blocked to deny all access.',
                                         action=dict(action='users.remove', payload={'user_id': user['user_id']}, back='users'))])
                 rows.append(self._back(panel, 'users'))
+        elif page in {'rules', 'rule'}:
+            if page == 'rules':
+                result = await self._backend(panel, 'rules.list', {'home': payload.get('home')})
+                text = rules_text(result)
+                for item in result.get('items', []):
+                    mark = '✓' if item.get('enabled') else '—'
+                    rows.append([button(f"{mark} {item.get('name') or item.get('id')}",
+                                        kind='page', page='rule', item=item)])
+                rows += [[button('Refresh', kind='page', page='rules')], self._back(panel)]
+            else:
+                item = payload['item']
+                text = automation_rule_text(item)
+                toggle = 'Disable' if item.get('enabled') else 'Enable'
+                rows = [[button(toggle, kind='confirm',
+                                label=f'{toggle} this rule?',
+                                action=dict(action='rules.update',
+                                            payload={'id': item['id'],
+                                                     'enabled': not item.get('enabled')},
+                                            back='rules'))],
+                        [button('Delete rule', kind='confirm',
+                                label='Delete this rule? The room stops doing it at once.',
+                                action=dict(action='rules.delete',
+                                            payload={'id': item['id']}, back='rules'))],
+                        self._back(panel, 'rules')]
         elif page in {'alerts', 'alert', 'alert_draft', 'alert_field'}:
             if page == 'alerts':
                 result = await self._backend(panel, 'alerts.list')

@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -44,7 +44,7 @@ def test_a_rule_that_names_a_home_only_fires_for_that_home(tmp_path):
     async def run():
         api = provider()
         alerts = engine(tmp_path, api)
-        alerts.save_rule({'enabled': True, 'home_id': 'livingroom', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'home_id': 'livingroom', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         alerts.observe(persons=1, jpeg=b'jpeg', home_id='buro')
         await alerts.drain()
@@ -68,7 +68,7 @@ def test_private_chat_everyone_writes_to_each_account(tmp_path):
         people = [123, 8928749210]
         alerts = PresenceAlerts(tmp_path, lambda: api, lambda: None, 123, -456,
                                 get_private_recipients=lambda: people)
-        alerts.save_rule({'enabled': True, 'destination': 'owner', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'destination': 'owner', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
@@ -89,7 +89,7 @@ def test_an_unconfirmed_recipient_stops_the_rest(tmp_path):
         ])
         alerts = PresenceAlerts(tmp_path, lambda: api, lambda: None, 123, -456,
                                 get_private_recipients=lambda: [123, 8928749210])
-        alerts.save_rule({'enabled': True, 'destination': 'owner', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'destination': 'owner', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
@@ -137,7 +137,7 @@ def test_workplace_filters_and_stability_are_per_source(tmp_path, monkeypatch):
         api.send_image.assert_awaited_once()
         assert api.send_image.call_args.args[0] == b'a'
         assert 'Place a' in api.send_image.call_args.args[2]
-        filtered = alerts.save_rule({'enabled': True, 'workplace_id': 'b', 'min_stable_s': 0})
+        filtered = alerts.save_rule({'enabled': True, 'workplace_id': 'b', 'min_stable_s': 0, 'min_frames': 1})
         clock[0] += 1
         alerts.observe(persons=1, source_id='a', jpeg=b'a')
         await alerts.drain()
@@ -190,7 +190,7 @@ def test_restart_and_uncertain_delivery_never_retry_same_episode(tmp_path, monke
         api = provider()
         api.send_image.side_effect = TelegramError('Unconfirmed connection', uncertain=True)
         alerts = engine(tmp_path, api)
-        alerts.save_rule({'enabled': True, 'min_stable_s': 0, 'cooldown_s': 10})
+        alerts.save_rule({'enabled': True, 'min_stable_s': 0, 'min_frames': 1, 'cooldown_s': 10})
         alerts.start()
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
@@ -212,7 +212,7 @@ def test_reappearance_requires_absence_and_reserved_cooldown(tmp_path, monkeypat
     async def run():
         api = provider()
         alerts = engine(tmp_path, api)
-        alerts.save_rule({'enabled': True, 'min_stable_s': 0, 'cooldown_s': 10, 'absence_s': 2})
+        alerts.save_rule({'enabled': True, 'min_stable_s': 0, 'min_frames': 1, 'cooldown_s': 10, 'absence_s': 2})
         alerts.start()
         for stamp, people in [(1000., 1), (1001., 0), (1003., 1), (1004., 0), (1011., 1)]:
             clock[0] = stamp
@@ -229,7 +229,7 @@ def test_named_rule_uses_only_fresh_direct_names_not_room_history(tmp_path, monk
     async def run():
         api = provider()
         alerts = engine(tmp_path, api, SimpleNamespace(room=SimpleNamespace(tracks={'old': {'name': 'Anton'}})))
-        alerts.save_rule({'enabled': True, 'target': 'person', 'name': 'Anton', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'target': 'person', 'name': 'Anton', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         for names in (None, ['Drew'], ['Anton']):
             clock[0] += 1
@@ -251,7 +251,7 @@ def test_unknown_rule_requires_explicit_fresh_unknown_evidence(tmp_path, monkeyp
     async def run():
         api = provider()
         alerts = engine(tmp_path, api)
-        alerts.save_rule({'enabled': True, 'target': 'unknown', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'target': 'unknown', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
@@ -271,7 +271,7 @@ def test_video_uses_clip_transport_and_fixed_group_destination(tmp_path):
         room = SimpleNamespace(receiving=False, session=SimpleNamespace(client_id='room'),
                                _request_camera_clip=AsyncMock(return_value=b'mp4'))
         alerts = engine(tmp_path, api, room)
-        alerts.save_rule({'enabled': True, 'media': 'video', 'destination': 'group', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'media': 'video', 'destination': 'group', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         alerts.observe(persons=1, source_id='room')
         await alerts.drain()
@@ -291,7 +291,7 @@ def test_busy_room_does_not_start_clip_or_retry(tmp_path):
         api = provider()
         room = SimpleNamespace(receiving=True, _request_camera_clip=AsyncMock())
         alerts = engine(tmp_path, api, room)
-        alerts.save_rule({'enabled': True, 'media': 'video', 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'media': 'video', 'min_stable_s': 0, 'min_frames': 1})
         alerts.start()
         alerts.observe(persons=1)
         await alerts.drain()
@@ -312,9 +312,11 @@ def test_missing_ack_is_uncertain_and_disabled_rule_does_not_send(tmp_path):
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
         api.send_image.assert_not_awaited()
-        alerts.save_rule({'enabled': True, 'min_stable_s': 0})
+        alerts.save_rule({'enabled': True, 'min_stable_s': 0, 'min_frames': 1})
         alerts.observe(persons=1, jpeg=b'jpeg')
         await alerts.drain()
         assert alerts.status()['deliveries'][0]['status'] == 'uncertain'
         await alerts.close()
     asyncio.run(run())
+
+

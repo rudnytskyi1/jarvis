@@ -274,6 +274,27 @@ class PresenceLog:
         seen = [row["zone"] for row in self.day(home_id, day=day) if row["zone"]]
         return tuple(dict.fromkeys(seen))
 
+    def entries(self, home_id: str, *, start: float, end: float) -> dict[str, float]:
+        """Who came into the home between two stamps: ``person_id`` → first entry.
+
+        ТЗ F-420: повод «встал» — первый вход человека за утро. Границы дня
+        считает вызывающий, потому что день у дома свой (``homes.tz``), а не
+        у сервера; поэтому здесь секунды, а не имя дня.
+        """
+        try:
+            rows: Sequence[Sequence[Any]] = self._conn.execute(
+                "SELECT person_id, ts FROM presence_events WHERE home_id=? AND kind=?"
+                " AND ts>=? AND ts<? AND person_id IS NOT NULL AND person_id<>''"
+                " ORDER BY ts, rowid",
+                (str(home_id or ""), KIND_ENTERED, float(start), float(end))).fetchall()
+        except sqlite3.Error as exc:
+            log.warning("Could not read the entries of %s (%s)", home_id, exc)
+            return {}
+        first: dict[str, float] = {}
+        for row in rows:
+            first.setdefault(str(row[0]), float(row[1] or 0.0))
+        return first
+
 
 def zone_spans(events: Iterable[dict[str, Any]], person_id: str,
                zone: str) -> list[tuple[float, float | None]]:

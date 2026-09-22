@@ -7,6 +7,7 @@ sends an empty TTS stream (``tts_start`` immediately followed by ``tts_end``).
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
@@ -287,6 +288,61 @@ class TtsEngine:
     @property
     def available(self) -> bool:
         return self._model is not None
+
+    def voices(self) -> list[str]:
+        """The voice ids this engine can actually produce (ТЗ F-607).
+
+        Silero lists them on the model (``speakers``); Kokoro, when its own
+        runtime offers the list, is asked the same question. An engine that
+        cannot answer returns nothing, which the callers read as "cannot
+        check" - not as "anything goes".
+        """
+        model = self._model
+        if model is None:
+            return []
+        listed = getattr(model, "speakers", None)
+        if listed:
+            try:
+                return [str(item) for item in listed]
+            except TypeError:
+                log.debug("The speech model's speaker list is not iterable")
+        getter = getattr(model, "get_voices", None)
+        if callable(getter):
+            try:
+                return sorted(str(item) for item in getter())
+            except Exception:  # noqa: BLE001 - an engine without the list is not an error
+                log.debug("The speech model does not report its voices", exc_info=True)
+        return []
+
+    def knows_voice(self, voice: Any) -> bool:
+        """True when this engine can say something in ``voice`` (False if unsure)."""
+        wanted = " ".join(str(voice or "").split())
+        if not wanted:
+            return False
+        if wanted == self.speaker:
+            return True
+        known = self.voices()
+        return bool(known) and wanted in known
+
+    def with_voice(self, voice: Any) -> TtsEngine:
+        """The same engine, speaking with ANOTHER voice (ТЗ F-607).
+
+        The loaded model is shared - only the speaker changes - so a person's
+        voice can travel between homes without loading a second model. A voice
+        this engine cannot produce returns the engine itself: the room keeps
+        hearing its answers in the room's own voice instead of in silence, and
+        the caller decides what to tell the person.
+        """
+        wanted = " ".join(str(voice or "").split())
+        if not wanted or wanted == self.speaker:
+            return self
+        if not self.knows_voice(wanted):
+            log.warning("The speech engine cannot produce the voice %r; keeping %r",
+                        wanted, self.speaker)
+            return self
+        clone = copy.copy(self)
+        clone.speaker = wanted
+        return clone
 
     def load(self) -> bool:
         """Load the Silero model on CPU. Never raises; returns success."""

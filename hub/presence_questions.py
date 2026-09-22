@@ -20,6 +20,8 @@ from hub.presence_state import KIND_ENTERED, KIND_LEFT, Occupant, zone_spans
 ASK_WHO = "who"
 ASK_CAME = "came"
 ASK_ZONE = "zone"
+#: F-602: «Макс дома?» — про человека, который может быть в ДРУГОЙ комнате.
+ASK_HOME = "home"
 
 _POLITE = re.compile(r"^(?:rowan|jarvis|джарвис|роуэн)\s*[,:!.]?\s*", re.I)
 _OPENING = re.compile(r"^[¿¡\s]+")
@@ -96,6 +98,19 @@ _ZONE: tuple[re.Pattern[str], ...] = (
 _TODAY = re.compile(r"\b(?:сегодня|today|hoy)\b", re.I)
 _YESTERDAY = re.compile(r"\b(?:вчера|yesterday|ayer)\b", re.I)
 
+#: «Макс дома?» — вопрос не про эту комнату, а про человека: он может стоять в
+#: другом доме хаба, и тогда ответ выдаёт только его собственный флаг F-602.
+_HOME: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:я|i|yo)\s+(?:сейчас\s+)?(?:дома|тут|здесь)\s*[?]?$", re.I),
+    re.compile(r"^am\s+i\s+(?:at\s+)?home\s*[?]?$", re.I),
+    re.compile(r"^¿?estoy\s+en\s+casa\s*[?]?$", re.I),
+    re.compile(r"^(?P<name>[^\W\d_\-]{2,})\s+(?:сейчас\s+)?(?:дома|дóма)\s*[?]?$", re.I),
+    re.compile(r"^дома\s+ли\s+(?P<name>[^\W\d_\-]{2,})\s*[?]?$", re.I),
+    re.compile(r"^is\s+(?P<name>[\w'\-]{2,})\s+(?:at\s+)?home\s*[?]?$", re.I),
+    re.compile(r"^(?P<name>[\w'\-]{2,})\s+(?:at\s+)?home\s*\??$", re.I),
+    re.compile(r"^¿?(?P<name>[\wáéíóúñ\-]{2,})\s+est[áa]\s+en\s+casa\s*[?]?$", re.I),
+)
+
 
 def parse(text: Any) -> Question | None:
     """Recognize one of the three questions, or return ``None`` (ordinary speech)."""
@@ -105,6 +120,16 @@ def parse(text: Any) -> Question | None:
     day = -1 if _YESTERDAY.search(said) else 0
     if _WHO.fullmatch(said):
         return Question(kind=ASK_WHO, day_offset=day)
+    for pattern in _HOME:
+        found = pattern.fullmatch(said)
+        if found is None:
+            continue
+        groups = found.groupdict()
+        name = str(groups.get("name") or "")
+        # «я дома?» / «am I at home?» — про самого говорящего; шаблоны без
+        # группы имени отвечают именно на этот вопрос.
+        about_me = "name" not in groups or name.casefold() in _ME
+        return Question(kind=ASK_HOME, who="" if about_me else name, about_me=about_me)
     for pattern in _ZONE:
         found = pattern.fullmatch(said)
         if found is None:
@@ -160,6 +185,44 @@ NO_SUCH_PERSON: dict[str, str] = {
     "en": "I do not know anybody called {name}.",
     "es": "No conozco a nadie que se llame {name}.",
 }
+#: F-602: ответы на «Макс дома?». «Не вижу» честнее, чем «нет»: отсутствие
+#: кадров — это отсутствие знания, а не знание об отсутствии.
+HOME_YES: dict[str, str] = {
+    "ru": "Да, {name} сейчас дома.",
+    "en": "Yes, {name} is home right now.",
+    "es": "Sí, {name} está en casa ahora mismo.",
+}
+HOME_NO: dict[str, str] = {
+    # Имя стоит в именительном падеже: «не вижу Макс» — не по-русски, а
+    # склонять чужие имена хаб не умеет и не должен.
+    "ru": "Сейчас {name} не дома — кадров с ним я не вижу.",
+    "en": "I do not see {name} at home right now.",
+    "es": "Ahora mismo no veo a {name} en casa.",
+}
+HOME_HIDDEN: dict[str, str] = {
+    "ru": "{name} не разрешил говорить, дома ли он. Спросите его самого.",
+    "en": "{name} has not allowed anyone to say whether they are home. Ask them.",
+    "es": "{name} no ha permitido decir si está en casa. Pregúntale a esa persona.",
+}
+HOME_UNRECOGNISED: dict[str, str] = {
+    "ru": "Мне нужно узнать ваш голос, чтобы говорить о присутствии других.",
+    "en": "I need to recognise your voice before I talk about where others are.",
+    "es": "Necesito reconocer tu voz antes de hablar de dónde están los demás.",
+}
+
+
+def answer_home(state: str, name: str, language: str = "ru") -> str:
+    """Ответ на «X дома?»: ``yes`` / ``no`` / ``hidden`` / ``unknown`` / ``voice``."""
+    lang = language_of(language)
+    if state == "yes":
+        return HOME_YES[lang].format(name=name)
+    if state == "no":
+        return HOME_NO[lang].format(name=name)
+    if state == "hidden":
+        return HOME_HIDDEN[lang].format(name=name)
+    if state == "voice":
+        return HOME_UNRECOGNISED[lang]
+    return NO_SUCH_PERSON[lang].format(name=name)
 CAME_NO: dict[str, str] = {
     "ru": "Нет, {name} {when} не заходил.",
     "en": "No, {name} did not come {when}.",

@@ -121,6 +121,9 @@ MSG_HELLO = "hello"
 MSG_ROOM_SPEECH = "room_speech"
 MSG_UTTERANCE_START = "utterance_start"
 MSG_UTTERANCE_END = "utterance_end"
+#: ТЗ F-711: a client (typically a phone) that ran its own VAD and STT sends
+#: the finished words instead of PCM; the hub answers as it would to speech.
+MSG_UTTERANCE_TEXT = "utterance_text"
 MSG_ACTION_RESULT = "action_result"
 #: Reply to a physical confirmation on the room PC; never an LLM tool result.
 MSG_VOICE_CONFIRMATION_RESULT = "voice_confirmation_result"
@@ -179,6 +182,13 @@ MSG_IMAGE_SHOW = "image_show"
 #: shown on the HUD while something slow happens in the background (face
 #: enrollment photos). Empty text clears it. Nothing is spoken.
 MSG_STATUS = "status"
+#: v2 (ТЗ F-709): a card for the room HUD -- ``{"id": str, "kind": "intercom" |
+#: ..., "title": str, "text": str, "ttl_s": float}``. A card is how the room
+#: SEES a message that also is (or will be) spoken: the intercom message that
+#: waited for its person (F-601) appears on the screen the moment it is said.
+#: Like other background frames, a card may be dropped under backpressure -
+#: words that matter are also spoken.
+MSG_CARD = "card"
 #: v2 (ТЗ F-708): what the brain itself is doing, for the room HUD --
 #: ``{"state": "online" | "queue" | "offline", "queue": int}``. The hub sends
 #: it when a room connects and when the GPU queue picks up or finishes work;
@@ -208,7 +218,7 @@ MSG_CONFIG_UPDATE = "config_update"
 #: PCM chunks are never in this set.
 BACKGROUND_SERVER_MESSAGE_TYPES = frozenset(
     {"camera_state", "camera_frame", "device_state", "hud", "status", "speaker",
-     "hub_status", "offline_hint"}
+     "hub_status", "offline_hint", "card"}
 )
 
 
@@ -222,6 +232,9 @@ def is_background_server_frame(payload: Mapping[str, Any]) -> bool:
 SAY_STATUS_FIELD = "status"
 #: How long a status caption stays up when the server gives no ttl.
 DEFAULT_STATUS_TTL_S = 8.0
+#: How long a card stays on the HUD when the server gives no ttl (F-709: cards
+#: auto-hide; a card is a moment, not a window).
+DEFAULT_CARD_TTL_S = 30.0
 
 # --- shared literals used inside the frames ---------------------------------
 #: WebSocket endpoint path served by the brain server.
@@ -274,6 +287,7 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_ROOM_SPEECH,
         MSG_UTTERANCE_START,
         MSG_UTTERANCE_END,
+        MSG_UTTERANCE_TEXT,
         MSG_ACTION_RESULT,
         MSG_VOICE_CONFIRMATION_RESULT,
         MSG_SCREENSHOT,
@@ -316,6 +330,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_TTS_END,
         MSG_IMAGE_SHOW,
         MSG_STATUS,
+        MSG_CARD,
         MSG_HUB_STATUS,
         MSG_SPEAKER,
         MSG_OFFLINE_HINT,
@@ -324,6 +339,25 @@ SERVER_MESSAGE_TYPES = frozenset(
         MSG_CONFIG_UPDATE,
     }
 )
+
+#: ТЗ F-711: a phone client has no camera and no PC, so these frames cannot
+#: come from it. The hub refuses them instead of pretending to see a room.
+PHONE_FORBIDDEN_INPUTS = frozenset(
+    {
+        MSG_CAMERA_STATE,
+        MSG_TRACKS,
+        MSG_BODY_CROP,
+        MSG_CAMERA_FRAME,
+        MSG_CAMERA_ERROR,
+        MSG_CAMERA_CLIP,
+        MSG_CAMERA_CLIP_ERROR,
+        MSG_SCREENSHOT,
+        MSG_SCREENSHOT_ERROR,
+    }
+)
+
+#: ТЗ F-711: client tools a phone cannot run - they all act on a computer.
+PHONE_FORBIDDEN_TOOLS = frozenset({"pc_control", "run_command", "browser_control"})
 
 __all__ = [
     "MSG_DISMISS",
@@ -335,6 +369,7 @@ __all__ = [
     "MSG_ROOM_SPEECH",
     "MSG_UTTERANCE_START",
     "MSG_UTTERANCE_END",
+    "MSG_UTTERANCE_TEXT",
     "MSG_ACTION_RESULT",
     "MSG_SCREENSHOT",
     "MSG_SCREENSHOT_ERROR",
@@ -363,6 +398,8 @@ __all__ = [
     "MSG_TTS_END",
     "MSG_IMAGE_SHOW",
     "MSG_STATUS",
+    "MSG_CARD",
+    "DEFAULT_CARD_TTL_S",
     "MSG_HUB_STATUS",
     "MSG_SPEAKER",
     "MSG_CONFIG_UPDATE",
@@ -385,6 +422,8 @@ __all__ = [
     "ERR_CLIENT_TIMEOUT",
     "CLIENT_MESSAGE_TYPES",
     "SERVER_MESSAGE_TYPES",
+    "PHONE_FORBIDDEN_INPUTS",
+    "PHONE_FORBIDDEN_TOOLS",
 ]
 
 
@@ -490,6 +529,15 @@ class UtteranceStart(Envelope):
 
 class UtteranceEnd(Envelope):
     type: Literal["utterance_end"] = "utterance_end"
+
+
+class UtteranceText(Envelope):
+    """ТЗ F-711: the finished words of a client that did its own VAD and STT."""
+
+    type: Literal["utterance_text"] = "utterance_text"
+    text: str = Field(min_length=1, max_length=2000)
+    #: What the client's own recognizer heard, if it knows (a whisper code).
+    language: str = Field(default="", max_length=16)
 
 
 class ActionResult(Envelope):
@@ -705,7 +753,7 @@ class ErrorMessage(Envelope):
 
 
 ClientMessage = Annotated[
-    Hello | UtteranceStart | UtteranceEnd | ActionResult | Tracks | BodyCropHeader | FaceBurstHeader | ScreenshotHeader | CameraFrameHeader | CameraClipHeader | SoundEvent | DeviceState | BargeIn | Ping | Pong,
+    Hello | UtteranceStart | UtteranceEnd | UtteranceText | ActionResult | Tracks | BodyCropHeader | FaceBurstHeader | ScreenshotHeader | CameraFrameHeader | CameraClipHeader | SoundEvent | DeviceState | BargeIn | Ping | Pong,
     Field(discriminator="type"),
 ]
 ServerMessage = Annotated[

@@ -177,6 +177,10 @@ class DeviceConfig(BaseModel):
     type: str
     area: str | None = None
     description: str | None = None
+    #: ТЗ F-606: a device a GUEST may not touch (the owner's own kit). The
+    #: client reports it in its ``hello`` device list, and the hub refuses a
+    #: guest with a sentence about the owner instead of "device not found".
+    restricted: bool = False
     #: Type-specific fields taken from the same YAML mapping.
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -185,7 +189,7 @@ class DeviceConfig(BaseModel):
     def _collect_params(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        first_class = {"name", "type", "area", "description", "params"}
+        first_class = {"name", "type", "area", "description", "restricted", "params"}
         explicit = data.get("params")
         params: dict[str, Any] = dict(explicit) if isinstance(explicit, dict) else {}
         for key, value in data.items():

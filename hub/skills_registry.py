@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,8 +74,17 @@ class SkillRegistry:
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot load {path}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Pydantic resolves a skill's argument model against ``sys.modules``:
+        # without this line an argument typed ``Literal[...]`` cannot be built,
+        # and the skill fails at its first call instead of at load time.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
         if not callable(getattr(module, "run", None)):
+            sys.modules.pop(spec.name, None)
             raise ImportError(f"{path.name} has no run(ctx, args)")
         return module
 

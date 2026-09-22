@@ -69,6 +69,9 @@ class Device(BaseModel):
     capabilities: list[Capability] = Field(default_factory=list)
     adapter: str = Field(min_length=1, max_length=40)
     adapter_config: dict[str, Any] = Field(default_factory=dict)
+    #: ТЗ F-606: a device the room owner keeps for themselves. A guest asking
+    #: for it hears why, not "I don't know that device".
+    restricted: bool = False
 
     @field_validator("aliases")
     @classmethod
@@ -204,15 +207,21 @@ class DeviceStore:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The hub database behind this store (typed wrappers write next to it)."""
+        return self._conn
+
     def save(self, device: Device) -> Device:
         self._conn.execute(
             "INSERT OR REPLACE INTO devices(device_id, home_id, name, aliases_json, zone, kind,"
-            " capabilities_json, adapter, adapter_config_json, state_json, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,"
+            " capabilities_json, adapter, adapter_config_json, restricted, state_json, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,"
             " COALESCE((SELECT state_json FROM devices WHERE device_id=?), '{}'), ?)",
             (device.id, device.home_id, device.name, json.dumps(device.aliases, ensure_ascii=False),
              device.zone, device.kind, json.dumps(list(device.capabilities)),
              device.adapter, json.dumps(device.adapter_config, ensure_ascii=False),
+             1 if device.restricted else 0,
              device.id, time.strftime("%Y-%m-%dT%H:%M:%S")))
         self._conn.commit()
         return device
@@ -220,13 +229,14 @@ class DeviceStore:
     def get(self, device_id: str) -> Device | None:
         row = self._conn.execute(
             "SELECT device_id, home_id, name, aliases_json, zone, kind, capabilities_json,"
-            " adapter, adapter_config_json FROM devices WHERE device_id=?", (str(device_id),)).fetchone()
+            " adapter, adapter_config_json, restricted FROM devices WHERE device_id=?",
+            (str(device_id),)).fetchone()
         return _to_device(row) if row else None
 
     def devices(self, home_id: str) -> list[Device]:
         rows = self._conn.execute(
             "SELECT device_id, home_id, name, aliases_json, zone, kind, capabilities_json,"
-            " adapter, adapter_config_json FROM devices WHERE home_id=? ORDER BY name",
+            " adapter, adapter_config_json, restricted FROM devices WHERE home_id=? ORDER BY name",
             (str(home_id),)).fetchall()
         return [_to_device(row) for row in rows]
 
@@ -272,10 +282,12 @@ class DeviceStore:
 
 
 def _to_device(row: Iterable[Any]) -> Device:
-    device_id, home_id, name, aliases, zone, kind, capabilities, adapter, adapter_config = row
+    (device_id, home_id, name, aliases, zone, kind, capabilities, adapter,
+     adapter_config, restricted) = row
     return Device(id=device_id, home_id=home_id, name=name, aliases=json.loads(aliases or "[]"),
                   zone=zone, kind=kind, capabilities=json.loads(capabilities or "[]"),
-                  adapter=adapter, adapter_config=json.loads(adapter_config or "{}"))
+                  adapter=adapter, adapter_config=json.loads(adapter_config or "{}"),
+                  restricted=bool(restricted))
 
 
 class DeviceTools:

@@ -514,9 +514,15 @@ class TelegramChat:
                 updated[key] = entry
                 changed = True
         if len(updated) > self.CHAT_LIMIT:
-            order = sorted(updated.items(), key=lambda item: float((item[1] or {}).get('seen') or 0.0),
-                           reverse=True)
-            updated = dict(order[:self.CHAT_LIMIT])
+            # Ties are real: three groups met inside one clock tick share the
+            # same ``seen`` stamp, and the dictionary order is then the only
+            # thing that says which of them is newer (the last one met).
+            order = sorted(
+                enumerate(updated.items()),
+                key=lambda item: (float((item[1][1] or {}).get('seen') or 0.0), item[0]),
+                reverse=True,
+            )
+            updated = dict(entry for _, entry in order[:self.CHAT_LIMIT])
             changed = True
         if changed:
             self.access.set_setting('chats', updated)

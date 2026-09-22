@@ -287,7 +287,8 @@ class Dispatcher:
     async def _pc_control(self, args: dict[str, Any]) -> PCResult:
         command = args.get("command")
         value = args.get("value")
-        result = await self.pc.execute(command, value)
+        target = args.get("target")
+        result = await self.pc.execute(command, value, target)
         if not result.detail:
             return PCResult(f"pc_control: {command}", result.output)
         return result

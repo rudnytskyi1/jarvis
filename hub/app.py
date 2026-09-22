@@ -49,12 +49,13 @@ import re
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, WebSocket
@@ -81,10 +82,16 @@ from hub import (
     speaker_context,
     telegram_audit,
 )
+from hub import automation as automation_mod
+from hub import briefing as briefing_mod
+from hub import device_state as device_state_mod
 from hub import greetings as greeting_mod
+from hub import intercom as intercom_mod
 from hub import privacy as privacy_mod
+from hub import reminders as reminders_mod
 from hub import segment as segment_mod
 from hub import speaker as speaker_mod
+from hub import untrusted as untrusted_mod
 from hub.admin_backend import AdminBackend
 from hub.admin_settings import restore_overrides
 from hub.api_budget import CloudUnavailable
@@ -749,12 +756,37 @@ _learning: Any = None
 _pin: Any = None
 #: ``DeviceTools`` for scenes and, later, the tool loop (F-501).
 _tools: Any = None
+#: ``DeviceStateStore`` — что устройства сами о себе сказали (F-505).
+_device_states: Any = None
+#: ``ObjectMemoryStore`` — память объектов дома «где мои ключи?» (F-305).
+_objects: Any = None
+#: ``ContactStore`` — взаимное согласие между людьми (F-602).
+_contacts: Any = None
+#: ``InterhomeLimiter`` — частота межкомнатных сообщений (F-603).
+_interhome_limits: Any = None
+#: ``GuestGrantStore`` — окна расширенного доступа гостю (F-606).
+_guest_grants: Any = None
+#: ``PersonPreferencesStore`` — язык, голос, wake-фраза и стиль человека (F-607).
+_preferences: Any = None
+#: ``IntercomStore`` — очередь сообщений между комнатами (F-601).
+_intercom: Any = None
+#: ``PollStore`` — опросы между комнатами (F-604).
+_polls: Any = None
+#: ``PushService`` — пуш-канал телефона: отправлено или очередь (F-712).
+_push: Any = None
 #: ``AuditLog`` for privileged panel actions (F-706).
 _audit: Any = None
 #: ТЗ F-301: ``presence(home_id)`` — кто в комнате, с какого времени, кадр.
 _presence: Any = None
+#: ТЗ F-507: присутствие дома как автоматика — «ушёл» после тишины и возврат
+#: владельца (одно на процесс: решение принимается по дому, а не по комнате).
+_home_watch: Any = None
 #: ``PresenceLog`` — журнал ``presence_events`` дома (F-301); lazy.
 _presence_events: Any = None
+#: ТЗ F-405: реестр скиллов хаба (``SkillRegistry``); грузится на старте.
+_skills: Any = None
+#: ТЗ F-405: watcher горячей перезагрузки скиллов (только dev-режим).
+_skill_watcher: Any = None
 #: ТЗ F-302: кэш синтеза коротких фиксированных реплик (приветствий и
 #: прощаний) — они повторяются, и человек не должен ждать синтеза на CPU.
 _tts_cache = TtsCache()
@@ -829,7 +861,7 @@ def _decision_chain(wake_words):
             order, timeout_s = _decision_settings()
             recorder = _decision_recorder()
             _decider = DecisionChain(
-                _decision_providers(order, wake_words),
+                _decision_providers(order, wake_words, timeout_s),
                 order,
                 timeout_s=timeout_s,
                 policies={name: Policy(**values) for name, values in DECISION_POLICIES.items()},
@@ -875,12 +907,48 @@ def _decision_settings() -> tuple[dict[str, tuple[str, ...]], float]:
     return order, timeout_s
 
 
-def _decision_providers(order: dict[str, tuple[str, ...]], wake_words) -> list[Any]:
+def _jev_provider(timeout_s: float = DECISION_TIMEOUT_S):
+    """ТЗ 5.2/5.5: ``JevDecider``, если он включён флагом и есть ключ.
+
+    Без ключа раннего доступа TypeSafe провайдера нет вовсе — хаб честно
+    решает на локальных провайдерах, а не выдумывает вердикт (открытый вопрос
+    раздела 17 записан в ``DECISIONS.md``).
+    """
+    settings = getattr(getattr(get_config().server, "decider", None), "providers", None)
+    jev = getattr(settings, "jev", None)
+    if jev is None or not bool(getattr(jev, "enabled", False)):
+        return None
+    key_env = str(getattr(jev, "api_key_env", "JEV_API_KEY") or "JEV_API_KEY")
+    key = str(os.environ.get(key_env) or "")
+    if not key:
+        log.info("Jev is switched on but %s is not set - decisions stay local (ТЗ 5.2, "
+                 "открытый вопрос раздела 17)", key_env)
+        return None
+    base_url = str(getattr(jev, "base_url", "") or "")
+    if not base_url:
+        log.info("Jev is switched on but no base_url is configured - decisions stay local")
+        return None
+    from hub.jev_decider import JevDecider
+
+    return JevDecider(
+        base_url=base_url, api_key=key,
+        path=str(getattr(jev, "path", "/v1/decide") or "/v1/decide"),
+        timeout_s=float(timeout_s),
+        # ТЗ 5.5: флаг дома ``cloud_decisions`` решает, уходит ли текст наружу.
+        allowed_for=_home_allows_cloud_decisions)
+
+
+def _decision_providers(order: dict[str, tuple[str, ...]], wake_words,
+                        timeout_s: float = DECISION_TIMEOUT_S) -> list[Any]:
     """The providers the configured chains actually need, in a stable order."""
     from hub.decider import RulesDecider
 
     providers: list[Any] = [RulesDecider(wake_phrases=tuple(wake_words))]
     names = {name for chain in order.values() for name in chain}
+    if "jev" in names:
+        jev = _jev_provider(timeout_s)
+        if jev is not None:
+            providers.append(jev)
     if "local_llm" in names:
         client = _llm
         if client is None:
@@ -1837,6 +1905,104 @@ def _greeting_settings(cfg: Any = None) -> Any:
     return settings
 
 
+def _presence_settings(cfg: Any = None) -> Any:
+    """``server.presence`` of the running config (ТЗ F-301/F-507), or ``None``."""
+    return getattr(getattr(cfg or _config, "server", None), "presence", None)
+
+
+def _presence_automation(cfg: Any = None):
+    """ТЗ F-507: автоматика «дом опустел» / «владелец вернулся», одна на процесс."""
+    global _home_watch
+    settings = _presence_settings(cfg)
+    if _home_watch is None:
+        try:
+            from hub.presence_automation import PresenceAutomation
+
+            _home_watch = PresenceAutomation(
+                left_after_s=float(getattr(settings, "left_after_s", 600.0) or 600.0))
+        except Exception as exc:  # noqa: BLE001 - автоматика не стоит комнаты
+            log.warning("The presence automation is unavailable (%s)", exc)
+            _home_watch = False
+    return _home_watch or None
+
+
+def _run_home_scene(home_id: str, scene_name: str) -> Any:
+    """ТЗ F-507/F-419: выполнить сцену дома так же, как это делает правило."""
+    store = _scene_store()
+    tools = _device_tools()
+    if store is None or tools is None:
+        raise RuntimeError("the devices are unavailable")
+    from hub.scenes import SceneRunner, match_scene
+
+    scene = match_scene(store, home_id, scene_name)
+    if scene is None:
+        scene = next((item for item in store.scenes(home_id)
+                      if str(getattr(item, 'name', '')).casefold()
+                      == str(scene_name).casefold()), None)
+    if scene is None:
+        raise LookupError(f"unknown scene {scene_name!r}")
+    connection = _home_connection(home_id)
+
+    async def say(text: str) -> bool:
+        if connection is None:
+            raise RuntimeError(f"no live client in {home_id}")
+        if not await connection._say_proactive(text):
+            raise RuntimeError("the room could not speak")
+        return True
+
+    runner = SceneRunner(store, set_device=tools.set,
+                         run_pc=(connection._run_client_action if connection else None),
+                         say=say)
+    return runner.run(scene, home_id=home_id)
+
+
+async def _handle_home_event(event: Any) -> dict[str, Any]:
+    """ТЗ F-507: дом опустел — сцена «ушёл» и охрана; вернулся владелец — приветствие."""
+    from hub.presence_automation import KIND_LEFT, KIND_RETURNED
+
+    home = str(getattr(event, 'home_id', '') or '')
+    kind = str(getattr(event, 'kind', '') or '')
+    audit = _audit_log()
+    if kind == KIND_LEFT:
+        settings = _presence_settings()
+        scene = str(getattr(settings, 'left_scene', '') or 'ушёл')
+        guard = bool(getattr(settings, 'guard_enabled', True))
+        report: dict[str, Any] = {"ok": False, "scene": scene, "guard": guard}
+        try:
+            outcome = await _run_home_scene(home, scene)
+            report["scene_report"] = dict(outcome or {})
+            report["ok"] = bool((outcome or {}).get('ok', True))
+            report["failed"] = int((outcome or {}).get('failed') or 0)
+        except Exception as exc:  # noqa: BLE001 - один дом не роняет остальные
+            report["error"] = str(exc)
+            log.warning("Could not run the leaving scene of %s (%s)", home, exc)
+        if audit is not None:
+            audit.record(action="presence.away", home_id=home, target=scene,
+                         result="ok" if report["ok"] else "failed", detail=report)
+        log.info("The home %s is away (scene %s, guard %s)", home, scene, guard)
+        return report
+    if kind == KIND_RETURNED:
+        people = [str(getattr(person, 'name', '') or getattr(person, 'person_id', '') or '')
+                  for person in (getattr(event, 'people', ()) or ())]
+        connection = _home_connection(home)
+        greeted: list[str] = []
+        if connection is not None:
+            latched = getattr(connection, '_due_greeting', None)
+            if latched is not None:
+                for label in people:
+                    if label:
+                        latched.add(label)
+                        greeted.append(label)
+        if audit is not None:
+            audit.record(action="presence.returned", home_id=home, target=", ".join(people),
+                         detail={"greeted": greeted, "live": connection is not None})
+        if greeted:
+            log.info("The owner is back in %s; a greeting is due for %s",
+                     home, ", ".join(greeted))
+        return {"ok": True, "greeted": greeted}
+    return {"ok": False, "error": f"unknown presence event {kind!r}"}
+
+
 def _adaptive_learning():
     """ТЗ F-211: the profile review of this hub, or ``None`` without a database."""
     global _learning
@@ -1930,6 +2096,45 @@ def _person_id_of(name: Any) -> str | None:
     return None
 
 
+def _person_id_spoken(name: Any) -> str | None:
+    """``persons.person_id`` по имени, как его ПРОИЗНЕСЛИ (ТЗ F-602).
+
+    «Добавь Макса в контакты» — это падеж, а не ошибка: человек говорит о
+    живом человеке, а не диктует строку базы. Имя ищется точно, а затем по
+    неизменяемой части: склонённая форма (``hub.contacts.spoken_name_variants``)
+    или, наоборот, короткая форма против полного имени («Макс» → «Максим»).
+    Совпадение должно быть единственным: два Макса — это вопрос, а не выбор
+    наугад.
+    """
+    from hub.contacts import spoken_name_variants
+
+    if _hub_conn is None:
+        return None
+    exact = _person_id_of(name)
+    if exact is not None:
+        return exact
+    variants = spoken_name_variants(str(name or ""))
+    if not variants:
+        return None
+    try:
+        people = [(str(row[0]), " ".join(str(row[1] or "").split()).casefold())
+                  for row in _hub_conn.execute("SELECT person_id, display_name FROM persons")]
+    except Exception as exc:  # noqa: BLE001 - a turn must not break on this
+        log.debug("Could not read the people list (%s)", exc)
+        return None
+    #: Сначала вариант целиком против имени, потом — начало полного имени.
+    for variant in variants:
+        hits = [person_id for person_id, display in people if display == variant]
+        if len(hits) == 1:
+            return hits[0]
+    for variant in variants:
+        hits = [person_id for person_id, display in people
+                if len(variant) >= 4 and display.startswith(variant)]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
 def _scene_store():
     """The ``scenes`` table of the hub database, or ``None`` without one (F-506)."""
     global _scenes
@@ -1966,6 +2171,620 @@ def _device_tools():
                 adapters = {}
             _tools = DeviceTools(store, adapters)
     return _tools or None
+
+
+def _device_state_store():
+    """ТЗ F-505: типизированное состояние устройств, или ``None`` без базы."""
+    global _device_states
+    if _device_states is None:
+        store = _device_store()
+        if store is None:
+            return None
+        from hub.device_state import DeviceStateStore
+
+        _device_states = DeviceStateStore(store)
+    return _device_states
+
+
+def _device_state_settings(cfg: Any = None) -> Any:
+    cfg = cfg or get_config()
+    return getattr(cfg.server, "device_state", None)
+
+
+def _object_memory_store():
+    """ТЗ F-305: память объектов дома (``objects_index``), или ``None``."""
+    global _objects
+    if _objects is None:
+        try:
+            from hub.object_memory import ObjectMemoryStore
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            _objects = ObjectMemoryStore(_hub_conn)
+        except Exception as exc:  # noqa: BLE001 - память объектов не стоит хода
+            log.info("The object memory is unavailable (%s)", exc)
+            _objects = False
+    return _objects or None
+
+
+def _contacts_store():
+    """ТЗ F-602: контакты и взаимное согласие (``contacts``), или ``None``."""
+    global _contacts
+    if _contacts is None:
+        try:
+            from hub.contacts import ContactStore
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            _contacts = ContactStore(_hub_conn)
+        except Exception as exc:  # noqa: BLE001 - без базы контактов просто нет
+            log.info("The contact store is unavailable (%s)", exc)
+            _contacts = False
+    return _contacts or None
+
+
+def _interhome_limiter():
+    """ТЗ F-603: частота межкомнатных сообщений из ``server.intercom``."""
+    global _interhome_limits
+    if _interhome_limits is None:
+        try:
+            from hub.interhome import InterhomeLimiter
+
+            settings = getattr(get_config().server, "intercom", None)
+            _interhome_limits = InterhomeLimiter(
+                window_s=float(getattr(settings, "cooldown_s", 600.0) or 600.0),
+                max_messages=int(getattr(settings, "max_messages", 1) or 1),
+                enabled=bool(getattr(settings, "enabled", True)))
+        except Exception as exc:  # noqa: BLE001 - лимит не стоит хода
+            log.info("The intercom limiter is unavailable (%s)", exc)
+            _interhome_limits = False
+    return _interhome_limits or None
+
+
+def _guest_grant_store():
+    """ТЗ F-606: окна расширенного доступа гостю (``guest_grants``), или ``None``."""
+    global _guest_grants
+    if _guest_grants is None:
+        try:
+            from hub.guest_access import GuestGrantStore
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            _guest_grants = GuestGrantStore(_hub_conn)
+        except Exception as exc:  # noqa: BLE001 - без базы окон просто нет
+            log.info("The guest grant store is unavailable (%s)", exc)
+            _guest_grants = False
+    return _guest_grants or None
+
+
+def _person_preferences_store():
+    """ТЗ F-607: настройки человека (``person_preferences``), или ``None``."""
+    global _preferences
+    if _preferences is None:
+        try:
+            from hub.person_preferences import PersonPreferencesStore
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            _preferences = PersonPreferencesStore(_hub_conn, registry=_voices)
+        except Exception as exc:  # noqa: BLE001 - без базы настроек просто нет
+            log.info("The person preferences store is unavailable (%s)", exc)
+            _preferences = False
+    return _preferences or None
+
+
+#: ТЗ F-602: ответы о контактах — на языке человека (ru/en/es), а не только
+#: по-английски: сказанное вслух «да» человек должен понимать.
+_CONTACT_LINES: dict[str, dict[str, str]] = {
+    "ru": {
+        "unknown_speaker": "Я не узнала ваш голос, а согласие между людьми даёт только "
+                           "сам человек. Повторите, когда я вас узнаю.",
+        "unknown_person": "Я не знаю человека по имени {name}. Скажите имя так, как оно "
+                          "записано у меня.",
+        "self": "Себя в контакты добавить нельзя.",
+        "invited": "Я передала {name} приглашение. Он подтвердит его сам, в своей комнате.",
+        "already": "Вы уже в контактах с {name}.",
+        "confirmed": "Готово: вы с {name} в контактах. Теперь можно писать друг другу "
+                     "между комнатами.",
+        "pending": "Приглашение от {name} ещё не подтверждено — подтвердить его может "
+                   "только он сам.",
+        "revoked": "Я убрала {name} из ваших контактов.",
+        "blocked_ok": "Я закрыла связь с {name}: он больше не может писать вам, а вы — ему.",
+        "unblocked": "Блокировка с {name} снята. Чтобы снова общаться, нужно новое "
+                     "взаимное подтверждение.",
+        "presence_on": "Хорошо: {name} будет видеть, дома ли вы.",
+        "presence_off": "Хорошо: {name} больше не видит, дома ли вы.",
+        "blocked": "Связь с {name} заблокирована. Снять блокировку может только тот, кто "
+                   "её поставил.",
+        "own": "Своё приглашение подтвердить нельзя: {name} должен сказать «да» сам.",
+        "nothing": "Приглашения от {name} нет, подтверждать нечего.",
+        "strangers": "Вы с {name} не в контактах, поэтому убирать нечего.",
+        "not_blocked": "Связь с {name} не заблокирована.",
+        "not_blocker": "Снять блокировку может только тот, кто её поставил.",
+        "no_contact_presence": "Сначала нужен подтверждённый контакт с {name}, а уже потом "
+                               "можно делиться присутствием.",
+        "failed": "Не получилось изменить контакты: {name}.",
+    },
+    "en": {
+        "unknown_speaker": "I could not recognise your voice, and consent between people "
+                           "can only be given by the person themselves. Say it again once "
+                           "I know you.",
+        "unknown_person": "I do not know anyone called {name}. Say the name as it is saved "
+                          "for me.",
+        "self": "You cannot add yourself as a contact.",
+        "invited": "I have passed the invitation to {name}. They will confirm it themselves, "
+                   "in their own room.",
+        "already": "You are already in contact with {name}.",
+        "confirmed": "Done: you and {name} are contacts now. You can message each other "
+                     "between rooms.",
+        "pending": "The invitation from {name} is still unconfirmed — only they can "
+                   "confirm it.",
+        "revoked": "I removed {name} from your contacts.",
+        "blocked_ok": "I blocked {name}: they cannot message you, and you cannot message "
+                      "them.",
+        "unblocked": "The block with {name} is lifted. Talking again needs a new mutual "
+                     "confirmation.",
+        "presence_on": "Fine: {name} will see whether you are home.",
+        "presence_off": "Fine: {name} no longer sees whether you are home.",
+        "blocked": "The connection with {name} is blocked. Only the person who blocked it "
+                   "can undo that.",
+        "own": "You cannot confirm your own invitation: {name} has to say yes themselves.",
+        "nothing": "There is no invitation from {name} to confirm.",
+        "strangers": "You and {name} are not contacts, so there is nothing to remove.",
+        "not_blocked": "The connection with {name} is not blocked.",
+        "not_blocker": "Only the person who blocked it can undo that.",
+        "no_contact_presence": "A confirmed contact with {name} comes first; presence "
+                               "sharing comes after.",
+        "failed": "I could not change your contacts: {name}.",
+    },
+    "es": {
+        "unknown_speaker": "No reconocí tu voz, y el consentimiento entre personas solo lo "
+                           "puede dar la propia persona. Dilo otra vez cuando te reconozca.",
+        "unknown_person": "No conozco a nadie llamado {name}. Dime el nombre tal como lo "
+                          "tengo guardado.",
+        "self": "No puedes agregarte a ti mismo como contacto.",
+        "invited": "Le pasé la invitación a {name}. La confirmará en su propia habitación.",
+        "already": "Ya estás en contacto con {name}.",
+        "confirmed": "Listo: tú y {name} ahora son contactos. Pueden escribirse entre "
+                     "habitaciones.",
+        "pending": "La invitación de {name} aún no está confirmada — solo esa persona "
+                   "puede confirmarla.",
+        "revoked": "Quité a {name} de tus contactos.",
+        "blocked_ok": "Bloqueé a {name}: ya no puede escribirte, y tú tampoco a esa persona.",
+        "unblocked": "El bloqueo con {name} se levantó. Para hablar de nuevo, ambos deben "
+                     "confirmar un contacto nuevo.",
+        "presence_on": "Bien: {name} verá si estás en casa.",
+        "presence_off": "Bien: {name} ya no verá si estás en casa.",
+        "blocked": "La conexión con {name} está bloqueada. Solo quien la bloqueó puede "
+                   "deshacerlo.",
+        "own": "No puedes confirmar tu propia invitación: {name} tiene que decir que sí.",
+        "nothing": "No hay ninguna invitación de {name} que confirmar.",
+        "strangers": "Tú y {name} no son contactos, así que no hay nada que quitar.",
+        "not_blocked": "La conexión con {name} no está bloqueada.",
+        "not_blocker": "Solo quien bloqueó la conexión puede deshacerla.",
+        "no_contact_presence": "Primero hace falta un contacto confirmado con {name}; "
+                               "compartir la presencia viene después.",
+        "failed": "No pude cambiar tus contactos: {name}.",
+    },
+}
+
+#: Причина отказа ``ContactError`` → строка ответа.
+_CONTACT_REFUSALS: tuple[tuple[str, str], ...] = (
+    ("blocked", "blocked"),
+    ("own invitation", "own"),
+    ("nothing to confirm", "nothing"),
+    ("not confirmed by both sides", "nothing"),
+    ("is not blocked", "not_blocked"),
+    ("only the person who blocked", "not_blocker"),
+    ("are not contacts", "strangers"),
+    ("presence sharing needs", "no_contact_presence"),
+)
+
+
+def _contact_line(language: str, key: str, name: str = "") -> str:
+    """Ответ человека о контактах на его языке; неизвестный язык → ru."""
+    table = _CONTACT_LINES.get(str(language or "").casefold(), _CONTACT_LINES["ru"])
+    return table.get(key, _CONTACT_LINES["ru"]["failed"]).format(name=name)
+
+
+def _contact_refusal_key(reason: str) -> str:
+    text = str(reason or "").casefold()
+    for needle, key in _CONTACT_REFUSALS:
+        if needle in text:
+            return key
+    return "failed"
+
+
+#: ТЗ F-602: отказы межкомнатного — по коду причины гейта, на языке человека.
+#: Одна и та же таблица отвечает интеркому (F-601), опросам (F-604) и вопросу
+#: о присутствии (P4-05), потому что гейт у них один.
+_INTERHOME_REFUSALS: dict[str, dict[str, str]] = {
+    "ru": {
+        "unknown_speaker": "Чтобы передать что-то в другую комнату, мне нужно узнать ваш "
+                           "голос.",
+        "unknown_person": "Я не знаю человека по имени {name}.",
+        "self": "Передать сообщение самому себе нельзя.",
+        "strangers": "Вы с {name} не в контактах, поэтому я не могу ничего передать. "
+                     "Скажите «добавь {name} в контакты», и он подтвердит это сам.",
+        "pending": "Знакомство с {name} ещё не подтвердили обе стороны — передать "
+                   "сообщение нельзя.",
+        "blocked": "Связь с {name} заблокирована, поэтому я ничего не передаю.",
+        "too_often": "Слишком часто: следующее сообщение в другую комнату можно через "
+                     "{minutes} мин.",
+    },
+    "en": {
+        "unknown_speaker": "To pass anything to another room I need to recognise your "
+                           "voice first.",
+        "unknown_person": "I do not know anyone called {name}.",
+        "self": "You cannot message yourself.",
+        "strangers": "You and {name} are not contacts, so I cannot pass anything on. Say "
+                     "“add {name} to my contacts”, and they will confirm it themselves.",
+        "pending": "The contact with {name} is not confirmed by both sides yet, so nothing "
+                   "can be passed on.",
+        "blocked": "The connection with {name} is blocked, so I am not passing anything on.",
+        "too_often": "That is too often: the next message to another room can go in "
+                     "{minutes} min.",
+    },
+    "es": {
+        "unknown_speaker": "Para pasar algo a otra habitación necesito reconocer tu voz "
+                           "primero.",
+        "unknown_person": "No conozco a nadie llamado {name}.",
+        "self": "No puedes escribirte a ti mismo.",
+        "strangers": "Tú y {name} no son contactos, así que no puedo pasar nada. Di "
+                     "«agrega a {name} a mis contactos» y esa persona lo confirmará.",
+        "pending": "El contacto con {name} todavía no está confirmado por ambas partes, "
+                   "así que no puedo pasar nada.",
+        "blocked": "La conexión con {name} está bloqueada, así que no paso nada.",
+        "too_often": "Es demasiado seguido: el próximo mensaje a otra habitación puede ir "
+                     "en {minutes} min.",
+    },
+}
+
+
+def _interhome_refusal(language: str, reason: str, name: str = "",
+                       minutes: str = "") -> str:
+    """Строка отказа межкомнатного; неизвестный язык или код → ru."""
+    table = _INTERHOME_REFUSALS.get(str(language or "").casefold(), _INTERHOME_REFUSALS["ru"])
+    line = table.get(str(reason or ""), "")
+    if not line:
+        table = _INTERHOME_REFUSALS["ru"]
+        line = table.get(str(reason or ""), "")
+    return line.format(name=name, minutes=minutes or "10")
+
+
+def _person_language(person_id: str, fallback: str = "ru") -> str:
+    """Язык человека из ``persons.preferred_language`` (F-106), иначе — чужой."""
+    if _hub_conn is None or not person_id:
+        return fallback
+    try:
+        row = _hub_conn.execute(
+            "SELECT preferred_language FROM persons WHERE person_id = ?",
+            (person_id,)).fetchone()
+    except Exception as exc:  # noqa: BLE001 - язык не стоит сообщения
+        log.debug("Could not read the language of %s (%s)", person_id, exc)
+        return fallback
+    code = str((row[0] if row is not None else "") or "").strip().casefold()[:2]
+    return code if code in ("ru", "en", "es") else fallback
+
+
+def _intercom_store():
+    """ТЗ F-601: очередь сообщений между комнатами, или ``None``."""
+    global _intercom
+    if _intercom is None:
+        try:
+            from hub.intercom import IntercomStore
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            settings = getattr(get_config().server, "intercom", None)
+            _intercom = IntercomStore(
+                _hub_conn, queue_limit=int(getattr(settings, "queue_limit", 50) or 50))
+        except Exception as exc:  # noqa: BLE001 - без базы интеркома просто нет
+            log.info("The intercom store is unavailable (%s)", exc)
+            _intercom = False
+    return _intercom or None
+
+
+def _poll_store():
+    """ТЗ F-604: опросы между комнатами, или ``None``."""
+    global _polls
+    if _polls is None:
+        try:
+            from hub.polls import PollStore
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            _polls = PollStore(_hub_conn)
+        except Exception as exc:  # noqa: BLE001 - без базы опросов просто нет
+            log.info("The poll store is unavailable (%s)", exc)
+            _polls = False
+    return _polls or None
+
+
+def _poll_person_allowed(person_id: str, author_id: str) -> bool:
+    """ТЗ F-602: спрашивают только тех, с кем у автора есть взаимное согласие."""
+    store = _contacts_store()
+    if store is None:
+        return False
+    return bool(store.allowed(person_id, author_id))
+
+
+async def _ask_poll_in_home(home_id: str, poll: Any, person_id: str) -> bool:
+    """Спросить человека в его комнате словами вопроса (ТЗ F-604, P4-16)."""
+    """Спросить человека в его комнате словами вопроса (ТЗ F-604, P4-16)."""
+    connection = _home_connection(home_id)
+    if connection is None:
+        log.info("No live client in %s to ask poll %s", home_id,
+                 getattr(poll, "poll_id", ""))
+        return False
+    from hub import polls as polls_mod
+
+    author = _person_display_name(str(getattr(poll, "author_person_id", "") or ""))
+    language = _person_language(person_id, fallback=connection._greeting_language())
+    try:
+        return bool(await connection._say_proactive(
+            polls_mod.ask_line(poll, author or "Rowan", language),
+            name=_person_display_name(str(person_id or ""))))
+    except Exception as exc:  # noqa: BLE001 - вопрос можно задать в следующий раз
+        log.warning("Could not ask poll %s in %s (%s)",
+                    getattr(poll, "poll_id", "?"), home_id, exc)
+        return False
+
+
+def _poll_ask_task(cfg: Any = None, *, conn: Any = None):
+    """ТЗ F-604: задавать вопросы при появлении как задача планировщика."""
+    cfg = cfg or get_config()
+    settings = getattr(getattr(cfg, "server", None), "intercom", None)
+    if settings is not None and not bool(getattr(settings, "enabled", True)):
+        return None
+    try:
+        from hub.polls import PollAskTask, PollStore
+
+        if conn is None:
+            _hub_gateway()
+            conn = _hub_conn
+        if conn is None:
+            raise RuntimeError("the hub database is unavailable")
+        return PollAskTask(
+            PollStore(conn),
+            ask=_ask_poll_in_home,
+            present=lambda home: _room_presence(home, None),
+            homes=[str(home.home_id) for home in (getattr(cfg, "homes", []) or [])],
+            allowed=_poll_person_allowed,
+            quiet=_home_intercom_quiet,
+            interval_s=float(getattr(settings, "check_interval_s", 30.0) or 30.0))
+    except Exception as exc:  # noqa: BLE001 - задача не стоит запуска хаба
+        log.info("The poll ask task is unavailable (%s)", exc)
+        return None
+
+
+async def _speak_poll_summary_in_home(home_id: str, poll: Any, tally: Any) -> bool:
+    """Прочитать автору итог его опроса в его комнате (ТЗ F-604, P4-18)."""
+    connection = _home_connection(home_id)
+    if connection is None:
+        log.info("No live client in %s to read the summary of %s", home_id,
+                 getattr(poll, "poll_id", ""))
+        return False
+    from hub import polls as polls_mod
+
+    author = str(getattr(poll, "author_person_id", "") or "")
+    language = _person_language(author, fallback=connection._greeting_language())
+    names = {str(person): _person_display_name(str(person))
+             for person in getattr(tally, "missing", ()) or ()}
+    try:
+        return bool(await connection._say_proactive(
+            polls_mod.summary_line(poll, tally, language, names),
+            name=_person_display_name(author)))
+    except Exception as exc:  # noqa: BLE001 - итог можно пересказать в следующий раз
+        log.warning("Could not read the summary of %s in %s (%s)",
+                    getattr(poll, "poll_id", "?"), home_id, exc)
+        return False
+
+
+def _poll_summary_task(cfg: Any = None, *, conn: Any = None):
+    """ТЗ F-604: итоги закрытых опросов — задача планировщика."""
+    cfg = cfg or get_config()
+    settings = getattr(getattr(cfg, "server", None), "intercom", None)
+    if settings is not None and not bool(getattr(settings, "enabled", True)):
+        return None
+    try:
+        from hub.polls import PollStore, PollSummaryTask
+
+        if conn is None:
+            _hub_gateway()
+            conn = _hub_conn
+        if conn is None:
+            raise RuntimeError("the hub database is unavailable")
+        return PollSummaryTask(
+            PollStore(conn),
+            speak=_speak_poll_summary_in_home,
+            present=lambda home: _room_presence(home, None),
+            homes=[str(home.home_id) for home in (getattr(cfg, "homes", []) or [])],
+            interval_s=float(getattr(settings, "check_interval_s", 30.0) or 30.0))
+    except Exception as exc:  # noqa: BLE001 - задача не стоит запуска хаба
+        log.info("The poll summary task is unavailable (%s)", exc)
+        return None
+
+
+#: ТЗ F-601: что слышит ОТПРАВИТЕЛЬ про своё сообщение.
+_INTERCOM_LINES: dict[str, dict[str, str]] = {
+    "ru": {
+        "unknown_speaker": "Я не узнала ваш голос, поэтому не могу передать сообщение.",
+        "unknown_person": "Я не знаю человека по имени {name}.",
+        "self": "Передать сообщение самому себе нельзя.",
+        "no_home": "Я не знаю, в каком доме живёт {name}, поэтому не знаю, куда передать.",
+        # Имя стоит в именительном падеже: склонять чужие имена хаб не умеет.
+        "spoken": "{name} сейчас в комнате — сказала вслух: «{text}».",
+        "queued": "{name} сейчас не в комнате. Передам при появлении.",
+        "no_message": "Я не получала для вас сообщений, поэтому не знаю, кому отвечать.",
+        "quiet": "{name} просил не беспокоить в тихие часы. Передам, когда они кончатся.",
+        "quiet_set": "Хорошо: ночью я не буду передавать вам сообщения.",
+        "quiet_unset": "Хорошо: ночью я буду передавать вам сообщения.",
+        "failed": "Не получилось передать сообщение {name}.",
+    },
+    "en": {
+        "unknown_speaker": "I could not recognise your voice, so I cannot pass a message on.",
+        "unknown_person": "I do not know anyone called {name}.",
+        "self": "You cannot send a message to yourself.",
+        "no_home": "I do not know which home {name} lives in, so I do not know where to send it.",
+        "spoken": "{name} is in the room — I said it out loud: “{text}”.",
+        "queued": "{name} is not in the room now. I will pass it on when they arrive.",
+        "no_message": "I have no message for you, so I do not know who to answer.",
+        "quiet": "{name} asked not to be disturbed during quiet hours. I will pass it on "
+                 "afterwards.",
+        "quiet_set": "Fine: I will not pass messages to you at night.",
+        "quiet_unset": "Fine: I will pass messages to you at night.",
+        "failed": "I could not pass the message to {name}.",
+    },
+    "es": {
+        "unknown_speaker": "No reconocí tu voz, así que no puedo pasar un mensaje.",
+        "unknown_person": "No conozco a nadie llamado {name}.",
+        "self": "No puedes enviarte un mensaje a ti mismo.",
+        "no_home": "No sé en qué casa vive {name}, así que no sé a dónde enviarlo.",
+        "spoken": "{name} está en la habitación — lo dije en voz alta: «{text}».",
+        "queued": "{name} no está en la habitación ahora. Se lo pasaré cuando llegue.",
+        "no_message": "No tengo ningún mensaje para ti, así que no sé a quién responder.",
+        "quiet": "{name} pidió que no le molesten en horas de silencio. Se lo pasaré "
+                 "después.",
+        "quiet_set": "Bien: no te pasaré mensajes por la noche.",
+        "quiet_unset": "Bien: te pasaré mensajes por la noche.",
+        "failed": "No pude pasarle el mensaje a {name}.",
+    },
+}
+
+#: ТЗ F-601: что слышит ПОЛУЧАТЕЛЬ. Слова отправителя не переводятся: чужую
+#: речь хаб не переписывает, он называет автора и передаёт сказанное.
+_INTERCOM_SPOKEN: dict[str, str] = {
+    "ru": "{sender} передаёт: {text}",
+    "en": "{sender} says: {text}",
+    "es": "{sender} dice: {text}",
+}
+
+
+def _intercom_line(language: str, key: str, name: str = "", text: str = "") -> str:
+    table = _INTERCOM_LINES.get(str(language or "").casefold(), _INTERCOM_LINES["ru"])
+    return table.get(key, _INTERCOM_LINES["ru"]["failed"]).format(name=name, text=text)
+
+
+def _intercom_spoken_line(language: str, sender: str, text: str) -> str:
+    line = _INTERCOM_SPOKEN.get(str(language or "").casefold(), _INTERCOM_SPOKEN["ru"])
+    return line.format(sender=sender, text=text)
+
+
+def _record_contact_event(action: str, actor: str, target: str, home_id: Any, *,
+                          result: str, reason: str = "", status: str = "") -> None:
+    """Одна строка F-706 про изменение контактов — и удача, и отказ."""
+    audit = _audit_log()
+    if audit is None:
+        return
+    detail: dict[str, Any] = {}
+    if reason:
+        detail["reason"] = reason
+    if status:
+        detail["status"] = status
+    audit.record(action=action, actor=actor, target=target, home_id=home_id,
+                 result=result, detail=detail)
+
+
+def _record_guest_event(action: str, actor: str, target: str, home_id: Any, *,
+                        result: str, capability: str = "", expires_at: str = "") -> None:
+    """Одна строка F-706 про доступ гостя — и выдача окна, и отказ в нём."""
+    audit = _audit_log()
+    if audit is None:
+        return
+    detail: dict[str, Any] = {}
+    if capability:
+        detail["capability"] = capability
+    if expires_at:
+        detail["expires_at"] = expires_at
+    audit.record(action=action, actor=actor, target=target, home_id=home_id,
+                 result=result, detail=detail)
+
+
+def _device_state_task(cfg: Any = None, *, audit: Any = None):
+    """ТЗ F-505: периодический опрос адаптеров как задача планировщика.
+
+    Интервал ``0`` (по умолчанию) означает «подписки достаточно»: состояние
+    приходит из отчётов комнаты, и опрашивать нечего. Задача появляется
+    только когда владелец назвал интервал И на хабе есть адаптеры.
+    """
+    settings = _device_state_settings(cfg)
+    interval = float(getattr(settings, "poll_interval_s", 0.0) or 0.0)
+    if settings is None or not bool(getattr(settings, "enabled", True)) or interval <= 0:
+        return None
+    try:
+        states = _device_state_store()
+        tools = _device_tools()
+        if states is None:
+            raise RuntimeError("the hub database is unavailable")
+        from hub.device_state import DeviceStateTask
+
+        homes = [str(home.home_id) for home in (getattr(cfg, "homes", []) or [])]
+        if not homes and states.devices is not None:
+            homes = states.devices.homes()
+        return DeviceStateTask(states, tools=tools, homes=homes, interval_s=interval)
+    except Exception as exc:  # noqa: BLE001 - хаб живёт и без опроса устройств
+        log.info("The device state poller is unavailable (%s)", exc)
+        return None
+
+
+def _presence_automation_task(cfg: Any = None, *, audit: Any = None):
+    """ТЗ F-507: «дом опустел» как задача планировщика, или ``None``.
+
+    Дом без единой комнаты в конфиге не проверяется: сцена «ушёл» должна
+    выполняться для настоящей комнаты, а не для строки, которой на хабе нет.
+    """
+    cfg = cfg or get_config()
+    settings = _presence_settings(cfg)
+    if settings is None or not bool(getattr(settings, "enabled", True)):
+        return None
+    homes = [str(home.home_id) for home in (getattr(cfg, "homes", []) or [])]
+    if not homes:
+        homes = list(_connections_homes())
+    if not homes:
+        return None
+    try:
+        from hub.presence_automation import PresenceAutomationTask
+
+        automation = _presence_automation(cfg)
+        if automation is None:
+            raise RuntimeError("the presence automation is unavailable")
+        automation.left_after_s = max(1.0, float(
+            getattr(settings, "left_after_s", 600.0) or 600.0))
+        return PresenceAutomationTask(
+            automation, homes, on_event=_handle_home_event,
+            interval_s=float(getattr(settings, "check_interval_s", 30.0) or 30.0))
+    except Exception as exc:  # noqa: BLE001 - хаб живёт и без автоматики
+        log.info("The presence automation task is unavailable (%s)", exc)
+        return None
+
+
+def _connections_homes() -> list[str]:
+    """The homes of the rooms that are connected right now, without duplicates."""
+    seen: list[str] = []
+    for connection in list(_connections):
+        home = str(getattr(connection, 'home_id', '') or '')
+        if home and home not in seen:
+            seen.append(home)
+    return seen
+
+
+def _away_homes() -> list[str]:
+    """ТЗ F-507: дома, которые сейчас «ушли» (``/health``), или ``[]``."""
+    automation = _presence_automation()
+    if automation is None:
+        return []
+    try:
+        return automation.homes_away()
+    except Exception as exc:  # noqa: BLE001 - health не падает из-за автоматики
+        log.debug("Could not read the away homes (%s)", exc)
+        return []
 
 
 def _audit_log():
@@ -2092,6 +2911,764 @@ def _memory_consolidation_task(cfg: Any = None, *, conn: Any = None, audit: Any 
         return None
 
 
+def _home_config_of(home_id: str) -> Any:
+    """``HomeConfig`` of one room from the live config, or ``None``."""
+    wanted = str(home_id or "")
+    for home in (getattr(get_config(), "homes", []) or []):
+        if str(getattr(home, "home_id", "")) == wanted:
+            return home
+    return None
+
+
+def _home_quiet_now(home_id: str, *, moment: Any = None) -> bool:
+    """ТЗ F-302/F-115: тихие часы ЭТОГО дома, а не хаба (у хаба их много)."""
+    home = _home_config_of(home_id)
+    settings = _greeting_settings(get_config())
+    if settings is None or not bool(getattr(settings, "enabled", True)):
+        return False
+    quiet = getattr(home, "quiet_hours", None)
+    start = str(getattr(quiet, "start", "") or getattr(settings, "quiet_start", ""))
+    end = str(getattr(quiet, "end", "") or getattr(settings, "quiet_end", ""))
+    tz = str(getattr(home, "tz", "") or "")
+    try:
+        return greeting_mod.in_quiet_hours(start, end, moment=moment, tz=tz)
+    except Exception as exc:  # noqa: BLE001 - тихие часы не повод не проверить правило
+        log.debug("Could not read the quiet hours of %s (%s)", home_id, exc)
+        return False
+
+
+def _home_intercom_quiet(home_id: str, person_id: str) -> bool:
+    """ТЗ F-601: тихие часы дома плюс личное разрешение получателя.
+
+    Ночью хаб молчит по умолчанию: разбудить человека чужой репликой хуже, чем
+    задержать её до утра. «Разреши интерком ночью» (P4-12) снимает запрет для
+    одного человека, а не для всего дома.
+    """
+    if not home_id or not _home_quiet_now(home_id):
+        return False
+    if _hub_conn is None:
+        return True
+    try:
+        from hub.intercom import quiet_ok
+
+        return not quiet_ok(_hub_conn, person_id)
+    except Exception as exc:  # noqa: BLE001 - тихие часы не глушат навсегда
+        log.debug("Could not read the quiet-hours setting of %s (%s)", person_id, exc)
+        return True
+
+
+def _person_display_name(person_id: str) -> str:
+    """``persons.display_name`` of an id, or ``""``."""
+    if not person_id or _hub_conn is None:
+        return ""
+    try:
+        row = _hub_conn.execute("SELECT display_name FROM persons WHERE person_id=?",
+                                (str(person_id),)).fetchone()
+    except Exception as exc:  # noqa: BLE001 - a name is never a dependency
+        log.debug("Could not read the name of %s (%s)", person_id, exc)
+        return ""
+    return str(row[0] or "") if row else ""
+
+
+def _field_of(row: Any, key: str) -> str:
+    """One field of a sighting or track, whether it is a dict or an object."""
+    if isinstance(row, Mapping):
+        return str(row.get(key) or "")
+    return str(getattr(row, key, "") or "")
+
+
+def _needs_admin_identity(tool: str, args: Any = None) -> bool:
+    """ТЗ F-208/F-507: calls that must prove WHO is asking, not only the role.
+
+    ``run_command`` and ``set_role`` were the two of phase 2; unlocking the room
+    PC (F-507) joins them, because the ТЗ asks for «лицо и голос» and the admin
+    threshold there, not just an admin role.
+    """
+    if tool in speaker_mod.HIGH_CONFIDENCE_TOOLS:
+        return True
+    if tool == 'remember' and str((args or {}).get('scope') or '') == 'global':
+        return True
+    if tool == 'pc_control':
+        return str((args or {}).get('command') or '').strip().casefold() == 'unlock'
+    return False
+
+
+def _home_allows_pc_unlock(home_id: str) -> bool:
+    """ТЗ F-507: сказал ли этот дом «разблокировать ПК можно».
+
+    По умолчанию — нет (открытый вопрос раздела 17): комната без строки
+    ``homes[].pc_unlock: true`` не разблокирует ПК никому.
+    """
+    home = _home_config_of(str(home_id or ''))
+    return bool(getattr(home, 'pc_unlock', False))
+
+
+def _home_allows_cloud_decisions(home_id: str) -> bool:
+    """ТЗ 5.5: уходит ли текст ЭТОГО дома к облачному провайдеру решений.
+
+    По умолчанию — нет: ``homes[].cloud_decisions`` выключен, и Jev для такой
+    комнаты не зовётся вовсе (цепочка идёт к локальным провайдерам).
+    """
+    home = _home_config_of(str(home_id or ''))
+    return bool(getattr(home, 'cloud_decisions', False))
+
+
+def _role_for_person(person_id: str) -> str:
+    """Роль человека по id: та же таблица ролей, что у голосовой команды."""
+    name = _person_display_name(person_id)
+    if not name or _voices is None:
+        return speaker_mod.ROLE_UNKNOWN
+    try:
+        return str(_voices.role_of(name) or speaker_mod.ROLE_UNKNOWN)
+    except Exception as exc:  # noqa: BLE001 - незнакомая роль не роняет правило
+        log.debug("Could not read the role of %s (%s)", person_id, exc)
+        return speaker_mod.ROLE_UNKNOWN
+
+
+def _home_connection(home_id: str) -> Any | None:
+    """The live, hello-ed connection of one room, or ``None``."""
+    return next((item for item in list(_connections)
+                 if str(getattr(item, 'home_id', '')) == str(home_id)
+                 and getattr(item, 'session', None) is not None), None)
+
+
+def _rule_facts(home_id: str, *, event: Any = None, sound: str = "",
+                sound_confidence: float = 0.0,
+                device_values: Any = None, now: Any = None) -> Any:
+    """ТЗ F-419: что хаб знает о комнате в момент проверки правила."""
+    home = _home_config_of(home_id)
+    moment = now or datetime.now(UTC)
+    present: list[Any] = []
+    state = _presence_state()
+    if state is not None:
+        try:
+            for row in state.occupants(home_id):
+                person_id = str(getattr(row, 'person_id', '') or '')
+                present.append(automation_mod.PresentPerson(
+                    person_id=person_id,
+                    name=str(getattr(row, 'name', '') or '') or _person_display_name(person_id),
+                    role=_role_for_person(person_id) if person_id else speaker_mod.ROLE_UNKNOWN,
+                ))
+        except Exception as exc:  # noqa: BLE001 - без присутствия правило просто не сработает
+            log.debug("Could not read presence for rule facts (%s)", exc)
+    return automation_mod.Facts(
+        home_id=str(home_id), now=moment,
+        tz=str(getattr(home, 'tz', '') or ''),
+        event=str(getattr(event, 'kind', '') or ''),
+        event_person_id=str(getattr(event, 'person_id', '') or ''),
+        event_zone=str(getattr(event, 'zone', '') or ''),
+        sound=str(sound or ''), sound_confidence=float(sound_confidence or 0.0),
+        device_values=dict(device_values or {}),
+        present=present, quiet_hours=_home_quiet_now(home_id, moment=moment),
+    )
+
+
+async def _execute_rule_action(rule: Any, action: Any, facts: Any) -> dict[str, Any]:
+    """ТЗ F-419: выполнить одно действие правила и вернуть честный результат."""
+    from hub.automation import ActionKind
+
+    if action.kind is ActionKind.SAY:
+        connection = _home_connection(facts.home_id)
+        if connection is None:
+            return {"ok": False, "error": f"no live client in {facts.home_id}"}
+        if await connection._say_proactive(action.text):
+            return {"ok": True}
+        return {"ok": False, "error": "the room could not speak"}
+    if action.kind is ActionKind.NOTIFY:
+        provider = _telegram
+        if provider is None or not getattr(provider, 'ready', False):
+            return {"ok": False, "error": "no notification channel is configured"}
+        try:
+            await provider.send_text(action.text)
+        except Exception as exc:  # noqa: BLE001 - канал может быть недоступен
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+    if action.kind is ActionKind.SCENE:
+        store = _scene_store()
+        tools = _device_tools()
+        if store is None or tools is None:
+            return {"ok": False, "error": "the devices are unavailable"}
+        from hub.scenes import SceneRunner, match_scene
+
+        scene = match_scene(store, facts.home_id, action.scene)
+        if scene is None:
+            scene = next((item for item in store.scenes(facts.home_id)
+                          if str(getattr(item, 'name', '')).casefold()
+                          == str(action.scene).casefold()), None)
+        if scene is None:
+            return {"ok": False, "error": f"unknown scene {action.scene!r}"}
+        connection = _home_connection(facts.home_id)
+        runner = SceneRunner(store, set_device=tools.set,
+                             run_pc=(connection._run_client_action if connection else None),
+                             say=None)
+        report = await runner.run(scene, home_id=facts.home_id)
+        if report.get("failed"):
+            return {"ok": False, "error": f"{report['failed']} scene step(s) failed"}
+        return {"ok": True}
+    if action.kind is ActionKind.SKILL:
+        registry = _skills
+        if registry is None:
+            return {"ok": False, "error": "no skills are loaded"}
+        result = await registry.run(action.skill, dict(action.args or {}),
+                                    home_id=facts.home_id)
+        if bool(getattr(result, 'ok', False)):
+            return {"ok": True, "spoken": str(getattr(result, 'spoken', '') or '')}
+        return {"ok": False, "error": str(getattr(result, 'error', '') or 'the skill failed')}
+    return {"ok": False, "error": f"unknown action {action.kind}"}
+
+
+def _rule_engine() -> Any:
+    """ТЗ F-419: движок правил на настоящей таблице ``rules``, или ``None``."""
+    conn = _hub_conn
+    if conn is None:
+        return None
+    return automation_mod.RuleEngine(
+        automation_mod.RuleStore(conn), execute=_execute_rule_action,
+        audit=_audit_log())
+
+
+def _rule_store() -> Any:
+    """ТЗ F-419: таблица ``rules`` для панели, или ``None`` без базы."""
+    conn = _hub_conn
+    return automation_mod.RuleStore(conn) if conn is not None else None
+
+
+def _rule_time_task(cfg: Any = None, *, conn: Any = None, audit: Any = None) -> Any:
+    """ТЗ F-419: правила по времени как задача планировщика, или ``None``."""
+    cfg = cfg or get_config()
+    settings = getattr(cfg.server, "rules", None)
+    if settings is None or not bool(getattr(settings, "enabled", True)):
+        return None
+    try:
+        if conn is None:
+            _hub_gateway()
+            conn = _hub_conn
+        if conn is None:
+            raise RuntimeError("the hub database is unavailable")
+        engine = automation_mod.RuleEngine(
+            automation_mod.RuleStore(conn), execute=_execute_rule_action,
+            audit=audit if audit is not None else _audit_log())
+        return automation_mod.RuleTimeTask(
+            engine, facts_for=lambda home: _rule_facts(home),
+            homes=[str(home.home_id) for home in (getattr(cfg, "homes", []) or [])],
+            interval_s=float(getattr(settings, "check_interval_s", 60.0) or 60.0),
+        )
+    except Exception as exc:  # noqa: BLE001 - хаб живёт и без правил
+        log.info("The rule engine is unavailable (%s)", exc)
+        return None
+
+
+def _room_presence(home_id: str, connection: Any) -> tuple[str, ...]:
+    """ТЗ F-301: ``person_id`` тех, кого камера видит в этой комнате прямо сейчас.
+
+    Присутствие хаба — одно на процесс (``_presence_state``), и именно оно
+    решает, где человек слышит своё напоминание. Резервный путь — комната
+    самой сессии: если состояния присутствия нет вовсе (хаб без ``presence``),
+    человек, который только что говорил здесь, всё равно дома.
+    """
+    state = _presence_state()
+    if state is not None:
+        try:
+            return tuple(str(row.person_id) for row in state.occupants(home_id)
+                         if str(row.person_id or ""))
+        except Exception as exc:  # noqa: BLE001 - присутствие не роняет доставку
+            log.debug("Could not read presence for %s (%s)", home_id, exc)
+    if connection is not None and str(getattr(connection, 'home_id', '')) == str(home_id):
+        name = connection._known_speaker_name()
+        person_id = _person_id_of(name) if name else None
+        return (str(person_id),) if person_id else ()
+    return ()
+
+
+async def _speak_reminder_in_home(home_id: str, reminder: Any) -> bool:
+    """Озвучить напоминание в комнате ``home_id``; ``False`` — там нет клиента."""
+    connection = next((item for item in list(_connections)
+                       if str(getattr(item, 'home_id', '')) == str(home_id)
+                       and getattr(item, 'session', None) is not None), None)
+    if connection is None:
+        log.info("No live client in %s to speak reminder %s", home_id,
+                 getattr(reminder, 'reminder_id', ''))
+        return False
+    language = connection._greeting_language()
+    line = reminders_mod.delivery_line(getattr(reminder, 'text', ''), language)
+    return await connection._say_proactive(
+        line, name=_person_display_name(str(getattr(reminder, 'person_id', '') or '')))
+
+
+def _reminder_delivery_task(cfg: Any = None, *, conn: Any = None, audit: Any = None):
+    """ТЗ F-417: доставка напоминаний как задача планировщика, или ``None``."""
+    cfg = cfg or get_config()
+    settings = getattr(cfg.server, "reminders", None)
+    if settings is None or not bool(getattr(settings, "enabled", True)):
+        return None
+    try:
+        if conn is None:
+            _hub_gateway()  # готовит data/hub.db и оставляет соединение открытым
+            conn = _hub_conn
+        if conn is None:
+            raise RuntimeError("the hub database is unavailable")
+        return reminders_mod.ReminderDeliveryTask(
+            reminders_mod.ReminderStore(conn),
+            speak=_speak_reminder_in_home,
+            present=lambda home: _room_presence(home, None),
+            homes=[str(home.home_id) for home in (getattr(cfg, "homes", []) or [])],
+            audit=audit if audit is not None else _audit_log(),
+            notify=_notify_reminder_off_home,
+            batch=int(getattr(settings, "due_batch", 50) or 50),
+            interval_s=float(getattr(settings, "check_interval_s", 30.0) or 30.0),
+        )
+    except Exception as exc:  # noqa: BLE001 - хаб живёт и без доставки
+        log.info("Reminder delivery is unavailable (%s)", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# пуш на телефон, когда человек не дома (ТЗ F-712)
+# ---------------------------------------------------------------------------
+
+def push_service():
+    """ТЗ F-712: пуш-канал телефона (``PushService``), или ``None`` без базы."""
+    global _push
+    if _push is None:
+        try:
+            from hub.push import PushService, PushStore, build_transport
+
+            _hub_gateway()
+            if _hub_conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            settings = getattr(get_config().server, "push", None)
+            _push = PushService(
+                PushStore(_hub_conn), build_transport(settings),
+                title=str(getattr(settings, "title", "Rowan") or "Rowan"),
+                max_queue=int(getattr(settings, "max_queue", 200) or 200),
+            )
+        except Exception as exc:  # noqa: BLE001 - хаб живёт и без пушей
+            log.info("Push notifications are unavailable (%s)", exc)
+            _push = False
+    return _push or None
+
+
+async def _notify_off_home(person_id: str, text: str, *, kind: str,
+                           home_id: Any = "", title: str = "") -> Any:
+    """ТЗ F-712: отправить человеку пуш ИЛИ положить в очередь телефона.
+
+    Читает и пишет БД хаба на своем цикле (``DECISIONS`` P1-44). Без
+    транспорта возвращает ``PushResult(queued=True)`` — «отправлено» не
+    выдумывается, а сообщение ждёт подключения телефона.
+    """
+    person = str(person_id or "")
+    service = push_service()
+    if service is None or not person:
+        return None
+    try:
+        result = service.notify(person, text, kind=kind, title=title,
+                                home_id=str(home_id or ""))
+    except Exception as exc:  # noqa: BLE001 - недоставленное не должно ронять ход
+        log.warning("Could not notify %s by push (%s)", person, exc)
+        return None
+    audit = _audit_log()
+    if audit is not None:
+        try:
+            audit.record(action="push.delivered" if result.delivered else "push.queued",
+                         actor="rowan", target=person, home_id=str(home_id or "") or None,
+                         # ``AuditLog`` keeps only ok/denied/failed, so the honest
+                         # detail ("was it handed over or queued?") rides in detail.
+                         result="ok",
+                         detail={"kind": kind, "reason": result.reason,
+                                 "delivered": bool(result.delivered),
+                                 "queued": bool(result.queued),
+                                 "message_id": result.message_id})
+        except Exception:  # noqa: BLE001 - журнал не отменяет уведомление
+            log.debug("Could not audit the push to %s", person)
+    return result
+
+
+async def _notify_reminder_off_home(reminder: Any) -> Any:
+    """Напоминание человеку, которого нет ни в одной комнате (F-417 + F-712)."""
+    person = str(getattr(reminder, "person_id", "") or "")
+    if not person:
+        return None
+    language = _person_language(person, fallback="ru")
+    line = reminders_mod.delivery_line(str(getattr(reminder, "text", "") or ""), language)
+    return await _notify_off_home(person, line, kind="reminder",
+                                  home_id=getattr(reminder, "home_id", "") or "")
+
+
+async def _notify_intercom_off_home(message: Any) -> Any:
+    """Интерком адресату, которого нет в комнате: остаётся и в очереди дома."""
+    person = str(getattr(message, "to_person", "") or "")
+    if not person:
+        return None
+    language = _person_language(person, fallback="ru")
+    sender = _person_display_name(str(getattr(message, "from_person", "") or ""))
+    line = _intercom_spoken_line(language, sender or "Rowan",
+                                 str(getattr(message, "text", "") or ""))
+    return await _notify_off_home(person, line, kind="intercom",
+                                  home_id=getattr(message, "home_id", "") or "")
+
+
+# ---------------------------------------------------------------------------
+# утренний брифинг (ТЗ F-420, P3-28)
+# ---------------------------------------------------------------------------
+
+#: Разделы брифинга, которые умеют собирать другие модули. Погода (F-421),
+#: Canvas, календарь и состояние устройств (F-505) подключаются сюда, и этот
+#: модуль о них ничего не знает: он только спрашивает разделы по очереди.
+_briefing_sources: list[Any] = []
+_briefing_gate: Any = None
+
+
+def register_briefing_source(source: Any) -> None:
+    """ТЗ F-420: подключить ещё один источник раздела утреннего брифинга."""
+    _briefing_sources.append(source)
+
+
+def _briefing_once_a_day() -> Any:
+    """Одна отметка «сегодня уже было» на процесс (решение P3-28)."""
+    global _briefing_gate
+    if _briefing_gate is None:
+        _briefing_gate = briefing_mod.OnceADay()
+    return _briefing_gate
+
+
+def _home_timezone_of(home_id: str) -> str:
+    """``homes.tz`` чужой комнаты: часы дома, а не сервера (ТЗ F-302/F-420)."""
+    home = " ".join(str(home_id or "").split())
+    if not home or _hub_conn is None:
+        return ""
+    try:
+        row = _hub_conn.execute("SELECT tz FROM homes WHERE home_id=?", (home,)).fetchone()
+    except Exception as exc:  # noqa: BLE001 - чужой пояс не роняет брифинг
+        log.debug("Could not read the time zone of %s (%s)", home, exc)
+        return ""
+    return str(row[0] or "") if row else ""
+
+
+def _home_weather_location(home_id: str) -> str:
+    """Место комнаты для погоды: ``homes[].weather_location`` из конфига (F-421).
+
+    Место живёт в конфиге дома, а не в базе: это настройка владельца, её не
+    меняют из разговора, и без неё скилл честно спрашивает город.
+    """
+    home = " ".join(str(home_id or "").split())
+    for entry in (getattr(get_config(), "homes", []) or []):
+        if str(getattr(entry, "home_id", "")) == home:
+            return " ".join(str(getattr(entry, "weather_location", "") or "").split())[:120]
+    return ""
+
+
+def _canvas_secret(person_id: str) -> str:
+    """Токен Canvas ЭТОГО человека из окружения (ТЗ F-421, раздел 1: секреты).
+
+    В конфиге лежит только имя переменной: сам токен никогда не попадает ни в
+    git, ни в лог. У Canvas токен выдают на человека, поэтому сначала ищется
+    его личная переменная, и только потом общая.
+    """
+    settings = getattr(getattr(get_config().server, "skills", None), "canvas", None)
+    return _person_secret(settings, person_id, "token_env")
+
+
+def _canvas_skill_context(home_id: str, person_id: str, language: str) -> Any:
+    """Настройки Canvas для скилла: адрес, срок, язык и токен человека."""
+    settings = getattr(getattr(get_config().server, "skills", None), "canvas", None)
+    return SimpleNamespace(
+        language=language, base_url=str(getattr(settings, "base_url", "") or ""),
+        token=_canvas_secret(person_id), timeout_s=float(getattr(settings, "timeout_s", 8.0) or 8.0),
+        days=int(getattr(settings, "days", 7) or 7), timezone=_home_timezone_of(home_id),
+        home_id=home_id, person_id=person_id)
+
+
+def _skill_context(home_id: str, person_id: str, language: str) -> Any:
+    """Всё, что скиллы дома узнают о ходе: язык, место, пояс и настройки интеграций."""
+    ctx = _canvas_skill_context(home_id, person_id, language)
+    ctx.location = _home_weather_location(home_id)
+    settings = getattr(getattr(get_config().server, "skills", None), "calendar", None)
+    ctx.client_id = _secret_value(getattr(settings, "client_id_env", ""))
+    ctx.client_secret = _secret_value(getattr(settings, "client_secret_env", ""))
+    ctx.refresh_token = _person_secret(settings, person_id, "refresh_token_env")
+    ctx.calendar_id = str(getattr(settings, "calendar_id", "") or "primary")
+    return ctx
+
+
+def _secret_value(env_name: Any) -> str:
+    """Значение секрета из окружения по имени переменной (раздел 1 ТЗ)."""
+    name = str(env_name or "")
+    return (os.environ.get(name, "") or "").strip() if name else ""
+
+
+def _person_secret(settings: Any, person_id: str, field: str) -> str:
+    """Личный секрет человека, иначе общий: сначала ``person_tokens``, потом поле."""
+    if settings is None:
+        return ""
+    personal = (getattr(settings, "person_tokens", None) or {}).get(str(person_id or ""))
+    for name in (personal, getattr(settings, field, "")):
+        value = _secret_value(name)
+        if value:
+            return value
+    return ""
+
+
+def _skill_switch(name: str) -> bool:
+    """ТЗ F-421: интеграция за флагом дома/хаба — календарь по умолчанию выключен."""
+    if name != "calendar":
+        return True
+    settings = getattr(getattr(get_config().server, "skills", None), "calendar", None)
+    return bool(getattr(settings, "enabled", False))
+
+
+def _person_display_name(person_id: Any) -> str:
+    """``persons.display_name`` of an id, or an empty string (ТЗ F-204)."""
+    if not person_id or _hub_conn is None:
+        return ""
+    try:
+        row = _hub_conn.execute("SELECT display_name FROM persons WHERE person_id=?",
+                                (str(person_id),)).fetchone()
+    except Exception as exc:  # noqa: BLE001 - имя не стоит брифинга
+        log.debug("Could not read the name of %s (%s)", person_id, exc)
+        return ""
+    return str(row[0] or "") if row else ""
+
+
+def _briefing_language(person_id: Any = "") -> str:
+    """Язык брифинга: язык человека, иначе язык комнаты (ТЗ F-106, F-420)."""
+    name = _person_display_name(person_id)
+    stored = preferred_language_of(_voices, _hub_conn, name) if name else None
+    if stored:
+        return briefing_mod.language_of(stored)
+    settings = getattr(getattr(get_config().server, 'tts', None), 'language', '') or ''
+    return briefing_mod.language_of(settings, default='en')
+
+
+def _briefing_entries(home_id: str, moment: datetime) -> dict[str, float]:
+    """Кто сегодня уже входил в эту комнату: ``person_id`` → первый вход.
+
+    ТЗ F-420: повод «встал» — вход в комнату (событие F-301). День считается
+    по часам ДОМА, поэтому границы — не имя дня, а две отметки времени.
+    """
+    log_ = _presence_log()
+    if log_ is None:
+        return {}
+    zone = briefing_mod.timezone_of(_home_timezone_of(home_id))
+    start = moment.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return log_.entries(home_id, start=start.timestamp(),
+                            end=(start + timedelta(days=1)).timestamp())
+    except Exception as exc:  # noqa: BLE001 - журнал присутствия не обязателен
+        log.debug("Could not read the entries of %s (%s)", home_id, exc)
+        return {}
+
+
+def _weather_briefing_source() -> Any:
+    """ТЗ F-421: погода в брифинге — раздел, который собирает скилл дома."""
+    if _skills is None:
+        return None
+    if _skills.get('weather', home_id=None) is None:
+        return None
+    return briefing_mod.SkillSource(
+        _skills, skill='weather', kind=briefing_mod.SectionKind.WEATHER,
+        args_of=lambda home, person: {'when': 'today'},
+        context_of=lambda home, person, language: SimpleNamespace(
+            language=language, location=_home_weather_location(home),
+            timezone=_home_timezone_of(home), home_id=home, person_id=person))
+
+
+def _canvas_briefing_source() -> Any:
+    """ТЗ F-421/F-420: дедлайны Canvas — раздел утреннего брифинга."""
+    if _skills is None or _skills.get('canvas', home_id=None) is None:
+        return None
+    return briefing_mod.SkillSource(
+        _skills, skill='canvas', kind=briefing_mod.SectionKind.DEADLINES,
+        args_of=lambda home, person: {'what': 'week'},
+        context_of=_canvas_skill_context)
+
+
+def _calendar_briefing_source() -> Any:
+    """ТЗ F-421/F-420: первая встреча дня — раздел утреннего брифинга."""
+    if _skills is None or _skills.get('calendar', home_id=None) is None:
+        return None
+    if not _skill_switch('calendar'):
+        return None
+    return briefing_mod.SkillSource(
+        _skills, skill='calendar', kind=briefing_mod.SectionKind.FIRST_EVENT,
+        args_of=lambda home, person: {'what': 'next'}, context_of=_skill_context)
+
+
+async def _briefing_text(data: Any) -> tuple[str, str]:
+    """Текст брифинга и то, кто его сказал: модель или сами факты (F-420)."""
+    settings = getattr(get_config().server, 'briefing', None)
+    limit = int(getattr(settings, 'max_chars', 700) or 700)
+    if _llm is not None:
+        try:
+            return await briefing_mod.llm_briefing(_llm, data, max_chars=limit), 'llm'
+        except briefing_mod.BriefingUnavailable as exc:
+            log.info("The briefing model did not answer (%s); speaking the facts", exc)
+        except Exception:  # noqa: BLE001 - модель не должна отменять брифинг
+            log.warning("The briefing model failed", exc_info=True)
+    return briefing_mod.facts_text(data, max_chars=limit), 'facts'
+
+
+async def _speak_briefing_in_home(home_id: str, data: Any) -> bool:
+    """Сказать брифинг в комнате ``home_id``; ``False`` — там нет клиента."""
+    connection = next((item for item in list(_connections)
+                       if str(getattr(item, 'home_id', '')) == str(home_id)
+                       and getattr(item, 'session', None) is not None), None)
+    if connection is None:
+        log.info("No live client in %s for the morning briefing of %s", home_id, data.person_id)
+        return False
+    text, source = await _briefing_text(data)
+    if not text:
+        log.info("The morning briefing for %s in %s was empty; nothing was said",
+                 data.person_id, home_id)
+        return False
+    log.info("Morning briefing for %s in %s (%s): %s", data.person_id, home_id, source, text)
+    return await connection._say_proactive(text, name=_person_display_name(data.person_id))
+
+
+def _morning_briefing_task(cfg: Any = None, *, conn: Any = None, audit: Any = None):
+    """ТЗ F-420: утренний брифинг как задача планировщика, или ``None``."""
+    cfg = cfg or get_config()
+    settings = getattr(cfg.server, "briefing", None)
+    if settings is None or not bool(getattr(settings, "enabled", False)):
+        return None
+    try:
+        parsed = briefing_mod.BriefingSettings.from_config(settings)
+        if conn is None:
+            _hub_gateway()  # готовит data/hub.db и оставляет соединение открытым
+            conn = _hub_conn
+        if conn is None:
+            raise RuntimeError("the hub database is unavailable")
+        sources = [briefing_mod.ReminderSource(reminders_mod.ReminderStore(conn),
+                                               tz_of=_home_timezone_of)]
+        weather = _weather_briefing_source()
+        if weather is not None:
+            sources.append(weather)
+        canvas = _canvas_briefing_source()
+        if canvas is not None:
+            sources.append(canvas)
+        calendar = _calendar_briefing_source()
+        if calendar is not None:
+            sources.append(calendar)
+        sources.extend(_briefing_sources)
+
+        async def sections(home_id: str, person_id: str, moment: datetime) -> list[Any]:
+            return await briefing_mod.collect_sections(
+                sources, person_id=person_id, home_id=home_id, moment=moment,
+                language=_briefing_language(person_id))
+
+        return briefing_mod.MorningBriefingTask(
+            parsed,
+            homes=[str(home.home_id) for home in (getattr(cfg, "homes", []) or [])],
+            occupants=lambda home: _room_presence(home, None),
+            entries=_briefing_entries,
+            sections_for=sections,
+            speak=_speak_briefing_in_home,
+            gate=_briefing_once_a_day(),
+            audit=audit if audit is not None else _audit_log(),
+            tz_of=_home_timezone_of,
+            name_of=_person_display_name,
+            language=_briefing_language,
+            interval_s=parsed.check_interval_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - хаб живёт и без брифинга
+        log.info("The morning briefing is unavailable (%s)", exc)
+        return None
+
+
+async def _speak_intercom_in_home(home_id: str, message: Any,
+                                  *, fallback: str = "ru") -> bool:
+    """Озвучить сообщение интеркома в комнате получателя (ТЗ F-601).
+
+    Одна точка речи и для живого хода (P4-09), и для отложенной доставки
+    (P4-10): язык — язык ПОЛУЧАТЕЛЯ, автор назван, слова не переписаны.
+    ``False`` значит «сказать не удалось» — сообщение остаётся в очереди.
+    """
+    connection = _home_connection(home_id)
+    if connection is None:
+        log.info("No live client in %s to speak intercom %s", home_id,
+                 getattr(message, "message_id", ""))
+        return False
+    recipient = str(getattr(message, "to_person", "") or "")
+    sender = _person_display_name(str(getattr(message, "from_person", "") or ""))
+    language = _person_language(recipient, fallback=fallback)
+    line = _intercom_spoken_line(language, sender or "Rowan",
+                                 str(getattr(message, "text", "") or ""))
+    try:
+        spoken = bool(await connection._say_proactive(
+            line, name=_person_display_name(recipient)))
+    except Exception as exc:  # noqa: BLE001 - неслышное сообщение ждёт следующего раза
+        log.warning("Could not speak the intercom message %s in %s (%s)",
+                    getattr(message, "message_id", "?"), home_id, exc)
+        return False
+    if spoken:
+        # ТЗ F-709: то, что прозвучало, комната видит карточкой на HUD.
+        await _push_card_in_home(home_id, _intercom_card_frame(message, sender))
+    return spoken
+
+
+def _intercom_card_frame(message: Any, sender: str) -> dict[str, Any]:
+    """ТЗ F-709: карточка интеркома для HUD получателя."""
+    return {"type": proto.MSG_CARD, "kind": "intercom",
+            "id": str(getattr(message, "message_id", "") or ""),
+            "title": str(sender or "Rowan"),
+            "text": str(getattr(message, "text", "") or ""),
+            "ttl_s": float(proto.DEFAULT_CARD_TTL_S)}
+
+
+async def _push_card_in_home(home_id: str, frame: dict[str, Any]) -> bool:
+    """Показать карточку в комнате; ``False`` — там сейчас нет клиента.
+
+    Карточки — фон (ТЗ 13): под нагрузкой её могут отбросить. Слова, которые
+    важны, всё равно произносятся, поэтому потеря карточки ничего не отменяет.
+    """
+    connection = _home_connection(home_id)
+    if connection is None:
+        log.info("No live client in %s to show the card", home_id)
+        return False
+    try:
+        return bool(await connection.send_json(dict(frame)))
+    except Exception as exc:  # noqa: BLE001 - карточка не отменяет разговора
+        log.warning("Could not show a card in %s (%s)", home_id, exc)
+        return False
+
+
+def _record_intercom_event(action: str, actor: str, target: str, home_id: Any, *,
+                           result: str, detail: dict[str, Any] | None = None) -> None:
+    """ТЗ F-706: интерком — привилегированное действие, у него свой журнал."""
+    audit = _audit_log()
+    if audit is None:
+        return
+    audit.record(action=action, actor=actor, target=target, home_id=home_id,
+                 result=result, detail=dict(detail or {}))
+
+
+def _intercom_delivery_task(cfg: Any = None, *, conn: Any = None, audit: Any = None):
+    """ТЗ F-601: доставка отложенных сообщений как задача планировщика."""
+    cfg = cfg or get_config()
+    settings = getattr(cfg.server, "intercom", None)
+    if settings is None or not bool(getattr(settings, "enabled", True)):
+        return None
+    try:
+        if conn is None:
+            _hub_gateway()  # готовит data/hub.db и оставляет соединение открытым
+            conn = _hub_conn
+        if conn is None:
+            raise RuntimeError("the hub database is unavailable")
+        limit = int(getattr(settings, "queue_limit", 50) or 50)
+        return intercom_mod.IntercomDeliveryTask(
+            intercom_mod.IntercomStore(conn, queue_limit=limit),
+            speak=_speak_intercom_in_home,
+            present=lambda home: _room_presence(home, None),
+            homes=[str(home.home_id) for home in (getattr(cfg, "homes", []) or [])],
+            audit=audit if audit is not None else _audit_log(),
+            batch=limit,
+            quiet=_home_intercom_quiet,
+            notify=_notify_intercom_off_home,
+            interval_s=float(getattr(settings, "check_interval_s", 30.0) or 30.0))
+    except Exception as exc:  # noqa: BLE001 - задача не стоит запуска хаба
+        log.info("The intercom delivery task is unavailable (%s)", exc)
+        return None
+
+
 def _hub_scheduler(cfg: Any = None, *, store: Any = None, audit: Any = None):
     """ТЗ F-304/F-416: все периодические задачи хаба в одном планировщике."""
     cfg = cfg or get_config()
@@ -2102,7 +3679,40 @@ def _hub_scheduler(cfg: Any = None, *, store: Any = None, audit: Any = None):
     nightly = _memory_consolidation_task(cfg, audit=audit)
     if nightly is not None:
         scheduler.add(Job(name=nightly.name, interval_s=nightly.interval_s, run=nightly.run))
-    if media is None and nightly is None:
+    delivery = _reminder_delivery_task(cfg, audit=audit)
+    if delivery is not None:
+        scheduler.add(Job(name=delivery.name, interval_s=delivery.interval_s, run=delivery.run))
+    rules = _rule_time_task(cfg, audit=audit)
+    if rules is not None:
+        scheduler.add(Job(name=rules.name, interval_s=rules.interval_s, run=rules.run))
+    briefing = _morning_briefing_task(cfg, audit=audit)
+    if briefing is not None:
+        scheduler.add(Job(name=briefing.name, interval_s=briefing.interval_s, run=briefing.run))
+    device_state = _device_state_task(cfg, audit=audit)
+    if device_state is not None:
+        scheduler.add(Job(name=device_state.name, interval_s=device_state.interval_s,
+                          run=device_state.run))
+    presence = _presence_automation_task(cfg, audit=audit)
+    if presence is not None:
+        scheduler.add(Job(name=presence.name, interval_s=presence.interval_s,
+                          run=presence.run))
+    # ТЗ F-601: сообщения интеркома, которые ждали прихода человека.
+    intercom = _intercom_delivery_task(cfg, audit=audit)
+    if intercom is not None:
+        scheduler.add(Job(name=intercom.name, interval_s=intercom.interval_s,
+                          run=intercom.run))
+    # ТЗ F-604: вопросы опросов при следующем присутствии человека.
+    polls = _poll_ask_task(cfg)
+    if polls is not None:
+        scheduler.add(Job(name=polls.name, interval_s=polls.interval_s, run=polls.run))
+    # ТЗ F-604: итоги закрытых опросов их авторам.
+    summaries = _poll_summary_task(cfg)
+    if summaries is not None:
+        scheduler.add(Job(name=summaries.name, interval_s=summaries.interval_s,
+                          run=summaries.run))
+    if (media is None and nightly is None and delivery is None and rules is None
+            and briefing is None and device_state is None and presence is None
+            and intercom is None and polls is None and summaries is None):
         return None
     return scheduler
 
@@ -2116,6 +3726,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _training_archive, _telegram_access, _telegram_admin, _presence_alerts, _guest_confirmations
     global _home_owners
     global _scheduler
+    global _skills, _skill_watcher
     cfg = get_config()
     if cfg.server.telegram.control_user_id:
         _telegram_access = await asyncio.to_thread(TelegramAdminState,
@@ -2215,7 +3826,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             get_decisions=_decision_recorder, get_switches=_device_switch_setup,
             get_wizard=_device_wizard, get_scenes=_scene_store, get_tools=_device_tools,
             get_audit=_audit_log, get_scope=_home_owners.scope,
-            get_workplace_home=_workplace_home, get_home_owners=lambda: _home_owners)
+            get_workplace_home=_workplace_home, get_home_owners=lambda: _home_owners,
+            get_rules=_rule_store)
         _telegram_admin = TelegramAdmin(_telegram, cfg, _telegram_access, backend, homes=_home_owners)
         # ТЗ F-210: the owner's "was that really Max?" question rides its own
         # single-use tokens, so it needs no panel and no LLM to be answered.
@@ -2403,6 +4015,8 @@ async def health() -> dict[str, Any]:
         "models": _models_snapshot(),
         # ТЗ F-304: периодические задачи хаба и отчёт последнего прохода.
         "scheduler": _scheduler_snapshot(),
+        # ТЗ F-507: дома, которые сейчас «ушли» (пустая комната + охрана).
+        "away_homes": _away_homes(),
     }
 
 
@@ -2661,6 +4275,7 @@ class Connection(CameraClipReceiver):
         #: ТЗ F-302: прощания, ещё не произнесённые, и время последнего
         #: прощания с каждым человеком (не чаще раза в 20 минут на человека).
         self._farewell_tasks: set[asyncio.Task] = set()
+        self._rule_tasks: set[asyncio.Task] = set()
         self._farewell_at: dict[str, float] = {}
         self._greet_block_logged_at = 0.0
         #: v1.6: monotonic clock of the last utterance a KNOWN voice spoke on
@@ -2771,6 +4386,14 @@ class Connection(CameraClipReceiver):
             return
 
         msg_type = payload.get("type")
+        # ТЗ F-711: a phone has no camera and no PC screen. Frames that only a
+        # room PC can produce are refused here, so the rest of the hub never
+        # has to guess whether a "camera frame" came from a real camera.
+        if (self._is_phone() and isinstance(msg_type, str)
+                and msg_type in proto.PHONE_FORBIDDEN_INPUTS):
+            log.warning("Phone client %s sent a %s frame — refused", self.peer, msg_type)
+            await self.send_error(f"a phone client cannot send {msg_type}")
+            return
         if msg_type == proto.MSG_HELLO:
             await self._on_hello(payload)
         elif msg_type == proto.MSG_ROOM_SPEECH:
@@ -2787,6 +4410,8 @@ class Connection(CameraClipReceiver):
             self._on_utterance_start(payload)
         elif msg_type == proto.MSG_UTTERANCE_END:
             await self._on_utterance_end()
+        elif msg_type == proto.MSG_UTTERANCE_TEXT:
+            await self._on_utterance_text(payload)
         elif msg_type == proto.MSG_ACTION_RESULT:
             self._on_action_result(payload)
         elif msg_type == proto.MSG_TRACKS:
@@ -2942,13 +4567,23 @@ class Connection(CameraClipReceiver):
             await self.ws.close(code=4401)
             return False
         self.home_id = session.home_id
+        # ТЗ F-712: the token may be bound to a person (a phone); the hub hands
+        # that person's queued pushes over on hello, never a self-declared name.
+        self._client_person = str(getattr(session, "person_id", "") or "")
         log.info("Client %s authenticated for home %s", session.identity.client_id, session.home_id)
         return True
 
     async def _on_hello(self, payload: dict[str, Any]) -> None:
         if not await self._authorize(payload):
             return
-        self._can_camera_clip = 'camera_clip' in (payload.get('capabilities') or [])
+        # ТЗ F-711: ``client.kind`` says whether this is a room PC, a phone or a
+        # sensor node. A phone has no camera; even if it advertised the
+        # capability, the hub does not ask it for frames.
+        kind = str(payload.get('kind') or proto.ClientKind.ROOM_PC.value)
+        if kind not in {member.value for member in proto.ClientKind}:
+            kind = proto.ClientKind.ROOM_PC.value
+        self._can_camera_clip = ('camera_clip' in (payload.get('capabilities') or [])
+                                 and kind != proto.ClientKind.PHONE.value)
         self.workplace_name = ' '.join(str(payload.get('workplace_name') or payload.get('client_id') or 'Room').split())[:80]
         self.camera_name = ' '.join(str(payload.get('camera_name') or 'Camera').split())[:80]
         if _telegram_access is not None and isinstance(payload.get('client_id'), str):
@@ -2974,6 +4609,7 @@ class Connection(CameraClipReceiver):
             history_turns=self.cfg.server.llm.history_turns,
             memory_facts=facts,
             permissions_enabled=self._permissions_enabled,
+            kind=kind,
             # Resolved per completion: the camera view changes between turns.
             presence=self.presence_text,
             prompt_path=(REPO_ROOT / self.cfg.server.llm.prompt_file
@@ -2996,6 +4632,15 @@ class Connection(CameraClipReceiver):
             await self.publish_hub_status()
         except Exception as exc:  # noqa: BLE001 - the HUD is never worth the room
             log.debug("Could not announce the hub status to %s (%s)", self.peer, exc)
+        # ТЗ F-712: a phone that belongs to a person gets the messages that were
+        # waiting for a phone. A room PC never has a bound person, so it does not.
+        if (kind == proto.ClientKind.PHONE.value
+                and str(getattr(self, "_client_person", "") or "")):
+            try:
+                await self._flush_push_outbox(self._client_person)
+            except Exception as exc:  # noqa: BLE001 - the phone still hears the rest
+                log.warning("Could not flush the push queue of %s (%s)",
+                            self._client_person, exc)
 
     async def _send_release(self) -> None:
         """Tell the room which release the hub wants it to run (ТЗ 4.9 OTA)."""
@@ -3043,9 +4688,94 @@ class Connection(CameraClipReceiver):
                                     degraded=list(getattr(self, '_degradations', ())))
 
     def _wake_words(self) -> list[str]:
-        """The wake spellings this room listens for."""
+        """The wake spellings this room listens for (ТЗ F-302, F-607).
+
+        The room's own spellings always count. The phrase the PERSON chose
+        rides with them (F-607), so somebody used to «Rowan, привет» is heard
+        in every room of the hub - the room's client listens for its own
+        spelling, and the hub accepts the personal one on any utterance it
+        does receive.
+        """
         wake = self.cfg.client.wakeword
-        return [wake.word, *wake.phrases]
+        words = [wake.word, *wake.phrases]
+        own = self._person_wake_word()
+        if own and own not in {str(word).casefold() for word in words}:
+            words.append(own)
+        return words
+
+    def _profile_here(self, person_id: str) -> bool:
+        """ТЗ F-212/F-607: may this person's profile be used in THIS room?
+
+        The personalization of F-607 rides on the shared profile of F-212: a
+        room reads it where the person is visible — their own (first) home, or
+        a home whose membership carries ``share_identity``. A foreign room
+        without that consent must not read the profile. A missing hub
+        database, an unbound room or an unknown person keeps the pre-F-212
+        behaviour (the hub's own recognition already applied the rule).
+        """
+        if not person_id or _hub_conn is None or not getattr(self, "home_id", ""):
+            return True
+        try:
+            from hub.shared_identity import visible_in
+
+            return visible_in(_hub_conn, str(person_id), str(self.home_id))
+        except Exception as exc:  # noqa: BLE001 - a broken check must not silence a room
+            log.debug("Could not check the profile sharing of %s (%s)", person_id, exc)
+            return True
+
+    def _person_wake_word(self) -> str:
+        """The wake phrase the person speaking chose, or ``""`` (ТЗ F-607)."""
+        try:
+            who = self._known_speaker_name()
+        except Exception:  # noqa: BLE001 - a harness without a speaker is fine
+            return ""
+        person_id = _person_id_of(who) if who else None
+        if not person_id:
+            return ""
+        # ТЗ F-212/F-607: the profile rides only where the person is visible.
+        if not self._profile_here(person_id):
+            return ""
+        store = _person_preferences_store()
+        if store is None:
+            return ""
+        try:
+            return store.get(person_id).wake_word
+        except Exception as exc:  # noqa: BLE001 - the room's words still work
+            log.debug("Could not read the wake phrase of %s (%s)", person_id, exc)
+            return ""
+
+    def _style_instruction(self) -> str:
+        """The reply style of the person speaking, as one prompt line (F-607).
+
+        A style the hub cannot deliver is a CONFIG ERROR and is reported as
+        one (ТЗ F-607) - the room still gets its answer, but the log says the
+        stored value is wrong instead of pretending it was the default.
+        """
+        try:
+            who = self._known_speaker_name()
+        except Exception:  # noqa: BLE001 - an unknown speaker has no style
+            return ""
+        person_id = _person_id_of(who) if who else None
+        if not person_id:
+            return ""
+        # ТЗ F-212/F-607: a foreign room without consent does not read the profile.
+        if not self._profile_here(person_id):
+            return ""
+        store = _person_preferences_store()
+        if store is None:
+            return ""
+        try:
+            stored = store.get(person_id).style
+        except Exception as exc:  # noqa: BLE001 - the answer still goes out
+            log.debug("Could not read the style of %s (%s)", person_id, exc)
+            return ""
+        from hub import person_preferences as person_preferences_mod
+
+        try:
+            return person_preferences_mod.style_instruction(stored)
+        except Exception as exc:  # noqa: BLE001 - a wrong stored style is reported below
+            log.error("The stored reply style of %s is wrong: %s", person_id, exc)
+            return ""
 
     def _whisper_language(self) -> str | None:
         """The language hint whisper gets for this utterance (ТЗ F-106).
@@ -3215,6 +4945,35 @@ class Connection(CameraClipReceiver):
         default configuration cannot behave differently; a configured model can
         only make the judgement stricter here.
         """
+        # ТЗ F-606: before the role matrix even runs, the GUEST matrix answers
+        # for the people this room does not own - a registered guest (F-210) in
+        # full, an unrecognised voice by adding its own refusals only. One
+        # point for the whole guest policy, so a tool cannot slip past it.
+        from hub import guest_access
+
+        is_guest = getattr(self, '_speaker_role', speaker_mod.ROLE_UNKNOWN) == speaker_mod.ROLE_GUEST
+        # ``server.permissions_enabled: false`` is the owner's own "no role
+        # checks here" switch: the guest matrix lives inside that same switch,
+        # like every other row of the permission table.
+        if self._permissions_enabled and (is_guest or self._home_guest()):
+            refusal = guest_access.tool_denial(
+                tool, args,
+                role=guest_access.ROLE_GUEST if is_guest else guest_access.ROLE_UNKNOWN,
+                restricted=self._device_restricted(tool, args),
+                language=self._reply_language or "ru",
+            )
+            if refusal:
+                # ТЗ F-606: the owner's spoken "allow him music" opens exactly
+                # one capability, and only until its window ends. The grant is
+                # tied to a person, so an unrecognised voice can never use one.
+                granted = guest_access.grant_for_tool(tool, args)
+                if granted and self._guest_grant_allows(granted):
+                    log.info("Guest access to %s is open until the owner's window ends",
+                             granted, extra={'utterance_id': self.utterance_id})
+                    return None
+                log.info("Guest access refused %s for %s", tool,
+                         self._speaker_name or speaker_mod.ROLE_UNKNOWN)
+                return refusal
         allowed, denial = admin_rights_heuristic(
             self._speaker_role, tool, args, self._speaker_name,
             speaker_score=self._speaker_score,
@@ -3239,6 +4998,37 @@ class Connection(CameraClipReceiver):
         """``"phone"`` or ``"room"`` - which client is asking (ТЗ F-208)."""
         kind = getattr(getattr(getattr(self, 'session', None), 'identity', None), 'kind', '')
         return 'phone' if str(kind) == 'phone' else 'room'
+
+    def _device_restricted(self, tool: str, args: dict[str, Any] | None) -> bool:
+        """ТЗ F-606/F-501: is the device this call names marked ``restricted``?
+
+        Two places know it and both are asked: the room's own ``hello`` device
+        list (``client.devices[].restricted``) and the hub's ``devices`` row of
+        this home. A name nobody knows is NOT restricted — the room answers its
+        usual "I don't know that device", and the guest matrix stays out of it.
+        """
+        from hub import guest_access
+
+        if str(tool or "") not in guest_access.DEVICE_TOOLS:
+            return False
+        name = str((args or {}).get("device") or "").strip()
+        if not name:
+            return False
+        wanted = name.casefold()
+        for device in getattr(self.session, "devices", None) or ():
+            if not isinstance(device, dict):
+                continue
+            if str(device.get("name") or "").strip().casefold() == wanted:
+                return bool(device.get("restricted"))
+        store = _device_store()
+        if store is None or not self.home_id:
+            return False
+        try:
+            found = store.resolve(str(self.home_id), name)
+        except Exception as exc:  # noqa: BLE001 - the guest matrix must never break a turn
+            log.debug("Could not resolve the device %r of %s (%s)", name, self.home_id, exc)
+            return False
+        return bool(found.restricted) if found is not None else False
 
     def _track_of_person(self, person_id: str) -> str | None:
         """The live track whose identity is this person, if the room has one."""
@@ -3297,8 +5087,7 @@ class Connection(CameraClipReceiver):
         identity_cfg = getattr(getattr(self.cfg.server, 'identity', None), 'enabled', False)
         if not identity_cfg or self._speaker_role != speaker_mod.ROLE_ADMIN:
             return None
-        if not (tool in speaker_mod.HIGH_CONFIDENCE_TOOLS
-                or (tool == 'remember' and str((args or {}).get('scope') or '') == 'global')):
+        if not _needs_admin_identity(tool, args):
             return None
         from hub.identity_fusion import admin_gate
 
@@ -3572,6 +5361,9 @@ class Connection(CameraClipReceiver):
         """
         payload = dict(context)
         payload['heuristic'] = heuristic
+        # ТЗ 5.5: провайдеры, уходящие наружу (Jev), смотрят на флаг дома —
+        # без комнаты в контексте облако не зовётся вовсе.
+        payload.setdefault('home_id', str(getattr(self, 'home_id', '') or ''))
         chain = _decision_chain(self._wake_words())
         if chain is None:
             return heuristic
@@ -4174,11 +5966,14 @@ class Connection(CameraClipReceiver):
         """True when the speaker is only visiting THIS home (ТЗ F-415).
 
         «Гость не получает память дома», and a guest is exactly the person
-        F-212 does not recognize here: an unknown voice, or somebody whose
-        profile this home was never shared with. A named profile that has no
-        ``persons`` row at all - data from before the identity database - keeps
-        the behaviour of the phases before it and counts as known, exactly as
-        ``_person_visible_here`` does.
+        F-212 does not recognize here: an unknown voice, somebody whose profile
+        this home was never shared with, or a person this room registered as a
+        GUEST (ТЗ F-210: ``guest`` membership). The guest's own room membership
+        makes ``_person_visible_here`` say yes, so the role has to be read as
+        well - otherwise the very guest F-606 is about would be handed the
+        home's memory. A named profile that has no ``persons`` row at all - data
+        from before the identity database - keeps the behaviour of the phases
+        before it and counts as known, exactly as ``_person_visible_here`` does.
         """
         name = self._known_speaker_name()
         if not name or speaker_mod.is_placeholder_name(name):
@@ -4186,6 +5981,8 @@ class Connection(CameraClipReceiver):
         person_id = _person_id_of(name)
         if person_id is None:
             return False
+        if _role_for_person(person_id) == speaker_mod.ROLE_GUEST:
+            return True
         return not self._person_visible_here(person_id)
 
     def _prompt_memory(self) -> list[str]:
@@ -4825,6 +6622,10 @@ class Connection(CameraClipReceiver):
         if name == 'forget_fact' and bool(getattr(memory, 'confirm_forget', True)):
             detail = " ".join(str(args.get('text') or args.get('query') or '').split())[:200]
             return f"forget «{detail}» and it cannot be restored"
+        # ТЗ F-419/F-113: правило меняет поведение дома, поэтому спрашивает
+        # всегда — и когда человек попросил его сам, и когда модель решила.
+        if name == 'create_rule':
+            return str(args.get('spoken') or 'turn this rule on')
         return dangerous_call(name, args, tools=settings.tools,
                               pc_commands=settings.pc_commands)
 
@@ -5130,6 +6931,16 @@ class Connection(CameraClipReceiver):
     def _permissions_enabled(self) -> bool:
         return self.cfg.server.permissions_enabled
 
+    @property
+    def _client_kind(self) -> str:
+        """ТЗ F-711: ``room_pc`` / ``phone`` / ``sensor_node`` of this connection."""
+        return str(getattr(getattr(self, "session", None), "kind", "room_pc")
+                   or "room_pc")
+
+    def _is_phone(self) -> bool:
+        """ТЗ F-711: a phone has no camera and no PC actions."""
+        return self._client_kind == "phone"
+
     def _memory_profile(self, requested: str = '') -> str:
         """Select a named profile without pretending its requester was recognized."""
         requested = ' '.join(str(requested or '').split())
@@ -5293,6 +7104,13 @@ class Connection(CameraClipReceiver):
         asked = self._confirmation_needed(name, args)
         if asked:
             return await self._request_confirmation(name, args, asked)
+        # ТЗ F-507: разблокировка ПК — только при явном разрешении дома.
+        # Проверка стоит ПОСЛЕ прав и подтверждения: человеку, которому нельзя
+        # даже просить, не говорят «подтвердите», а объясняют запрет дома.
+        if name == 'pc_control' and str(args.get('command') or '').strip().casefold() == 'unlock':
+            refusal = self._pc_unlock_refusal()
+            if refusal:
+                return {"ok": False, "error": refusal, "reply": refusal}
         descriptions = {
             'browser_control': 'Reading and controlling the browser',
             "look_at_screen": "Reading the screen", "click_screen": "Finding and clicking the requested control",
@@ -5337,6 +7155,8 @@ class Connection(CameraClipReceiver):
             return await self._run_forget_fact(args)
         if name == "list_memory":
             return await self._run_list_memory(args)
+        if name == "create_rule":
+            return await self._run_create_rule(args)
         if name == "show_photo":
             return await self._run_show_photo(args)
         if name == "enroll_voice":
@@ -5353,8 +7173,71 @@ class Connection(CameraClipReceiver):
             return await self._run_enroll_face(args)
         if name == "find_object":
             return await self._run_find_object(args)
+        if name == "run_skill":
+            return await self._run_skill(args)
         log.warning("Tool %r has no server-side handler", name)
         return {"ok": False, "error": f"unknown tool: {name}"}
+
+    async def _run_skill(self, args: dict[str, Any]) -> dict[str, Any]:
+        """ТЗ F-405/F-421: позвать скилл дома и вернуть модели его данные.
+
+        Скилл сам объявляет себя манифестом: имя, дом, нужную роль и то,
+        читает ли он что-то снаружи. Хаб проверяет, что ЭТОТ человек в ЭТОЙ
+        комнате вправе его звать (роль и область видимости манифеста), отдаёт
+        аргументы строгой модели скилла и помечает ответ как недоверенный
+        текст, только если скилл объявил ``reads_internet`` (F-411): ответ
+        погоды — это данные, а не указания.
+        """
+        if _skills is None:
+            return {"ok": False, "error": "no skills are loaded on this hub"}
+        home = str(getattr(self, "home_id", "") or "")
+        name = " ".join(str(args.get("skill") or "").split())[:41]
+        if not name:
+            return {"ok": False, "error": "name the skill to run"}
+        try:
+            allowed = sorted(manifest.name for manifest in
+                             _skills.available(home_id=home, role=self._speaker_role))
+        except Exception:  # noqa: BLE001 - реестр не роняет ход
+            log.warning("Could not read the skill registry", exc_info=True)
+            return {"ok": False, "error": "the skills are unavailable right now"}
+        if name not in allowed:
+            known = ", ".join(allowed) or "none"
+            return {"ok": False,
+                    "error": f"this room has no skill {name!r}; available skills: {known}"}
+        if not _skill_switch(name):
+            return {"ok": False,
+                    "error": f"the {name} skill is switched off on this hub"}
+        raw = args.get("args")
+        payload: Any = {}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                return {"ok": False, "error": "args must be a JSON object string"}
+        elif isinstance(raw, dict):
+            payload = raw
+        elif raw not in (None, ""):
+            return {"ok": False, "error": "args must be a JSON object string"}
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "args must be a JSON object string"}
+        ctx = _skill_context(home, _person_id_of(self._known_speaker_name()) or "",
+                             self._reply_language or self._greeting_language())
+        result = await _skills.run(name, payload, home_id=home, ctx=ctx)
+        answer: dict[str, Any] = {"ok": bool(result.ok), "skill": name,
+                                  "spoken": str(result.spoken or ""),
+                                  "data": dict(result.data or {})}
+        if result.error:
+            answer["error"] = str(result.error)
+        skill = _skills.get(name, home_id=home)
+        manifest = getattr(skill, "manifest", None)
+        source = untrusted_mod.skill_source(bool(getattr(manifest, "reads_internet", False)))
+        if bool(result.ok) and source is not None:
+            # ТЗ F-411: ответ скилла, читающего наружу, остаётся данными.
+            self._note_untrusted(untrusted_mod.SKILL_RESULT, answer)
+            untrusted_mod.mark_result(answer, source)
+        log.info("Skill %s answered ok=%s for %s", name, answer["ok"],
+                 self._known_speaker_name())
+        return answer
 
     async def _run_enroll_voice(self, args: dict[str, Any]) -> dict[str, Any]:
         """Start guided registration without saving the command as a sample.
@@ -5433,10 +7316,52 @@ class Connection(CameraClipReceiver):
         remembered = await self._remember_scene_turn(store, home_id, text)
         if remembered is not None:
             return remembered
+        # ТЗ F-607: «как обычно» — это любимая сцена ЧЕЛОВЕКА, а не комнаты.
+        from hub.scenes import usual_scene_request
+
+        if usual_scene_request(text):
+            favourite = await self._favourite_scene_turn(store, home_id)
+            if favourite is not None:
+                return favourite
         scene = _match_scene(store, home_id, text)
         if scene is None:
             return None
         return await self._run_scene_turn(store, scene, home_id)
+
+    async def _favourite_scene_turn(self, store: Any, home_id: str) -> str | None:
+        """Run the person's own scene in THIS room, if this room allows it (F-607).
+
+        The name is the person's, the scene is the room's: the hub looks the
+        favourite up among this home's scenes, and everything the home decides
+        about running it (``restricted`` devices, a guest's rights) is applied
+        by :meth:`_run_scene_turn` exactly as for any other scene. ``None``
+        means "nobody asked for a favourite" - the turn goes on as usual.
+        """
+        person_id = _person_id_of(self._known_speaker_name())
+        language = self._reply_language or "ru"
+        from hub.scenes import favourite_line
+
+        if not person_id:
+            return favourite_line("unknown", language)
+        # ТЗ F-212/F-607: a favourite scene is part of the shared profile, so it
+        # travels only where the person is visible (own home, or shared).
+        if not self._profile_here(person_id):
+            return favourite_line("foreign", language)
+        prefs = _person_preferences_store()
+        if prefs is None:
+            return None
+        try:
+            names = prefs.favourite_scenes(person_id)
+        except Exception as exc:  # noqa: BLE001 - the turn must still be answered
+            log.debug("Could not read the favourite scenes of %s (%s)", person_id, exc)
+            return None
+        if not names:
+            return favourite_line("none", language)
+        for name in names:
+            scene = _match_scene(store, home_id, name)
+            if scene is not None:
+                return await self._run_scene_turn(store, scene, home_id)
+        return favourite_line("absent", language, name=names[0])
 
     async def _remember_scene_turn(self, store, home_id, text):
         """Save the previous turn's actions as a scene when asked in words."""
@@ -5467,6 +7392,16 @@ class Connection(CameraClipReceiver):
         """Carry out a scene in this room and say what happened."""
         from hub.scenes import SceneRunner
 
+        # ТЗ F-606: a scene whose steps touch a device the owner kept for
+        # themselves is a restricted scene for a guest — refused in words about
+        # the owner, not by a device that mysteriously "is not found".
+        if (self._permissions_enabled
+                and (getattr(self, '_speaker_role', speaker_mod.ROLE_UNKNOWN)
+                     == speaker_mod.ROLE_GUEST or self._home_guest())
+                and self._scene_restricted(scene)):
+            from hub import guest_access
+
+            return guest_access.denial(guest_access.RESTRICTED, self._reply_language or "ru")
         tools = _device_tools()
         if tools is None:
             return "The devices are unavailable right now, so I cannot run that scene."
@@ -5486,6 +7421,15 @@ class Connection(CameraClipReceiver):
             failures = " ".join(str(row["detail"]) for row in report["steps"] if not row["ok"])
             answer = (answer + " " + failures).strip()
         return answer or report["message"]
+
+    def _scene_restricted(self, scene: Any) -> bool:
+        """True when any device step of the scene names a ``restricted`` device."""
+        for step in getattr(scene, "steps", None) or ():
+            if str(getattr(step, "kind", "") or "") != "device":
+                continue
+            if self._device_restricted("device_set", {"device": getattr(step, "device", "")}):
+                return True
+        return False
 
     async def _enrollment_turn(self, text: str) -> str | None:
         """Run explicit registration locally; no invented names or LLM progress."""
@@ -5998,6 +7942,183 @@ class Connection(CameraClipReceiver):
                  extra={'utterance_id': self.utterance_id})
         return memory_admin.forget_question(selection.candidate.text, lang, window_s=window)
 
+    # --- ТЗ F-419: правила голосом -------------------------------------------
+
+    async def _rule_turn(self, text: str, language: str = "") -> str | None:
+        """«когда я приду после 22:00, включи тёплый свет» (ТЗ F-419, P3-26).
+
+        Реплику-правило распознаёт сам хаб, а САМО правило составляет локальная
+        модель со structured output: дом, автор и включённость приходят от
+        хаба, а не от языка человека. Прежде чем правило заработает, комната
+        слышит его словами и подтверждает голосом (F-113): без «да» правило не
+        записывается вовсе.
+        """
+        settings = getattr(getattr(self.cfg, 'server', None), 'rules', None)
+        if settings is None or not bool(getattr(settings, 'enabled', True)):
+            return None
+        if not bool(getattr(settings, 'voice_creation', True)):
+            return None
+        if not automation_mod.looks_like_rule(text):
+            return None
+        lang = automation_mod.language_of(language or self._memory_language())
+        if _llm is None:
+            return automation_mod.rule_unavailable_answer(lang)
+        person_id = _person_id_of(self._known_speaker_name())
+        if person_id is None:
+            return automation_mod.rule_unknown_person_answer(lang)
+        draft = getattr(self, '_rule_drafter', None)
+        if draft is None:
+            draft = automation_mod.llm_rule_drafter(_llm)
+            self._rule_drafter = draft
+        try:
+            wanted = await draft(str(text), language=lang,
+                                 now=datetime.now(UTC), tz=self._home_timezone())
+        except automation_mod.RuleDraftUnavailable as exc:
+            log.info("Could not compose a rule from %r (%s)", text, exc,
+                     extra={'utterance_id': self.utterance_id})
+            return automation_mod.rule_unclear_answer(lang)
+        except Exception:  # noqa: BLE001 - модель может быть недоступна
+            log.warning("The rule drafter failed", exc_info=True)
+            return automation_mod.rule_unavailable_answer(lang)
+        rule = automation_mod.Rule(
+            home_id=str(self.home_id or ''), name=wanted.name, trigger=wanted.trigger,
+            conditions=wanted.conditions, actions=wanted.actions,
+            author_person_id=person_id,
+        )
+        args = {'rule': rule.model_dump_json(), 'language': lang}
+        window = float(getattr(self.cfg.server.confirmations, 'window_s', 8.0) or 8.0)
+        await self._request_confirmation('create_rule', args,
+                                         f"когда-то: {automation_mod.describe(rule, lang)}")
+        # Комната слышит СВОЙ вопрос про правило, а не общую английскую строку.
+        self._confirmation_opened = None
+        log.info("A new rule from %s waits for its yes: %s", self._known_speaker_name(),
+                 automation_mod.describe(rule, lang), extra={'utterance_id': self.utterance_id})
+        return automation_mod.rule_question(rule, lang, window_s=window)
+
+    async def _run_create_rule(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Записать подтверждённое правило в таблицу ``rules`` (ТЗ F-419)."""
+        conn = _hub_conn
+        if conn is None:
+            return {'ok': False, 'error': 'the hub database is unavailable'}
+        raw = str(args.get('rule') or '')
+        lang = automation_mod.language_of(args.get('language') or self._memory_language())
+        try:
+            rule = automation_mod.Rule.model_validate_json(raw)
+        except Exception as exc:  # noqa: BLE001 - правило проверяется моделью заново
+            return {'ok': False, 'error': f'that rule cannot be read: {exc}'}
+        if str(rule.home_id) != str(self.home_id or ''):
+            # Права на чужой дом так не получают: правило живёт там, где сказано.
+            return {'ok': False, 'error': 'a rule belongs to the room where it was asked'}
+        author = _person_id_of(self._known_speaker_name())
+        if author is None:
+            return {'ok': False, 'error': 'the author of the rule is not recognised'}
+        rule = rule.model_copy(update={'author_person_id': author})
+        try:
+            automation_mod.RuleStore(conn).write(rule)
+        except Exception:  # noqa: BLE001 - база может отказать
+            log.exception("Could not store the new rule")
+            return {'ok': False, 'error': 'the rule could not be stored'}
+        audit = _audit_log()
+        if audit is not None:
+            try:
+                audit.record(action='rule.created', actor=self._known_speaker_name(),
+                             target=rule.rule_id, home_id=self.home_id, result='ok',
+                             detail={'rule': automation_mod.describe(rule, lang)})
+            except Exception:  # noqa: BLE001 - правило уже записано
+                log.warning("Could not audit the new rule", exc_info=True)
+        log.info("Rule %s created for %s: %s", rule.rule_id, self._known_speaker_name(),
+                 automation_mod.describe(rule, lang), extra={'utterance_id': self.utterance_id})
+        return {'ok': True, 'rule_id': rule.rule_id, 'name': rule.name,
+                'reply': automation_mod.rule_created_answer(rule.name, lang)}
+
+    # --- ТЗ F-213: «забудь меня» ---------------------------------------------
+
+    # --- ТЗ F-417: напоминания -----------------------------------------------
+
+    def _reminder_settings(self) -> Any:
+        """The ``server.reminders`` section, or ``None`` on an old config."""
+        return getattr(getattr(self.cfg, 'server', None), 'reminders', None)
+
+    async def _reminder_turn(self, text: str, language: str = "") -> str | None:
+        """«напомни …» with a named time: parse it and keep the row (F-417).
+
+        The time is read by the hub itself, in the room's own time zone, and
+        the row goes into ``reminders`` (schema 14). Delivery is a separate
+        task (P3-22) - this turn only answers with what it actually stored, so
+        nothing is promised that did not happen.
+        """
+        settings = self._reminder_settings()
+        if settings is None or not bool(getattr(settings, 'enabled', True)):
+            return None
+        if not reminders_mod.is_reminder_request(text):
+            return None
+        lang = reminders_mod.language_of(language or self._memory_language())
+        # ТЗ F-417/F-301: «напомни, когда приду домой» — это не срок, а
+        # событие входа, и проверяется раньше времени: момента у него нет.
+        arrival = reminders_mod.parse_arrival(text)
+        request = None if arrival is not None else reminders_mod.parse(
+            text, tz=self._home_timezone(),
+            default_hour=int(getattr(settings, 'default_hour', reminders_mod.DEFAULT_HOUR)))
+        if arrival is None and request is None:
+            log.info("«Напомни» without a readable time: %r", text,
+                     extra={'utterance_id': self.utterance_id})
+            return reminders_mod.missing_time_answer(lang)
+        conn = _hub_conn
+        if conn is None:
+            return reminders_mod.storage_unavailable_answer(lang)
+        person_id = _person_id_of(self._known_speaker_name())
+        if person_id is None:
+            log.info("«Напомни» from an unrecognised speaker; nothing was stored",
+                     extra={'utterance_id': self.utterance_id})
+            return reminders_mod.unknown_person_answer(lang)
+        store = reminders_mod.ReminderStore(conn)
+        cap = int(getattr(settings, 'max_pending_per_person', 100) or 100)
+        if len(store.pending(person_id=person_id, limit=cap + 1)) >= cap:
+            log.info("Reminder refused for %s: %d pending (cap %d)",
+                     self._known_speaker_name(), cap, cap,
+                     extra={'utterance_id': self.utterance_id})
+            return reminders_mod.too_many_answer(lang)
+        asked = arrival if arrival is not None else request
+        try:
+            if arrival is not None:
+                entry = store.add(
+                    text=arrival.text, person_id=person_id,
+                    home_id=str(self.home_id or ''),
+                    trigger=reminders_mod.TriggerKind.PERSON_ENTERED)
+            elif request is not None:
+                entry = store.add(text=request.text, due_at=request.due_at,
+                                  person_id=person_id,
+                                  home_id=str(self.home_id or ''))
+            else:  # pragma: no cover - разбор выше уже отсёк этот случай
+                return reminders_mod.missing_time_answer(lang)
+        except Exception:  # noqa: BLE001 - a broken store is not a lost turn
+            log.exception("Could not store a reminder")
+            return reminders_mod.storage_unavailable_answer(lang)
+        audit = _audit_log()
+        if audit is not None:
+            try:
+                audit.record(
+                    action='reminder.scheduled', actor=self._known_speaker_name(),
+                    target=entry.reminder_id, home_id=self.home_id, result='ok',
+                    detail={'text': entry.text,
+                            'due_at': entry.due_at.isoformat() if entry.due_at else '',
+                            'trigger': str(entry.trigger),
+                            'matched': getattr(asked, 'matched', ''),
+                            'tz': self._home_timezone()},
+                )
+            except Exception:  # noqa: BLE001 - the reminder is already kept
+                log.warning("Could not audit the new reminder", exc_info=True)
+        log.info("Reminder %s (%s) is kept for %s at %s", entry.reminder_id,
+                 entry.trigger, self._known_speaker_name(),
+                 entry.due_at.isoformat() if entry.due_at else 'the next arrival',
+                 extra={'utterance_id': self.utterance_id})
+        if arrival is not None:
+            return reminders_mod.arrival_answer(arrival.text, lang)
+        if request is None:  # pragma: no cover - см. выше
+            return reminders_mod.arrival_answer('', lang)
+        return reminders_mod.scheduled_answer(
+            request, language=lang, tz=self._home_timezone())
+
     # --- ТЗ F-213: «забудь меня» ---------------------------------------------
 
     def _forget_window(self) -> float:
@@ -6234,6 +8355,10 @@ class Connection(CameraClipReceiver):
         if not home:
             return None
         spoken = str(getattr(self, '_reply_language', '') or language or asked.language)
+        # ТЗ F-602: «Макс дома?» — вопрос про человека, который может стоять в
+        # другой комнате, поэтому у него свой ответ и свой гейт согласия.
+        if asked.kind == questions.ASK_HOME:
+            return self._home_question_turn(asked, home, spoken)
         question = questions.Question(
             kind=asked.kind, who=asked.who, about_me=asked.about_me, zone=asked.zone,
             day_offset=asked.day_offset, language=questions.language_of(spoken))
@@ -6259,6 +8384,101 @@ class Connection(CameraClipReceiver):
         log.info("Answering a presence question (%s) in %s for %s: %d event(s), %d in the room",
                  question.kind, home, name or speaker or 'a stranger', len(events), len(occupants))
         return questions.answer(question, facts)
+
+    def _hub_home_ids(self) -> tuple[str, ...]:
+        """Все дома хаба: из таблицы ``homes``, а без базы — из конфига."""
+        if _hub_conn is not None:
+            try:
+                rows = _hub_conn.execute("SELECT home_id FROM homes").fetchall()
+                if rows:
+                    return tuple(str(row[0]) for row in rows if str(row[0] or ""))
+            except Exception as exc:  # noqa: BLE001 - список домов не стоит хода
+                log.debug("Could not read the homes (%s)", exc)
+        found: list[str] = []
+        for home in list(getattr(self.cfg, "homes", []) or []):
+            home_id = str(getattr(home, "home_id", "") or "")
+            if home_id and home_id not in found:
+                found.append(home_id)
+        return tuple(found)
+
+    def _live_homes(self, person_id: str) -> tuple[str, ...]:
+        """Дома, где присутствие СЕЙЧАС видит этого человека (ТЗ F-301)."""
+        state = _presence_state()
+        if state is None or not person_id:
+            return ()
+        found: list[str] = []
+        for home_id in self._hub_home_ids():
+            try:
+                occupants = state.occupants(home_id)
+            except Exception as exc:  # noqa: BLE001 - пустой дом не стоит ответа
+                log.debug("Could not read the presence of %s (%s)", home_id, exc)
+                continue
+            if any(str(getattr(item, "person_id", "") or "") == person_id
+                   for item in occupants):
+                found.append(home_id)
+        return tuple(found)
+
+    def _home_question_turn(self, asked: Any, home: str, language: str) -> str:
+        """ТЗ F-602: «Макс дома?» — по его собственному разрешению.
+
+        В СВОЕЙ комнате присутствие и так видно (F-301 отвечает «кто дома»), а
+        вот ответ про другую комнату — это межкомнатное сообщение, и оно
+        выдаётся только когда Макс разрешил (``share_presence``) и знакомство
+        подтверждено обеими сторонами. Незнакомец и человек, не разрешивший
+        делиться, получают разные ответы: молчание вместо «да» и «нет», потому
+        что и то и другое было бы информацией.
+        """
+        from hub import presence_questions as questions
+
+        lang = questions.language_of(language)
+        speaker_id = _person_id_spoken(self._known_speaker_name())
+        asked_about = "" if asked.about_me else asked.who
+        person_id = speaker_id if asked.about_me else _person_id_spoken(asked_about)
+        name = (_person_display_name(person_id) if person_id else "") or \
+            asked_about or self._known_speaker_name()
+        if person_id is None:
+            log.info("Presence question about an unknown person (%r)", asked.who)
+            return questions.answer_home("unknown", asked.who, lang)
+        homes = self._live_homes(person_id)
+        if home in homes:
+            return questions.answer_home("yes", name, lang)
+        if not asked.about_me:
+            if speaker_id is None:
+                log.info("Presence question from an unrecognised voice about %s", person_id)
+                return questions.answer_home("voice", name, lang)
+            store = _contacts_store()
+            shared = store is not None and store.presence_shared(person_id, speaker_id)
+            if not shared:
+                log.info("The presence of %s is not shared with %s", person_id, speaker_id)
+                return questions.answer_home("hidden", name, lang)
+        return questions.answer_home("yes" if homes else "no", name, lang)
+
+    async def _where_turn(self, text: str, language: str = "") -> str | None:
+        """ТЗ F-305: «где мои ключи?» — из памяти объектов, без модели.
+
+        Модель не видит кадры, поэтому любой её ответ о том, где лежит вещь,
+        был бы выдумкой. Хаб отвечает ровно тем, что записал индексатор
+        (``objects_index``): последнее место и время; пока записей нет — честное
+        «не видела за последние 48 часов». Комната без дома и вопрос о человеке
+        (его разбирает присутствие F-301) остаются модели, как и раньше.
+        """
+        from hub import object_memory
+
+        label = object_memory.where_question(text)
+        if not label:
+            return None
+        home = str(getattr(self, 'home_id', '') or '')
+        store = _object_memory_store()
+        if not home or store is None:
+            return None
+        if _person_id_of(label) is not None:
+            return None  # «где Макс?» — это вопрос о присутствии, а не о вещах
+        sighting = store.last_seen(home, label)
+        log.info("Answering where-is (%r) in %s: %s", label, home,
+                 "seen" if sighting is not None else "nothing recorded")
+        return object_memory.answer_for(
+            sighting, label, language=language or self._reply_language,
+            tz=self._home_timezone())
 
     async def _share_identity_turn(self, text: str) -> str | None:
         """The person's own consent to be recognized in the other rooms (F-212).
@@ -6289,6 +8509,560 @@ class Connection(CameraClipReceiver):
                     "and voice." if changed else "You had already allowed that.")
         return ("Your face and voice are recognised only in this room now."
                 if changed else "You had already refused that.")
+
+    async def _preference_turn(self, text: str, language: str = "") -> str | None:
+        """ТЗ F-607: «отвечай по-английски», «говори кратко» — настройки человека.
+
+        Only a RECOGNIZED person changes their own settings, and only in a room
+        that may read their profile (F-212): a foreign home without consent is
+        refused in words, not written to. Every value that really changed is
+        recorded in the ``audit`` table (F-706). A rate request («говори
+        медленнее») is answered honestly: F-607 keeps no per-person speed.
+        """
+        from hub import preference_commands as pref_mod
+
+        spoken = language or self._reply_language or "ru"
+        changes = pref_mod.preference_changes(text)
+        if not changes:
+            return pref_mod.speed_line(spoken) if pref_mod.speed_request(text) else None
+        person_id = _person_id_of(self._known_speaker_name())
+        if not person_id:
+            return pref_mod.unknown_voice_line(spoken)
+        if not self._profile_here(person_id):
+            return pref_mod.foreign_line(spoken)
+        store = _person_preferences_store()
+        if store is None:
+            return pref_mod.not_saved_line(spoken)
+        fields = {change.field: change.value for change in changes}
+        try:
+            before = store.get(person_id)
+            store.set(person_id, **fields)
+        except Exception as exc:  # noqa: BLE001 - the room must hear the truth
+            log.warning("Could not save the settings of %s (%s)", person_id, exc,
+                        extra={'utterance_id': self.utterance_id})
+            return pref_mod.not_saved_line(spoken)
+        for change in changes:
+            if str(getattr(before, change.field, "")) == change.value:
+                continue
+            self._record_preference_change(person_id, change)
+        log.info("The settings of %s changed: %s", person_id,
+                 ", ".join(f"{c.field}={c.value!r}" for c in changes),
+                 extra={'utterance_id': self.utterance_id})
+        return pref_mod.change_lines(changes, spoken)
+
+    def _record_preference_change(self, person_id: str, change: Any) -> None:
+        """One audit row per setting that really changed (ТЗ F-706)."""
+        audit = _audit_log()
+        if audit is None:
+            return
+        try:
+            audit.record(action=f"preference.{change.field}", actor=person_id,
+                         target=person_id, home_id=str(self.home_id or "") or None,
+                         result="ok", detail={"value": change.value, "field": change.field})
+        except Exception as exc:  # noqa: BLE001 - the setting stands even if auditing fails
+            log.warning("Could not audit the %s change of %s (%s)",
+                        change.field, person_id, exc)
+
+    async def _contact_turn(self, text: str, language: str = "") -> str | None:
+        """ТЗ F-602: «добавь Макса в контакты» и «подтверди контакт с Антоном».
+
+        Межкомнатное открывается только взаимным согласием, и дать его может
+        только сам человек своим голосом: хаб не принимает «да» за другого и не
+        подтверждает приглашение со слов владельца. Кроме разговора здесь
+        происходит ровно две вещи — строка в ``contacts`` (через
+        ``hub.contacts.ContactStore``) и строка в ``audit`` (F-706).
+        """
+        from hub import contacts as contacts_mod
+
+        command = contacts_mod.contact_command(text)
+        if command is None:
+            return None
+        store = _contacts_store()
+        if store is None:
+            return None  # без базы контактов остаётся прежнее поведение
+        lang = language or self._reply_language or "ru"
+        person_id = _person_id_spoken(self._known_speaker_name())
+        if person_id is None:
+            return _contact_line(lang, "unknown_speaker")
+        other_id = _person_id_spoken(command.name)
+        if other_id is None:
+            return _contact_line(lang, "unknown_person", command.name)
+        if other_id == person_id:
+            return _contact_line(lang, "self", command.name)
+        other_name = _person_display_name(other_id) or command.name
+        intent = command.intent
+        inviting = intent is contacts_mod.ContactIntent.INVITE
+        actions = {
+            contacts_mod.ContactIntent.INVITE: "contact.invite",
+            contacts_mod.ContactIntent.CONFIRM: "contact.confirm",
+            contacts_mod.ContactIntent.REVOKE: "contact.revoke",
+            contacts_mod.ContactIntent.BLOCK: "contact.block",
+            contacts_mod.ContactIntent.UNBLOCK: "contact.unblock",
+            contacts_mod.ContactIntent.PRESENCE_ON: "contact.presence_on",
+            contacts_mod.ContactIntent.PRESENCE_OFF: "contact.presence_off",
+        }
+        action = actions.get(intent, "contact.change")
+        try:
+            contact = self._apply_contact(store, intent, person_id, other_id)
+        except contacts_mod.ContactError as exc:
+            log.info("Contact %s from %s to %s was refused (%s)", action, person_id,
+                     other_id, exc)
+            _record_contact_event(action, person_id, other_id, self.home_id,
+                                  result="denied", reason=str(exc))
+            return _contact_line(lang, _contact_refusal_key(str(exc)), other_name)
+        _record_contact_event(action, person_id, other_id, self.home_id, result="ok",
+                              status=contact.status if contact is not None else "")
+        log.info("Contact %s from %s to %s is %s", action, person_id, other_id,
+                 contact.status if contact is not None else "removed")
+        if inviting:
+            confirmed = contact is not None and contact.confirmed
+            return _contact_line(lang, "already" if confirmed else "invited", other_name)
+        if intent is contacts_mod.ContactIntent.CONFIRM:
+            confirmed = contact is not None and contact.confirmed
+            return _contact_line(lang, "confirmed" if confirmed else "pending", other_name)
+        if intent is contacts_mod.ContactIntent.BLOCK:
+            return _contact_line(lang, "blocked_ok", other_name)
+        if intent is contacts_mod.ContactIntent.UNBLOCK:
+            return _contact_line(lang, "unblocked", other_name)
+        if intent is contacts_mod.ContactIntent.PRESENCE_ON:
+            return _contact_line(lang, "presence_on", other_name)
+        if intent is contacts_mod.ContactIntent.PRESENCE_OFF:
+            return _contact_line(lang, "presence_off", other_name)
+        return _contact_line(lang, "revoked", other_name)
+
+    @staticmethod
+    def _apply_contact(store: Any, intent: Any, person_id: str, other_id: str) -> Any:
+        """Одно действие над парой по её намерению — одна ветка на строку ответа."""
+        from hub.contacts import ContactIntent
+
+        if intent is ContactIntent.INVITE:
+            return store.invite(person_id, other_id)
+        if intent is ContactIntent.CONFIRM:
+            return store.confirm(person_id, other_id)
+        if intent is ContactIntent.BLOCK:
+            return store.block(person_id, other_id)
+        if intent is ContactIntent.UNBLOCK:
+            store.unblock(person_id, other_id)
+            return store.get(person_id, other_id)
+        if intent is ContactIntent.PRESENCE_ON:
+            return store.set_share_presence(person_id, other_id, True)
+        if intent is ContactIntent.PRESENCE_OFF:
+            return store.set_share_presence(person_id, other_id, False)
+        store.revoke(person_id, other_id)
+        return store.get(person_id, other_id)
+
+    # ------------------------------------------------- гостевые окна (F-606)
+
+    def _present_guests(self) -> list[str]:
+        """``person_id`` гостей, видимых в этой комнате прямо сейчас (F-606)."""
+        found: list[str] = []
+        for name in self._present_people():
+            person_id = _person_id_of(name)
+            if not person_id or person_id in found:
+                continue
+            if (_role_for_person(person_id) == speaker_mod.ROLE_GUEST
+                    or not self._person_visible_here(person_id)):
+                found.append(person_id)
+        return found
+
+    def _guest_grant_window(self) -> float:
+        """Сколько секунд живёт окно владельца (``server.identity.guest``)."""
+        identity = getattr(getattr(self.cfg, "server", None), "identity", None)
+        guest = getattr(identity, "guest", None)
+        return float(getattr(guest, "grant_window_s", 1800) or 1800)
+
+    def _guest_grant_allows(self, capability: str) -> bool:
+        """ТЗ F-606: есть ли у ГОВОРЯЩЕГО сейчас окно на это право."""
+        store = _guest_grant_store()
+        if store is None or not self.home_id:
+            return False
+        person_id = _person_id_of(self._known_speaker_name())
+        if not person_id:
+            return False
+        try:
+            return store.allows(str(self.home_id), person_id, capability)
+        except Exception as exc:  # noqa: BLE001 - сомнение не выдаёт доступ
+            log.debug("Could not read the guest grants of %s (%s)", person_id, exc)
+            return False
+
+    def _resolve_grant_target(self, name: str, lang: str) -> tuple[str, str]:
+        """Кому разрешает владелец: ``(person_id, "")`` или ``("", отказ словами)``."""
+        from hub import guest_access
+
+        guests = self._present_guests()
+        if name:
+            wanted = _person_id_spoken(name)
+            if wanted and wanted in guests:
+                return wanted, ""
+            return "", guest_access.grant_line(lang, "unknown_guest", name)
+        if not guests:
+            return "", guest_access.grant_line(lang, "no_guest")
+        if len(guests) > 1:
+            return "", guest_access.grant_line(lang, "several")
+        return guests[0], ""
+
+    async def _guest_grant_turn(self, text: str, language: str = "") -> str | None:
+        """ТЗ F-606: «разреши ему музыку» — окно доступа гостю от владельца.
+
+        Право выдаётся голосом ХОЗЯИНА комнаты, только на время
+        (`server.identity.guest.grant_window_s`) и только на то право, которое
+        ТЗ называет («музыку»). Кому именно — имя в реплике или единственный
+        гость, которого комната видит сейчас; двух гостей хаб не угадывает.
+        И выдача, и отказ ложатся в аудит (F-706).
+        """
+        from hub import guest_access
+
+        request = guest_access.grant_command(text)
+        if request is None:
+            return None
+        lang = language or self._reply_language or "ru"
+        speaker_id = _person_id_of(self._known_speaker_name())
+        if speaker_id is None:
+            return guest_access.grant_line(lang, "unknown_speaker")
+        if getattr(self, "_speaker_role", speaker_mod.ROLE_UNKNOWN) != speaker_mod.ROLE_ADMIN:
+            _record_guest_event("guest.grant", speaker_id, "", self.home_id, result="denied",
+                                capability=request.capability)
+            return guest_access.grant_line(lang, "not_owner")
+        target, refusal = self._resolve_grant_target(request.name, lang)
+        if refusal:
+            _record_guest_event("guest.grant", speaker_id, "", self.home_id, result="denied",
+                                capability=request.capability)
+            return refusal
+        store = _guest_grant_store()
+        if store is None:
+            return guest_access.grant_line(lang, "no_store")
+        window_s = self._guest_grant_window()
+        try:
+            grant = store.grant(home_id=str(self.home_id), guest_person_id=target,
+                                capability=request.capability, granted_by=speaker_id,
+                                window_s=window_s)
+        except Exception:  # noqa: BLE001 - комната должна услышать, что не вышло
+            log.exception("Could not store the guest grant for %s", target)
+            return guest_access.grant_line(lang, "no_store")
+        _record_guest_event("guest.grant", speaker_id, target, self.home_id, result="ok",
+                            capability=grant.capability, expires_at=grant.expires_at)
+        log.info("Guest %s may use %s in %s until %s", target, grant.capability,
+                 self.home_id, grant.expires_at, extra={'utterance_id': self.utterance_id})
+        return guest_access.grant_line(lang, "ok", _person_display_name(target),
+                                       max(1, int(round(window_s / 60))))
+
+    def _interhome_gate(self, other_id: str, language: str = "") -> str:
+        """Единая точка межкомнатного (F-602): ``""`` — можно, иначе отказ словами.
+
+        Всё, что уходит из одной комнаты в другую — интерком (F-601), опрос
+        (F-604), вопрос о присутствии (P4-05), — проходит ЗДЕСЬ. Пока обе
+        стороны не подтвердили знакомство, доставки не существует: функция
+        возвращает готовую строку отказа, и вызывающему нечего обойти.
+        """
+        from hub.contacts import ContactError
+
+        lang = language or self._reply_language or "ru"
+        # ТЗ F-606: интерком — не гостевое право. Отказ стоит здесь, в одном
+        # гейте, поэтому его получают и интерком (F-601), и опрос (F-604), и
+        # вопрос о присутствии (P4-05), сколько бы путей ни вело в другую комнату.
+        from hub import guest_access
+
+        guest_refusal = guest_access.intercom_denial(
+            guest=getattr(self, '_speaker_role', speaker_mod.ROLE_UNKNOWN)
+            == speaker_mod.ROLE_GUEST,
+            stranger=self._home_guest(),
+            language=lang,
+        )
+        if guest_refusal:
+            log.info("Interhome delivery refused: %s is a guest here",
+                     self._known_speaker_name() or speaker_mod.ROLE_UNKNOWN)
+            return guest_refusal
+        store = _contacts_store()
+        person_id = _person_id_spoken(self._known_speaker_name())
+        if person_id is None:
+            return _interhome_refusal(lang, "unknown_speaker")
+        if not other_id or other_id == person_id:
+            return _interhome_refusal(lang, "self")
+        name = _person_display_name(other_id)
+        if store is None:
+            log.info("Interhome delivery from %s to %s has no contact store",
+                     person_id, other_id)
+            return _interhome_refusal(lang, "strangers", name)
+        try:
+            store.contact_gate(person_id, other_id)
+        except ContactError:
+            reason = store.gate_reason(person_id, other_id) or "strangers"
+            log.info("Interhome delivery from %s to %s was refused (%s)",
+                     person_id, other_id, reason)
+            return _interhome_refusal(lang, reason, name)
+        return ""
+
+    async def _interhome_send(self, other_id: str, language: str,
+                              deliver: Any) -> str:
+        """Доставка в другую комнату через один гейт: без согласия её не будет.
+
+        После согласия стоит второе, уже не про приватность, а про тишину:
+        лимит F-603 («не чаще раза в 10 минут на человека»). Лимит тратится
+        ТОЛЬКО на состоявшуюся доставку — отказ по согласию права не сжигает.
+        """
+        refusal = self._interhome_gate(other_id, language)
+        if refusal:
+            return refusal
+        from hub.interhome import minutes_left
+
+        lang = language or self._reply_language or "ru"
+        sender = _person_id_spoken(self._known_speaker_name()) or ""
+        limiter = _interhome_limiter()
+        if limiter is not None:
+            allowed, retry_s = limiter.check(sender, str(self.home_id or ""))
+            if not allowed:
+                log.info("Interhome delivery from %s is too frequent (%.0f s left)",
+                         sender, retry_s)
+                return _interhome_refusal(lang, "too_often",
+                                          _person_display_name(other_id),
+                                          minutes=str(minutes_left(retry_s)))
+        answer = await deliver()
+        if limiter is not None:
+            limiter.record(sender, str(self.home_id or ""))
+        return answer
+
+    # ------------------------------------------------------------- интерком
+
+    def _home_of_person(self, person_id: str) -> str:
+        """Дом человека: где его ВИДНО сейчас (F-301), иначе — его собственный.
+
+        ТЗ F-601 говорит «хаб находит дом Макса». Порядок именно такой: живое
+        присутствие точнее прописки (человек может быть в гостях), а если его
+        нигде не видно, берётся самый ранний членский дом (F-212) — тот, в
+        котором он живёт. Нет ни того, ни другого — хаб честно не знает, куда
+        передавать, и говорит это.
+        """
+        homes = self._live_homes(person_id)
+        if homes:
+            return homes[0]
+        if _hub_conn is None or not person_id:
+            return ""
+        try:
+            row = _hub_conn.execute(
+                "SELECT home_id FROM memberships WHERE person_id = ?"
+                " ORDER BY created_at, home_id LIMIT 1", (person_id,)).fetchone()
+        except Exception as exc:  # noqa: BLE001 - дом не стоит сообщения
+            log.debug("Could not read the home of %s (%s)", person_id, exc)
+            return ""
+        return str(row[0] or "") if row is not None else ""
+
+    def _person_in_room(self, home_id: str, person_id: str) -> bool:
+        """Стоит ли человек в комнате прямо сейчас (живое присутствие F-301)."""
+        state = _presence_state()
+        if state is None or not home_id or not person_id:
+            return False
+        try:
+            occupants = state.occupants(home_id)
+        except Exception as exc:  # noqa: BLE001 - без присутствия сообщение ждёт
+            log.debug("Could not read the presence of %s (%s)", home_id, exc)
+            return False
+        return any(str(getattr(item, "person_id", "") or "") == person_id
+                   for item in occupants)
+
+    def _intercom_quiet_now(self, home_id: str, person_id: str) -> bool:
+        """ТЗ F-601: тихие часы дома плюс личное разрешение получателя."""
+        return _home_intercom_quiet(home_id, person_id)
+
+    def _intercom_quiet_turn(self, allow: bool, lang: str) -> str:
+        """ТЗ F-601: «разреши/запрети интерком ночью» — личный выбор человека."""
+        from hub.intercom import set_quiet_ok
+
+        person_id = _person_id_spoken(self._known_speaker_name())
+        if person_id is None or _hub_conn is None:
+            return _intercom_line(lang, "unknown_speaker")
+        try:
+            changed = set_quiet_ok(_hub_conn, person_id, bool(allow))
+        except Exception as exc:  # noqa: BLE001 - ответ важнее причины
+            log.warning("Could not save the intercom quiet setting of %s (%s)",
+                        person_id, exc)
+            return _intercom_line(lang, "failed", _person_display_name(person_id))
+        audit = _audit_log()
+        if audit is not None:
+            audit.record(action="intercom.quiet", actor=person_id,
+                         target="allow_night" if allow else "mute_night",
+                         home_id=self.home_id, result="ok", detail={"changed": changed})
+        log.info("Intercom quiet hours for %s: %s", person_id,
+                 "messages allowed" if allow else "messages wait")
+        return _intercom_line(lang, "quiet_unset" if allow else "quiet_set")
+
+    async def _speak_intercom(self, message: Any) -> bool:
+        """Сказать сообщение в комнате получателя — его словами и языком."""
+        return await _speak_intercom_in_home(
+            str(getattr(message, "home_id", "") or ""), message,
+            fallback=str(self._reply_language or "ru"))
+
+    async def _intercom_reply_turn(self, reply: Any, store: Any, sender_id: str,
+                                   lang: str) -> str:
+        """ТЗ F-601: «передай ему: ок» — ответ автору последнего сообщения.
+
+        Отвечают тому, чьё сообщение РЕАЛЬНО прозвучало (``last_delivered``):
+        иначе «ему» было бы угадыванием. Ответ идёт тем же путём, что и само
+        сообщение — через согласие (F-602) и лимит (F-603), — а исходное
+        сообщение помечается ``replied``, даже если ответ ещё ждёт человека.
+        """
+        original = store.last_delivered(sender_id)
+        if original is None or not original.from_person:
+            log.info("No delivered message to answer for %s", sender_id)
+            return _intercom_line(lang, "no_message")
+        author_id = str(original.from_person)
+        if author_id == sender_id:
+            return _intercom_line(lang, "self")
+        author_home = self._home_of_person(author_id)
+        author_name = _person_display_name(author_id) or ""
+        if not author_home:
+            return _intercom_line(lang, "no_home", author_name)
+
+        async def deliver() -> str:
+            message = store.enqueue(to_person=author_id, from_person=sender_id,
+                                    text=reply.text, home_id=author_home,
+                                    origin_home=str(self.home_id or ""),
+                                    kind=intercom_mod.IntercomKind.REPLY,
+                                    reply_to=original.message_id)
+            store.mark_replied(original.message_id)
+            if self._intercom_quiet_now(author_home, author_id):
+                log.info("Intercom reply %s waits: quiet hours in %s",
+                         message.message_id, author_home)
+                return _intercom_line(lang, "quiet", author_name)
+            if self._person_in_room(author_home, author_id) and \
+                    await self._speak_intercom(message):
+                store.mark_spoken(message.message_id)
+                log.info("Intercom reply %s from %s reached %s in %s", message.message_id,
+                         sender_id, author_id, author_home)
+                return _intercom_line(lang, "spoken", author_name, reply.text)
+            log.info("Intercom reply %s from %s waits for %s in %s", message.message_id,
+                     sender_id, author_id, author_home)
+            return _intercom_line(lang, "queued", author_name)
+
+        answer = await self._interhome_send(author_id, lang, deliver)
+        return answer or _intercom_line(lang, "failed", author_name)
+
+    async def _poll_turn(self, text: str, language: str = "") -> str | None:
+        """ТЗ F-604: «да» / «нет» / «позже» в ответ на заданный опрос.
+
+        Ход срабатывает ТОЛЬКО когда человеку уже задали вопрос и он молчит:
+        «да» в обычном разговоре — это не ответ на опрос. Повтор не
+        перезаписывает ответ молча: сначала хаб говорит, что уже записано, и
+        называет слова явной замены.
+        """
+        from hub import polls as polls_mod
+
+        store = _poll_store()
+        if store is None or _hub_conn is None:
+            return None
+        person_id = _person_id_spoken(self._known_speaker_name())
+        if person_id is None:
+            return None
+        asked = store.asked_polls(person_id)
+        if not asked:
+            return None
+        # Отвечаем на самый старый вопрос, который ещё ждёт ответа; если все
+        # уже отвечены — говорим про самый старый (и предлагаем замену).
+        poll = next((item for item in asked
+                     if store.answer_of(item.poll_id, person_id) is None), asked[0])
+        command = polls_mod.answer_command(text, options=poll.options)
+        if command is None:
+            return None
+        lang = language or self._reply_language or _person_language(person_id)
+        existing = store.answer_of(poll.poll_id, person_id)
+        if existing is not None and not command.replace:
+            return polls_mod.answer_again_line(
+                polls_mod.option_word(existing.answer, lang), lang)
+        try:
+            answer = store.answer(poll.poll_id, person_id, command.answer,
+                                  home_id=str(self.home_id or ""),
+                                  replace=bool(command.replace))
+        except Exception as exc:  # noqa: BLE001 - комната должна услышать причину
+            log.warning("Could not record the poll answer of %s (%s)", person_id, exc)
+            return polls_mod.answer_failed_line(lang)
+        audit = _audit_log()
+        if audit is not None:
+            audit.record(action="poll.answer", actor=person_id, target=poll.poll_id,
+                         home_id=self.home_id, result="ok",
+                         detail={"answer": answer.answer, "replace": bool(command.replace),
+                                 "question": poll.question})
+        log.info("Poll %s: %s answered %s in %s", poll.poll_id, person_id,
+                 answer.answer, self.home_id)
+        return polls_mod.answer_line(polls_mod.option_word(answer.answer, lang), lang)
+
+    async def _intercom_turn(self, text: str, language: str = "") -> str | None:
+        """ТЗ F-601: «скажи Максу, что я иду» — межкомнатное сообщение.
+
+        Путь сообщения: согласие (F-602) → лимит частоты (F-603) → очередь
+        дома получателя → громкая речь, если он в комнате, иначе «передам,
+        когда придёт». Хаб не переписывает слова отправителя и называет автора:
+        получатель должен знать, кто говорит.
+        """
+        from hub import intercom as intercom_mod
+
+        requested = intercom_mod.intercom_request(text)
+        # «Передай ему: ок» — ответ на последнее полученное сообщение (F-601).
+        answer_to = None if requested is not None else intercom_mod.intercom_reply(text)
+        quiet = intercom_mod.intercom_quiet_command(text)
+        if requested is None and answer_to is None and quiet is None:
+            return None
+        store = _intercom_store()
+        if store is None:
+            return None  # без базы интеркома остаётся прежнее поведение
+        lang = language or self._reply_language or "ru"
+        sender_id = _person_id_spoken(self._known_speaker_name())
+        if quiet is not None:
+            return self._intercom_quiet_turn(quiet, lang)
+        if sender_id is None:
+            return _intercom_line(lang, "unknown_speaker")
+        if requested is None:
+            assert answer_to is not None
+            return await self._intercom_reply_turn(answer_to, store, sender_id, lang)
+        recipient_id = _person_id_spoken(requested.to)
+        if recipient_id is None:
+            return _intercom_line(lang, "unknown_person", requested.to)
+        if recipient_id == sender_id:
+            return _intercom_line(lang, "self")
+        recipient_home = self._home_of_person(recipient_id)
+        name = _person_display_name(recipient_id) or requested.to
+        if not recipient_home:
+            log.info("No home is known for %s, so the message cannot be routed",
+                     recipient_id)
+            return _intercom_line(lang, "no_home", name)
+
+        async def deliver() -> str:
+            message = store.enqueue(to_person=recipient_id, from_person=sender_id,
+                                    text=requested.text, home_id=recipient_home,
+                                    origin_home=str(self.home_id or ""))
+            if self._intercom_quiet_now(recipient_home, recipient_id):
+                log.info("Intercom %s waits: quiet hours in %s", message.message_id,
+                         recipient_home)
+                _record_intercom_event("intercom.send", sender_id, recipient_id,
+                                       recipient_home, result="ok",
+                                       detail={"status": "quiet",
+                                               "message_id": message.message_id})
+                return _intercom_line(lang, "quiet", name)
+            if self._person_in_room(recipient_home, recipient_id) and \
+                    await self._speak_intercom(message):
+                store.mark_spoken(message.message_id)
+                log.info("Intercom %s from %s was spoken to %s in %s", message.message_id,
+                         sender_id, recipient_id, recipient_home)
+                _record_intercom_event("intercom.send", sender_id, recipient_id,
+                                       recipient_home, result="ok",
+                                       detail={"status": "spoken",
+                                               "message_id": message.message_id})
+                return _intercom_line(lang, "spoken", name, requested.text)
+            log.info("Intercom %s from %s waits for %s in %s", message.message_id,
+                     sender_id, recipient_id, recipient_home)
+            _record_intercom_event("intercom.send", sender_id, recipient_id,
+                                   recipient_home, result="ok",
+                                   detail={"status": "queued",
+                                           "message_id": message.message_id})
+            return _intercom_line(lang, "queued", name)
+
+        refusal = self._interhome_gate(recipient_id, lang)
+        if refusal:
+            _record_intercom_event("intercom.send", sender_id, recipient_id,
+                                   self.home_id, result="denied", detail={"reason": refusal})
+            return refusal
+        answer = await self._interhome_send(recipient_id, lang, deliver)
+        if not answer:
+            return _intercom_line(lang, "failed", name)
+        return answer
 
     @staticmethod
     def _enroll_status_text(pending: dict[str, Any], note: str = "") -> str:
@@ -6482,6 +9256,22 @@ class Connection(CameraClipReceiver):
 
     async def _run_client_action(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Send one action to the client and wait for its ``action_result``."""
+        # ТЗ F-711: a phone client has no PC. The call is refused BEFORE it is
+        # sent, so the model gets an honest reason instead of a timeout.
+        if self._is_phone() and name in proto.PHONE_FORBIDDEN_TOOLS:
+            log.info("Refusing %s: client %s is a phone", name, self.peer)
+            return {"ok": False, "error": (
+                f"This is a phone client: it cannot {name.replace('_', ' ')}. "
+                "The room computer and the camera belong to a room PC.")}
+        repeat = self._device_command_is_already_done(name, args)
+        if repeat:
+            # ТЗ F-505: «свет уже выключен» — повторно команда не выполняется.
+            record = {"id": "-", "tool": name, "args": dict(args), "result":
+                      {"ok": True, "already": True, "note": repeat}}
+            self._utterance_actions.append(record)
+            log.info("Not sending %s: %s", name, repeat)
+            return {"ok": True, "already": True,
+                    "note": f"{repeat}. The command was not sent again."}
         action_id = f"a{self._action_seq}"
         self._action_seq += 1
         item = action_item(action_id, name, args)
@@ -6511,6 +9301,8 @@ class Connection(CameraClipReceiver):
             self._pending_actions.pop(action_id, None)
 
         record["result"] = result
+        # ТЗ F-505: что команда рассказала о состоянии устройства.
+        self._record_device_report(name, result)
         return result
 
     async def _request_image(
@@ -6801,9 +9593,11 @@ class Connection(CameraClipReceiver):
         state = _presence_state()
         if not home or state is None:
             return []
-        from hub.presence_state import KIND_LEFT, KINDS
+        from hub.presence_state import KIND_ENTERED, KIND_LEFT, KINDS
 
-        events = state.observe(home, self._presence_sightings())
+        sightings = self._presence_sightings()
+        events = state.observe(home, sightings)
+        self._note_home_presence(home, sightings)
         store = _presence_log()
         if events:
             log.info("Presence in %s: %s", home,
@@ -6815,6 +9609,14 @@ class Connection(CameraClipReceiver):
                 # ТЗ F-302: уход человека — повод попрощаться (событие F-301).
                 if str(getattr(event, 'kind', '')) == KIND_LEFT and event.person_id:
                     self._schedule_farewell(str(event.person_id))
+                # ТЗ F-417/F-301: «напомни, когда приду домой» ждёт именно
+                # этого события; дальше строку произносит доставка P3-22.
+                if (str(getattr(event, 'kind', '')) == KIND_ENTERED
+                        and getattr(event, 'person_id', '')):
+                    self._arm_arrival_reminders(str(event.person_id))
+                # ТЗ F-419: события F-301 запускают правила дома. Решение о
+                # правах принимает сам движок; здесь только факты события.
+                self._schedule_rule_run(event)
                 # ТЗ F-702: события присутствия F-301 кормят правила уведомлений
                 # (person_entered / person_left / unknown_appeared / zone_entered).
                 kind = str(getattr(event, 'kind', '') or '')
@@ -6825,17 +9627,116 @@ class Connection(CameraClipReceiver):
                         zone=str(getattr(event, 'zone', '') or ''))
         return events
 
+    def _arm_arrival_reminders(self, person_id: str) -> list[Any]:
+        """ТЗ F-417: у человека, вошедшего в комнату, оживают его «когда приду».
+
+        Строка получает срок «сейчас» и попадает в обычную доставку P3-22:
+        человек уже в комнате, поэтому услышит её здесь же. Ошибка базы
+        ничего не ломает: приветствие и события присутствия важнее.
+        """
+        store = getattr(self, '_arrival_store', None)
+        if store is None:
+            if _hub_conn is None:
+                return []
+            store = reminders_mod.ReminderStore(_hub_conn)
+            self._arrival_store = store
+        try:
+            armed = store.arm_arrivals(person_id, home_id=str(self.home_id or ''))
+        except Exception:  # noqa: BLE001 - напоминание не стоит поведения комнаты
+            log.warning("Could not arm the arrival reminders of %s", person_id, exc_info=True)
+            self._arrival_store = None
+            return []
+        return list(armed)
+
+    def _note_home_presence(self, home: str, sightings: Sequence[Any]) -> None:
+        """ТЗ F-507: покормить автоматику «ушёл»/«вернулся» живым наблюдением.
+
+        Роли берутся из той же таблицы, что у голосовой команды (F-208):
+        вернувшимся владельцем считается человек с ролью ``admin``, а
+        безымянный трек — это «в комнате кто-то есть», но не владелец.
+        """
+        automation = _presence_automation(getattr(self, 'cfg', None))
+        if automation is None:
+            return
+        from hub.presence_automation import HomePerson
+
+        people = []
+        for row in sightings or ():
+            person_id = _field_of(row, 'person_id')
+            if not person_id:
+                continue
+            people.append(HomePerson(person_id=person_id,
+                                     name=_field_of(row, 'name'),
+                                     role=_role_for_person(person_id)))
+        try:
+            event = automation.note(home, seen=bool(sightings), people=people)
+        except Exception as exc:  # noqa: BLE001 - кадр важнее автоматики
+            log.debug("Could not note the presence of %s (%s)", home, exc)
+            return
+        if event is not None:
+            self._schedule_home_event(event)
+
+    def _schedule_home_event(self, event: Any) -> None:
+        """ТЗ F-507: обработать событие автоматики, не блокируя кадр."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - a bare test without a loop
+            log.debug("No loop to handle the presence event on")
+            return
+        task = loop.create_task(_handle_home_event(event))
+        tasks = getattr(self, '_home_event_tasks', None)
+        if tasks is None:
+            tasks = self._home_event_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _schedule_rule_run(self, event: Any) -> None:
+        """ТЗ F-419: проверить правила дома на событие F-301, не блокируя кадр.
+
+        Проверка правил асинхронная (сцена, say, скилл), а разбор кадра — нет:
+        поэтому правило уезжает отдельной задачей, и сломанное правило не
+        мешает ни приветствию, ни событиям присутствия.
+        """
+        settings = getattr(getattr(getattr(self, 'cfg', None), 'server', None), 'rules', None)
+        if settings is None or not bool(getattr(settings, 'enabled', True)):
+            return
+        facts = _rule_facts(str(getattr(self, 'home_id', '') or ''), event=event)
+        try:
+            # Ask for the loop first: creating the coroutine before a failed
+            # create_task would leave it un-awaited and leak a RuntimeWarning.
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no running loop (a bare test)
+            log.debug("No loop to check the rules on")
+            return
+        task = loop.create_task(self._run_rules(facts))
+        # Harness-соединения (и тесты) собираются через ``__new__`` и могут не
+        # иметь набора задач: набор заводится лениво, а не падает.
+        tasks = getattr(self, '_rule_tasks', None)
+        if tasks is None:
+            tasks = self._rule_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _run_rules(self, facts: Any) -> None:
+        """Один прогон правил по событию; отчёт остаётся в аудите."""
+        if _hub_conn is None:
+            return
+        try:
+            engine = automation_mod.RuleEngine(
+                automation_mod.RuleStore(_hub_conn), execute=_execute_rule_action,
+                audit=_audit_log())
+            runs = await engine.run(facts)
+        except Exception:  # noqa: BLE001 - правило не стоит поведения комнаты
+            log.warning("Could not check the rules of %s", facts.home_id, exc_info=True)
+            return
+        fired = [run for run in runs if run.outcome == "ok"]
+        if fired:
+            log.info("Rules in %s: %d action(s) done, %d refused or failed",
+                     facts.home_id, len(fired), len(runs) - len(fired))
+
     def _display_name(self, person_id: str) -> str:
         """``persons.display_name`` of an id, or an empty string."""
-        if not person_id or _hub_conn is None:
-            return ""
-        try:
-            row = _hub_conn.execute("SELECT display_name FROM persons WHERE person_id=?",
-                                    (str(person_id),)).fetchone()
-        except Exception as exc:  # noqa: BLE001 - a goodbye must never break the room
-            log.debug("Could not read the name of %s (%s)", person_id, exc)
-            return ""
-        return str(row[0] or "") if row else ""
+        return _person_display_name(person_id)
 
     def _may_say_bye(self, person_id: str, *, cooldown_s: float | None = None) -> bool:
         """ТЗ F-302: одно прощание на человека не чаще раза в 20 минут."""
@@ -6864,10 +9765,11 @@ class Connection(CameraClipReceiver):
                 settings, 'cooldown_s', greeting_mod.COOLDOWN_S)):
             return
         try:
-            task = asyncio.create_task(self._say_farewell(name))
+            loop = asyncio.get_running_loop()
         except RuntimeError:  # pragma: no cover - no running loop (a bare test)
             log.debug("No loop to speak a goodbye on")
             return
+        task = loop.create_task(self._say_farewell(name))
         self._farewell_tasks.add(task)
         task.add_done_callback(self._farewell_tasks.discard)
 
@@ -7024,6 +9926,11 @@ class Connection(CameraClipReceiver):
         or :data:`server.session.NO_PRESENCE_TEXT` when the camera is off,
         absent or sees nobody.
         """
+        # ТЗ F-606/F-212: «гость не получает общий профиль». Who lives here is
+        # the house's profile, so a guest is told that people are here - never
+        # which people. The count stays honest; the names do not travel.
+        if self._home_guest():
+            return self._guest_presence_text()
         tracked = self.room.description() if hasattr(self, 'room') else ''
         if tracked:
             return 'Room now: ' + tracked
@@ -7054,6 +9961,26 @@ class Connection(CameraClipReceiver):
             return f"Present in the room: {persons} person{plural}, face not identified yet"
         return NO_PRESENCE_TEXT
 
+    def _guest_presence_text(self) -> str:
+        """How many people are here, without naming the household (ТЗ F-606)."""
+        labels = []
+        try:
+            labels = [label for label in self.presence.present() if label != LABEL_UNKNOWN]
+        except Exception:  # noqa: BLE001 - the prompt is not worth a crash
+            log.debug("Could not read the presence tracker for a guest")
+        unknown = 0
+        try:
+            unknown = max(0, int(self.presence.unknown_count))
+        except Exception:  # noqa: BLE001 - a missing count is just zero
+            unknown = 0
+        count = len(labels) + unknown
+        if not count:
+            count = int((self.camera_state or {}).get("persons") or 0)
+        if not count:
+            return NO_PRESENCE_TEXT
+        plural = "s" if count > 1 else ""
+        return f"Present in the room: {count} person{plural}, not identified for a guest"
+
     # ------------------------------------------------- speaker and home context
 
     def _home_config(self) -> Any:
@@ -7080,6 +10007,46 @@ class Connection(CameraClipReceiver):
             log.debug("Could not read the presence tracker for the prompt")
             return []
         return [label for label in present if label and label != LABEL_UNKNOWN]
+
+    def _available_skill_names(self) -> list[str]:
+        """ТЗ F-405/F-421: имена скиллов, которые дом и этот человек могут позвать.
+
+        Роль берётся у говорящего, дом — у комнаты: скилл с ``role: admin``
+        не показывается гостю, а скилл чужого дома — вообще никому.
+        """
+        if _skills is None:
+            return []
+        try:
+            return [manifest.name for manifest in _skills.available(
+                home_id=str(getattr(self, 'home_id', '') or ''), role=self._speaker_role)
+                if _skill_switch(manifest.name)]
+        except Exception:  # noqa: BLE001 - список скиллов не стоит хода
+            log.debug("Could not list the skills of this room", exc_info=True)
+            return []
+
+    def _known_device_states(self) -> dict[str, str]:
+        """ТЗ F-505: состояние устройств словами — для блока ``[home: ...]``.
+
+        Комната перечисляет устройства по своим именам, а состояние знает хаб:
+        строки складываются по имени, поэтому блок говорит «lamp (off)», а не
+        «on/off not reported by the room».
+        """
+        states = _device_state_store()
+        if states is None:
+            return {}
+        home = str(getattr(self, 'home_id', '') or '')
+        if not home:
+            return {}
+        language = device_state_mod.language_of(
+            getattr(self, '_reply_language', '') or getattr(self, '_speaker_language', ''))
+        try:
+            # Имя, алиас и id: комната называет устройство по-своему, и блок
+            # должен сойтись с её же списком устройств.
+            return {name: device_state_mod.state_words(state.values, language=language)
+                    for name, state in states.by_name(home).items()}
+        except Exception:  # noqa: BLE001 - контекст не стоит хода
+            log.debug("Could not read the device states of %s", home, exc_info=True)
+            return {}
 
     def _unknown_people(self) -> int:
         """How many people the camera saw without recognising them (F-412)."""
@@ -7110,11 +10077,18 @@ class Connection(CameraClipReceiver):
         )
         config_home = self._home_config()
         moment = at.timestamp() if isinstance(at, datetime) else None
+        # ТЗ F-606/F-212: «гость не получает память дома и общий профиль» —
+        # the household's own people are the shared profile of the house, so a
+        # guest is told how many people are here, not who they are. The count
+        # stays honest (``_unknown_people``), the names do not travel.
+        guest = self._home_guest()
         home = speaker_context.home_state_from(
             home_id=getattr(self, 'home_id', ''), config_home=config_home,
-            people=self._present_people(), unknown_people=self._unknown_people(),
+            people=[] if guest else self._present_people(),
+            unknown_people=self._unknown_people(),
             devices=getattr(self.session, 'devices', None),
-            moment=moment,
+            moment=moment, skills=self._available_skill_names(),
+            states=self._known_device_states(),
         )
         # The room has its own clock: a hub on another machine must not make the
         # model think "now" is the host's evening.
@@ -7127,6 +10101,12 @@ class Connection(CameraClipReceiver):
         instruction = ''
         if self._reply_language and self._reply_language != 'en':
             instruction = language_instruction(self._reply_language)
+        # ТЗ F-607: the reply style of THIS person rides next to the language,
+        # in the per-turn prefix, so the shared system prompt stays byte-equal
+        # and the prompt cache keeps working.
+        style = self._style_instruction()
+        if style:
+            instruction = f"{instruction} {style}".strip()
         return speaker_context.render_prefix(
             at=stamp, profile=profile, home=home, live_view=live_view,
             language=instruction, note=note, memory=memory, text=text,
@@ -7457,15 +10437,7 @@ class Connection(CameraClipReceiver):
         cached = getattr(self, "_home_tz", None)
         if cached is not None:
             return cached
-        zone = ""
-        home = str(getattr(self, "home_id", "") or "")
-        if home and _hub_conn is not None:
-            try:
-                row = _hub_conn.execute("SELECT tz FROM homes WHERE home_id=?",
-                                        (home,)).fetchone()
-                zone = str(row[0] or "") if row else ""
-            except Exception as exc:  # noqa: BLE001 - a wrong clock must not break speech
-                log.debug("Could not read the time zone of %s (%s)", home, exc)
+        zone = _home_timezone_of(str(getattr(self, "home_id", "") or ""))
         self._home_tz = zone
         return zone
 
@@ -7559,8 +10531,77 @@ class Connection(CameraClipReceiver):
             await self.send_json({"type": proto.MSG_SAY, "text": text})
             # ТЗ F-302: приветствие берётся из TTS-кэша, поэтому повторная
             # фраза звучит сразу, а не после синтеза на CPU.
-            await self._stream_tts(voice, text, cache=True)
+            # ТЗ F-607: the greeted person hears their own voice back.
+            await self._stream_tts(self._reply_voice(voice, name=target), text, cache=True)
         log.info("Greeting spoken to %s: %r", target, text)
+
+    async def _say_proactive(self, text: str, *, name: str = "") -> bool:
+        """Say a line the hub decided on itself, without an utterance (F-417).
+
+        A reminder comes due on the scheduler's clock, not in the middle of a
+        turn, so nothing here may touch the model or the tools: the room hears
+        the line (``say``) and the same text is synthesised for the speaker.
+        ``False`` means there was no way to speak at all (no TTS, empty line).
+
+        ``name`` is the person the line is FOR; ТЗ F-607 then gives them their
+        own voice (a reminder to Max sounds like Max chose that voice), and an
+        empty name keeps the room's voice.
+        """
+        line = " ".join(str(text or "").split())
+        voice = _tts
+        if not line:
+            return False
+        if voice is None:
+            log.warning("Nothing to speak with: the TTS engine is not loaded")
+            return False
+        voice = self._reply_voice(voice, name=name)
+        async with self._reply_lock:
+            await self.send_json({"type": proto.MSG_SAY, "text": line})
+            await self._stream_tts(voice, line, cache=True)
+        return True
+
+    async def _flush_push_outbox(self, person_id: str) -> int:
+        """ТЗ F-712: hand a person the messages that waited for their phone.
+
+        Called when the phone of that person connects (the client record names
+        them). Each message is spoken here and only then marked delivered, so a
+        room that went silent keeps the message for the next connection instead
+        of losing it. Returns how many were actually handed over.
+        """
+        person = str(person_id or "")
+        service = push_service()
+        if service is None or not person:
+            return 0
+        try:
+            pending = service.store.pending(person)
+        except Exception as exc:  # noqa: BLE001 - an empty queue is the fallback
+            log.warning("Could not read the push queue of %s (%s)", person, exc)
+            return 0
+        handed = 0
+        name = _person_display_name(person)
+        for row in pending:
+            try:
+                spoken = await self._say_proactive(str(row["body"]), name=name)
+            except Exception as exc:  # noqa: BLE001 - the rest must still be tried
+                log.warning("Could not speak the queued push %s (%s)", row["message_id"], exc)
+                break
+            if not spoken:
+                break
+            if not service.store.mark_delivered(int(row["message_id"])):
+                continue
+            handed += 1
+            audit = _audit_log()
+            if audit is not None:
+                try:
+                    audit.record(action="push.delivered", actor=person, target=person,
+                                 home_id=str(self.home_id or "") or None, result="ok",
+                                 detail={"message_id": row["message_id"], "kind": row["kind"]})
+                except Exception:  # noqa: BLE001 - the message is already heard
+                    log.debug("Could not audit the queued push %s", row["message_id"])
+        if handed:
+            log.info("Handed %d queued push message(s) to %s", handed, person,
+                     extra={'utterance_id': getattr(self, 'utterance_id', '')})
+        return handed
 
     async def _refuse_tools(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Tool executor for the greeting: proactive speech may not act.
@@ -7587,17 +10628,118 @@ class Connection(CameraClipReceiver):
             return record["result"]
 
         log.info("look_at_screen (%s): %r", shot_id, query)
+        region = args.get("region")
+        box = None
+        if region is not None and str(region).strip():
+            from hub import screen_regions
+
+            box = screen_regions.parse_region(region)
+            if box is None:
+                result = {"ok": False, "error": (
+                    f"I could not understand the screen region {region!r}. "
+                    "Name it as 'top left', 'bottom right', 'left half', 'center', "
+                    "or give x, y, width, height as fractions of the screen.")}
+                record["result"] = result
+                return result
         captured = await self._request_screenshot(shot_id)
         if isinstance(captured, str):
             result: dict[str, Any] = {"ok": False, "error": captured}
         else:
-            answer, level = await self._describe_image(captured.jpeg, query, label="look-at-screen")
+            jpeg = captured.jpeg
+            words = ""
+            if box is not None:
+                from hub import screen_regions
+
+                words = screen_regions.region_words(box)
+                jpeg = screen_regions.crop_jpeg(jpeg, box)
+            described = query
+            if words:
+                described = (f"{query} (the picture is {words} of the room PC's screen)"
+                             if query else f"What is on {words} of this screen?")
+            answer, level = await self._describe_image(jpeg, described, label="look-at-screen")
             result = {"ok": True, "answer": answer}
+            if words:
+                result["region"] = words
             if level:
                 result["vision_level"] = level
 
         record["result"] = result
         return result
+
+    def _pc_unlock_refusal(self) -> str:
+        """ТЗ F-507: пустая строка — дом разрешил разблокировку, иначе причина.
+
+        Каждая попытка (и разрешённая, и запрещённая) ложится в аудит: F-706
+        называет разблокировку ПК привилегированным действием, а «кому дом
+        разрешил» — ровно то, что владелец захочет увидеть в журнале.
+        """
+        actor = str(getattr(self, '_speaker_name', '') or '')
+        home = str(getattr(self, 'home_id', '') or '')
+        audit = _audit_log()
+        if _home_allows_pc_unlock(home):
+            if audit is not None:
+                audit.record(action='pc.unlock', actor=actor, target='unlock', home_id=home,
+                             result='ok', detail={'allowed': True})
+            return ''
+        reason = ('Unlocking the PC is switched off for this home. '
+                  'The owner can allow it in the home settings.')
+        if audit is not None:
+            audit.record(action='pc.unlock', actor=actor, target='unlock', home_id=home,
+                         result='denied', detail={'note': reason})
+        return reason
+
+    def _device_command_is_already_done(self, name: str, args: dict[str, Any]) -> str:
+        """ТЗ F-505: причина, по которой команда не нужна, или пустая строка."""
+        settings = _device_state_settings(getattr(self, 'cfg', None))
+        if settings is None or not bool(getattr(settings, 'enabled', True)):
+            return ""
+        states = _device_state_store()
+        if states is None:
+            return ""
+        home = str(getattr(self, 'home_id', '') or '')
+        device = str(args.get('device') or '')
+        if not home or not device:
+            return ""
+        if name == 'set_light':
+            if args.get('brightness') is not None or args.get('color') is not None:
+                return ""  # частичное изменение — это не «уже так и есть»
+            capability, value = 'on_off', str(args.get('state') or '').casefold()
+            if value not in {'on', 'off'}:
+                return ""
+            try:
+                needle = device_state_mod.coerce_for_state(capability, value == 'on')
+            except Exception:  # noqa: BLE001 - непонятное значение идёт как есть
+                needle = value
+        elif name == 'set_switch':
+            action = str(args.get('action') or '').casefold()
+            if action not in {'on', 'off'}:
+                return ""  # 'press' — это действие, а не состояние
+            capability, needle = 'on_off', action
+        else:
+            return ""
+        try:
+            return states.already(home, device, capability, needle,
+                                  stale_after_s=float(getattr(settings, 'stale_after_s', 900.0)
+                                                      or 0.0))
+        except Exception:  # noqa: BLE001 - состояние не мешает команде
+            log.debug("Could not check the known state of %s", device, exc_info=True)
+            return ""
+
+    def _record_device_report(self, name: str, result: Any) -> None:
+        """ТЗ F-505: отчёт комнаты о выполненной команде становится состоянием."""
+        if name not in {'set_light', 'set_switch'} or not isinstance(result, dict):
+            return
+        if not result.get('ok'):
+            return
+        output = result.get('output') or result.get('detail') or ''
+        states = _device_state_store()
+        if states is None:
+            return
+        home = str(getattr(self, 'home_id', '') or '')
+        try:
+            states.record_report(home, output, source='room')
+        except Exception:  # noqa: BLE001 - запись состояния не стоит хода
+            log.debug("Could not record the device report %r", output, exc_info=True)
 
     async def _describe_image(self, jpeg: bytes, query: str, *, label: str,
                               people: int = 0) -> tuple[str, str]:
@@ -8334,7 +11476,9 @@ class Connection(CameraClipReceiver):
         # another named person's archive or a different room connection.
         if not self._permissions_enabled and self._anonymous_generated_visible:
             guest = _generated_images.last(self._anonymous_image_owner)
-            if guest and time.time() - guest[1] <= 300 and (last is None or guest[1] > last[1]):
+            # Two images saved inside the same clock tick share a timestamp;
+            # the guest's picture was shown last, so it wins the tie.
+            if guest and time.time() - guest[1] <= 300 and (last is None or guest[1] >= last[1]):
                 last = guest
         return last
 
@@ -8999,8 +12143,10 @@ class Connection(CameraClipReceiver):
             result = {"ok": False, "error": f"could not store the fact: {exc}"}
         else:
             if self.session is not None:
-                facts = await asyncio.to_thread(_memory.effective, self._known_speaker_name())
-                self.session.set_memory(facts)
+                # ТЗ F-415/F-606: the same rule as everywhere else — a guest
+                # gets their own facts, never the home's. Read on the loop for
+                # the same reason ``_prompt_memory`` is (DECISIONS P1-44).
+                self.session.set_memory(self._prompt_memory())
             await self._store_memory_fact(args, fact, owner, shared)
             result = {"ok": True, "remembered_about": owner or "the room"}
 
@@ -9479,7 +12625,59 @@ class Connection(CameraClipReceiver):
                 _audio_archive.failures += 1
                 log.exception('Could not archive interrupted request audio')
 
-    async def _process_utterance(self, pcm: bytes, recording=None) -> None:
+    async def _on_utterance_text(self, payload: dict[str, Any]) -> None:
+        """ТЗ F-711: a client that ran its own VAD and STT sends the words.
+
+        A phone has no room microphone to stream, so the hub runs the very same
+        turn from the finished transcript: one utterance, the same router, the
+        same memory and the same answer (``say`` + TTS audio). The turn is
+        booked exactly like speech (an utterance id, the metrics clock, the
+        draft/speculation reset) so logs and budgets stay comparable; the D-03
+        hallucination rule and the wake-word gate are not re-run, because the
+        client's own VAD already decided this turn is for Rowan.
+        """
+        text = " ".join(str(payload.get("text") or "").split())
+        if not text:
+            await self.send_error(proto.ERR_EMPTY_TRANSCRIPT)
+            return
+        self._on_utterance_start({"utterance_id": payload.get("utterance_id"),
+                                  "sr": self.sample_rate, "verify_wake": False})
+        self.receiving = False
+        self.audio = bytearray()
+        if self._live_preview:
+            # No PCM is coming, so the preview that ``_on_utterance_start`` may
+            # have opened has nothing to watch.
+            self._live_preview.stop()
+            self._live_preview = None
+        if self.session is None:
+            facts: list[str] = []
+            if _memory is not None:
+                facts = await asyncio.to_thread(_memory.facts)
+            self.session = Session(
+                client_id=None,
+                devices=[],
+                history_turns=self.cfg.server.llm.history_turns,
+                memory_facts=facts,
+                permissions_enabled=self._permissions_enabled,
+                presence=self.presence_text,
+                kind=getattr(self, '_client_kind', 'room_pc'),
+            )
+            self._start_greeting_task()
+        pending_control = getattr(self, '_telegram_control_task', None)
+        if pending_control is not None and not pending_control.done():
+            await self.send_error(
+                'Rowan is handling a Telegram command. Please try again when it finishes.')
+            return
+        if self._task is not None and not self._task.done():
+            await self.send_error('Rowan is already answering. Please try again in a moment.')
+            return
+        language = str(payload.get("language") or "") or None
+        self._task = asyncio.create_task(
+            self._process_utterance(b"", None, transcript=text, language=language))
+
+    async def _process_utterance(self, pcm: bytes, recording=None, *,
+                                 transcript: str | None = None,
+                                 language: str | None = None) -> None:
         self._current_audio_recording = recording
         turn = {
             'audio_recording_id': recording['id'] if recording else None,
@@ -9487,7 +12685,12 @@ class Connection(CameraClipReceiver):
             'captured_at': self._utterance_started_at or time.time(), 'status': 'processing'}
         recording_token = _recording_turn.set(turn)
         try:
-            await self._handle_utterance(pcm)
+            if transcript is None:
+                # The speech path is called exactly as it always was, so a
+                # monkeypatched handler (and the protocol) keeps working.
+                await self._handle_utterance(pcm)
+            else:
+                await self._handle_utterance(pcm, transcript=transcript, language=language)
             turn['status'] = 'completed'
         except asyncio.CancelledError:
             turn['status'] = 'cancelled'
@@ -9576,7 +12779,8 @@ class Connection(CameraClipReceiver):
             raise TimeoutError(f'{stage} did not finish within {float(safety):.0f} s')
         return task.result()
 
-    async def _handle_utterance(self, pcm: bytes) -> None:
+    async def _handle_utterance(self, pcm: bytes, *, transcript: str | None = None,
+                                language: str | None = None) -> None:
         verify_wake = getattr(self, '_verify_wake', False) and not (
             self._enroll_pending or self._enroll_ask_name or self._face_selection)
         session = self.session
@@ -9634,50 +12838,64 @@ class Connection(CameraClipReceiver):
         # took away - this turn ends, the reply lock is released, the client is
         # told, and the wake word works again instead of the assistant going
         # deaf until somebody restarts the server by hand.
-        try:
-            if self.cfg.server.diarization.enabled:
-                if _diarizer is None:
-                    raise RuntimeError("Diarization is enabled but unavailable")
-                wake = self.cfg.client.wakeword
-                # ТЗ 4.5/15.1: the diarized pass has its own deadline. When it
-                # overruns, the turn degrades to a plain transcript (no speaker
-                # labels, no ReID) instead of leaving the room in silence.
-                diarization_budget = min(
-                    self.cfg.server.diarization.timeout_s,
-                    self._stage_budget('diarization_ms', self.cfg.server.diarization.timeout_s),
-                )
-                try:
-                    attributed = await asyncio.wait_for(
-                        self._gpu(PRIORITY_UTTERANCE, "stt-diarized",
-                                  lambda: self._recognize_diarized(pcm, self.sample_rate)),
-                        timeout=diarization_budget,
+        if transcript is not None:
+            # ТЗ F-711: the phone ran its own VAD and STT, so the hub takes the
+            # words at face value. There is no audio to measure, which is why
+            # the D-03 hallucination rule (a rate against the clip) is not asked
+            # here, and why the speaker is not identified by voice.
+            text = " ".join(str(transcript).split())
+            if not text:
+                await self.send_error(proto.ERR_EMPTY_TRANSCRIPT)
+                self._finish_utterance(note='empty_transcript', ok=False)
+                return
+            if language:
+                language = str(language)
+            stt_ms = int((time.perf_counter() - t_start) * 1000)
+        else:
+            try:
+                if self.cfg.server.diarization.enabled:
+                    if _diarizer is None:
+                        raise RuntimeError("Diarization is enabled but unavailable")
+                    wake = self.cfg.client.wakeword
+                    # ТЗ 4.5/15.1: the diarized pass has its own deadline. When it
+                    # overruns, the turn degrades to a plain transcript (no speaker
+                    # labels, no ReID) instead of leaving the room in silence.
+                    diarization_budget = min(
+                        self.cfg.server.diarization.timeout_s,
+                        self._stage_budget('diarization_ms', self.cfg.server.diarization.timeout_s),
                     )
-                    text, language = attributed.text, attributed.language
-                    self._transcript_segments = attributed.segments
-                except TimeoutError:
-                    self._degrade('diarization',
-                                  f'no diarized transcript within {diarization_budget:.1f} s')
-                    attributed = None
+                    try:
+                        attributed = await asyncio.wait_for(
+                            self._gpu(PRIORITY_UTTERANCE, "stt-diarized",
+                                      lambda: self._recognize_diarized(pcm, self.sample_rate)),
+                            timeout=diarization_budget,
+                        )
+                        text, language = attributed.text, attributed.language
+                        self._transcript_segments = attributed.segments
+                    except TimeoutError:
+                        self._degrade('diarization',
+                                      f'no diarized transcript within {diarization_budget:.1f} s')
+                        attributed = None
+                        text, language = await self._plain_transcript(engine, pcm)
+                else:
                     text, language = await self._plain_transcript(engine, pcm)
-            else:
-                text, language = await self._plain_transcript(engine, pcm)
-        except TimeoutError as exc:
-            # The message names the deadline that actually fired, not the
-            # diarization safety net: with stage budgets on, the plain pass has
-            # its own (much shorter) deadline and that is the one that expired.
-            log.error(
-                "Speech recognition did not finish (%s). The worker may still be "
-                "running; restart the server if this repeats.", exc,
-            )
-            await self.send_error("stt timed out")
-            self._finish_utterance(note='stt_timeout', ok=False)
-            return
-        except Exception:
-            log.exception("Speech recognition failed")
-            await self.send_error("stt failed")
-            self._finish_utterance(note='stt_failed', ok=False)
-            return
-        stt_ms = int((time.perf_counter() - t_start) * 1000)
+            except TimeoutError as exc:
+                # The message names the deadline that actually fired, not the
+                # diarization safety net: with stage budgets on, the plain pass has
+                # its own (much shorter) deadline and that is the one that expired.
+                log.error(
+                    "Speech recognition did not finish (%s). The worker may still be "
+                    "running; restart the server if this repeats.", exc,
+                )
+                await self.send_error("stt timed out")
+                self._finish_utterance(note='stt_timeout', ok=False)
+                return
+            except Exception:
+                log.exception("Speech recognition failed")
+                await self.send_error("stt failed")
+                self._finish_utterance(note='stt_failed', ok=False)
+                return
+            stt_ms = int((time.perf_counter() - t_start) * 1000)
         #: D-04 and the app-choice offer both need the request itself, not only
         #: the tool arguments.
         self._utterance_text = text
@@ -9700,31 +12918,32 @@ class Connection(CameraClipReceiver):
         # Decider; the pipeline's own verdict (rate, stop phrases, a decode
         # loop - ТЗ F-105) rides in as the rules answer.
         audio_s = len(pcm) / float(max(1, self.sample_rate * 2))
-        noise = screen_transcript(
-            text, audio_s,
-            stop_phrases=self.cfg.server.stt.hallucination.stop_phrases,
-            repetition=self.cfg.server.stt.hallucination.repetition,
-            extra_stop_phrases=self.cfg.server.stt.hallucination.extra_stop_phrases,
-            max_chars_per_second=self.cfg.server.stt.hallucination.max_chars_per_second,
-        )
-        if await self._decide(
-            'hallucination',
-            question='Is this transcript real speech, or Whisper hallucinating from noise?',
-            context={'text': text, 'duration_s': round(audio_s, 3),
-                     'reason': noise.reason},
-            heuristic=noise.hallucination,
-        ):
-            log.info("Utterance %s looks like a Whisper hallucination (%s, %d chars in %.2f s)",
-                     self.utterance_id, noise.reason or 'D-03', len(text), audio_s,
-                     extra={'utterance_id': self.utterance_id})
-            await self._log_dialog(
-                started_at, session, text, language, "",
-                {"stt": stt_ms, "llm": 0, "tts": 0, "total": stt_ms},
-                note='suspected hallucination',
+        if transcript is None:
+            noise = screen_transcript(
+                text, audio_s,
+                stop_phrases=self.cfg.server.stt.hallucination.stop_phrases,
+                repetition=self.cfg.server.stt.hallucination.repetition,
+                extra_stop_phrases=self.cfg.server.stt.hallucination.extra_stop_phrases,
+                max_chars_per_second=self.cfg.server.stt.hallucination.max_chars_per_second,
             )
-            self._finish_utterance(stages={'stt': stt_ms, 'total': stt_ms},
-                                   note='hallucination', ok=False)
-            return
+            if await self._decide(
+                'hallucination',
+                question='Is this transcript real speech, or Whisper hallucinating from noise?',
+                context={'text': text, 'duration_s': round(audio_s, 3),
+                         'reason': noise.reason},
+                heuristic=noise.hallucination,
+            ):
+                log.info("Utterance %s looks like a Whisper hallucination (%s, %d chars in %.2f s)",
+                         self.utterance_id, noise.reason or 'D-03', len(text), audio_s,
+                         extra={'utterance_id': self.utterance_id})
+                await self._log_dialog(
+                    started_at, session, text, language, "",
+                    {"stt": stt_ms, "llm": 0, "tts": 0, "total": stt_ms},
+                    note='suspected hallucination',
+                )
+                self._finish_utterance(stages={'stt': stt_ms, 'total': stt_ms},
+                                       note='hallucination', ok=False)
+                return
 
         transcript_payload = {"type": proto.MSG_TRANSCRIPT, "text": text, "language": language or ""}
         if self.utterance_id:
@@ -10016,12 +13235,35 @@ class Connection(CameraClipReceiver):
         # what the owner asked for.
         if scripted is None:
             scripted = await self._share_identity_turn(text)
+        # ТЗ F-607: «отвечай по-английски», «говори кратко» — настройки человека.
+        if scripted is None:
+            scripted = await self._preference_turn(text, language)
+        # ТЗ F-602: «добавь Макса в контакты» — взаимное согласие, без модели.
+        if scripted is None:
+            scripted = await self._contact_turn(text, language)
+        # ТЗ F-606: «разреши ему музыку» — владелец расширяет доступ гостю на окно.
+        if scripted is None:
+            scripted = await self._guest_grant_turn(text, language)
+        # ТЗ F-601: «скажи Максу, что я иду» — интерком между комнатами.
+        if scripted is None:
+            scripted = await self._intercom_turn(text, language)
+        # ТЗ F-604: «да» / «нет» / «позже» в ответ на заданный опрос.
+        if scripted is None:
+            scripted = await self._poll_turn(text, language)
         if scripted is None:
             scripted = await self._forget_turn(text, language)
         # ТЗ F-418: «запомни, что …» / «забудь, что …» / «что ты обо мне
         # знаешь?» — the hub's own memory tools, not a model paraphrase.
         if scripted is None:
             scripted = await self._memory_turn(text, language)
+        # ТЗ F-417: «напомни через 20 минут» / «в пятницу в 9» — время читает
+        # хаб по часам комнаты, строка ложится в `reminders`.
+        if scripted is None:
+            scripted = await self._reminder_turn(text, language)
+        # ТЗ F-419: «когда я приду после 22:00, включи тёплый свет» — правило
+        # составляет модель, а включает его устное «да» (F-113).
+        if scripted is None:
+            scripted = await self._rule_turn(text, language)
         # ТЗ F-215: «почему ты решил, что это Макс?» is answered from the hub's
         # own belief (F-206), never from the model's imagination.
         if scripted is None:
@@ -10030,6 +13272,9 @@ class Connection(CameraClipReceiver):
         # столом» — вопросы о фактах БД, а не темы для модели.
         if scripted is None:
             scripted = await self._presence_turn(text, language)
+        # ТЗ F-305: «где мои ключи?» — последнее место из памяти объектов.
+        if scripted is None:
+            scripted = await self._where_turn(text, language)
         # ТЗ F-303: «перестань смотреть» / «смотри снова» — режим камеры.
         if scripted is None:
             scripted = await self._privacy_turn(text, language)
@@ -10058,7 +13303,12 @@ class Connection(CameraClipReceiver):
         session.reset()
         session.roleplay = self._roleplay_modes.current(self._known_speaker_name())
         if _memory is not None:
-            session.set_memory(await asyncio.to_thread(self._prompt_memory))
+            # ТЗ F-415/F-606: ``_prompt_memory`` asks the hub database WHO is
+            # speaking (a guest of this room is not a member of it), and the
+            # connection belongs to the event loop (DECISIONS P1-44): off the
+            # loop the question raised and the guest was handed the home's
+            # memory. The file reads inside it are small and locked.
+            session.set_memory(self._prompt_memory())
         recent = []
         history_reader = _dialog_reader()
         if history_reader is not None and self._known_speaker_name():
@@ -10308,7 +13558,8 @@ class Connection(CameraClipReceiver):
                 say_payload[proto.SAY_STATUS_FIELD] = "Voice saved"
             await self.send_json(say_payload)
             t_tts = time.perf_counter()
-            await self._stream_tts(voice, say_text)
+            # ТЗ F-607: the person's own voice, wherever they are.
+            await self._stream_tts(self._reply_voice(voice), say_text)
             tts_ms = int((time.perf_counter() - t_tts) * 1000)
 
         total_ms = int((time.perf_counter() - t_start) * 1000)
@@ -10429,6 +13680,50 @@ class Connection(CameraClipReceiver):
         except Exception as exc:  # noqa: BLE001 - archiving must never break a reply
             log.warning("Could not store utterance %s in dialog_turns (%s)",
                         utterance_id, type(exc).__name__, extra={'utterance_id': utterance_id})
+
+    def _reply_voice(self, voice: Any, *, name: str = "") -> Any:
+        """ТЗ F-607: the reply voice of the PERSON, not of the home.
+
+        ``person_preferences.voice`` wins when it is set and the speech engine
+        can actually produce it; otherwise the room keeps its own voice and the
+        refusal is honest in the log rather than silent in the room. ``name``
+        lets a proactive line (greeting, reminder, intercom) be spoken in the
+        voice of the person it is FOR, not of whoever spoke last.
+        """
+        try:
+            who = " ".join(str(name or "").split()) or self._known_speaker_name()
+        except Exception:  # noqa: BLE001 - an unknown speaker is not a failure
+            return voice
+        if not who:
+            return voice
+        person_id = _person_id_of(who)
+        if not person_id:
+            return voice
+        # ТЗ F-212/F-607: the reply voice is part of the shared profile.
+        if not self._profile_here(person_id):
+            return voice
+        store = _person_preferences_store()
+        if store is None:
+            return voice
+        try:
+            wanted = store.get(person_id).voice
+        except Exception as exc:  # noqa: BLE001 - a missing setting is not a failure
+            log.debug("Could not read the reply voice of %s (%s)", person_id, exc)
+            return voice
+        if not wanted:
+            return voice
+        maker = getattr(voice, "with_voice", None)
+        if maker is None:
+            return voice
+        try:
+            spoken = maker(wanted)
+        except Exception:  # noqa: BLE001 - the room keeps hearing answers
+            log.exception("Could not speak with the voice %r of %s", wanted, person_id)
+            return voice
+        if spoken is not voice:
+            log.info("Answering %s in their own voice %r", person_id, wanted,
+                     extra={'utterance_id': getattr(self, 'utterance_id', '')})
+        return spoken
 
     async def _stream_tts(self, voice: TtsEngine, text: str, purpose='reply', notice_id='',
                           cache: bool = False) -> None:

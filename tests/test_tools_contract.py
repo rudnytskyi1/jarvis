@@ -25,7 +25,7 @@ def test_browser_controls_existing_profile_and_atomic_search_contract():
     assert 'Uses a separate persistent profile' not in tool['description']
 
 
-def test_fifteen_tools_exposed():
+def test_every_tool_exposed():
     assert tool_names() == {
         "inspect_photo",
         "browser_control",
@@ -39,6 +39,7 @@ def test_fifteen_tools_exposed():
         "remember",
         "forget_fact",
         "list_memory",
+        "create_rule",
         "enroll_voice",
         "set_role",
         "look_at_camera",
@@ -51,6 +52,7 @@ def test_fifteen_tools_exposed():
         "telegram_send",
         "set_wallpaper",
         "list_people",
+        "run_skill",
     }
 
 
@@ -68,6 +70,7 @@ def test_matrix_split():
         "remember",
         "forget_fact",
         "list_memory",
+        "create_rule",
         "enroll_voice",
         "set_role",
         "look_at_camera",
@@ -80,6 +83,7 @@ def test_matrix_split():
         "telegram_send",
         "set_wallpaper",
         "list_people",
+        "run_skill",
     }
     assert CLIENT_TOOLS == {"set_light", "set_switch", "pc_control", "run_command", "browser_control"}
     assert is_client_tool("pc_control") and not is_client_tool("click_screen")

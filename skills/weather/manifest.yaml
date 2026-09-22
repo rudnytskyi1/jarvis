@@ -1,0 +1,8 @@
+name: weather
+description: Current weather and the forecast for a place, from Open-Meteo (no API key).
+scope: hub
+role: user
+caps: []
+version: 0.1.0
+enabled: true
+reads_internet: true

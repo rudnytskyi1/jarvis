@@ -102,6 +102,7 @@ from common.protocol import (
     MSG_ACTIONS,
     MSG_CAMERA_ERROR,
     MSG_CAMERA_REQUEST,
+    MSG_CARD,
     MSG_CONFIG_UPDATE,
     MSG_ERROR,
     MSG_HELLO,
@@ -342,6 +343,9 @@ def clip_output(value: Any) -> str | None:
 
 def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
     """Build the ``hello`` payload from the client config (SPEC §4.1)."""
+    kind = str(_attr(cfg_client, "kind") or "room_pc")
+    if kind not in {"room_pc", "phone", "sensor_node"}:
+        kind = "room_pc"
     devices: list[dict[str, Any]] = []
     for dev in (_attr(cfg_client, "devices") or []):
         name = _opt_str(_attr(dev, "name"))
@@ -355,12 +359,17 @@ def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
                 "description": _opt_str(_attr(dev, "description")),
             }
         )
+    # ТЗ F-711: a phone declares itself as one and never advertises a camera.
+    capabilities = ["voice_confirmation", "live_transcript"]
+    if kind == "room_pc":
+        capabilities.append(_protocol.CAP_CAMERA_CLIP)
     return {
         "type": MSG_HELLO,
         "client_id": str(_attr(cfg_client, "client_id") or "client"),
+        "kind": kind,
         "workplace_name": str(_attr(cfg_client, 'workplace_name') or _attr(cfg_client, 'client_id') or 'client'),
         "camera_name": str(_attr(_attr(cfg_client, 'camera'), 'name') or 'Основная камера'),
-        "capabilities": ["voice_confirmation", "live_transcript", _protocol.CAP_CAMERA_CLIP],
+        "capabilities": capabilities,
         "devices": devices,
         # ТЗ F-303: приватность живёт на клиенте, поэтому он и говорит, что у
         # него на самом деле (а не хаб угадывает по своим воспоминаниям).
@@ -1194,6 +1203,8 @@ class JarvisClient:
             log.debug("The server sent ready")
         elif mtype == MSG_STATUS:
             self._on_status_message(msg, in_conversation=False)
+        elif mtype == MSG_CARD:
+            self._on_card_message(msg, in_conversation=False)
         elif mtype == MSG_SPEAKER:
             self._on_speaker_message(msg)
         elif mtype == MSG_CONFIG_UPDATE:
@@ -1334,6 +1345,28 @@ class JarvisClient:
             revision,
             ", ".join(sorted(self.room_config)) or "no fields",
         )
+
+    def _on_card_message(self, msg: dict[str, Any], in_conversation: bool) -> None:
+        """MSG_CARD (ТЗ F-709): карточка на HUD — сообщение интеркома.
+
+        Карточка живёт свою ``ttl_s`` и гаснет сама: это момент, а не окно.
+        Между ходами HUD обычно тёмный, поэтому карточка зажигает рабочее
+        состояние, как и подпись F-708; во время разговора ход сам держит HUD.
+        """
+        title = str(msg.get("title") or "").strip()
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            return
+        try:
+            ttl_s = float(msg.get("ttl_s") or _protocol.DEFAULT_CARD_TTL_S)
+        except (TypeError, ValueError):
+            ttl_s = _protocol.DEFAULT_CARD_TTL_S
+        caption = f"{title}: {text}" if title else text
+        log.info("Card on the HUD (%s): %s", msg.get("kind") or "card", caption)
+        if not in_conversation and self._mode == MODE_IDLE:
+            self._status_owns_hud = True
+            self.overlay.set_state("thinking")
+        self._show_status(caption, ttl_s)
 
     def _on_status_message(self, msg: dict[str, Any], in_conversation: bool) -> None:
         """MSG_STATUS: a caption for background work, e.g. face enrollment photos.
@@ -1986,6 +2019,8 @@ class JarvisClient:
                     log.debug("The server sent ready")
                 elif mtype == MSG_STATUS:
                     self._on_status_message(msg, in_conversation=True)
+                elif mtype == MSG_CARD:
+                    self._on_card_message(msg, in_conversation=True)
                 elif mtype == MSG_SPEAKER:
                     self._on_speaker_message(msg)
                 else:

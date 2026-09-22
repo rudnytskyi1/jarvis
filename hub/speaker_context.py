@@ -87,6 +87,9 @@ class HomeDevice(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     kind: str = KIND_OTHER
     area: str = Field(default="", max_length=120)
+    #: ТЗ F-505: состояние словами («on», «off, brightness 40%») или пусто,
+    #: когда комната о нём ещё не отчиталась.
+    state: str = Field(default="", max_length=60)
 
 
 class HomeState(BaseModel):
@@ -108,6 +111,9 @@ class HomeState(BaseModel):
     #: ``HH:MM-HH:MM`` when the room has quiet hours at all.
     quiet_hours: str = ""
     quiet_now: bool = False
+    #: ТЗ F-405/F-421: skill names this room and this speaker may call. The
+    #: model needs them to know which integrations exist here at all.
+    skills: list[str] = Field(default_factory=list)
 
 
 def profile_from(*, name: Any, role: Any, language: Any, memory: Any,
@@ -151,25 +157,38 @@ def profile_from(*, name: Any, role: Any, language: Any, memory: Any,
 
 def home_state_from(*, home_id: Any = "", config_home: Any = None, people: Any = None,
                     unknown_people: Any = 0, devices: Any = None,
-                    lights_known: bool = False, moment: Any = None) -> HomeState:
+                    lights_known: bool = False, moment: Any = None,
+                    skills: Any = None, states: Any = None) -> HomeState:
     """Build the home state from the room config, presence and device list.
 
     ``config_home`` is :class:`common.config.HomeConfig` or ``None`` (a hub
     whose config carries no such room). ``people`` are the recognised names the
     presence tracker holds right now.
+
+    ``states`` (ТЗ F-505) is ``name → state words`` — what the hub has actually
+    seen about each device. A room that reported the state of its lights is no
+    longer described as "on/off not reported": the block carries what is known.
     """
     quiet = getattr(config_home, "quiet_hours", None)
     window = greeting_mod.window(getattr(quiet, "start", ""), getattr(quiet, "end", ""))
     timezone = _one_line(getattr(config_home, "tz", ""), limit=64)
     rows: list[HomeDevice] = []
+    seen: dict[str, str] = {str(key).casefold(): str(value)
+                            for key, value in (states or {}).items()}
+    lights_reported = False
     for device in devices or []:
         if not isinstance(device, dict):
             continue
         name = _one_line(device.get("name"), limit=120)
         if not name:
             continue
-        rows.append(HomeDevice(name=name, kind=device_kind(device.get("type")),
-                               area=_one_line(device.get("area"), limit=120)))
+        kind = device_kind(device.get("type"))
+        state = seen.get(name.casefold(), "")
+        if kind == KIND_LIGHT and state:
+            lights_reported = True
+        rows.append(HomeDevice(name=name, kind=kind,
+                               area=_one_line(device.get("area"), limit=120),
+                               state=_one_line(state, limit=60)))
     names: list[str] = []
     for entry in people or []:
         label = _one_line(entry, limit=80)
@@ -185,11 +204,12 @@ def home_state_from(*, home_id: Any = "", config_home: Any = None, people: Any =
         people=names[:8],
         unknown_people=unknown,
         devices=rows[:16],
-        lights_known=bool(lights_known),
+        lights_known=bool(lights_known or lights_reported),
         timezone=timezone,
         quiet_hours=f"{window[0]}-{window[1]}" if window else "",
         quiet_now=bool(window and greeting_mod.in_quiet_hours(
             window[0], window[1], moment=moment, tz=timezone)),
+        skills=[_one_line(name, limit=41) for name in (skills or []) if _one_line(name, limit=41)][:12],
     )
 
 
@@ -218,6 +238,11 @@ def render_profile(profile: SpeakerProfile) -> str:
     return " | ".join(parts)
 
 
+def _with_state(device: HomeDevice) -> str:
+    """``lamp (off)`` когда состояние известно, иначе просто ``lamp``."""
+    return f"{device.name} ({device.state})" if device.state else device.name
+
+
 def render_home(home: HomeState) -> str:
     """The home half of the prefix, or ``""`` when there is nothing to say."""
     parts: list[str] = []
@@ -228,15 +253,17 @@ def render_home(home: HomeState) -> str:
                      else f"in the room: {home.unknown_people} unknown people")
     lights = [device for device in home.devices if device.kind == KIND_LIGHT]
     if lights:
-        listed = ", ".join(device.name for device in lights)
+        listed = ", ".join(_with_state(device) for device in lights)
         parts.append(f"lights: {listed}" if home.lights_known
                      else f"lights: {listed} (on/off not reported by the room)")
     switches = [device for device in home.devices if device.kind == KIND_SWITCH]
     if switches:
-        parts.append("switches: " + ", ".join(device.name for device in switches))
+        parts.append("switches: " + ", ".join(_with_state(device) for device in switches))
     if home.quiet_hours:
         parts.append(f"quiet hours: {home.quiet_hours} "
                      f"({'on, keep it quiet' if home.quiet_now else 'off'})")
+    if home.skills:
+        parts.append("skills: " + ", ".join(home.skills))
     if not parts and not home.name and not home.home_id:
         return ""
     head = home.name or home.home_id
