@@ -22,7 +22,7 @@ from hub.image_prompt import action_revoked, visual_request
 from hub.room_questions import current_people_question, inspect_current_people
 from hub.session import Session
 from hub.telegram import TelegramError
-from hub.telegram_chat import _OTHER_MEDIA, current_image_request
+from hub.telegram_chat import _OTHER_MEDIA, _integer, current_image_request
 from hub.telegram_intent import (
     _EXCLUDED_TARGET,
     _POLITE,
@@ -520,6 +520,10 @@ class TelegramController:
                         'To describe, recognize people or locate an object in that attached photo, use inspect_photo '
                         'with query and optional segmentation target. This inspects the supplied photo without '
                         'using the live room camera. Image creation/editing still requires an explicit request.')
+                    if _integer(message.get('album_size')) and message['album_size'] > 1:
+                        prompt += (f'\n{message["album_size"]} photos arrived in ONE album, and they are all '
+                            'part of this one request. The newest photo is the edit source (source=last); the '
+                            'others are described with inspect_photo. Never answer as if only one photo came.')
                 prepared = [{'role': 'system', 'content': prompt}]
                 if context:
                     # The prior group turns are outside text: they are what

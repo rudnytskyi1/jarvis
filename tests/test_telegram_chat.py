@@ -13,6 +13,7 @@ from PIL import Image
 from hub.image_generation import ImageStore, decode_image
 from hub.telegram import TelegramError
 from hub.telegram_admin_state import TelegramAdminState
+from hub import telegram_chat
 from hub.telegram_chat import TelegramChat, addressed_text, current_image_request
 from hub.untrusted import strip as strip_untrusted
 
@@ -56,6 +57,76 @@ def png():
 def image_generator():
     return SimpleNamespace(check_ready=Mock(), cfg=SimpleNamespace(model='gemini-3.1-flash-image'),
                            generate=AsyncMock(return_value=decode_image(png(), 'image/png')))
+
+
+def album_item(number, message_id, file_id, *, media_group='g1', caption=None):
+    """One photo of a Telegram album: a message with no text and its own id."""
+    # In a real private chat the chat id IS the sender id.
+    body = {'message_id': message_id, 'date': int(time.time()),
+            'chat': {'id': 7, 'type': 'private'},
+            'from': {'id': 7, 'is_bot': False, 'first_name': 'Anton'},
+            'media_group_id': media_group,
+            'photo': [{'file_id': file_id, 'width': 90, 'height': 60, 'file_size': 12000}]}
+    if caption is not None:
+        body['caption'] = caption
+    return {'update_id': number, 'message': body}
+
+
+def owner_runtime(tmp_path, transport=None, reply=None):
+    """A private chat with the owner, which is where photos are attached."""
+    chat = TelegramChat(transport or provider(),
+                        SimpleNamespace(chat_id=-100, poll_timeout_s=20, control_user_id=7),
+                        reply or AsyncMock(return_value=''), None, None, tmp_path / 'telegram')
+    chat.bot_id, chat.username = 99, 'RowanBot'
+    chat._started_at = 0
+    return chat
+
+
+def test_a_photo_album_is_one_request_with_one_answer(tmp_path, monkeypatch):
+    """Three photos in one Telegram message must not become three requests.
+
+    The owner attached several photos and the room answered every single one of
+    them with its own "Что сделать с фотографией?" - the album arrived as three
+    updates and each one was handled on its own.
+    """
+    monkeypatch.setattr(telegram_chat, 'ALBUM_WINDOW_S', 0.05)
+    async def run():
+        transport, reply = provider(), AsyncMock(return_value='')
+        bot = owner_runtime(tmp_path, transport=transport, reply=reply)
+        await bot.process_update(album_item(1, 11, 'f1'))
+        await bot.process_update(album_item(2, 12, 'f2'))
+        await bot.process_update(album_item(3, 13, 'f3'))
+        for _ in range(100):
+            if not bot._album_tasks:
+                break
+            await asyncio.sleep(0.02)
+        assert transport.send_text.await_count == 1
+        assert reply.await_count == 0
+        asked = transport.send_text.await_args.args[0]
+        assert 'фото' in asked
+    asyncio.run(run())
+
+
+def test_the_album_arrives_as_one_message_with_all_of_its_photos(tmp_path, monkeypatch):
+    monkeypatch.setattr(telegram_chat, 'ALBUM_WINDOW_S', 0.05)
+    async def run():
+        bot = owner_runtime(tmp_path)
+        seen = []
+        bot._answer = AsyncMock(side_effect=lambda update_id, message, text: seen.append((message, text)))
+        await bot.process_update(album_item(1, 31, 'f1'))
+        await bot.process_update(album_item(2, 32, 'f2', caption='Добавь шляпу'))
+        for _ in range(100):
+            if not bot._album_tasks:
+                break
+            await asyncio.sleep(0.02)
+        assert len(seen) == 1
+        message, text = seen[0]
+        assert text == 'Добавь шляпу'
+        assert message['album_size'] == 2
+        assert [photos[0]['file_id'] for photos in message['album_photos']] == ['f1', 'f2']
+        # The newest photo stays the edit source, exactly like "source=last".
+        assert message['photo'][0]['file_id'] == 'f2'
+    asyncio.run(run())
 
 
 def test_a_group_the_bot_meets_becomes_a_notification_destination(tmp_path):

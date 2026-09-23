@@ -272,6 +272,49 @@ def test_additional_session_keeps_existing_samples_and_commits_after_six(tmp_pat
     asyncio.run(run())
 
 
+def test_enroll_my_face_starts_a_face_registration_not_a_voice_one(tmp_path, monkeypatch):
+    """A neighbour asked about his face and heard "voice samples, Anton".
+
+    Live log 20:35: "Rowan AI, enroll my face" -> "Let's add new voice samples
+    to your profile, Anton. Sentence 1 of 6." The word "enroll" was in the
+    negative lookahead, so an explicit FACE request was read as a voice one.
+    """
+    async def run():
+        registry(tmp_path, monkeypatch, [0.3, 0.95])
+        conn = connection()
+        conn._speaker_name, conn._speaker_role, conn._speaker_score = 'Anton', 'admin', 0.3
+        reply = await conn._enrollment_turn('Rowan AI, enroll my face')
+        assert conn._enroll_pending is None
+        assert conn._enroll_ask_name['mode'] == 'face'
+        assert 'voice samples' not in reply
+    asyncio.run(run())
+
+
+def test_stop_cancels_a_registration_even_without_the_word_registration(tmp_path, monkeypatch):
+    """The same neighbour said "stop, this is not me" and the room continued."""
+    async def run():
+        registry(tmp_path, monkeypatch, [0.3, 0.95])
+        conn = connection()
+        conn._enroll_pending = {'name': 'Anton', 'samples': 1, 'total_speech_s': 4.0,
+                                'recordings': [], 'expires': 10 ** 9}
+        reply = await conn._enrollment_turn('Oh, Rowan AI, stop, stop, this is not me')
+        assert reply == 'Registration cancelled.'
+        assert conn._enroll_pending is None
+    asyncio.run(run())
+
+
+def test_a_voice_match_alone_does_not_record_into_somebody_elses_profile(tmp_path, monkeypatch):
+    """The neighbour's voice scored as Anton (0.30); that is not an identity."""
+    async def run():
+        registry(tmp_path, monkeypatch, [0.3, 0.95])
+        conn = connection()
+        conn._speaker_name, conn._speaker_role, conn._speaker_score = 'Anton', 'admin', 0.3
+        reply = await conn._enrollment_turn('Rowan AI, remember my voice')
+        assert conn._enroll_pending is None
+        assert 'What name' in reply
+    asyncio.run(run())
+
+
 def test_the_sentence_on_the_screen_counts_as_a_sample_even_though_it_says_remember(
         tmp_path, monkeypatch):
     """A guest read sentence 1 four times and not one sample was kept.

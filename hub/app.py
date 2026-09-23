@@ -9417,7 +9417,11 @@ class Connection(CameraClipReceiver):
         if ask and now > ask["expires"]:
             self._enroll_ask_name = ask = None
         face_job = getattr(self, '_enroll_face_task', None)
-        if (pending or ask or getattr(self, "_face_selection", None) or (face_job and not face_job.done())) and re.search(r"\b(?:cancel|stop registration|never mind)\b|отмена", text, re.I):
+        # "stop" alone must stop a recording: the neighbour whose voice scored
+        # as Anton said "Oh, Rowan AI, stop, stop, this is not me" and the room
+        # went on to "Sentence 2 of 6. Anton, read the sentence on screen."
+        if (pending or ask or getattr(self, "_face_selection", None) or (face_job and not face_job.done())) and re.search(
+                r"\b(?:cancel|stop|never mind|forget it|not me|no thanks)\b|отмена|прекрати|это не я|не я\b", text, re.I):
             if face_job and not face_job.done():
                 face_job.cancel()
             self._enroll_pending = self._enroll_ask_name = self._face_selection = None
@@ -9482,10 +9486,23 @@ class Connection(CameraClipReceiver):
             return enrollment.prompt(pending)
         if not enrollment.requested(text) and not ask:
             return None
-        face_only = bool(re.search(r"(?:my face|мо[её] лицо)", text, re.I)) and not re.search(r"voice|голос|register|enroll", text, re.I)
+        # "enroll my face" NAMED the face. The old rule also rejected the word
+        # "enroll", so the request fell through to mode "voice" and the live
+        # room answered "Let's add new voice samples to your profile, Anton."
+        # to a neighbour who had asked about his face.
+        face_only = (bool(re.search(r"(?:my face|мо[её] лицо|\bface\b|\bлицо\b)", text, re.I))
+                     and not re.search(r"voice|голос", text, re.I))
         mode = ask["mode"] if ask else ("face" if face_only else "voice")
         include_face = ask.get("face", False) if ask else bool(re.search(r"register|remember me|face|регистрац|лицо|запомни меня", text, re.I))
-        name = enrollment.extract_name(text, answering=bool(ask)) or (self._known_speaker_name() if not ask else "")
+        # A voice match is NOT an identity for a new registration. Only an
+        # explicit "add more / update my voice samples" is about the person who
+        # is already saved; anything else has to name its owner, or the room
+        # records a stranger's voice into somebody else's profile.
+        updating = bool(re.search(
+            r"\b(?:update|add|more|another|extra)\b[^.!?]{0,30}\b(?:voice|samples?)\b"
+            r"|дозапиш\w*|добав\w*\s+[^.!?]{0,30}(?:голос|образц)", text, re.I))
+        name = enrollment.extract_name(text, answering=bool(ask)) or (
+            self._known_speaker_name() if (not ask and updating) else "")
         if not name or speaker_mod.is_placeholder_name(name):
             self._enroll_ask_name = {"mode": mode, "face": include_face, "expires": now + 180}
             return "What name should I save? Say Rowan AI, my name is, followed by your name. You can spell it out."

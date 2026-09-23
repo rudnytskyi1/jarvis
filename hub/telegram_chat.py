@@ -26,6 +26,9 @@ log = logging.getLogger(__name__)
 PROMPT = Path(__file__).resolve().parents[1] / 'prompts' / 'telegram.md'
 MAX_PHOTO_BYTES = 8_000_000
 MAX_CONTEXT_BYTES = 40_000
+#: How long Telegram gets to deliver the rest of one album before the room
+#: answers it. Photos of one media group arrive as separate updates.
+ALBUM_WINDOW_S = 1.4
 _OTHER_MEDIA = ('document', 'video', 'animation', 'sticker', 'audio', 'voice', 'video_note')
 _REQUEST_START = (r'''^[^\w"'“”‘’«»`]*'''
                   r'(?:(?:can|could|would|will)\s+you\s+|(?:можешь|можете)\s+|'
@@ -268,6 +271,11 @@ class TelegramChat:
         #: Independent messages run side by side (owner's rule, DECISIONS
         #: TG-PARALLEL-01): one slow answer must not hold up the next request.
         self._pending: set[asyncio.Task] = set()
+        #: One album (media_group_id) arrives as one update PER photo. Without
+        #: this buffer the room answered a three-photo message three times, each
+        #: with its own "Что сделать с фотографией?" - the owner's report.
+        self._albums: dict[str, list[dict]] = {}
+        self._album_tasks: set[asyncio.Task] = set()
         self._slots = asyncio.Semaphore(max(1, int(getattr(self.cfg, 'max_parallel_requests', 4) or 4)))
         self._initialized = False
         self._started_at = time.time()
@@ -789,6 +797,12 @@ class TelegramChat:
                     await asyncio.to_thread(self._advance, update_id)
                     return True
             message = self._group_message(update)
+            # One album is one request: buffer its photos and answer once.
+            if message is not None and self._album_of(message):
+                await asyncio.to_thread(self._advance, update_id)
+                await asyncio.to_thread(self._remember_message, message, True)
+                self._queue_album(update, message)
+                return True
             observe = getattr(self.access, 'observe_user', None)
             if message is not None and callable(observe):
                 await asyncio.to_thread(observe, message['from'])
@@ -806,6 +820,60 @@ class TelegramChat:
         # него, поэтому следующее сообщение не ждёт конца предыдущего.
         await self._answer(update_id, message, text)
         return True
+
+    @staticmethod
+    def _album_of(message):
+        """The media group this photo belongs to, or ``''`` for a single photo."""
+        group = message.get('media_group_id')
+        return str(group) if isinstance(group, (str, int)) and str(group).strip() else ''
+
+    def _queue_album(self, update, message):
+        """Hold one photo of an album; the last one decides when it is answered."""
+        group = self._album_of(message)
+        items = self._albums.setdefault(group, [])
+        items.append({'update_id': update['update_id'], 'message': message})
+        if len(items) > 1:
+            return
+        task = asyncio.get_running_loop().create_task(self._answer_album(group))
+        self._album_tasks.add(task)
+        task.add_done_callback(self._album_tasks.discard)
+
+    @staticmethod
+    def _merge_album(items):
+        """One message that carries the whole album and its caption.
+
+        The newest photo of the album stays in ``photo`` so that every existing
+        path - the size pick, "source=last" and the reply-to-a-bot-photo rule -
+        keeps meaning what it meant for a single message.
+        """
+        first = items[0]['message']
+        merged = dict(first)
+        photos = [item['message']['photo'] for item in items
+                  if isinstance(item['message'].get('photo'), list) and item['message']['photo']]
+        merged['photo'] = photos[-1] if photos else []
+        merged['album_size'] = len(photos)
+        merged['album_photos'] = photos
+        merged['album_message_ids'] = [item['message'].get('message_id') for item in items]
+        text = ''
+        for item in items:
+            candidate = item['message'].get('caption') or item['message'].get('text') or ''
+            if str(candidate).strip():
+                text = str(candidate).strip()
+                break
+        return merged, text, items[-1]['update_id']
+
+    async def _answer_album(self, group):
+        try:
+            await asyncio.sleep(ALBUM_WINDOW_S)
+            items = self._albums.pop(group, [])
+            if not items:
+                return
+            merged, text, update_id = self._merge_album(items)
+            await self._answer(update_id, merged, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one album must not kill the poller
+            log.exception('The Telegram album %s could not be answered', group)
 
     async def _answer(self, update_id, message, text):
         if not self._can_chat(message):
