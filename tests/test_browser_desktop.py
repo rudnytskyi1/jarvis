@@ -31,6 +31,8 @@ class FakeDesktop:
         self.events = []
         self.released = False
         self.element = object()
+        #: Windows whose accessibility tree holds no page document at all.
+        self.pageless = set()
 
     def windows(self):
         return self.inventory
@@ -42,10 +44,17 @@ class FakeDesktop:
         self.active = window['hwnd']
 
     def page(self, window, stop):
-        return {'key': ((1,), self.url, 'YouTube'), 'url': self.url,
-                'title': 'YouTube', 'document': object(), 'root': object()}
+        if window['hwnd'] in self.pageless:
+            return {'key': ((), '', window['title']), 'url': '', 'caption': window['title'],
+                    'typed': '', 'blank': True, 'title': window['title'],
+                    'document': None, 'root': object()}
+        return {'key': ((1,), self.url, 'YouTube'), 'url': self.url, 'typed': '',
+                'caption': 'YouTube - Google Chrome', 'blank': False, 'title': 'YouTube',
+                'document': object(), 'root': object()}
 
     def elements(self, page, stop):
+        if page.get('document') is None:
+            return [], ''
         return [(self.element, {'role': 'input', 'text': 'Search', 'disabled': False,
             'bounds': (10, 10, 100, 40), 'signature': self.signature})], 'Videos'
 
@@ -96,6 +105,80 @@ def test_a_typed_address_that_never_loads_is_a_failure_not_a_success(monkeypatch
         with pytest.raises(ValueError, match='did not open youtube.com'):
             await browser.execute({'command': 'navigate',
                                    'url': 'https://www.youtube.com/results?search_query=MrBeast'})
+        await browser.close()
+    asyncio.run(run())
+
+
+def test_a_caption_change_is_not_proof_the_address_loaded(monkeypatch):
+    """Only a loaded document proves the address opened.
+
+    Chrome re-creates its accessibility tree while a page loads, so the window
+    element changes on every read. The live report (VE-01/VE-02 in
+    ``data/live-eval/last.json``) came back as a success with ``url: ""`` and
+    nothing but a window caption - "YouTube - Google Chrome", or "Search icon"
+    for the browser's own new tab: the caption was read as a page that loaded,
+    and the room heard "YouTube is open" about a window that was still showing
+    what it had before.
+    """
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_WAIT_S', 0.2)
+
+    async def run():
+        backend = FakeDesktop()
+        backend.url = 'https://example.com/'
+        backend.navigate = lambda window, url, stop: backend.events.append(('navigate', url))
+        reads = []
+
+        def churning(window, stop):
+            reads.append(1)
+            return {'key': ((len(reads),), backend.url, 'Example Domain'),
+                    'url': backend.url, 'typed': 'youtube.com', 'blank': False,
+                    'caption': f'draft {len(reads)} - Google Chrome',
+                    'title': 'Example Domain', 'document': object(), 'root': object()}
+
+        backend.page = churning
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        with pytest.raises(ValueError, match='did not open youtube.com'):
+            await browser.execute({'command': 'navigate', 'url': 'https://www.youtube.com'})
+        assert len(reads) > 1  # the address was given every chance to load
+        await browser.close()
+    asyncio.run(run())
+
+
+def test_a_window_that_shows_no_page_is_not_reported_as_a_loading_page():
+    """A window with no document is a failure, not a page to wait for.
+
+    VE-07...VE-11 answered the room from a Chrome window whose accessibility
+    tree had no document at all (no url, no elements, caption "Search icon")
+    while still reporting ``ok``; the model then told the owner "the page isn't
+    loaded" and gave up on ``type MrBeast in the search box and press enter``.
+    """
+    async def run():
+        backend = FakeDesktop()
+        backend.inventory[0]['title'] = 'Search icon'
+        backend.pageless = {10}
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        with pytest.raises(ValueError, match='not showing a readable page'):
+            await browser.execute({'command': 'read'})
+        with pytest.raises(ValueError, match='not showing a readable page'):
+            await browser.execute({'command': 'scroll', 'direction': 'down'})
+        assert backend.events == []  # nothing was scrolled in that window
+        await browser.close()
+    asyncio.run(run())
+
+
+def test_the_window_that_really_shows_a_page_is_used_instead():
+    """The page can be open next to a page-less window of the same browser."""
+    async def run():
+        backend = FakeDesktop()
+        backend.inventory.insert(0, {'hwnd': 11, 'pid': 20, 'name': 'Google Chrome',
+                                     'image': 'chrome.exe', 'title': 'Search icon'})
+        backend.pageless = {11}
+        backend.active = 11  # the page-less window is in the foreground
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        data = json.loads(await browser.execute({'command': 'read'}))
+        assert data['url'] == 'https://www.youtube.com'
+        assert data['title'] == 'YouTube' and data['elements']
+        assert backend.active == 10  # the window that really shows the page
         await browser.close()
     asyncio.run(run())
 

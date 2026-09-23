@@ -75,6 +75,25 @@ def _host(url: str) -> str:
     return host[4:] if host.startswith('www.') else host
 
 
+def _no_page_error(page) -> ValueError:
+    """The honest failure of a window that is not showing a page at all.
+
+    A window whose accessibility tree has no document is not a page that is
+    still loading: Chrome answers that way for its own popups, and for a
+    window whose renderer has not handed over any tree. The old tool read such
+    a window, returned zero elements and the note "the page is loading", and
+    the room heard "the page isn't loaded" while the real page was open in
+    another window of the same browser.
+    """
+    caption = str(page.get('caption') or page.get('title') or '').strip()
+    where = f' {caption!r}' if caption else ''
+    return ValueError(
+        f'The browser window{where} is not showing a readable page: no page '
+        'document is exposed, so nothing could be read or clicked. Open the '
+        'site in that window first (browser_control navigate), or look at '
+        'the screen instead.')
+
+
 def _cancelled(stop):
     if stop.is_set():
         raise InterruptedError('Browser action cancelled')
@@ -230,11 +249,18 @@ class _WindowsUIA:
         # somebody had just typed. It travels separately as ``typed``.
         document_url = self._value(doc) if doc else ''
         typed = self._value(address) if address else ''
-        title = str(doc.CurrentName if doc else root.CurrentName or '')
+        page_title = str(doc.CurrentName or '') if doc else ''
+        # What the desktop shows is the window caption. The accessibility name
+        # of the root element is not it - Chrome answers "Search icon" for its
+        # own new tab - so it is only the last resort for reporting.
+        caption = str(window.get('title') or '') or str(root.CurrentName or '')
+        title = page_title or caption
         runtime = tuple(doc.GetRuntimeId()) if doc else ()
-        blank = not document_url and title.strip().casefold() in _BLANK_TITLES
+        # No document at all means "not a page", not "a page that is loading";
+        # an empty page title keeps that state in the blank set.
+        blank = not document_url and page_title.strip().casefold() in _BLANK_TITLES
         return {'key': (runtime, document_url, title), 'url': document_url,
-                'typed': typed, 'blank': blank, 'title': title,
+                'typed': typed, 'blank': blank, 'title': title, 'caption': caption,
                 'document': doc, 'root': root}
 
     @staticmethod
@@ -404,7 +430,7 @@ class _WindowsUIA:
         if command == 'scroll':
             doc = page['document']
             if not doc:
-                raise ValueError('The browser page is still loading. Read the page again.')
+                raise _no_page_error(page)
             doc.SetFocus()
             if not self._focused_within(window, doc, stop):
                 raise ValueError('Could not focus the browser page for scrolling.')
@@ -477,6 +503,13 @@ class DesktopBrowserController:
                 self._stop = None
 
     def _select(self, windows, args, stop, command=''):
+        """Pick the window to act on, plus every candidate in preference order.
+
+        The candidates are returned so that a window which turns out to show no
+        page at all can be skipped in favour of one that does (VE-07...VE-11:
+        the room was answered from a Chrome window titled "Search icon" that had
+        no document, while the page the owner asked about was open next to it).
+        """
         selector = str(args.get('browser') or '').strip()
         if selector:
             windows = [w for w in windows if matches(w['name'], selector)]
@@ -489,21 +522,24 @@ class DesktopBrowserController:
             if not windows:
                 raise ValueError('The selected browser window is no longer open.')
         if not windows:
-            return None
+            return None, []
         active = self._backend.foreground()
+        focused = [w for w in windows if w['hwnd'] == active]
+        # The window the owner is looking at comes first; the rest stay behind
+        # it as the fallback for a window that shows no page.
+        ordered = focused + [w for w in windows if w['hwnd'] != active]
         if len(windows) == 1:
-            return windows[0]
+            return ordered[0], ordered
         # Between browsers, use the existing app-choice flow. Within one browser
         # the foreground window is the user's existing window selection.
-        focused = [w for w in windows if w['hwnd'] == active]
         if len({w['name'].casefold() for w in windows}) == 1 and len(focused) == 1:
-            return focused[0]
+            return ordered[0], ordered
         if command == 'navigate':
             # An explicit address does not depend on whatever page is already
             # open: any ordinary browser window can take it. Asking "which
             # window?" for "open YouTube" is exactly the kind of question the
             # owner should never hear.
-            return focused[0] if focused else windows[0]
+            return ordered[0], ordered
         _cancelled(stop)
         self._choices.clear()
         choices = []
@@ -511,7 +547,7 @@ class DesktopBrowserController:
             ref = uuid.uuid4().hex[:16]
             self._choices[ref] = ((window['hwnd'], window['pid']), time.monotonic() + 180)
             choices.append({'window_ref': ref, 'browser': window['name'], 'title': window['title'][:120]})
-        return {'choices': choices}
+        return {'choices': choices}, ordered
 
     def _snapshot(self, window, page, stop):
         elements, text = self._backend.elements(page, stop)
@@ -538,7 +574,8 @@ class DesktopBrowserController:
         if self._backend is None:
             self._backend = self._factory()
         windows = self._backend.windows()
-        window = self._select(windows, args, stop, command=args['command'])
+        command = args['command']
+        window, candidates = self._select(windows, args, stop, command=command)
         if window is None:
             raise ValueError('No matching ordinary browser window is open. Use open_app to choose and open a browser first.')
         if 'choices' in window:
@@ -547,7 +584,7 @@ class DesktopBrowserController:
                 'note': 'Several browser windows are open. Ask which one to use, then pass its window_ref.'}, ensure_ascii=False)
         self._backend.focus(window, stop)
         page = self._backend.page(window, stop)
-        command = args['command']
+        window, page = self._showing_a_page(candidates, window, page, stop)
         element = None
         if command in ('click', 'fill') or (command == 'press' and args.get('ref')):
             ref = self._refs.get(str(args.get('ref') or ''))
@@ -555,23 +592,59 @@ class DesktopBrowserController:
                 raise ValueError(_STALE)
             self._backend.validate(ref.element, ref.signature)
             element = ref.element
-        if command != 'read':
-            self._refs.clear()
-            if command == 'navigate':
-                page = self._navigate(window, page, str(args['url']), stop)
-            else:
-                self._backend.act(window, page, command, element, args, stop)
-                stop.wait(.45)
-                page = attempt(lambda: self._backend.page(window, stop))
-        # New/hydrating documents can expose no content on the first UIA query.
-        for retry in range(3):
+        if command == 'read':
+            return self._page_snapshot(window, page, stop)
+        self._refs.clear()
+        if command == 'navigate':
+            page = self._navigate(window, page, str(args['url']), stop)
+        else:
+            if page.get('document') is None:
+                raise _no_page_error(page)
+            self._backend.act(window, page, command, element, args, stop)
+            stop.wait(.45)
+            page = attempt(lambda: self._backend.page(window, stop))
+        return self._page_snapshot(window, page, stop)
+
+    def _showing_a_page(self, candidates, window, page, stop):
+        """Prefer, among the candidates, a window that really shows a page.
+
+        Chrome keeps windows whose accessibility tree holds no document at all
+        (its own popups, and windows whose renderer has not handed a tree over).
+        Reading one of those made the room hear "the page isn't loaded" while
+        the page it asked about was open in the next window of the same browser.
+        """
+        if page.get('document') is not None or len(candidates) < 2:
+            return window, page
+        for other in candidates:
+            if (other['hwnd'], other['pid']) == (window['hwnd'], window['pid']):
+                continue
+            _cancelled(stop)
+            try:
+                probe = attempt(lambda current=other: self._backend.page(current, stop))
+            except Exception:  # noqa: BLE001 - a window that cannot be read is skipped
+                continue
+            if probe.get('document') is not None:
+                self._backend.focus(other, stop)
+                return other, probe
+        return window, page
+
+    def _page_snapshot(self, window, page, stop):
+        """One honest page snapshot, giving a loading document a moment to exist.
+
+        New and hydrating documents can expose nothing on the first UIA query,
+        so a missing document is asked about again. It is never reported as a
+        page that is loading: a window with no document at all is a failure the
+        model has to know about, not a page it should wait for.
+        """
+        for _retry in range(3):
             _cancelled(stop)
             snapshot = attempt(lambda current=page: self._snapshot(window, current, stop))
             data = json.loads(snapshot)
-            if data['elements'] or data['text'] or retry == 2:
+            if data['elements'] or data['text'] or page.get('document') is not None:
                 return snapshot
             stop.wait(.3)
             page = attempt(lambda: self._backend.page(window, stop))
+        raise _no_page_error(page)
 
     def _navigate(self, window, before, url, stop):
         """Type the address, then prove that a different page really loaded.
@@ -581,6 +654,12 @@ class DesktopBrowserController:
         the document 0.45 s later, saw the omnibox text, and reported success
         while the window was still on its New Tab page - the room then heard
         "YouTube is open" about a page that had never loaded.
+
+        Only a document that really loaded proves the address opened. A window
+        caption that changed - and Chrome re-creating its accessibility tree,
+        which hands out a new runtime id on every read - used to count as proof:
+        the room heard "YouTube is open" while the window was still showing the
+        page (or the popup) it had before.
         """
         wanted = _host(url)
         attempt(lambda: self._backend.navigate(window, url, stop), attempts=2)
@@ -595,13 +674,14 @@ class DesktopBrowserController:
                 if time.monotonic() >= deadline:
                     raise
                 continue
-            landed = bool(wanted) and wanted in str(page.get('url') or '').casefold()
-            moved = page.get('key') != before.get('key')
-            if landed or (moved and not page.get('blank')):
+            loaded = str(page.get('url') or '').strip()
+            landed = bool(wanted) and wanted in loaded.casefold()
+            moved = bool(loaded) and loaded != str(before.get('url') or '').strip()
+            if landed or moved:
                 return page
             if time.monotonic() >= deadline:
                 break
-        still = str(page.get('title') or '').strip() or 'an empty page'
+        still = str(page.get('title') or page.get('caption') or '').strip() or 'a page with no readable document'
         typed = str(page.get('typed') or '').strip()
         raise ValueError(
             f'The address bar did not open {wanted or url}: the browser is still on '
