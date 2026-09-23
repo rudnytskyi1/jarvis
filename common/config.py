@@ -210,8 +210,14 @@ class LLMConfig(_Strict):
     #: Local spending guard for the cloud providers (ТЗ F-403). ``0`` means the
     #: owner removed the ceiling entirely: usage is still counted and shown, but
     #: no request is ever refused for spending too much. The owner asked for
-    #: that on 2026-09-22 ("убери все ограничения"); DECISIONS.md API-01.
-    monthly_budget_usd: float = Field(default=18.0, ge=0, allow_inf_nan=False)
+    #: that on 2026-09-22 ("убери все ограничения") and again on 2026-09-23
+    #: ("monthly api allowance убери нахер у меня чатбот не работает"), so the
+    #: DEFAULT is now "no ceiling": only a number the owner typed himself can
+    #: stop a turn. A config that never mentions the key therefore cannot
+    #: silently agree to refuse cloud turns - the $18 default did exactly that
+    #: on a hub started with a config that omitted the line (2026-09-23).
+    #: DECISIONS.md API-01, API-04.
+    monthly_budget_usd: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     #: Size of one request body before it goes out. A body over this number is
     #: TRIMMED (the oldest turns are dropped) instead of refused — the owner
     #: asked on 2026-09-22 that "conversation is too long" never be spoken

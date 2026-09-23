@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import copy
+import logging
 
 from common.config import Config
+
+log = logging.getLogger(__name__)
 
 CATEGORIES = {
     'llm': 'AI and budget', 'stt': 'Speech recognition', 'diarization': 'Speaker separation',
@@ -141,8 +144,17 @@ def apply_live(cfg, key, value, runtime):
             stt.hotwords = ', '.join(value)[:1024]
     if key == 'server.llm.monthly_budget_usd':
         llm = runtime.get('llm')
+        applied = 0
         for target in (getattr(llm, '_responses', None), runtime.get('image_generator')):
             budget = getattr(target, 'budget', None)
             if budget is not None:
                 # 0 is the owner's "no monthly ceiling" (DECISIONS.md API-01).
                 budget.set_limit(value)
+                applied += 1
+        if applied:
+            # Владелец 2026-09-23 («убери нахер, у меня чатбот не работает»)
+            # искал причину в логе: строка ниже говорит, что предел расходов
+            # кто-то поставил в ЖИВОМ хабе и с какого момента он действует.
+            log.warning("The API spending ceiling is now %s USD a month "
+                        "(0 = no ceiling); the running hub applies it at once",
+                        value)

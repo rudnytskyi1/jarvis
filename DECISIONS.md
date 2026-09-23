@@ -5154,3 +5154,29 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   `ffmpeg` даёт H.264 + faststart (2520 байт). Ссылка: ТЗ F-702;
   `hub/video_transcode.py`, `hub/telegram.py`, `scripts/video_probe.py`,
   `tests/test_video_transcode.py`, `tests/test_telegram_admin_transport.py`.
+
+- **API-04 — месячного предела расходов больше нет по умолчанию.** Владелец
+  2026-09-23: «monthly api allowance убери нахер у меня чатбот не работает».
+  Причина найдена в логе живого хаба, а не в догадках:
+  `14:31:34 INFO jarvis.server.llm: LLM: deepseek-flash via OpenAI Responses;
+  monthly allowance $18.00` и следующая строка `Cloud turn stopped: Monthly API
+  allowance reached; local commands remain available.` — то есть хаб считал
+  месячный потолок в 18 USD и отказывал в каждом облачном ходе, пока потолок
+  не сняли перезапуском. Источником был не конфиг живого профиля
+  (`config.openai.yaml` всё это время писал `monthly_budget_usd: 0`), а
+  УМОЛЧАНИЕ модели конфигурации: `common/config.py` объявлял
+  `Field(default=18.0)`, поэтому любой конфиг, который просто не упоминает ключ
+  (`config.yaml`, временный конфиг для прогона, копия примера), молча получал
+  право отклонять запросы. Выбран вариант: умолчание стало `0.0` = «предела
+  нет, расход считается и виден» (`common/config.py`, оба `getattr(...)` в
+  `hub/app.py`, `config.example.yaml`); сам механизм потолка остался — число,
+  которое владелец введёт сам в панели, по-прежнему работает, но теперь оно
+  видно в логе: `hub/admin_settings.py` пишет WARNING «The API spending ceiling
+  is now N USD a month (0 = no ceiling)» в момент применения. Обоснование:
+  отказ из-за суммы — это стена, о которой владелец не помнит, что её поставил;
+  умолчание не должно уметь отклонять запросы. Проверено:
+  `python scripts/llm_probe.py` → «предел расходов: нет (0)», живого ответа
+  дождались за 863 мс («Yes, I'm working.»); `pytest tests/test_config.py
+  tests/test_admin_settings.py tests/test_api_budget.py
+  tests/test_image_generation.py tests/test_metrics.py tests/test_digest.py -q`
+  → 109 passed. Ссылка: ТЗ F-403/F-704; DECISIONS.md API-01, API-02.

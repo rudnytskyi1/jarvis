@@ -740,3 +740,13 @@
   H.264 + faststart (2520 байт); `pytest tests/test_video_transcode.py
   tests/test_telegram_admin_transport.py tests/test_presence_alerts.py -q`
   → 57 passed.
+- [x] **AU-28 — месячный предел расходов снят по умолчанию (API-04).**
+  Владелец 2026-09-23: «monthly api allowance убери нахер у меня чатбот не
+  работает». В логе живого хаба: `monthly allowance $18.00` и следом
+  `Cloud turn stopped: Monthly API allowance reached` — каждый облачный ход
+  отклонялся. Умолчание в `common/config.py` было `18.0`, поэтому конфиг без
+  этой строки молча получал право отказывать. Проверено: `python
+  scripts/llm_probe.py` → «предел расходов: нет (0)», живой ответ за 863 мс;
+  `pytest tests/test_config.py tests/test_admin_settings.py
+  tests/test_api_budget.py tests/test_image_generation.py tests/test_metrics.py
+  tests/test_digest.py -q` → 109 passed.

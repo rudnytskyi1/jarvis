@@ -25,6 +25,22 @@ def test_llm_invariants(cfg):
     assert llm.keep_alive
 
 
+def test_no_config_agrees_to_refuse_cloud_turns_by_default():
+    """Владелец 2026-09-23: «monthly api allowance убери нахер, чатбот не работает».
+
+    Умолчание — «предела нет»: конфиг, который просто не упоминает ключ, не
+    получает право отклонять запросы. Прежнее умолчание $18 молча включало
+    отказ, и ассистент отвечал «Monthly API allowance reached».
+    """
+    from common.config import Config, LLMConfig
+
+    assert LLMConfig().monthly_budget_usd == 0
+    assert Config().server.llm.monthly_budget_usd == 0
+    # Оба конфига репозитория тоже без потолка: 0 = считать, но не отказывать.
+    for name in ("config.yaml", "config.example.yaml"):
+        assert load_config(REPO_ROOT / name).server.llm.monthly_budget_usd == 0, name
+
+
 def test_stt_language_whitelist(cfg):
     assert cfg.server.stt.language is None, "auto-detect stays on"
     assert set(cfg.server.stt.allowed_languages) == {"en", "ru", "es"}

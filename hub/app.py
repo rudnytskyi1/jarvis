@@ -132,10 +132,10 @@ from hub.decision_points import (
     action_result_heuristic,
     addressed_heuristic,
     admin_rights_heuristic,
+    any_step_unfinished,
     claim_guard_heuristic,
     continuation_heuristic,
     looks_like_injection,
-    site_step_unfinished,
     untrusted_text,
 )
 from hub.dialog_turns import DialogTurns
@@ -207,11 +207,13 @@ from hub.tools import (
     CLIENT_TOOLS,
     MOUSE_CLICK_TOOL,
     WRONG_TOOL_FOR_PAGES,
+    WRONG_TOOL_FOR_SECRETS,
     action_item,
     mouse_click_args,
     normalize_click_button,
     normalize_pc_control_args,
     opening_a_web_page,
+    types_a_secret,
 )
 from hub.training_archive import TrainingArchive
 from hub.tts import TtsCache, TtsEngine, split_text
@@ -1025,54 +1027,42 @@ def _batched_jev():
 def _narrow_tools_for(understanding: Mapping[str, Any]) -> list[dict] | None:
     """The tool list one utterance is answered with (U-14), or ``None`` for all.
 
-    Only two answers are used, and only above the configured confidence:
-    ``act`` (is anything to be done at all) and ``family`` (which family of
-    tools). Everything else - no Jev, a timeout, an unusable answer, a family
-    that is not one of ours, a low confidence - returns ``None``, and the model
-    gets every tool exactly as it did before this change.
+    Three answers are used, and only above the configured confidence: ``act``
+    (is anything to be done at all), ``family`` (which family of tools) and
+    ``single`` (is this one request or several in one sentence). Everything else
+    - no Jev, a timeout, an unusable answer, a family that is not one of ours, a
+    low confidence - returns ``None``, and the model gets every tool exactly as
+    it did before this change.
+
+    The body lives in :mod:`hub.turn_reading` because the Telegram request
+    narrows its tools the same way (AU-19); this entry point stays for the
+    voice turn and for the tests that ask the hub its own question.
     """
-    from hub.tools import CORE_TOOLS, TOOLS, tools_for_family
+    from hub.turn_reading import narrow_tools_for
 
     settings = _understanding_settings()
-    threshold = float(getattr(settings, "min_confidence", 0.65))
-    if not isinstance(understanding, Mapping):
-        return None
-    family = understanding.get("family")
-    named = ""
-    if isinstance(family, Mapping) and float(family.get("confidence") or 0.0) >= threshold:
-        named = str(family.get("value") or "")
-        if named == "none":
-            named = ""
-    act = understanding.get("act")
-    # A turn Jev is sure is only a question needs no device tool at all; the
-    # core set (remember, recall, speak, message) stays, so the model can still
-    # save or recall the very thing it is answering about. The bar is higher
-    # than for a family, because being wrong here costs an action.
-    if (isinstance(act, Mapping) and act.get("value") is False
-            and float(act.get("confidence") or 0.0) >= max(0.9, threshold)):
-        # «Ничего не делать» и семейство могут прийти одним чтением: «who is in
-        # the room?» — это вопрос, но ответить на него можно только взглядом.
-        # The core-only set used to win here and hid ``look_at_camera`` /
-        # ``find_object`` / ``list_people`` (AU-03, mass audit 2026-09-23).
-        # Every family set already contains the core tools, so trusting the
-        # named family costs nothing on a real conversation.
-        if named:
-            tools = tools_for_family(named)
-            if tools is not None:
-                log.info("Jev read the turn as %r (confidence %.2f, %d tools offered); "
-                         "the act answer was 'nothing to do', the family still rules",
-                         named, float(family.get("confidence") or 0.0), len(tools))
-                return tools
-        allowed = set(CORE_TOOLS)
-        return [tool for tool in TOOLS if tool["function"]["name"] in allowed]
-    if not named:
-        return None
-    tools = tools_for_family(named)
-    if tools is None:
-        return None
-    log.info("Jev read the turn as %r (confidence %.2f, %d tools offered)",
-             named, float(family.get("confidence") or 0.0), len(tools))
-    return tools
+    return narrow_tools_for(
+        understanding, threshold=float(getattr(settings, "min_confidence", 0.65)))
+
+
+async def _telegram_turn_tools(text: str, home_id: str = "",
+                               room: str = "") -> list[dict[str, Any]] | None:
+    """Jev reads one Telegram request exactly as it reads a spoken turn (AU-19).
+
+    Владелец 2026-09-23: «в Telegram должны быть те же возможности, что и у
+    голосового ассистента». Голосовой ход сужает набор инструментов по чтению
+    Jev; чат в Telegram раньше уходил в модель со всеми инструментами и без
+    чтения вовсе. Здесь тот же клиент, тот же вопрос и та же трасса хода
+    (``hub/turn_reading.py``), поэтому Telegram-запрос теперь виден в
+    ``turn_events`` как событие ``understanding``.
+    """
+    from hub.turn_reading import turn_tools
+
+    settings = _understanding_settings()
+    return await turn_tools(
+        _batched_jev(), text, home_id=str(home_id or ''), room=str(room or ''),
+        threshold=float(getattr(settings, 'min_confidence', 0.65)),
+        timeout_s=max(0.05, float(getattr(settings, 'timeout_ms', 900)) / 1000.0))
 
 
 def _decision_cache():
@@ -1366,7 +1356,7 @@ def cloud_budget_allows(level: str) -> bool:
         entry = getattr(models, "levels", {}).get(level) if models is not None else None
         llm_cfg = getattr(getattr(_config, "server", None), "llm", None)
         ledger = ApiBudget(REPO_ROOT / "data" / "api_usage.sqlite3",
-                           monthly_usd=float(getattr(llm_cfg, "monthly_budget_usd", 18.0)),
+                           monthly_usd=float(getattr(llm_cfg, "monthly_budget_usd", 0.0)),
                            model=entry.model if entry is not None else "gpt-5.4-mini")
         status = ledger.status()
         limit = status["limit_usd"]
@@ -4965,7 +4955,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             get_memory=lambda: _memory, get_telegram=lambda: _telegram,
             get_image_store=lambda: _generated_images,
             get_image_reference=lambda message, prompt, owner: _telegram_chat._image_reference(message, prompt, owner),
-            access=_telegram_access, inspect_photo=PhotoInspector(_admin_runtime), select_room=_selected_telegram_room)
+            access=_telegram_access, inspect_photo=PhotoInspector(_admin_runtime), select_room=_selected_telegram_room,
+            # AU-19: Telegram is read by the same Jev call as a spoken turn.
+            understand=_telegram_turn_tools)
         _telegram_chat = TelegramChat(_telegram, cfg.server.telegram, _llm.reply_text,
             image_generator=_image_generator, image_store=_generated_images,
             folder=REPO_ROOT / 'data' / 'telegram', control_reply=controller, access=_telegram_access,
@@ -5018,6 +5010,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _telegram_chat = None
         if _llm is not None:
             _llm.close()
+        # ТЗ 15.1: соединение с Jev живёт между ходами, поэтому закрывается
+        # здесь, а не на каждом ходу (AU-11). ``_jev_client`` бывает и ``False``
+        # («провайдера нет»), поэтому спрашиваем сам объект.
+        _jev_close = getattr(_jev_client, "aclose", None)
+        if _jev_close is not None:
+            await _jev_close()
         if _levels is not None:
             _levels.close()
             _levels = None
@@ -5188,7 +5186,7 @@ def _api_budget_status() -> dict[str, Any] | None:
         cfg = get_config()
         llm = getattr(cfg.server, "llm", None)
         ledger = ApiBudget(REPO_ROOT / "data" / "api_usage.sqlite3",
-                           monthly_usd=float(getattr(llm, "monthly_budget_usd", 18.0)),
+                           monthly_usd=float(getattr(llm, "monthly_budget_usd", 0.0)),
                            model=str(getattr(llm, "model", "gpt-5.4-mini")))
         return dict(ledger.status())
     except Exception as exc:  # noqa: BLE001 - метрика не роняет endpoint
@@ -6660,34 +6658,22 @@ class Connection(CameraClipReceiver):
         unusable answer or a low confidence all leave the turn exactly as it
         was (ТЗ раздел 1, «не ломать работающее»).
         """
-        client = _batched_jev()
-        if client is None:
-            return None
-        from hub import turn_trace
-        from hub.tools import TOOL_FAMILY_MEANINGS, TOOL_FAMILY_NAMES
+        # ТЗ 15.1: чтение реплики стоит на пути до первого звука, поэтому его
+        # собственное время пишется в трассу хода отдельным событием. Без этого
+        # «llm» в отчёте хода смешивает Jev, раунды модели и инструменты, и
+        # отнести задержку не к чему (массовый аудит 2026-09-23, AU-11).
+        # Тот же самый код читает запрос из Telegram-чата (AU-19):
+        # ``hub/turn_reading.py``.
+        from hub.turn_reading import turn_tools
 
         settings = _understanding_settings()
-        context = {
-            'home_id': str(getattr(self, 'home_id', '') or ''),
-            'room': str(getattr(self, 'client_id', '') or ''),
-            'text': ' '.join(str(text or '').split())[:1000],
-        }
-        try:
-            found = await client.understand(
-                context, families=list(TOOL_FAMILY_NAMES),
-                meanings=TOOL_FAMILY_MEANINGS,
-                timeout_s=max(0.05, float(getattr(settings, 'timeout_ms', 900)) / 1000.0))
-        except Exception as exc:  # noqa: BLE001 - a reading never breaks a turn
-            log.info("The batched Jev reading is unavailable (%s); every tool stays available",
-                     exc, extra={'utterance_id': self.utterance_id})
-            return None
-        turn_trace.record("understanding", str(getattr(client, 'model', '') or 'jev'), payload={
-            'text': context['text'],
-            'answers': {name: {'value': item['value'],
-                               'confidence': round(float(item['confidence']), 2)}
-                        for name, item in found.items()},
-        })
-        return _narrow_tools_for(found)
+        return await turn_tools(
+            _batched_jev(), text,
+            home_id=str(getattr(self, 'home_id', '') or ''),
+            room=str(getattr(self, 'client_id', '') or ''),
+            threshold=float(getattr(settings, 'min_confidence', 0.65)),
+            timeout_s=max(0.05, float(getattr(settings, 'timeout_ms', 900)) / 1000.0),
+            utterance_id=str(self.utterance_id or ''))
 
     async def _decide(self, decision_type: str, *, question: str, context: dict[str, Any],
                       heuristic: Any, method: str = 'yes_no',
@@ -9277,6 +9263,14 @@ class Connection(CameraClipReceiver):
         # slot used to vanish and the room heard a bogus "application rejected".
         if name == 'pc_control':
             args = normalize_pc_control_args(args)
+            # ТЗ F-512: пароли и платёжные данные не набираются за человека.
+            # Для computer-use это уже запрещено; ``type_text`` получает то же
+            # правило, потому что текст приходит из голоса комнаты и остаётся в
+            # транскрипте, в логе и в обучающем архиве.
+            secret = types_a_secret(args)
+            if secret:
+                log.info("pc_control refused to type %s", secret)
+                return {'ok': False, 'wrong_tool': True, 'error': WRONG_TOOL_FOR_SECRETS}
         denial = await self._permission_check(name, args)
         if denial is not None:
             log.info(
@@ -15944,8 +15938,12 @@ class Connection(CameraClipReceiver):
             # step that reaches a site is the one that gets lost - "open chrome
             # and go to youtube" came back as "Chrome is open". That is not a
             # judgement call, so it is not left to the decider: the request
-            # named an address and no action of this turn reached one.
-            unfinished_step = site_step_unfinished(text, self._utterance_actions)
+            # named an address and no action of this turn reached one. The same
+            # rule covers the other half the audit saw dropped - "save a photo
+            # and put it on my wallpaper" came back with one half done three
+            # times out of three (AU-21), so the steps the owner names by their
+            # own words are checked too (`any_step_unfinished`).
+            unfinished_step = any_step_unfinished(text, self._utterance_actions)
             judge_needed = await self._decide(
                 'action_result',
                 question='Does the result of this action match what was asked?',
@@ -15960,8 +15958,8 @@ class Connection(CameraClipReceiver):
                 ),
             )
             if unfinished_step and not judge_needed:
-                log.info("Self-check forced: the request named a site and no action "
-                         "of this turn reached one")
+                log.info("Self-check forced: the request named a step and no action "
+                         "of this turn carried it out")
                 judge_needed = True
             if not judge_needed and not self._utterance_actions:
                 judge_type = 'sight_claim'

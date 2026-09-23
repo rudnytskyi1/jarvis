@@ -133,7 +133,7 @@ server:
     model: millard-qwen4:latest           # Qwen3.6-35B-A3B multimodal; tool calling + vision verified
     api_key: ollama
     api_key_env: OPENAI_API_KEY  # openai_responses only; never put the real key in YAML
-    monthly_budget_usd: 18.0    # monthly app allowance; 0 = no ceiling (still counted)
+    monthly_budget_usd: 0       # 0 = no ceiling (usage is still counted and shown)
     max_input_bytes: 64000      # an oversized cloud request is trimmed, never refused
     vision_base_url: null      # separate Ollama URL when chat uses OpenAI
     prompt_file: null          # cloud profile uses prompts/cloud.md
