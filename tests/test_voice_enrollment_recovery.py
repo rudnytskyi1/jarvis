@@ -10,7 +10,7 @@ import pytest
 from common import protocol
 from common.config import Config
 from hub import app, enrollment, speaker
-from hub.diarization import Span, Transcript, Word, attribute
+from hub.diarization import AttributedUtterance, Span, Transcript, Word, attribute
 from tests.test_diarization_pipeline import setup
 
 
@@ -269,6 +269,34 @@ def test_additional_session_keeps_existing_samples_and_commits_after_six(tmp_pat
         assert person['voice_embeddings'][:2] == [[1., 0.]] * 2
         assert person['role'] == 'admin' and person['face_embeddings'] == [[.1, .2]]
         conn._confirm_voice_recovery.assert_not_awaited()
+    asyncio.run(run())
+
+
+def test_the_sentence_on_the_screen_counts_as_a_sample_even_though_it_says_remember(
+        tmp_path, monkeypatch):
+    """A guest read sentence 1 four times and not one sample was kept.
+
+    Sentence 1 is "Rowan AI, please remember how my normal voice sounds when I
+    speak in this room." The memory turn used to run before the enrollment turn,
+    so the hub read its OWN sentence off the screen as a personal note and
+    answered "I can save personal notes only for the person whose voice I
+    recognize right now" - the line the friend heard while his overlay already
+    said "Sentence 1 of 6". Nothing was ever saved and the registration he had
+    just started quietly stopped existing.
+    """
+    async def run():
+        result = AttributedUtterance(text=enrollment.PHRASES[0], language='en',
+                                     name='unknown', role='unknown', score=0.08,
+                                     pcm=b'\0\1' * 16000 * 4)
+        conn, brain, voices = setup(monkeypatch, result)
+        registry(tmp_path, monkeypatch, [0., 1.])
+        conn._enroll_pending = {'name': 'Colin', 'samples': 0, 'total_speech_s': 0.0,
+                                'recordings': [], 'expires': 10 ** 9}
+        await conn._handle_utterance(b'\0\1' * 16000 * 4)
+        assert conn._enroll_pending['samples'] == 1
+        said = [call.args[0].get('text', '') for call in conn.send_json.call_args_list]
+        assert any('Sentence 2 of 6' in text for text in said), said
+        brain.generate.assert_not_awaited()
     asyncio.run(run())
 
 

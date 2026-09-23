@@ -15471,6 +15471,16 @@ class Connection(CameraClipReceiver):
             scripted = await self._poll_turn(text, language)
         if scripted is None:
             scripted = await self._forget_turn(text, language)
+        # A voice enrollment owns the sentence it puts on the screen. Sentence 1
+        # is "Rowan AI, please remember how my normal voice sounds when I speak
+        # in this room", so the memory turn below read the hub's OWN enrollment
+        # line as a personal note and answered it with "I can save personal notes
+        # only for the person whose voice I recognize right now": a guest read
+        # the sentence four times, no sample was ever kept, and the registration
+        # the room had just started simply never happened.
+        if scripted is None and (self._enroll_pending or self._face_selection
+                                 or enrollment.requested(text)):
+            scripted = await self._enrollment_turn(text)
         # ТЗ F-418: «запомни, что …» / «забудь, что …» / «что ты обо мне
         # знаешь?» — the hub's own memory tools, not a model paraphrase.
         if scripted is None:
