@@ -6,6 +6,7 @@ The ledger covers this application only, not other users of the API project.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -16,13 +17,28 @@ from pathlib import Path
 from common.image_models import IMAGE_MODEL_RATES
 from common.openai_models import OPENAI_CACHE_RATES, OPENAI_CACHED_INPUT_RATES, OPENAI_TEXT_RATES
 
+log = logging.getLogger(__name__)
+
 
 class CloudUnavailable(RuntimeError):
     """A cloud request cannot safely be made or completed."""
 
 
 class BudgetExceeded(CloudUnavailable):
+    """Историческое имя: потолок больше не поднимает это исключение.
+
+    Владелец 2026-09-23: «api allowance reached убери это, я не хочу». Класс
+    остался, потому что его импортируют старые модули и тесты, но НИ ОДИН путь
+    учёта расходов его теперь не бросает: сумма не имеет права остановить
+    ответ. См. :meth:`ApiBudget.reserve`.
+    """
+
     pass
+
+
+#: Месяцы, о превышении потолка в которых уже написали в лог: строка нужна
+#: ровно один раз за месяц, а не на каждый запрос.
+_warned_months: set[tuple[str, int]] = set()
 
 
 def microdollars(input_tokens: int, output_tokens: int, model: str = 'gpt-5.4-mini',
@@ -61,7 +77,11 @@ def microdollars(input_tokens: int, output_tokens: int, model: str = 'gpt-5.4-mi
 
 
 class ApiBudget:
-    def __init__(self, path: Path, monthly_usd: float = 18.0, *, model: str = 'gpt-5.4-mini'):
+    def __init__(self, path: Path, monthly_usd: float = 0.0, *, model: str = 'gpt-5.4-mini'):
+        #: Умолчание — «потолка нет» (владелец, 2026-09-23): любой вызов, который
+        #: не назвал сумму, не получает права отказать. Раньше здесь стояло
+        #: 18.0, и клиент, созданный без параметра, молча считал себя
+        #: ограниченным.
         amount = Decimal(str(monthly_usd))
         if not amount.is_finite() or amount < 0:
             raise ValueError("API monthly budget cannot be negative")
@@ -126,10 +146,26 @@ class ApiBudget:
             month = self.month()
             used = db.execute("SELECT COALESCE(SUM(amount), 0) FROM requests WHERE month=?", (month,)).fetchone()[0]
             if self.limit is not None and used + amount > self.limit:
-                raise BudgetExceeded("Monthly API allowance reached; local commands remain available.")
+                # Владелец 2026-09-23: «api allowance reached убери это, я не
+                # хочу». Потолок больше НЕ останавливает запрос: он только
+                # пишет строку в лог (раз на месяц), а расход идёт дальше и
+                # остаётся видимым в панели и в Telegram. Отказ из-за суммы
+                # выглядел как «чатбот не работает», а экономии не давал.
+                self._warn_over_limit(month, used + amount)
             db.execute("INSERT INTO requests(id, month, amount, model, created_at) VALUES (?, ?, ?, ?, ?)",
                        (request_id, month, amount, self.model, self.now()))
         return request_id
+
+    def _warn_over_limit(self, month: str, spent: int) -> None:
+        """Сказать в лог, что расход прошёл намеченный потолок, и идти дальше."""
+        key = (month, int(self.limit or 0))
+        if key in _warned_months:
+            return
+        _warned_months.add(key)
+        log.warning("API spending passed the %s USD ceiling set in the config "
+                    "(%.4f USD this month). Nothing is refused; the ceiling is "
+                    "only reported now - set it to 0 to stop even this line.",
+                    (self.limit or 0) / 1_000_000, spent / 1_000_000)
 
     @staticmethod
     def now() -> str:

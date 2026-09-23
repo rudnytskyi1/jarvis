@@ -82,11 +82,23 @@ def test_timeout_no_retry_and_retains_reservation(tmp_path, monkeypatch):
     client.close()
 
 
-def test_exhausted_budget_still_sends_nothing(tmp_path, monkeypatch):
-    client = make_client(tmp_path, monkeypatch, lambda r: pytest.fail("must not send"), monthly_budget_usd=0.0001)
-    with pytest.raises(CloudUnavailable):
-        client.complete([{"role": "user", "content": "hi"}], TOOLS)
-    assert client.budget.status()["accounted_usd"] == 0
+def test_an_exhausted_ceiling_still_sends_and_only_reports(tmp_path, monkeypatch):
+    """Владелец 2026-09-23: «api allowance reached убери это, я не хочу».
+
+    Потолок 0.0001 USD давно пройден, и всё равно запрос уходит: сумма больше
+    не останавливает ответ, она только пишется в лог и остаётся видимой.
+    """
+    sent: list[dict] = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=answer(
+            [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]))
+
+    client = make_client(tmp_path, monkeypatch, handler, monthly_budget_usd=0.0001)
+    assert client.complete([{"role": "user", "content": "hi"}], TOOLS)[0] == "ok"
+    assert sent, 'запрос обязан уйти, даже когда потолок превышен'
+    assert client.budget.status()["accounted_usd"] > 0
     client.close()
 
 

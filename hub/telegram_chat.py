@@ -14,7 +14,6 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from hub.api_budget import BudgetExceeded
 from hub.conversations import Conversations
 from hub.image_prompt import action_revoked, is_image_request, visual_request, visual_target
 from hub.image_subjects import person_named
@@ -960,8 +959,6 @@ class TelegramChat:
                         "I couldn't finish that request. I won't retry it automatically.")
                 if isinstance(exc, TelegramInputError):
                     line = str(exc)
-                elif isinstance(exc, BudgetExceeded):
-                    line = 'The monthly API budget is exhausted.'
                 try:
                     await self.provider.send_text(line, **self._delivery_kwargs(message))
                 except Exception:

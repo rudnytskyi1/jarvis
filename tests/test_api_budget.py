@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from hub.api_budget import ApiBudget, BudgetExceeded
+from hub.api_budget import ApiBudget
 
 
 def test_pending_reservation_survives_restart(tmp_path):
@@ -11,9 +11,10 @@ def test_pending_reservation_survives_restart(tmp_path):
     budget = ApiBudget(path, 0.01)
     budget.reserve(10_000, 500)  # $0.00975, uncertain after a timeout/crash
     reopened = ApiBudget(path, 0.01)
-    with pytest.raises(BudgetExceeded):
-        reopened.reserve(1_000, 0)
-    assert reopened.status()["unsettled_requests"] == 1
+    # Потолок превышен, но бронь всё равно записана: сумма не отказывает
+    # (владелец 2026-09-23: «api allowance reached убери это, я не хочу»).
+    reopened.reserve(1_000, 0)
+    assert reopened.status()["unsettled_requests"] == 2
 
 
 def test_settlement_refunds_estimate_once_and_counts_output(tmp_path):
@@ -29,14 +30,13 @@ def test_concurrent_process_style_clients_cannot_overspend(tmp_path):
     path = tmp_path / "ledger.db"
     ApiBudget(path, 0.009)
     def reserve(_):
-        try:
-            ApiBudget(path, 0.009).reserve(0, 1000)  # $0.0045 each
-            return True
-        except BudgetExceeded:
-            return False
+        ApiBudget(path, 0.009).reserve(0, 1000)  # $0.0045 each
+        return True
     with ThreadPoolExecutor(max_workers=8) as pool:
-        assert sum(pool.map(reserve, range(16))) == 2
-    assert ApiBudget(path, 0.009).status()["accounted_usd"] == 0.009
+        assert sum(pool.map(reserve, range(16))) == 16
+    # Ceiling 0.009 is passed after two reservations, and nothing is refused:
+    # the number is a report, not a wall.
+    assert ApiBudget(path, 0.009).status()["accounted_usd"] == 0.072
 
 
 def test_month_rollover_does_not_refund_previous_month(tmp_path, monkeypatch):
@@ -78,10 +78,11 @@ def test_full_model_reservation_and_settlement_use_full_price(tmp_path):
     budget = ApiBudget(tmp_path / 'ledger.db', .04, model='gpt-5.4')
     key = budget.reserve(10_000, 600)
     assert budget.status()['accounted_usd'] == .034
-    with pytest.raises(BudgetExceeded):
-        budget.reserve(0, 1000)
+    # Over the ceiling and still allowed: the ceiling only reports itself.
+    budget.reserve(0, 1000)
+    assert budget.status()['accounted_usd'] == .049
     budget.settle(key, 3000, 300)
-    assert budget.status()['accounted_usd'] == .012
+    assert budget.status()['accounted_usd'] == .027
 
 
 def test_model_switch_preserves_combined_spend_and_original_reservation_rate(tmp_path):
@@ -116,14 +117,11 @@ def test_concurrent_mixed_models_share_the_same_monthly_limit(tmp_path):
     ApiBudget(path, .03)
     def reserve(index):
         model = 'gpt-5.4' if index % 2 else 'gpt-5.4-mini'
-        try:
-            ApiBudget(path, .03, model=model).reserve(0, 1000)
-            return .015 if index % 2 else .0045
-        except BudgetExceeded:
-            return 0
+        ApiBudget(path, .03, model=model).reserve(0, 1000)
+        return .015 if index % 2 else .0045
     with ThreadPoolExecutor(max_workers=8) as pool:
         spent = sum(pool.map(reserve, range(16)))
-    assert spent <= .03
+    assert spent > .03, 'потолок не останавливает ни одну из 16 броней'
     assert ApiBudget(path, .03).status()['accounted_usd'] == pytest.approx(spent)
 
 
@@ -132,11 +130,10 @@ def test_luna_reserves_cache_write_ceiling_and_settles_actual_usage_after_switch
     luna = ApiBudget(path, .004, model='gpt-5.6-luna')
     key = luna.reserve(10_000, 600)
     assert luna.status()['accounted_usd'] == .00322
-    with pytest.raises(BudgetExceeded):
-        luna.reserve(4000, 0)
+    luna.reserve(4000, 0)  # over the ceiling, still recorded
     other_model = ApiBudget(path, .004, model='gpt-5.4')
     other_model.settle(key, 3000, 300, input_tokens_details={'cached_tokens': 1500, 'cache_write_tokens': 1000})
-    assert luna.status()['accounted_usd'] == .00074
+    assert luna.status()['accounted_usd'] == .00174
 
 
 @pytest.mark.parametrize('details', [{'cached_tokens': -1}, {'cached_tokens': True},
@@ -178,6 +175,43 @@ def test_status_separates_providers_and_reserves_without_changing_budget_guard(t
     assert status['settled_estimate_usd'] == .0101
     assert status['reserved_usd'] == .0645 and status['accounted_usd'] == .0746
     assert status['unsettled_requests'] == 2 and status['billing_synced'] is False
-    with pytest.raises(BudgetExceeded):
-        image.reserve(0, 500)
-    assert ApiBudget(path, monthly_usd=.1).status() == status
+    # Over the ceiling and still booked; only the report changes.
+    image.reserve(0, 500)
+    after = ApiBudget(path, monthly_usd=.1).status()
+    assert after['unsettled_requests'] == 3
+    assert after['accounted_usd'] > status['accounted_usd']
+
+
+def test_the_ceiling_never_refuses_and_says_so_in_the_log(tmp_path, caplog):
+    """Владелец 2026-09-23: «api allowance reached убери это, я не хочу»."""
+    import logging
+
+    # Потолок с уникальным ключом (месяц, сумма): строка пишется один раз на
+    # пару, и этот тест не должен зависеть от порядка других тестов файла.
+    budget = ApiBudget(tmp_path / 'ledger.db', 0.003)
+    with caplog.at_level(logging.WARNING, logger='hub.api_budget'):
+        budget.reserve(0, 1000)          # $0.0045: already over the ceiling
+        first = budget.reserve(0, 1000)  # and the second one is not refused either
+    assert first
+    assert budget.status()['accounted_usd'] == pytest.approx(0.009)
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any('passed the' in message and 'Nothing is refused' in message
+               for message in warnings), warnings
+    # The line is said once per (month, ceiling), not once per request.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger='hub.api_budget'):
+        budget.reserve(0, 1000)
+    assert not [record for record in caplog.records if 'passed the' in record.getMessage()]
+
+
+def test_the_model_router_is_never_blocked_by_the_ceiling():
+    """Владелец 2026-09-23: «api allowance reached убери это, я не хочу».
+
+    Раньше ``cloud_budget_allows`` отвечал «нет», когда расход переходил за
+    потолок, и уровень модели молча уходил на локальный или в отказ. Теперь
+    ответ всегда «да»: расход считает и показывает ``ApiBudget``.
+    """
+    from hub import app as hub_app
+
+    for level in ('cloud_cheap', 'cloud_strong', 'local', 'unknown-level'):
+        assert hub_app.cloud_budget_allows(level) is True, level

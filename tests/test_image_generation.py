@@ -11,7 +11,7 @@ from PIL import Image
 
 from common.config import Config, ImageGenerationConfig, LLMConfig
 from hub import app
-from hub.api_budget import ApiBudget, BudgetExceeded, CloudUnavailable
+from hub.api_budget import ApiBudget, CloudUnavailable
 from hub.image_generation import ImageGenerator, ImageStore, decode_image
 
 
@@ -114,8 +114,9 @@ def test_partial_usage_is_conservative_and_invalid_usage_keeps_reservation(tmp_p
     asyncio.run(run())
 
 
-def test_missing_key_and_exhausted_shared_budget_send_no_request(tmp_path, monkeypatch):
-    handler = Mock()
+def test_a_missing_key_sends_nothing_and_a_used_up_ceiling_still_draws(tmp_path, monkeypatch):
+    """Владелец 2026-09-23: «api allowance reached убери это, я не хочу»."""
+    handler = Mock(return_value=httpx.Response(200, json=response_image()))
     async def run():
         client = generator(tmp_path, monkeypatch, handler)
         monkeypatch.delenv('GEMINI_API_KEY')
@@ -127,9 +128,10 @@ def test_missing_key_and_exhausted_shared_budget_send_no_request(tmp_path, monke
             # Spending by chat counts against image generation's same allowance.
             chat = ApiBudget(tmp_path / 'usage.db', model='gpt-5.6-luna')
             chat.reserve(70_800_000, 0)  # conservative $17.70
-            with pytest.raises(BudgetExceeded):
-                await client.generate('Draw a square')
-            handler.assert_not_called()
+            # Сумма превышена, и всё равно рисуем: потолок только сообщает о
+            # себе в лог, а не отказывает в работе.
+            await client.generate('Draw a square')
+            handler.assert_called()
         finally:
             await client.close()
     asyncio.run(run())

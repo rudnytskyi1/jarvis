@@ -1343,31 +1343,16 @@ def _gpu_wait_estimate(priority: int = PRIORITY_UTTERANCE) -> float:
 def cloud_budget_allows(level: str) -> bool:
     """Whether a cloud level may spend (ТЗ F-403).
 
-    The overflow is only ever allowed with room in the same ledger the cloud
-    clients charge to, minus a tenth kept back for the tasks the owner started
-    by hand. Anything unknown - no ledger, an unpriced model - means no
-    spending, so a misconfigured hub stays local instead of surprising the
-    owner with a bill.
-    """
-    try:
-        from hub.api_budget import ApiBudget
+    Владелец 2026-09-23: «api allowance reached убери это, я не хочу». Ответ
+    всегда «да»: расход считает и показывает ``ApiBudget`` (панель, Telegram,
+    дайджест), но ни один уровень моделей не выключается из-за суммы. Прежний
+    ответ «нет» не экономил деньги, а превращался в молчащего ассистента и
+    строку «Cloud turn stopped: Monthly API allowance reached» в логе.
 
-        models = getattr(_config, "models", None)
-        entry = getattr(models, "levels", {}).get(level) if models is not None else None
-        llm_cfg = getattr(getattr(_config, "server", None), "llm", None)
-        ledger = ApiBudget(REPO_ROOT / "data" / "api_usage.sqlite3",
-                           monthly_usd=float(getattr(llm_cfg, "monthly_budget_usd", 0.0)),
-                           model=entry.model if entry is not None else "gpt-5.4-mini")
-        status = ledger.status()
-        limit = status["limit_usd"]
-        if limit is None:
-            # The owner removed the monthly ceiling (DECISIONS.md API-01):
-            # accounting still runs, but nothing is held back for spending.
-            return True
-        return float(status["accounted_usd"]) < float(limit) * 0.9
-    except Exception as exc:  # noqa: BLE001 - unknown budget means no spending
-        log.warning("Cloud budget check is unavailable (%s) - replies stay local", exc)
-        return False
+    Подпись и вызов из :class:`hub.model_router.ModelRouter` сохранены: роутер
+    по-прежнему спрашивает разрешение, просто теперь его нельзя не получить.
+    """
+    return True
 
 
 def _model_router(decider: Any = None) -> ModelRouter | None:

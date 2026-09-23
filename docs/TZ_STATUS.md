@@ -1944,3 +1944,15 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_image_generation.py tests/test_metrics.py tests/test_digest.py -q`
   → 109 passed; `pytest tests -q` → 9371 passed, 11 skipped, 15 failed (все
   пятнадцать — чужой незаконченный `tests/test_guess_who.py`).
+
+- **API-05 — потолок расходов нигде не отказывает (23.09.2026).** Владелец:
+  «api allowance reached убери это, я не хочу». Убрано насовсем: `ApiBudget.reserve`
+  больше не бросает `BudgetExceeded` (превышение — одна строка WARNING на пару
+  «месяц, сумма», расход считается дальше), `hub/app.py::cloud_budget_allows`
+  отвечает `True` всегда, ветка «The monthly API budget is exhausted.» из
+  `hub/telegram_chat.py` удалена, умолчание `ApiBudget.monthly_usd` — `0`,
+  стартовая строка лога говорит «(reporting only, no request is refused)».
+  Проверено: `pytest tests/test_api_budget.py tests/test_openai_responses.py
+  tests/test_image_generation.py tests/test_digest.py tests/test_models_health.py
+  tests/test_browser_recovery.py -q` → 116 passed; `python scripts/llm_probe.py`
+  → предел 0, живой ответ 863 мс.

@@ -750,3 +750,13 @@
   `pytest tests/test_config.py tests/test_admin_settings.py
   tests/test_api_budget.py tests/test_image_generation.py tests/test_metrics.py
   tests/test_digest.py -q` → 109 passed.
+- [x] **AU-29 — отказа «api allowance reached» больше нет нигде (API-05).**
+  Владелец 2026-09-23: «api allowance reached убери это, я не хочу».
+  `ApiBudget.reserve` больше не бросает `BudgetExceeded` (превышение только
+  пишется в лог одной строкой на пару «месяц, сумма»),
+  `hub/app.py::cloud_budget_allows` отвечает `True` всегда, ветка «The monthly
+  API budget is exhausted.» из Telegram удалена, умолчание
+  `ApiBudget.monthly_usd` стало `0`. Проверено: `pytest
+  tests/test_api_budget.py tests/test_openai_responses.py
+  tests/test_image_generation.py tests/test_digest.py tests/test_models_health.py
+  tests/test_browser_recovery.py -q` → 116 passed.

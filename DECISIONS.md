@@ -5180,3 +5180,30 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   tests/test_admin_settings.py tests/test_api_budget.py
   tests/test_image_generation.py tests/test_metrics.py tests/test_digest.py -q`
   → 109 passed. Ссылка: ТЗ F-403/F-704; DECISIONS.md API-01, API-02.
+
+- **API-05 — потолок расходов больше нигде не отказывает.** Владелец
+  2026-09-23: «api allowance reached убери это, я не хочу». API-04 снял
+  умолчание (18 → 0), но механизм отказа оставался живым: `ApiBudget.reserve`
+  бросал `BudgetExceeded` («Monthly API allowance reached; local commands
+  remain available.»), а `hub/app.py::cloud_budget_allows` отвечал «нет» после
+  потолка, из-за чего уровень модели молча уходил в сторону, а в Telegram
+  звучало «The monthly API budget is exhausted.». Выбран вариант: **отказ
+  убран целиком, учёт остался.** (1) `reserve` больше не бросает: превышение
+  пишет одну строку WARNING на пару (месяц, сумма) — «API spending passed the
+  N USD ceiling… Nothing is refused» — и продолжает считать; (2)
+  `cloud_budget_allows` всегда `True` (подпись и вызов из `ModelRouter`
+  сохранены, чтобы роутер не переписывать); (3) ветка с фразой «The monthly API
+  budget is exhausted.» из `hub/telegram_chat.py` удалена вместе с импортом;
+  (4) `ApiBudget.monthly_usd` по умолчанию тоже `0` — клиент, созданный без
+  параметра, не считает себя ограниченным; (5) стартовая строка лога теперь
+  говорит прямо: «monthly allowance … (reporting only, no request is refused)».
+  Обоснование: отказ по сумме не экономил деньги (запрос всё равно был нужен
+  владельцу), а выглядел как «чатбот не работает»; сумму он и так видит в
+  панели и в Telegram. Нужен реальный потолок — это уже вопрос провайдера
+  (лимит на ключе), а не поведения ассистента. Проверено: `pytest
+  tests/test_api_budget.py tests/test_openai_responses.py
+  tests/test_image_generation.py tests/test_digest.py tests/test_models_health.py
+  tests/test_browser_recovery.py -q` → 116 passed; `hub.app.cloud_budget_allows`
+  отвечает `True` на все уровни; `python scripts/llm_probe.py` → «предел
+  расходов: нет (0)», живой ответ 863 мс. Ссылка: ТЗ F-403; DECISIONS.md
+  API-01…API-04.

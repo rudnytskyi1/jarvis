@@ -763,8 +763,11 @@ class LlmClient:
             self._responses = ResponsesClient(cfg_llm)
             self._reasoning_may_leak = False
             limit = self._responses.budget.limit
-            log.info("LLM: %s via OpenAI Responses; monthly allowance %s", self.model,
-                     "none (counting only)" if limit is None else f"${limit / 1_000_000:.2f}")
+            # Владелец 2026-09-23: сумма больше ничего не останавливает, поэтому
+            # строка говорит это прямо - иначе её читают как «потолок есть».
+            log.info("LLM: %s via OpenAI Responses; monthly allowance %s "
+                     "(reporting only, no request is refused)", self.model,
+                     "none" if limit is None else f"${limit / 1_000_000:.2f}")
         elif self.provider == PROVIDER_OLLAMA_NATIVE:
             self._http = httpx.Client(timeout=REQUEST_TIMEOUT_S)
             log.info(
