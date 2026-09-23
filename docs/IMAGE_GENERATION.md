@@ -49,19 +49,30 @@ voice recognition and room tracking do not generate paid image requests.
 
 ## One-time setup on the brain PC
 
-1. Create a key in [Google AI Studio](https://aistudio.google.com/apikey).
-   Google image generation requires a project with billing enabled.
-2. Run `set-gemini-key.bat` in the project root. Paste the key into the hidden
-   prompt. Never put it in YAML or a chat message. It is saved with Windows DPAPI
-   for this Windows account, separately from the OpenAI key.
-3. Set `server.image_generation.enabled: true` in the active config (already
-   enabled in Anton's `config.openai.yaml`). Restart the brain server with
-   `start-jarvis-openai.bat`. Close the old server before starting another.
-   The room client reconnects; it needs no Gemini key or package installation.
+Two roads lead to the same model, chosen by `server.image_generation.provider`:
 
-The normal launcher loads the saved key without prompting. A missing Gemini key
-does not interrupt voice chat. `/health` reports `image_generation: true` when
-enabled and a key is loaded; this is configuration status, not a paid API test.
+* **`vertex`** — Google Cloud Vertex AI, paid by the project's credits
+  (the owner's choice since 2026-09-23). Project id, region and a
+  service-account key, or an Express API key; the access token is fetched and
+  refreshed by the hub itself. Full steps:
+  [VERTEX_IMAGE_GENERATION.md](VERTEX_IMAGE_GENERATION.md).
+* **`gemini`** — AI Studio, one long-lived key:
+  1. Create a key in [Google AI Studio](https://aistudio.google.com/apikey).
+     Google image generation requires a project with billing enabled.
+  2. Run `set-gemini-key.bat` in the project root. Paste the key into the hidden
+     prompt. Never put it in YAML or a chat message. It is saved with Windows
+     DPAPI for this Windows account, separately from the OpenAI key.
+
+Either way, `server.image_generation.enabled: true` has to be set in the active
+config (already true in Anton's `config.openai.yaml`). Restart the brain server
+with `start-jarvis-openai.bat`. Close the old server before starting another.
+The room client reconnects; it needs no Google key or package installation.
+
+The normal launcher loads the saved Gemini key without prompting. Missing
+credentials never interrupt voice chat: the image tool answers with what is
+missing and nothing is sent. `/health` reports `image_generation: true` when the
+chosen provider is enabled *and* is set up; this is configuration status, not a
+paid API test.
 
 ## Voice examples
 

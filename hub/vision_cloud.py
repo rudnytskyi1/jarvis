@@ -74,6 +74,10 @@ def _as_cfg(entry: Any, *, monthly_budget_usd: float, max_tokens: int | None = N
     return SimpleNamespace(
         model=str(getattr(entry, "model", "") or ""),
         api_key_env=str(getattr(entry, "api_key_env", "OPENAI_API_KEY") or "OPENAI_API_KEY"),
+        # 2026-09-23: без base_url облачное зрение уходило на api.openai.com и
+        # получало 401, хотя уровень настроен на api.deepseek.com — в логе это
+        # виделось как «Screen check failed: OpenAI is unavailable».
+        base_url=str(getattr(entry, "base_url", "") or ""),
         max_tokens=int(max_tokens or getattr(entry, "max_tokens", 1024) or 1024),
         monthly_budget_usd=float(monthly_budget_usd),
     )

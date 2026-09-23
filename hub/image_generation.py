@@ -1,7 +1,17 @@
 """On-demand Nano Banana 2, with bounded I/O and the shared API ledger.
 
-No retries, background uploads, provider safety overrides, or chat-history
-uploads. Missing/uncertain billing retains the conservative reservation.
+No background uploads, provider safety overrides, or chat-history uploads.
+Missing/uncertain billing retains the conservative reservation.
+
+Две дороги к одной модели (владелец, 2026-09-23: «для генерации картинок
+теперь используй vertexai api (у меня бесплатные 300$ credits)»):
+
+* ``provider: gemini`` - AI Studio, одна ``GEMINI_API_KEY``;
+* ``provider: vertex`` - Google Cloud: проект, регион и короткоживущий
+  OAuth2-токен из ``hub/vertex_auth.py``.
+
+Различается ровно то, куда уходит запрос и чем он подписан; тело запроса,
+учёт расхода, повторы и разбор ответа у двух дорог общие.
 """
 from __future__ import annotations
 
@@ -27,6 +37,7 @@ from PIL import Image, ImageOps
 from common.config import ImageGenerationConfig
 from hub.api_budget import ApiBudget, CloudUnavailable
 from hub.image_prompt import person_reference_requested
+from hub.vertex_auth import VertexAuth, VertexAuthError
 
 log = logging.getLogger(__name__)
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -97,6 +108,27 @@ class GeneratedImage:
     jpeg: bytes
     width: int
     height: int
+
+
+async def _google_message(response: httpx.Response) -> str:
+    """Google's own words about a failed request, short enough to show a person.
+
+    Vertex answers a wrong project, a disabled API and an unbilled account with
+    three different sentences in ``error.message``; repeating it beats inventing
+    a diagnosis. Never raises: a body that cannot be read or parsed adds nothing.
+    """
+    try:
+        raw = await response.aread()
+    except Exception:  # noqa: BLE001 - a body we cannot read is not an error of ours
+        return ''
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return ''
+    error = parsed.get('error') if isinstance(parsed, dict) else None
+    text = error.get('message') if isinstance(error, dict) else error
+    text = ' '.join(str(text or '').split())[:200]
+    return f': {text}' if text else ''
 
 
 def decode_image(raw: bytes, mime: str) -> GeneratedImage:
@@ -244,15 +276,36 @@ class ImageGenerator:
         self.budget = ApiBudget(ledger_path, monthly_usd, model=cfg.model)
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout_s, connect=10),
                                       transport=transport, follow_redirects=False)
+        # Vertex is the owner's paid road (Google Cloud credits); the Gemini key
+        # stays as the fallback configuration. Only one of the two is built.
+        self.vertex = (VertexAuth(cfg, transport=transport) if cfg.provider == 'vertex' else None)
         self._lock = asyncio.Lock()
 
     @property
+    def provider_label(self) -> str:
+        """How the provider is named to the person, in their own sentence."""
+        return 'Vertex AI' if self.vertex is not None else 'Google Gemini'
+
+    @property
     def ready(self) -> bool:
-        return bool(self.cfg.enabled and os.environ.get(self.cfg.api_key_env, '').strip())
+        if not self.cfg.enabled:
+            return False
+        if self.vertex is not None:
+            return self.vertex.ready
+        return bool(os.environ.get(self.cfg.api_key_env, '').strip())
 
     def check_ready(self) -> None:
         if not self.cfg.enabled:
             raise CloudUnavailable('Image generation is disabled in the server configuration.')
+        if self.vertex is not None:
+            reason = self.vertex.missing_reason()
+            if reason:
+                raise CloudUnavailable(
+                    f'Vertex AI image generation is missing {reason}. Nothing was sent. '
+                    'See docs/VERTEX_IMAGE_GENERATION.md.')
+            if self._lock.locked():
+                raise CloudUnavailable('Another image is being generated. Please wait for it to finish.')
+            return
         if not self.ready:
             raise CloudUnavailable('Nano Banana needs a Gemini API key. Run set-gemini-key.bat on the brain PC, '
                                    'then restart the server. Do not send the key in chat.')
@@ -349,39 +402,71 @@ class ImageGenerator:
         return '' if cls._reply_text(data) else 'NO_IMAGE'
 
     async def _send(self, payload: dict) -> dict:
-        """One metered POST to Gemini; the caller decides about a retry."""
+        """One metered POST to the provider; the caller decides about a retry."""
         try:
             reservation = self.budget.reserve(MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS)
         except CloudUnavailable:
             raise
         except Exception as exc:
             raise CloudUnavailable('API accounting is unavailable; no image request was sent.') from exc
+        provider = self.provider_label
+        try:
+            url, headers, params = await self._endpoint()
+        except (VertexAuthError, KeyError) as exc:
+            # Nothing was sent, so nothing is billed: the reservation stays until
+            # the shared ledger is reconciled, exactly like a transport failure.
+            log.warning('%s credentials are not usable (%s)', provider, type(exc).__name__)
+            raise CloudUnavailable(str(exc) or f'{provider} credentials are not usable.') from exc
         try:
             async with asyncio.timeout(self.cfg.timeout_s):
-                async with self.http.stream('POST',
-                        f'https://generativelanguage.googleapis.com/v1/models/{self.cfg.model}:generateContent',
-                        headers={'x-goog-api-key': os.environ[self.cfg.api_key_env]}, json=payload) as response:
+                async with self.http.stream('POST', url, headers=headers, params=params,
+                                            json=payload) as response:
                     if response.status_code in {401, 403}:
-                        raise CloudUnavailable('Google rejected the Gemini key or model access. Check the key and billing in AI Studio.')
+                        raise CloudUnavailable(self._credential_refusal(response.status_code))
+                    if response.status_code == 402:
+                        raise CloudUnavailable(
+                            f'{provider} refused to bill this request (HTTP 402): the project or key '
+                            'has no balance. Nothing was created. Check billing on the Google side; '
+                            'rephrasing the request will not help.')
                     if response.status_code == 429:
-                        raise CloudUnavailable('Google image quota is exhausted. Check Gemini billing or try later.')
+                        raise CloudUnavailable(f'{provider} image quota is exhausted. Try later.')
                     if response.status_code != 200:
-                        raise CloudUnavailable(f'Google image generation failed (HTTP {response.status_code}). No image was returned.')
+                        detail = await _google_message(response)
+                        raise CloudUnavailable(
+                            f'{provider} image generation failed (HTTP {response.status_code}{detail}). '
+                            'No image was returned.')
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
                         if len(body) > MAX_RESPONSE_BYTES:
-                            raise CloudUnavailable('Google returned an image response that is too large.')
+                            raise CloudUnavailable(f'{provider} returned an image response that is too large.')
                     data = json.loads(body)
         except CloudUnavailable:
             raise
         except Exception as exc:
-            log.warning('Gemini request failed (%s); reservation retained', type(exc).__name__)
+            log.warning('%s request failed (%s); reservation retained', provider, type(exc).__name__)
             raise CloudUnavailable('Nano Banana could not finish the request. No image is ready; it was not retried.') from exc
         if not isinstance(data, dict):
-            raise CloudUnavailable('Google returned an invalid image response.')
+            raise CloudUnavailable(f'{provider} returned an invalid image response.')
         self._settle(reservation, data)
         return data
+
+    async def _endpoint(self) -> tuple[str, dict[str, str], dict[str, str]]:
+        """Where one image request goes and how it proves who it is."""
+        if self.vertex is not None:
+            return await self.vertex.authorization(self.cfg.model)
+        return (f'https://generativelanguage.googleapis.com/v1/models/{self.cfg.model}:generateContent',
+                {'x-goog-api-key': os.environ[self.cfg.api_key_env]}, {})
+
+    def _credential_refusal(self, status: int) -> str:
+        """What Google's 401/403 means on this road, in the owner's terms."""
+        if self.vertex is not None:
+            return (f'{self.provider_label} rejected the credential or the model access '
+                    f'(HTTP {status}). Check that the service account may use Vertex AI in '
+                    'server.image_generation.vertex_project and that the Vertex AI API is enabled '
+                    'there. See docs/VERTEX_IMAGE_GENERATION.md.')
+        return ('Google rejected the Gemini key or model access. Check the key and billing '
+                'in AI Studio.')
 
     async def generate(self, prompt: str, reference: bytes | None = None,
                        mime: str = 'image/jpeg', *,
@@ -396,7 +481,7 @@ class ImageGenerator:
         from hub import turn_trace
 
         turn_trace.record('prompt', 'image', payload={
-            'provider': 'gemini', 'model': self.cfg.model, 'prompt': prompt,
+            'provider': self.cfg.provider, 'model': self.cfg.model, 'prompt': prompt,
             'reference': bool(reference), 'references': len(list(references or ()))})
         parts = [{'text': prompt}]
         image_config = {'imageSize': self.cfg.image_size}
@@ -448,7 +533,9 @@ class ImageGenerator:
                 turn_trace.record('image', 'declined', ok=False, payload={
                     'reason': str((data.get('promptFeedback') or {}).get('blockReason')),
                     'model': self.cfg.model, 'prompt': prompt})
-                raise CloudUnavailable('Google declined this image request. No image was created. Do not retry or rephrase it automatically.')
+                raise CloudUnavailable(
+                    f'{self.provider_label} declined this image request. No image was created. '
+                    'Do not retry or rephrase it automatically.')
             candidates = data.get('candidates') or []
             if not candidates or candidates[0].get('finishReason') != 'STOP':
                 said = self._reply_text(data)
@@ -457,9 +544,9 @@ class ImageGenerator:
                                   or 'no candidates'),
                     'said': said[:300],
                     'model': self.cfg.model, 'prompt': prompt})
-                detail = f' Google itself said: "{said[:300]}".' if said else ''
+                detail = f' {self.provider_label} itself said: "{said[:300]}".' if said else ''
                 raise CloudUnavailable(
-                    'Google finished this image request without a picture'
+                    f'{self.provider_label} finished this image request without a picture'
                     f' ({reason or "no image"}).{detail}'
                     ' Nothing was changed. Say what to change in other words, or use another photo.')
             for part in (candidates[0].get('content') or {}).get('parts', []):
@@ -470,12 +557,16 @@ class ImageGenerator:
                     try:
                         raw = base64.b64decode(inline['data'], validate=True)
                     except (ValueError, KeyError, TypeError) as exc:
-                        raise CloudUnavailable('Google returned invalid image data.') from exc
+                        raise CloudUnavailable(
+                            f'{self.provider_label} returned invalid image data.') from exc
                     return await asyncio.to_thread(decode_image, raw, inline.get('mimeType', ''))
             said = self._reply_text(data)
             raise CloudUnavailable(
-                'Google returned no image.' + (f' It said: "{said[:300]}".' if said else '')
+                f'{self.provider_label} returned no image.'
+                + (f' It said: "{said[:300]}".' if said else '')
                 + ' Nothing was changed; do not claim the photo was edited.')
 
     async def close(self) -> None:
         await self.http.aclose()
+        if self.vertex is not None:
+            await self.vertex.close()

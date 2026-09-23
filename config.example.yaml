@@ -108,8 +108,18 @@ server:
 
   image_generation:          # optional Nano Banana 2; docs/IMAGE_GENERATION.md
     enabled: false
+    # gemini = AI Studio key (long-lived, billed to that key's account)
+    # vertex = Google Cloud Vertex AI (billed to the project, owner's credits)
+    # see docs/VERTEX_IMAGE_GENERATION.md for the five-minute setup
+    provider: gemini
     model: gemini-3.1-flash-image
-    api_key_env: GEMINI_API_KEY # saved separately on the brain PC, never in YAML
+    api_key_env: GEMINI_API_KEY # provider: gemini; never in YAML
+    vertex_project: ''         # provider: vertex; Google Cloud project id
+    vertex_location: us-central1 # or "global" for the newest models
+    vertex_credentials_path: '' # empty = search the places listed in the guide
+    vertex_credentials_env: GOOGLE_APPLICATION_CREDENTIALS
+    vertex_access_token_env: VERTEX_ACCESS_TOKEN # a ready-made token, for a test
+    vertex_api_key_env: VERTEX_API_KEY # Express-mode key, when there is no robot
     image_size: 1K
     timeout_s: 120
 
@@ -413,6 +423,23 @@ server:
     points: 1                # сколько очков даёт верный ответ
     guess_window_s: 20       # «угадай, кто сказал»: секунд на догадки
     guess_points: 5          # очков самой быстрой комнате (остальным — меньше)
+
+  notes:                     # ТЗ F-609: голосовые заметки друг другу
+    enabled: true            # заметка звучит, когда получатель появится в комнате
+    ttl_days: 7              # ТЗ: аудио хранится 7 дней (те же 7 дней и в медиах)
+    queue_limit: 20          # сколько невыданных заметок держит один дом
+    check_interval_s: 30     # как часто проверять, не пришёл ли получатель
+    max_note_s: 60           # дольше — обрезаем и честно об этом говорим
+    min_note_s: 0.5          # короче — не заметка
+
+  shopping:                  # ТЗ F-610: общий список покупок и дел
+    enabled: true            # список читают комната, Telegram и HUD
+    homes: []                # группа домов; пусто — все комнаты хаба
+    list_limit: 15           # сколько пунктов произносить и показывать
+    max_items: 200           # предел списка
+
+  do_not_disturb:            # ТЗ F-611: «я занят до 18» между комнатами
+    enabled: true            # интерком и вопросы опросов ждут до названного часа
 
   tts:
     engine: silero

@@ -289,13 +289,46 @@ class LLMConfig(_Strict):
 
 
 class ImageGenerationConfig(_Strict):
-    """On-demand Google Nano Banana 2; shares the LLM's monthly allowance."""
+    """On-demand Google Nano Banana 2; shares the LLM's monthly allowance.
+
+    Владелец 2026-09-23: «для генерации картинок теперь используй vertexai api
+    (у меня бесплатные 300$ credits)». Поэтому провайдер выбирается явно:
+
+    * ``gemini`` - прежний путь через AI Studio: одна долгоживущая
+      ``GEMINI_API_KEY``, расход уходит на её аккаунт (у владельца он отвечает
+      ``HTTP 402``, потому что баланс пуст);
+    * ``vertex`` - Google Cloud: запрос идёт в проект по короткоживущему
+      OAuth2-токену, а расход списывается с кредитов проекта (см.
+      ``hub/vertex_auth.py`` и ``docs/VERTEX_IMAGE_GENERATION.md``).
+
+    Поля ``vertex_*`` читаются только при ``provider: vertex``; при ``gemini``
+    они просто лежат без дела, чтобы переключение было одной строкой.
+    """
 
     enabled: bool = False
+    provider: Literal['gemini', 'vertex'] = 'gemini'
     model: Literal['gemini-3.1-flash-image'] = 'gemini-3.1-flash-image'
     api_key_env: str = Field(default='GEMINI_API_KEY', min_length=1, pattern=r'^\w+$')
     image_size: Literal['1K'] = '1K'
     timeout_s: float = Field(default=120, ge=15, le=180)
+    #: Google Cloud project id that owns the credits (``provider: vertex``).
+    vertex_project: str = Field(default='', pattern=r'^[A-Za-z0-9.:_-]*$')
+    #: Vertex region. ``global`` is the cheapest and the most available; a
+    #: regional name (``us-central1``) is used when the model is not global.
+    vertex_location: str = Field(default='us-central1', min_length=1,
+                                 pattern=r'^[a-z0-9-]+$')
+    #: Service-account JSON key. Empty = look at VERTEX_CREDENTIALS /
+    #: GOOGLE_APPLICATION_CREDENTIALS, then data/vertex-credentials.json, then
+    #: the gcloud application-default file.
+    vertex_credentials_path: str = ''
+    vertex_credentials_env: str = Field(default='GOOGLE_APPLICATION_CREDENTIALS',
+                                        min_length=1, pattern=r'^\w+$')
+    #: A ready-made token, for a one-off check from a console.
+    vertex_access_token_env: str = Field(default='VERTEX_ACCESS_TOKEN', min_length=1,
+                                         pattern=r'^\w+$')
+    #: Express-mode API key (``?key=``), when the owner has no service account.
+    vertex_api_key_env: str = Field(default='VERTEX_API_KEY', min_length=1,
+                                    pattern=r'^\w+$')
 
 
 class TelegramConfig(_Strict):
@@ -481,6 +514,8 @@ class MediaConfig(_Strict):
 
     media_ttl_days: int = Field(default=3, ge=1)
     clip_ttl_days: int = Field(default=7, ge=1)
+    #: ТЗ F-609: голосовая заметка другому человеку живёт 7 дней.
+    note_ttl_days: int = Field(default=7, ge=1)
     cleanup_interval_s: int = Field(default=3600, ge=0)
 
 
@@ -1280,6 +1315,71 @@ class SharedEventsConfig(_Strict):
     list_limit: int = Field(default=5, ge=1, le=20)
 
 
+class NotesConfig(_Strict):
+    """Голосовые заметки друг другу (``server.notes``, ТЗ F-609).
+
+    ТЗ называет единственное число — «аудио хранится 7 дней» — и то, что
+    заметка звучит при появлении человека. Остальное вынесено в конфиг: одна
+    комната и общежитие требуют разной очереди, а ``max_note_s`` не даёт
+    заметке превратиться в час записи, которая ждёт получателя.
+    """
+
+    enabled: bool = True
+    #: ТЗ F-609: сколько дней живёт запись (те же 7 дней и в медиах хаба F-304).
+    ttl_days: int = Field(default=7, ge=1, le=365)
+    #: Сколько заметок один дом держит невыданными (как очередь F-601).
+    queue_limit: int = Field(default=20, ge=1, le=200)
+    #: Как часто проверять, не пришёл ли получатель (задача доставки F-609).
+    check_interval_s: float = Field(default=30.0, ge=5.0, le=600.0)
+    #: Самая длинная заметка: дольше — обрезаем и говорим об этом.
+    max_note_s: float = Field(default=60.0, ge=5.0, le=600.0)
+    #: Короче этого запись не считается заметкой (щелчок микрофона — не слова).
+    min_note_s: float = Field(default=0.5, ge=0.1, le=5.0)
+
+
+class ShoppingConfig(_Strict):
+    """Общий список покупок и дел (``server.shopping``, ТЗ F-610).
+
+    Список принадлежит ГРУППЕ домов: ``homes`` называет комнаты, которые его
+    читают и на HUD которых он появляется карточкой (пусто — все дома хаба).
+    ``list_limit`` — сколько пунктов хаб произносит и показывает, ``max_items``
+    не даёт списку расти бесконечно.
+    """
+
+    enabled: bool = True
+    #: Комнаты группы; пусто — все дома хаба.
+    homes: list[str] = Field(default_factory=list)
+    #: Сколько пунктов показывать на карточке и в ответе.
+    list_limit: int = Field(default=15, ge=1, le=50)
+    #: Предел списка: сверх него добавление честно отказывает.
+    max_items: int = Field(default=200, ge=10, le=2000)
+
+
+class DoNotDisturbConfig(_Strict):
+    """Статус «не беспокоить» между комнатами (``server.do_not_disturb``, F-611).
+
+    ТЗ не называет чисел: статус живёт ровно до названного человеком часа, а
+    флаг нужен, чтобы владелец мог выключить саму возможность (например, если
+    режим мешает срочным сообщениям).
+    """
+
+    enabled: bool = True
+
+
+class CoWatchConfig(_Strict):
+    """Совместный просмотр (``server.co_watch``, ТЗ F-612).
+
+    ``scene`` — имя сцены, которая ставится в обеих комнатах (пресет F-506
+    «кино» по умолчанию). ``player`` — приложение, которое хаб открывает на
+    обоих ПК; пусто значит «плеер не настроен», и хаб честно говорит, что
+    запустить его нечем, вместо того чтобы делать вид, что кино идёт.
+    """
+
+    enabled: bool = True
+    scene: str = Field(default="кино", max_length=60)
+    player: str = Field(default="", max_length=60)
+
+
 class GamesConfig(_Strict):
     """Игры между комнатами (``server.games``, ТЗ F-608).
 
@@ -1628,6 +1728,14 @@ class ServerConfig(_Strict):
     shared_events: SharedEventsConfig = Field(default_factory=SharedEventsConfig)
     #: ТЗ F-608: игры между комнатами (квиз по темам, вопросы пишет модель).
     games: GamesConfig = Field(default_factory=GamesConfig)
+    #: ТЗ F-609: голосовые заметки друг другу — звучат при появлении человека.
+    notes: NotesConfig = Field(default_factory=NotesConfig)
+    #: ТЗ F-610: общий список покупок и дел группы домов.
+    shopping: ShoppingConfig = Field(default_factory=ShoppingConfig)
+    #: ТЗ F-611: статус «не беспокоить» между комнатами.
+    do_not_disturb: DoNotDisturbConfig = Field(default_factory=DoNotDisturbConfig)
+    #: ТЗ F-612: совместный просмотр — сцена «кино» в двух комнатах.
+    co_watch: CoWatchConfig = Field(default_factory=CoWatchConfig)
     greeting: GreetingConfig = Field(default_factory=GreetingConfig)
     web_admin: WebAdminConfig = Field(default_factory=WebAdminConfig)
     #: Release tag the room clients should run (ТЗ 4.9 OTA). Empty = не трогать.

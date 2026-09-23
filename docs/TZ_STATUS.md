@@ -2219,3 +2219,29 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_photo_request_wording.py -q` → 18 passed; набор
   telegram/image тестов → 379 passed; `ruff check` по изменённым файлам →
   All checks passed. Решение — `DECISIONS.md`, PHOTO-01.
+
+- **Картинки переведены на Vertex AI — провайдер выбирается конфигом
+  (23.09.2026).** Владелец: «для генерации картинок теперь используй vertexai
+  api (у меня бесплатные 300$ credits)». Причина: ключ AI Studio отвечал
+  `HTTP 402 Payment Required`. Что сделано: `server.image_generation.provider`
+  (`gemini` | `vertex`), `hub/vertex_auth.py` (Express-ключ, готовый токен,
+  сервис-аккаунт с подписанным JWT, файл `gcloud auth application-default
+  login`; токен кэшируется и обновляется), `scripts/set-vertex-key.ps1`,
+  `scripts/vertex_image_probe.py --dry-run`, `docs/VERTEX_IMAGE_GENERATION.md`,
+  поля `vertex_*` в `config.example.yaml`. Ошибки провайдера показываются
+  владельцу как есть (401/403 — доступ, 402 — биллинг, 404 — текст Google).
+  Проверено: `pytest tests/test_vertex_auth.py
+  tests/test_image_generation_vertex.py -q` → 18 passed; набор image/vision
+  тестов → 335 passed; `ruff check` по изменённым файлам → All checks passed;
+  `mypy common` → Success. Живая проверка с реальными кредитами — после того, как
+  владелец положит ключ сервис-аккаунта (до этого `--dry-run` печатает, чего не
+  хватает). Решение — `DECISIONS.md`, IMG-VERTEX-01.
+
+- **Облачное зрение получило свой `base_url` (23.09.2026).** `look_at_camera`
+  отвечал «Screen check failed: OpenAI is unavailable», потому что
+  `hub/vision_cloud.py::_as_cfg` не передавал уровень `cloud_strong` его
+  `base_url` и запрос уходил на `api.openai.com` с ключом DeepSeek (401).
+  Проверено живьём: ответ пришёл с `https://api.deepseek.com/v1/responses`;
+  `pytest tests/test_vision_cloud.py tests/test_image_difficulty.py
+  tests/test_screen_ocr.py tests/test_models_health.py -q` → 58 passed. Решение —
+  `DECISIONS.md`, VISION-01.

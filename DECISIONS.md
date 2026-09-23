@@ -5564,3 +5564,50 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   tests/test_image_generation.py -q` → 379 passed; `ruff check hub/image_prompt.py
   hub/telegram_control.py tests/test_photo_request_wording.py` → All checks passed.
   Ссылка: ТЗ F-404/F-510; DECISIONS.md TG-10.
+
+- **IMG-VERTEX-01 — картинки рисует Vertex AI, а не ключ AI Studio
+  (23.09.2026).** Владелец: «для генерации картинок теперь используй vertexai
+  api (у меня бесплатные 300$ credits хочу их для генерации использовать)».
+  Причина смены дороги видна в логе: `POST
+  generativelanguage.googleapis.com/v1/models/gemini-3.1-flash-image:generateContent`
+  отвечал `HTTP 402 Payment Required`, то есть ключ AI Studio упирался в пустой
+  баланс ещё до разговора о формулировке («У тебя есть функция...», «Google не
+  смог завершить редактирование» из жалоб 22–23.09 — это один и тот же 402).
+  Вопрос, которого ТЗ не решает (в разделе 17 провайдер картинок не назван),
+  закрыт вариантом «по умолчанию» из пункта 17.3: внешний сервис выбирается
+  конфигом. Сделано: `server.image_generation.provider` со значениями `gemini`
+  (прежняя дорога) и `vertex` (новая, стоит в `config.openai.yaml`), плюс
+  `hub/vertex_auth.py` — Express-ключ (`?key=`), готовый `VERTEX_ACCESS_TOKEN`,
+  сервис-аккаунт (JWT RS256 через `cryptography`, токен кэшируется на час и
+  обновляется сам) и файл `gcloud auth application-default login` (refresh
+  token). Выбор дороги — единственное различие: тело запроса, учёт расхода,
+  один повтор на «пустой» ответ, разбор `blockReason` и запись трассы у обеих
+  дорог общие. Ошибки называются своими словами: `401/403` — доступ или
+  включённый ли API, `402` — биллинг проекта (и прямая фраза «переформулировка
+  не поможет»), `404` — текст Google «Publisher Model not found» (не тот
+  регион/модель), нет проекта или файла — запрос не уходит вовсе. Проверено:
+  `pytest tests/test_vertex_auth.py tests/test_image_generation_vertex.py -q` →
+  18 passed; `pytest tests/test_image_generation.py tests/test_image_references.py
+  tests/test_image_aspect_ratio.py tests/test_image_prompt.py
+  tests/test_api_budget.py tests/test_config.py -q` → 277 passed; `ruff check` по
+  изменённым файлам → All checks passed; `mypy common` → Success. Живая проверка
+  провайдера ждёт ключа сервис-аккаунта: пока его нет,
+  `python scripts/vertex_image_probe.py --dry-run` печатает, что именно не
+  настроено, и **не отправляет** запрос. Инструкция —
+  `docs/VERTEX_IMAGE_GENERATION.md`, ключ кладёт `scripts/set-vertex-key.ps1`.
+  Ссылка: ТЗ 17.3, F-404/F-510; DECISIONS.md API-01, PHOTO-01.
+
+- **VISION-01 — облачное зрение больше не уходит на `api.openai.com`
+  (23.09.2026).** В логе хаба `look_at_camera` отвечал «Screen check failed:
+  OpenAI is unavailable», хотя уровень `models.levels.cloud_strong` настроен на
+  `https://api.deepseek.com/v1`. Причина: `hub/vision_cloud.py::_as_cfg`
+  собирал уровень без `base_url`, `ResponsesClient` брал адрес OpenAI по
+  умолчанию, и ключ `DEEPSEEK_API_KEY` к нему не подходил (`401 Unauthorized`).
+  Это ломало «посмотри на экран/что в комнате» — то, на чём строится и
+  «поставь Антона на диван». Сделано: `_as_cfg` передаёт `base_url` уровня.
+  Проверено живьём: `CloudVision.describe(...)` → запрос на
+  `https://api.deepseek.com/v1/responses`, ответ верный («The visible window
+  title is "YouTube - Google Chrome"»); `pytest tests/test_vision_cloud.py
+  tests/test_image_difficulty.py tests/test_screen_ocr.py
+  tests/test_models_health.py -q` → 58 passed. Ссылка: ТЗ F-404; DECISIONS.md
+  IMG-VERTEX-01.
