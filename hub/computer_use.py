@@ -4,7 +4,9 @@
 vision-LLM → действие мыши и клавиатуры. Такому агенту нельзя верить на слово,
 поэтому здесь живёт ХАБОВАЯ часть ограничений:
 
-* один прогон — не больше 15 шагов (``common.computer_use.MAX_STEPS``);
+* шаги не ограничены, пока владелец сам не поставит предел
+  (``server.computer_use.max_steps``; ``0`` — лимита нет, решение владельца
+  от 2026-09-23 «никаких лимитов»);
 * allow-list приложений: пусто — агент не трогает ни одного;
 * запрет ввода паролей и платёжных данных (слова трёх языков);
 * отказ записывается в прогон и виден снаружи, а не глотается молча;
@@ -25,7 +27,7 @@ from typing import Any
 
 from common.computer_use import (
     ACTIONS,
-    MAX_STEPS,
+    DEFAULT_MAX_STEPS,
     ComputerUsePolicy,
     ComputerUseStep,
     changes_system,
@@ -89,6 +91,14 @@ class ComputerUseRun:
 
     @property
     def remaining(self) -> int:
+        """Сколько шагов осталось; ``-1`` — лимита нет.
+
+        Владелец снял потолок в 15 шагов (2026-09-23), поэтому прогон
+        заканчивается делом, стоп-словом или подтверждением опасного шага, а не
+        счётчиком. ``-1`` и значит «счётчика нет» — так это видно в панели.
+        """
+        if self.policy.unlimited:
+            return -1
         return max(0, self.policy.max_steps - self.used)
 
     # --- шаги -----------------------------------------------------------
@@ -112,8 +122,8 @@ class ComputerUseRun:
         if reason:
             return self._refuse(index, reason)
         self.steps.append(step)
-        log.info("computer use %s step %d/%d in %s: %s", self.run_id, self.used,
-                 self.policy.max_steps, self.home_id, step.describe())
+        log.info("computer use %s step %d/%s in %s: %s", self.run_id, self.used,
+                 self.policy.max_steps or "no limit", self.home_id, step.describe())
         return StepDecision(ok=True, reason="", index=index, step=step)
 
     def _refuse(self, index: int, reason: str) -> StepDecision:
@@ -260,7 +270,7 @@ class ComputerUseRuns:
 
 __all__ = [
     "ACTIONS",
-    "MAX_STEPS",
+    "DEFAULT_MAX_STEPS",
     "ComputerUsePolicy",
     "ComputerUseRefused",
     "ComputerUseRun",

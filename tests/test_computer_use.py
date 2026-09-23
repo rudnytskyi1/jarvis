@@ -1,9 +1,13 @@
-"""P5-14 (F-512): лимит 15 шагов, allow-list приложений, запрет секретов.
+"""P5-14 (F-512): шаги без потолка, allow-list приложений, запрет секретов.
 
 Проверяется и хабовая часть (что вообще разрешено и что случилось с шагом), и
 исполнитель на комнате (последняя линия перед мышью): шаг за пределами лимита,
 приложение вне allow-list, ввод пароля или платёжных данных и печать в
 неизвестное окно обязаны останавливаться ДО действия.
+
+Потолок в 15 шагов снят владельцем 2026-09-23 («никаких лимитов, все что его
+попросили — делает»): по умолчанию прогон не считает шаги пределом, а число в
+конфиге — это предел, который владелец поставил сам.
 """
 from __future__ import annotations
 
@@ -18,7 +22,9 @@ from client.actions.computer_use import (
     ComputerUseUnavailable,
 )
 from common.computer_use import (
+    DEFAULT_MAX_STEPS,
     MAX_STEPS,
+    UNLIMITED_STEPS,
     ComputerUsePolicy,
     ComputerUseStep,
     normalize_app,
@@ -31,12 +37,23 @@ from hub.computer_use import ComputerUseRun, ComputerUseRuns, policy_for
 # --- правила ---------------------------------------------------------------
 
 
-def test_the_step_limit_of_the_spec_cannot_be_raised():
-    assert MAX_STEPS == 15
-    assert ComputerUseConfig(max_steps=15).max_steps == 15
-    for too_many in (16, 100, 0):
-        with pytest.raises(ValidationError):
-            ComputerUseConfig(max_steps=too_many)
+def test_the_step_ceiling_is_gone_and_the_owner_can_set_one():
+    """Потолок ТЗ снят; ``0`` — без лимита, любое число — предел владельца."""
+    assert DEFAULT_MAX_STEPS == UNLIMITED_STEPS == 0
+    assert MAX_STEPS == 15, "прежний предел ТЗ остался только справкой"
+    assert ComputerUseConfig().max_steps == 0
+    assert ComputerUseConfig(max_steps=0).max_steps == 0
+    assert ComputerUseConfig(max_steps=500).max_steps == 500
+    with pytest.raises(ValidationError):
+        ComputerUseConfig(max_steps=-1)
+
+
+def test_a_policy_without_a_limit_says_so():
+    assert ComputerUsePolicy(enabled=True).unlimited is True
+    assert ComputerUsePolicy(enabled=True, max_steps=0).unlimited is True
+    assert ComputerUsePolicy(enabled=True, max_steps=3).unlimited is False
+    assert ComputerUsePolicy(enabled=True).refuse(ComputerUseStep(action="key", key="enter"),
+                                                  index=999) == ""
 
 
 def test_secrets_and_money_are_named_in_three_languages():
@@ -58,6 +75,15 @@ def test_the_allow_list_is_the_only_thing_the_agent_may_touch():
     # Пустой список — безопасное умолчание: ни одного приложения.
     assert ComputerUsePolicy(enabled=True).allows_app("discord") is False
     assert normalize_app('"C:\\Program Files\\Steam\\steam.exe"') == "steam"
+
+
+def test_a_star_in_the_allow_list_means_every_application():
+    """Владелец сам снимает allow-list звёздочкой (2026-09-23)."""
+    policy = ComputerUsePolicy(enabled=True, allowed_apps=["*"])
+    assert policy.allowed_apps == ["*"]
+    assert policy.allows_app("chrome") and policy.allows_app("C:\\Apps\\Discord.exe")
+    empty = ComputerUsePolicy(enabled=True)
+    assert empty.allows_app("chrome") is False, "пустой список остаётся «ничего»"
 
 
 def test_a_step_outside_the_allow_list_is_refused_with_a_reason():
@@ -86,15 +112,25 @@ def _policy(**kwargs) -> ComputerUsePolicy:
     return ComputerUsePolicy(enabled=True, allowed_apps=["discord"], **kwargs)
 
 
-def test_the_fifteenth_step_runs_and_the_sixteenth_is_refused():
+def test_a_run_without_a_limit_keeps_taking_steps():
+    """Сорок шагов подряд — и ни одного отказа по счёту (владелец, 23.09)."""
     run = ComputerUseRun(home_id="livingroom", goal="ответь Максу", policy=_policy())
-    for index in range(MAX_STEPS):
+    for index in range(40):
         decision = run.accept({"action": "click", "x": 0.5, "y": 0.5})
         assert decision.ok is True and decision.index == index
-    assert run.used == MAX_STEPS and run.remaining == 0
+    assert run.used == 40 and run.remaining == -1
+    assert run.summary()["remaining"] == -1, "в панели видно, что счётчика нет"
+
+
+def test_a_limit_the_owner_sets_still_stops_the_run():
+    """Владелец может поставить свой предел — тогда он работает."""
+    run = ComputerUseRun(home_id="livingroom", goal="ответь Максу",
+                         policy=_policy(max_steps=3))
+    for _ in range(3):
+        assert run.accept({"action": "click", "x": 0.5, "y": 0.5}).ok is True
     over = run.accept({"action": "click", "x": 0.5, "y": 0.5})
-    assert over.ok is False and "15" in over.reason
-    assert run.used == MAX_STEPS, "отказ не занимает шаг"
+    assert over.ok is False and "3" in over.reason
+    assert run.used == 3, "отказ не занимает шаг"
     assert len(run.refusals) == 1
 
 
@@ -102,7 +138,7 @@ def test_a_refused_step_does_not_eat_the_budget():
     run = ComputerUseRun(home_id="livingroom", goal="открой хром", policy=_policy())
     refused = run.accept({"action": "app", "app": "chrome"})
     assert refused.ok is False and "chrome" in refused.reason
-    assert run.used == 0 and run.remaining == MAX_STEPS
+    assert run.used == 0 and run.remaining == -1
     assert run.accept({"action": "app", "app": "Discord"}).ok is True
 
 
@@ -167,7 +203,7 @@ def test_the_summary_names_every_step_and_refusal():
     summary = run.summary()
     assert summary["used"] == 2 and summary["steps"][-1] == "type 2 characters"
     assert any("password" in reason for reason in summary["refusals"])
-    assert summary["run_id"] and summary["max_steps"] == 15
+    assert summary["run_id"] and summary["max_steps"] == 0
 
 
 # --- исполнитель на комнате -------------------------------------------------
@@ -246,14 +282,25 @@ def test_the_executor_never_types_a_secret_even_if_the_hub_asked():
     assert not any(call[0] == "write" for call in gui.calls)
 
 
-def test_the_executor_counts_real_actions_and_obeys_the_limit():
+def test_the_executor_keeps_going_when_the_owner_set_no_limit():
+    """Потолок снят: комната выполняет шаг за шагом, пока задача не сделана."""
     gui = _Gui()
     executor = _executor(gui)
-    for _ in range(MAX_STEPS):
+    for _ in range(MAX_STEPS * 2):
+        assert executor.execute({"action": "key", "key": "enter"})["ok"] is True
+    assert sum(1 for call in gui.calls if call[0] == "press") == MAX_STEPS * 2
+
+
+def test_the_executor_obeys_the_limit_the_owner_set():
+    gui = _Gui()
+    executor = ComputerUseExecutor(
+        policy=ComputerUsePolicy(enabled=True, allowed_apps=["discord"], max_steps=3),
+        gui=gui, foreground=lambda: "Discord", size=lambda: gui.size)
+    for _ in range(3):
         assert executor.execute({"action": "key", "key": "enter"})["ok"] is True
     over = executor.execute({"action": "key", "key": "enter"})
-    assert over["ok"] is False and "15" in over["reason"]
-    assert sum(1 for call in gui.calls if call[0] == "press") == MAX_STEPS
+    assert over["ok"] is False and "3" in over["reason"]
+    assert sum(1 for call in gui.calls if call[0] == "press") == 3
 
 
 def test_a_step_naming_another_app_is_refused_before_acting():

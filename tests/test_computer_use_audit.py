@@ -127,23 +127,40 @@ def test_finishing_without_a_task_is_not_an_error(monkeypatch):
     assert result["ok"] is True and "no computer-use task" in result["note"]
 
 
-def test_the_room_reports_how_many_steps_are_left(monkeypatch):
+def test_the_room_reports_that_there_is_no_step_limit(monkeypatch):
+    """Потолок снят: комната отвечает «шагов без счёта», а не «14 осталось»."""
     conn = _connection()
     first = asyncio.run(conn._run_computer_use({"goal": "ответь Максу",
-                                                "action": "app", "app": "Discord"}))
-    assert first["remaining"] == 14 and "14 left" in first["note"]
+                                               "action": "app", "app": "Discord"}))
+    assert first["remaining"] == -1 and "no step limit" in first["note"]
 
 
-def test_a_step_over_the_hub_limit_never_reaches_the_room(monkeypatch):
+def test_a_step_over_the_limit_the_owner_set_never_reaches_the_room(monkeypatch):
+    """Владелец может поставить свой предел — он работает так же строго."""
     conn = _connection()
+    conn.cfg.server.computer_use = ComputerUseConfig(enabled=True, allowed_apps=["Discord"],
+                                                    max_steps=2)
     run = hub_app._computer_use_runs().start(
-        ROOM, "ответь Максу", ComputerUsePolicy(enabled=True, allowed_apps=["discord"]))
-    for _ in range(15):
+        ROOM, "ответь Максу",
+        ComputerUsePolicy(enabled=True, allowed_apps=["discord"], max_steps=2))
+    for _ in range(2):
         run.accept({"action": "wait", "seconds": 0.0})
     result = asyncio.run(conn._run_computer_use({"goal": "ответь Максу",
                                                  "action": "wait", "seconds": 0.0}))
-    assert result["ok"] is False and "15" in result["error"]
+    assert result["ok"] is False and "2" in result["error"]
     conn._run_client_action.assert_not_awaited()
+
+
+def test_without_a_limit_the_room_keeps_taking_steps(monkeypatch):
+    """Без лимита шаг принимается и после пятнадцатого."""
+    conn = _connection()
+    run = hub_app._computer_use_runs().start(
+        ROOM, "ответь Максу", ComputerUsePolicy(enabled=True, allowed_apps=["discord"]))
+    for _ in range(20):
+        run.accept({"action": "wait", "seconds": 0.0})
+    result = asyncio.run(conn._run_computer_use({"goal": "ответь Максу",
+                                                 "action": "wait", "seconds": 0.0}))
+    assert result["ok"] is True and result["remaining"] == -1
 
 
 # --- подтверждение F-113 ----------------------------------------------------

@@ -44,10 +44,34 @@
   семейные итоги — в `docs/AUDIT_MASS_AFTER.md`. Остаток провалов в основном
   не поломки, а честные отказы стенда («действия на ПК выключены», «личность
   выключена», «устройств нет») — это записано задач AU-05/AU-06.
-- [ ] **AU-02 — браузер: остатки после защиты `run_command`.** Защита уже в
-  хабе (`opening_a_web_page`), нужно проверить живьём:
-  `--family browser --family noisy`, починить остатки (первый вызов не
-  `browser_control`, отсутствие слова из просьбы в аргументах), дописать тесты.
+- [x] **AU-02 — браузер: остатки после защиты `run_command`.** Проверено:
+  живой прогон `--family browser --family noisy` с `--workers 6`
+  (`data/audit/runs/mass-04-browser-before.jsonl`, 409 сценариев) — 362
+  прошло, 47 падений. Главная причина нашлась в промпте: `prompts/system.md`
+  сам учил «For sites and online services … call `run_command` with
+  Start-Process and the address» (10 падений «первым вызван `run_command`») и
+  читал «открой chrome/spotify» как программу (5 «первым вызван
+  `pc_control`»); значение семейства Jev `pc` не исключало сайты (6
+  «сужение скрыло `browser_control`»). Сделано: промпт переписан на
+  `browser_control` navigate для сайта по имени, поиска и текста в поле
+  страницы; `TOOL_FAMILY_MEANINGS` называет онлайн-сервисы (YouTube, Netflix,
+  Twitch, Gmail, Reddit, Spotify) в браузерном семействе и «не сайт, не
+  страница, не поиск» — в ПК; слово из просьбы проверяется в том вызове,
+  который модель сделала, когда верны два инструмента (`spotify` есть и
+  сайтом, и программой — `DECISIONS.md` AUDIT-08); «найди погоду» принимает
+  и `run_skill` (`skills/weather`); сценарии набора текста помечены
+  `needs_actions`. Повторный прогон тех же 409 сценариев
+  (`data/audit/runs/mass-06-browser-final.jsonl`) — **390 из 394** разобранных
+  прошло (98.98 %), 33 прежде падавших сценария закрыто, 15 печатаются как
+  `SKIP` (`fill` берёт ref из `read`, стенд без `--actions` страницу не
+  отдаёт). Осталось 4: `AU-0189` — «the dorm portal» без известного адреса
+  модель ищет ярлык через `run_command`; `AU-0357`/`AU-0358` — закрытие
+  вкладки/окна начинается с `look_at_screen`/`run_command`; `AU-0971` —
+  «quiet please» модель читает как «замолчи», а не как `mute`. Тесты:
+  `tests/audit/test_request_matrix.py` (матрица + вердикт стенда),
+  `tests/test_web_page_guard.py` (промпт и защита хаба говорят одно и то же);
+  `pytest tests -q` → 60 failed только в чужом `tests/test_guess_who.py`,
+  `ruff check .` → All checks passed, `mypy common` → Success.
 - [ ] **AU-03 — зрение: «кто в комнате», «что на экране».** Живой прогон
   `--family vision`; цель — Jev выбирает семейство `vision` и модель зовёт
   `look_at_camera`/`look_at_screen` первым вызовом. Проверять и `offered`.
@@ -89,3 +113,11 @@
 - [ ] **AU-13 — итог.** Обновить `docs/AUDIT_MASS.md`, `docs/TZ_STATUS.md`,
   `README.md` (какие слои аудита есть и как их запускать), `DECISIONS.md`.
   После закрытия — вернуть звук на ПК: `pwsh -File scripts/room-audio.ps1 unmute`.
+- [x] **AU-14 — лимит шагов computer_use снят (просьба владельца 23.09.2026).**
+  «the step limit of 15 steps is reached… убери эту фигню. никаких лимитов: все
+  что его попросили — делает». Проверено: `max_steps: 0` = лимита нет,
+  `["*"]` = любое приложение, `max_tool_rounds: 40`; `pytest
+  tests/test_computer_use.py tests/test_computer_use_audit.py -q` → 37 passed;
+  `ruff check .` → All checks passed; `mypy common` → Success. Обоснование —
+  `DECISIONS.md`, «Лимит шагов computer_use снят». **Чего нет:** живого прогона
+  длиннее пятнадцати шагов (появится после перезапуска хаба).

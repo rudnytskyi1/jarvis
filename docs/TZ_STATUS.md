@@ -1598,3 +1598,23 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   `ruff check .` → All checks passed; живой `/admin/turns` → 200 и чистый пустой
   список. **Чего нет:** живого запроса в новой панели — первая настоящая цепочка
   появится после следующей реплики в комнате или сообщения в Telegram.
+
+- **CU-LIMIT-01 (F-512) — потолок в 15 шагов у computer-use снят (23.09.2026).**
+  Владелец: «the step limit of 15 steps is reached… убери эту фигню. никаких
+  лимитов: все что его попросили — делает». Что изменено: `MAX_STEPS` больше не
+  потолок, добавлены `DEFAULT_MAX_STEPS = 0` и `UNLIMITED_STEPS = 0`
+  (`common/computer_use.py`), `0` значит «лимита нет», положительное число —
+  предел владельца; `ComputerUsePolicy.unlimited`; в `common/config.py`
+  `max_steps: int = Field(default=0, ge=0)` вместо `ge=1, le=15`; allow-list
+  `["*"]` = любое приложение (`ANY_APP`); `hub/computer_use.py::remaining`
+  отдаёт `-1` при снятом лимите, лог пишет `no limit`; ответ на шаг в
+  `hub/app.py` — «step N done; no step limit»; описание инструмента
+  `computer_use` в `hub/tools.py` больше не обещает «At most 15 steps»;
+  `config.example.yaml` и `config.openai.yaml` — `max_steps: 0`,
+  `max_tool_rounds: 40`. Живое включение: `computer_use.enabled: true`,
+  `allowed_apps: ["*"]` в `config.openai.yaml` (локальный, в git не попадает).
+  Проверено: `pytest tests/test_computer_use.py tests/test_computer_use_audit.py
+  -q` → 37 passed; `ruff check .` → All checks passed; `mypy common` → Success.
+  **Чего нет:** живого прогона длиннее пятнадцати шагов — он появится при
+  первой настоящей многошаговой просьбе после перезапуска хаба.
+  Обоснование решения — `DECISIONS.md`, «Лимит шагов computer_use снят».

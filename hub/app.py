@@ -8281,7 +8281,9 @@ class Connection(CameraClipReceiver):
                     "index": result.get("index"), "remaining": run.remaining}
         return {"ok": True, "index": result.get("index"), "step": result.get("step"),
                 "used": run.used, "remaining": run.remaining,
-                "note": (f"step {run.used} of {run.policy.max_steps} done; "
+                "note": (f"step {run.used} done; no step limit"
+                         if run.policy.unlimited else
+                         f"step {run.used} of {run.policy.max_steps} done; "
                          f"{run.remaining} left")}
 
     async def _on_posture_event(self, payload: dict[str, Any]) -> None:
