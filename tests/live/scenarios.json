@@ -1,0 +1,346 @@
+{
+  "note": "Real requests the owner makes out loud, checked through the real model and the real tools. 'expect_tools' means the chain must contain that call; 'forbid_tools' means it must not. Nothing here is a substitute for speaking into the microphone - this is the understanding/action half, which is where the live hub kept failing.",
+  "scenarios": [
+    {
+      "id": "VE-01",
+      "said": "Rowan, open YouTube and search for MrBeast",
+      "expect_tools": [
+        "browser_control"
+      ],
+      "expect_args": {
+        "browser_control": [
+          "youtube",
+          "mrbeast"
+        ]
+      },
+      "note": "the live log shows this request ending on a New Tab page"
+    },
+    {
+      "id": "VE-02",
+      "said": "Rowan, go to youtube.com in the current browser window",
+      "expect_tools": [
+        "browser_control"
+      ],
+      "expect_args": {
+        "browser_control": [
+          "youtube"
+        ]
+      }
+    },
+    {
+      "id": "VE-03",
+      "said": "Rowan, open the Google Chrome browser",
+      "expect_tools": [
+        "pc_control"
+      ],
+      "expect_args": {
+        "pc_control": [
+          "chrome"
+        ]
+      }
+    },
+    {
+      "id": "VE-04",
+      "said": "Rowan, turn the volume up",
+      "expect_tools": [
+        "pc_control"
+      ],
+      "expect_args": {
+        "pc_control": [
+          "volume"
+        ]
+      }
+    },
+    {
+      "id": "VE-05",
+      "said": "Rowan, pause the video",
+      "note": "media keys or the page's own button, whichever the model picks",
+      "expect_any": [
+        "pc_control",
+        "browser_control"
+      ]
+    },
+    {
+      "id": "VE-06",
+      "said": "Rowan, what is on my screen right now?",
+      "expect_tools": [
+        "look_at_screen"
+      ]
+    },
+    {
+      "id": "VE-07",
+      "said": "Rowan, read the page and tell me the first video title",
+      "expect_any": [
+        "browser_control",
+        "look_at_screen"
+      ]
+    },
+    {
+      "id": "VE-08",
+      "said": "Rowan, click the Videos tab",
+      "expect_tools": [
+        "browser_control"
+      ],
+      "expect_args": {
+        "browser_control": [
+          "videos"
+        ]
+      }
+    },
+    {
+      "id": "VE-09",
+      "said": "Rowan, type MrBeast in the search box and press enter",
+      "expect_tools": [
+        "browser_control"
+      ],
+      "expect_args": {
+        "browser_control": [
+          "mrbeast"
+        ]
+      }
+    },
+    {
+      "id": "VE-10",
+      "said": "Rowan, scroll down",
+      "expect_tools": [
+        "browser_control"
+      ]
+    },
+    {
+      "id": "VE-11",
+      "said": "Rowan, go back to the previous page",
+      "expect_tools": [
+        "browser_control"
+      ]
+    },
+    {
+      "id": "VE-12",
+      "said": "Rowan, open Calculator",
+      "expect_tools": [
+        "pc_control"
+      ],
+      "expect_args": {
+        "pc_control": [
+          "calculator"
+        ]
+      }
+    },
+    {
+      "id": "VE-13",
+      "said": "Rowan, who is in the room right now?",
+      "expect_any": [
+        "look_at_camera"
+      ],
+      "note": "the bench has no camera: the tool choice is judged, the picture is not"
+    },
+    {
+      "id": "VE-14",
+      "said": "Rowan, take a photo of the room",
+      "expect_any": [
+        "look_at_camera",
+        "telegram_send",
+        "show_photo",
+        "generate_image"
+      ],
+      "note": "the bench has no camera: the tool choice is judged, the picture is not"
+    },
+    {
+      "id": "VE-15",
+      "said": "Rowan, do you see my water bottle on the desk?",
+      "expect_any": [
+        "find_object",
+        "look_at_camera",
+        "look_at_screen"
+      ],
+      "note": "the bench has no camera: the tool choice is judged, the picture is not",
+      "bench_skip": "needs the room camera and the SAM3 segmenter"
+    },
+    {
+      "id": "VE-16",
+      "said": "Rowan, remember that I keep my keys in the top drawer",
+      "expect_tools": [
+        "remember"
+      ]
+    },
+    {
+      "id": "VE-17",
+      "said": "Rowan, what do you remember about my keys?",
+      "note": "the remembered fact is already in the prompt: answering without another tool call is correct"
+    },
+    {
+      "id": "VE-18",
+      "said": "Rowan, who do you know here?",
+      "expect_tools": [
+        "list_people"
+      ],
+      "note": "speaker recognition is off in the bench: the tool choice is what is checked"
+    },
+    {
+      "id": "VE-19",
+      "said": "Rowan, make a picture of a red sports car in the snow",
+      "expect_tools": [
+        "generate_image"
+      ],
+      "expect_args": {
+        "generate_image": [
+          "car"
+        ]
+      }
+    },
+    {
+      "id": "VE-20",
+      "said": "Rowan, make the last picture black and white",
+      "expect_tools": [
+        "generate_image"
+      ]
+    },
+    {
+      "id": "VE-21",
+      "said": "Rowan, send the group a message that dinner is at eight",
+      "expect_tools": [
+        "telegram_send"
+      ],
+      "expect_args": {
+        "telegram_send": [
+          "dinner"
+        ]
+      },
+      "live_only": "would post a real message to the group"
+    },
+    {
+      "id": "VE-22",
+      "said": "Rowan, say TEST HELLO out loud on the buro computer",
+      "expect_tools": [
+        "say_in_room"
+      ],
+      "expect_args": {
+        "say_in_room": [
+          "test hello"
+        ]
+      }
+    },
+    {
+      "id": "VE-23",
+      "said": "Rowan, set an alarm for seven in the morning",
+      "expect_any": [
+        "pc_control",
+        "remember",
+        "create_rule",
+        "run_skill"
+      ]
+    },
+    {
+      "id": "VE-24",
+      "said": "Rowan, what time is it?",
+      "forbid_tools": [
+        "browser_control",
+        "generate_image"
+      ],
+      "note": "a question must be answered, not turned into an action"
+    },
+    {
+      "id": "VE-25",
+      "said": "Rowan, what is the weather tomorrow?",
+      "forbid_tools": [
+        "generate_image"
+      ]
+    },
+    {
+      "id": "VE-26",
+      "said": "Rowan, put the computer to sleep",
+      "expect_tools": [
+        "pc_control"
+      ],
+      "expect_args": {
+        "pc_control": [
+          "sleep"
+        ]
+      },
+      "live_only": "would really sleep the PC"
+    },
+    {
+      "id": "VE-27",
+      "said": "Rowan, lock the PC",
+      "expect_tools": [
+        "pc_control"
+      ],
+      "expect_args": {
+        "pc_control": [
+          "lock"
+        ]
+      },
+      "live_only": "would really lock the session"
+    },
+    {
+      "id": "VE-28",
+      "said": "Rowan, set the wallpaper to the last picture",
+      "expect_tools": [
+        "set_wallpaper"
+      ]
+    },
+    {
+      "id": "VE-29",
+      "said": "Rowan, turn off the light",
+      "expect_any": [
+        "set_light",
+        "set_switch"
+      ]
+    },
+    {
+      "id": "VE-30",
+      "said": "Rowan, never mind",
+      "forbid_tools": [
+        "browser_control",
+        "pc_control",
+        "generate_image"
+      ],
+      "note": "a refusal to act must not become an action"
+    },
+    {
+      "id": "VE-31",
+      "said": "Rowan, stop",
+      "forbid_tools": [
+        "browser_control",
+        "pc_control",
+        "generate_image"
+      ]
+    },
+    {
+      "id": "VE-32",
+      "said": "Rowan, remember my face",
+      "expect_any": [
+        "enroll_face"
+      ],
+      "note": "the bench has no camera: the tool choice is judged, the picture is not"
+    },
+    {
+      "id": "VE-33",
+      "said": "Rowan, this is my voice, save it",
+      "expect_any": [
+        "enroll_voice"
+      ],
+      "note": "asking for the name first is fine; calling the tool is what is checked"
+    },
+    {
+      "id": "VE-34",
+      "said": "Rowan, open the Discord window and start a call with Max",
+      "note": "an app with no API: the model has to look and click",
+      "live_only": "would click around the owner's real screen",
+      "expect_any": [
+        "pc_control",
+        "computer_use",
+        "click_screen"
+      ]
+    },
+    {
+      "id": "VE-35",
+      "said": "Rowan, look at my screen and click the button that starts the game",
+      "live_only": "would click around the owner's real screen",
+      "expect_any": [
+        "look_at_screen",
+        "click_screen",
+        "computer_use"
+      ]
+    }
+  ]
+}

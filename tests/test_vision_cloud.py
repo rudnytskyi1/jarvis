@@ -16,7 +16,7 @@ import pytest
 from common.config import Config, HomeConfig, ModelLevelConfig, ModelsConfig
 from hub.api_budget import CloudUnavailable
 from hub.model_router import LEVEL_LOCAL_VISION, ModelRouter
-from hub.vision_cloud import CloudVision
+from hub.vision_cloud import CloudVision, fit_for_api
 from hub.vision_levels import build_cloud_vision, cloud_vision_entry, image_is_hard
 
 
@@ -67,6 +67,103 @@ def test_a_hub_without_a_local_vision_level_can_still_look_with_the_cloud():
     assert decision.level == "cloud_strong"
     # А без разрешения дома смотреть нечем, и это честный None.
     assert router.vision_pick(hard_image=False, cloud_allowed=False) is None
+
+
+# --- локальный сервер зрения не запущен -------------------------------------
+
+
+class _DeadLocal:
+    """The local multimodal server is down: its answer is an error string."""
+
+    def describe_screenshot(self, jpeg, query=None):
+        return ("Screen check failed: [WinError 10061] No connection could be made "
+                "because the target machine actively refused it")
+
+
+class _Cloud:
+    level_model = "gpt-5.6-luna"
+
+    def __init__(self):
+        self.asked = 0
+
+    def describe(self, jpeg, query=None):
+        self.asked += 1
+        return "Example Domain — the browser is showing a test page."
+
+
+def _sighted_connection(monkeypatch, *, cloud_vision: bool, cloud):
+    from unittest.mock import AsyncMock
+
+    from hub import app as hub_app
+
+    cfg = Config()
+    cfg.homes = [HomeConfig(home_id="livingroom", name="anton", cloud_vision=cloud_vision)]
+    conn = hub_app.Connection(SimpleNamespace(client=None), cfg)
+    conn.home_id = "livingroom"
+    conn._speaker_name = "Anton"
+    conn.send_json = AsyncMock()
+    monkeypatch.setattr(hub_app, "_vision", _DeadLocal())
+    monkeypatch.setattr(hub_app, "_vision_cloud", cloud)
+    monkeypatch.setattr(hub_app, "_model_router", lambda: None)
+
+    async def run_on_gpu(label, factory):
+        return factory()
+
+    conn._vision_gpu = run_on_gpu
+    return conn
+
+
+def test_a_dead_local_vision_server_falls_back_to_the_allowed_cloud(monkeypatch):
+    """Without Ollama every screen question ended in WinError 10061."""
+    cloud = _Cloud()
+    conn = _sighted_connection(monkeypatch, cloud_vision=True, cloud=cloud)
+    answer, level = asyncio.run(conn._describe_image(b"\xff\xd8screen\xff\xd9", "what is on screen?",
+                                                     label="look-at-screen"))
+    assert cloud.asked == 1
+    assert answer.startswith("Example Domain")
+    assert level == "cloud_vision (gpt-5.6-luna)"
+
+
+def test_a_home_that_forbids_the_cloud_keeps_the_honest_failure(monkeypatch):
+    cloud = _Cloud()
+    conn = _sighted_connection(monkeypatch, cloud_vision=False, cloud=cloud)
+    answer, _level = asyncio.run(conn._describe_image(b"\xff\xd8screen\xff\xd9", "what is on screen?",
+                                                      label="look-at-screen"))
+    assert cloud.asked == 0, "дом не разрешал — кадр не уехал"
+    assert answer.startswith("Screen check failed")
+
+
+# --- размер кадра -----------------------------------------------------------
+
+
+def _screenshot(width=1600, height=900, quality=95):
+    import io
+    import os
+
+    from PIL import Image, ImageDraw
+
+    # Noise on purpose: a real desktop photo does not compress like a blank page.
+    image = Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
+    draw = ImageDraw.Draw(image)
+    for row in range(20):
+        draw.text((30, 20 + row * 40), f"window {row}: some text on the screen {row * 7}", fill="black")
+    out = io.BytesIO()
+    image.save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
+def test_a_full_screenshot_is_shrunk_to_fit_the_api_allowance():
+    """128 KB is the hub's allowance for one request; base64 costs a third more."""
+    frame = _screenshot()
+    assert len(frame) > 128_000, "кадр действительно большой"
+    fitted = fit_for_api(frame, 128_000)
+    assert len(fitted) <= int(128_000 * 0.7)
+    assert fitted[:2] == b"\xff\xd8", "это по-прежнему JPEG"
+
+
+def test_a_small_frame_is_left_alone():
+    frame = _screenshot(320, 200, quality=60)
+    assert fit_for_api(frame, 4_000_000) == frame
 
 
 def test_with_levels_off_the_router_does_not_invent_a_vision_level():

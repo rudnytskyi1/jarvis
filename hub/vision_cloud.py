@@ -29,6 +29,43 @@ DEFAULT_PROMPT = (
     "labels. Never guess: if something is not visible, say so."
 )
 
+#: A screenshot of a real desktop is far bigger than the hub's API allowance for
+#: one request (``server.llm.max_input_bytes``, 128 KB here), and base64 makes it
+#: a third bigger again. The picture is therefore re-encoded until it fits: the
+#: model needs readable windows, not the original pixels.
+_SHRINK_STEPS = ((0.75, 80), (0.6, 75), (0.5, 70), (0.4, 70), (0.3, 65), (0.25, 60))
+
+
+def fit_for_api(jpeg: bytes, limit: int, *, log_shrunk: bool = True) -> bytes:
+    """Shrink a JPEG until it fits ``limit`` bytes of the API request, or give up.
+
+    Returns the original bytes when it already fits or when Pillow cannot decode
+    them: a caller that cannot shrink must not silently drop the picture.
+    """
+    # Base64 costs a third more, and the prompt plus framing need room too.
+    budget = max(4096, int(int(limit) * 0.7) - 2048)
+    if len(jpeg) <= budget:
+        return jpeg
+    try:
+        import io
+
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    except Exception as exc:  # noqa: BLE001 - an unreadable frame is not ours to fix
+        log.warning("Could not shrink the frame for the cloud (%s)", exc)
+        return jpeg
+    for scale, quality in _SHRINK_STEPS:
+        size = (max(64, int(image.width * scale)), max(64, int(image.height * scale)))
+        out = io.BytesIO()
+        image.resize(size, Image.LANCZOS).save(out, "JPEG", quality=quality)
+        if out.tell() <= budget:
+            if log_shrunk:
+                log.info("Shrank the frame for the cloud: %d KB -> %d KB at %dx%d",
+                         len(jpeg) // 1024, out.tell() // 1024, size[0], size[1])
+            return out.getvalue()
+    return jpeg
+
 
 def _as_cfg(entry: Any, *, monthly_budget_usd: float, max_tokens: int | None = None) -> Any:
     """A level in the shape the budgeted transport reads."""
@@ -70,6 +107,10 @@ class CloudVision:
         """
         question = " ".join(str(query or "").split())
         prompt = f"{DEFAULT_PROMPT}\n\nQuestion: {question}" if question else DEFAULT_PROMPT
+        # The request carries the picture as base64 inside one JSON body, and the
+        # hub's own allowance for that body is small (128 KB here): a real
+        # screenshot has to be shrunk first or the look never leaves the house.
+        jpeg = fit_for_api(jpeg, int(getattr(self.client, "max_input_bytes", 128000)))
         try:
             answer = self.client.describe_image(jpeg, prompt)
         except CloudUnavailable as exc:
@@ -88,4 +129,4 @@ class CloudVision:
         self.client.close()
 
 
-__all__ = ["DEFAULT_PROMPT", "CloudVision"]
+__all__ = ["DEFAULT_PROMPT", "CloudVision", "fit_for_api"]

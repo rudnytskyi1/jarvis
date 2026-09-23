@@ -14,6 +14,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from . import pc
 from .app_control import BROWSERS, matches, visible_apps
@@ -28,6 +29,50 @@ _ROLES = {50000: 'button', 50002: 'checkbox', 50003: 'combobox',
 _DOCUMENT = 50030
 _STALE = 'Stale or missing element ref. Read the page again.'
 _CHANGED = 'The element changed. Read the page again.'
+#: How long a typed address is given to turn into a real page. Chrome answers
+#: Enter instantly and loads afterwards, so reading the document once (as the
+#: first version did, 0.45 s later) sees the page that was already there.
+NAVIGATE_WAIT_S = 8.0
+#: Titles of the browser's own blank page: a "URL" next to one of these is the
+#: text that was typed, not a page that loaded.
+_BLANK_TITLES = {'new tab', 'новая вкладка', 'новый tab', ''}
+
+#: COM hiccups that mean "ask again", not "the browser is broken". UI Automation
+#: raises these while Chrome re-parents its accessibility tree, and the room
+#: used to hear about them as a failed browser action.
+_TRANSIENT_COM_MARKERS = (
+    'unable to invoke any of the subscribers',
+    'call was rejected by callee',
+    'call rejected by callee',
+    'the rpc server is unavailable',
+    'server call retry later',
+    'the callee (server [not server application]) is not available',
+)
+
+
+def _transient_com(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return any(marker in text for marker in _TRANSIENT_COM_MARKERS)
+
+
+def attempt(action, *, attempts: int = 3, pause: float = 0.3):
+    """Run one UIA read again when COM hiccups instead of failing the tool."""
+    last: BaseException | None = None
+    for index in range(max(1, int(attempts))):
+        try:
+            return action()
+        except Exception as exc:  # noqa: BLE001 - only transient ones are retried
+            if not _transient_com(exc):
+                raise
+            last = exc
+            time.sleep(pause * (index + 1))
+    raise last if last is not None else RuntimeError('UI Automation failed')
+
+
+def _host(url: str) -> str:
+    """The host a navigation targets, without ``www.``; '' when there is none."""
+    host = str(urlsplit(str(url)).netloc or '').casefold()
+    return host[4:] if host.startswith('www.') else host
 
 
 def _cancelled(stop):
@@ -179,14 +224,17 @@ class _WindowsUIA:
         root = self._uia.ElementFromHandle(window['hwnd'])
         doc = self._document(root)
         address = self._address(root, stop)
-        # Chrome may hide the scheme in its unfocused omnibox. Prefer the
-        # document's full URL and never invent https for an observed http page.
+        # The document's own URL is the page that is really loaded. The omnibox
+        # is only what was typed: Chrome keeps the text there when Enter did
+        # nothing, so trusting it made a New Tab page report the YouTube URL
+        # somebody had just typed. It travels separately as ``typed``.
         document_url = self._value(doc) if doc else ''
-        url = document_url if document_url.startswith(('http://', 'https://')) else (
-            self._value(address) if address else '')
+        typed = self._value(address) if address else ''
         title = str(doc.CurrentName if doc else root.CurrentName or '')
         runtime = tuple(doc.GetRuntimeId()) if doc else ()
-        return {'key': (runtime, url, title), 'url': url, 'title': title,
+        blank = not document_url and title.strip().casefold() in _BLANK_TITLES
+        return {'key': (runtime, document_url, title), 'url': document_url,
+                'typed': typed, 'blank': blank, 'title': title,
                 'document': doc, 'root': root}
 
     @staticmethod
@@ -504,20 +552,55 @@ class DesktopBrowserController:
         if command != 'read':
             self._refs.clear()
             if command == 'navigate':
-                self._backend.navigate(window, args['url'], stop)
+                page = self._navigate(window, page, str(args['url']), stop)
             else:
                 self._backend.act(window, page, command, element, args, stop)
-            stop.wait(.45)
-            page = self._backend.page(window, stop)
+                stop.wait(.45)
+                page = attempt(lambda: self._backend.page(window, stop))
         # New/hydrating documents can expose no content on the first UIA query.
-        for attempt in range(3):
+        for retry in range(3):
             _cancelled(stop)
-            snapshot = self._snapshot(window, page, stop)
+            snapshot = attempt(lambda current=page: self._snapshot(window, current, stop))
             data = json.loads(snapshot)
-            if data['elements'] or data['text'] or attempt == 2:
+            if data['elements'] or data['text'] or retry == 2:
                 return snapshot
             stop.wait(.3)
-            page = self._backend.page(window, stop)
+            page = attempt(lambda: self._backend.page(window, stop))
+
+    def _navigate(self, window, before, url, stop):
+        """Type the address, then prove that a different page really loaded.
+
+        Chrome answers Enter at once and loads afterwards; it also keeps the
+        typed text in the omnibox when nothing happens. The first version read
+        the document 0.45 s later, saw the omnibox text, and reported success
+        while the window was still on its New Tab page - the room then heard
+        "YouTube is open" about a page that had never loaded.
+        """
+        wanted = _host(url)
+        attempt(lambda: self._backend.navigate(window, url, stop), attempts=2)
+        deadline = time.monotonic() + NAVIGATE_WAIT_S
+        page = before
+        while True:
+            _cancelled(stop)
+            stop.wait(.3)
+            try:
+                page = attempt(lambda: self._backend.page(window, stop), attempts=2)
+            except Exception:  # noqa: BLE001 - the page is still loading its tree
+                if time.monotonic() >= deadline:
+                    raise
+                continue
+            landed = bool(wanted) and wanted in str(page.get('url') or '').casefold()
+            moved = page.get('key') != before.get('key')
+            if landed or (moved and not page.get('blank')):
+                return page
+            if time.monotonic() >= deadline:
+                break
+        still = str(page.get('title') or '').strip() or 'an empty page'
+        typed = str(page.get('typed') or '').strip()
+        raise ValueError(
+            f'The address bar did not open {wanted or url}: the browser is still on '
+            f'{still}' + (f' with {typed!r} typed in the address bar' if typed else '')
+            + '. Focus that browser window and retry.')
 
     async def close(self):
         if self._stop is not None:

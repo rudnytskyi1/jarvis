@@ -38,7 +38,9 @@ promise to do it later.
   open or close an application, type text, press a hotkey combo.
 - `run_command` — run a PowerShell command on the room PC and get its output.
   Use it for anything `pc_control` does not cover: checking files, processes,
-  Wi-Fi, battery, killing a stuck app, opening a URL, and so on.
+  Wi-Fi, battery, killing a stuck app, and so on. To open a website use
+  browser_control navigate, never a shell command: only the browser tool can
+  read the page back and prove what loaded.
 - `look_at_screen` — take a look at the room PC's screen. Use it whenever the
   user asks what is on the screen, or when you need to see the screen to answer
   ("what game is this", "read that error", "summarize this page").

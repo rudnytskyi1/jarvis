@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from client.actions import browser_desktop
 from client.actions.browser_desktop import DesktopBrowserController, _ordinary_process, _WindowsUIA
 
 
@@ -74,6 +75,46 @@ def test_reuses_existing_browser_and_close_only_releases_backend():
         assert backend.released
         assert backend.inventory[0]['hwnd'] == 10
     asyncio.run(run())
+
+
+def test_a_typed_address_that_never_loads_is_a_failure_not_a_success(monkeypatch):
+    """Chrome keeps the typed text in the omnibox when Enter did nothing.
+
+    The live hub read that text back as "the URL" and reported a New Tab page as
+    an open YouTube, so the room heard a success that never happened.
+    """
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_WAIT_S', 0.2)
+
+    async def run():
+        backend = FakeDesktop()
+        backend.url = ''
+        backend.page = lambda window, stop: {
+            'key': ((7,), '', 'New Tab'), 'url': '',
+            'typed': 'youtube.com/results?search_query=MrBeast', 'blank': True,
+            'title': 'New Tab', 'document': object(), 'root': object()}
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        with pytest.raises(ValueError, match='did not open youtube.com'):
+            await browser.execute({'command': 'navigate',
+                                   'url': 'https://www.youtube.com/results?search_query=MrBeast'})
+        await browser.close()
+    asyncio.run(run())
+
+
+def test_a_transient_com_hiccup_is_retried_but_a_real_error_is_not():
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError(
+                "COMError: (-2147220991, 'An event was unable to invoke any of the subscribers')")
+        return 'page'
+
+    assert browser_desktop.attempt(flaky, attempts=3, pause=0) == 'page'
+    assert len(calls) == 3
+    with pytest.raises(ValueError, match='no such element'):
+        browser_desktop.attempt(lambda: (_ for _ in ()).throw(ValueError('no such element')),
+                                attempts=3, pause=0)
 
 
 @pytest.mark.parametrize('change', ['url', 'signature', 'window_pid', 'read_again'])

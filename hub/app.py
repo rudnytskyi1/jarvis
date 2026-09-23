@@ -12831,6 +12831,22 @@ class Connection(CameraClipReceiver):
             return "Screen check failed: vision model is not loaded", ""
         answer = await self._vision_gpu(
             label, lambda: _vision.describe_screenshot(jpeg, query))
+        # The local multimodal model is a process of its own (Ollama). When it is
+        # not running, every screen question used to end with "Screen check
+        # failed: [WinError 10061]" and the room heard that instead of an answer.
+        # This home allows the cloud look, so the same picture goes there.
+        if (answer.startswith("Screen check failed") and _vision_cloud is not None
+                and self._cloud_vision_allowed()):
+            model = str(getattr(_vision_cloud, "level_model", "") or "cloud")
+            log.info("%s: the local vision model did not answer (%s); asking %s",
+                     label, answer[:160], model)
+            try:
+                cloud = await asyncio.to_thread(_vision_cloud.describe, jpeg, query)
+            except Exception as exc:  # noqa: BLE001 - the local failure stands
+                log.warning("%s: the cloud vision model failed too (%s)", label, exc)
+            else:
+                if not cloud.startswith("Screen check failed"):
+                    return cloud, f"cloud_vision ({model})"
         return answer, level or "local_vision"
 
     async def _vision_route(self, *, hard: bool, query: str = "", people: int = 0) -> Any:
