@@ -144,6 +144,7 @@ from hub.early_start import (
     EARLY_START_HOLD_S,
     SpeculativeRound,
     early_result_or_none,
+    may_run_early,
     reconcile,
     usable_draft,
 )
@@ -1036,6 +1037,12 @@ def _narrow_tools_for(understanding: Mapping[str, Any]) -> list[dict] | None:
     threshold = float(getattr(settings, "min_confidence", 0.65))
     if not isinstance(understanding, Mapping):
         return None
+    family = understanding.get("family")
+    named = ""
+    if isinstance(family, Mapping) and float(family.get("confidence") or 0.0) >= threshold:
+        named = str(family.get("value") or "")
+        if named == "none":
+            named = ""
     act = understanding.get("act")
     # A turn Jev is sure is only a question needs no device tool at all; the
     # core set (remember, recall, speak, message) stays, so the model can still
@@ -1043,19 +1050,28 @@ def _narrow_tools_for(understanding: Mapping[str, Any]) -> list[dict] | None:
     # than for a family, because being wrong here costs an action.
     if (isinstance(act, Mapping) and act.get("value") is False
             and float(act.get("confidence") or 0.0) >= max(0.9, threshold)):
+        # «Ничего не делать» и семейство могут прийти одним чтением: «who is in
+        # the room?» — это вопрос, но ответить на него можно только взглядом.
+        # The core-only set used to win here and hid ``look_at_camera`` /
+        # ``find_object`` / ``list_people`` (AU-03, mass audit 2026-09-23).
+        # Every family set already contains the core tools, so trusting the
+        # named family costs nothing on a real conversation.
+        if named:
+            tools = tools_for_family(named)
+            if tools is not None:
+                log.info("Jev read the turn as %r (confidence %.2f, %d tools offered); "
+                         "the act answer was 'nothing to do', the family still rules",
+                         named, float(family.get("confidence") or 0.0), len(tools))
+                return tools
         allowed = set(CORE_TOOLS)
         return [tool for tool in TOOLS if tool["function"]["name"] in allowed]
-    family = understanding.get("family")
-    if not isinstance(family, Mapping) or float(family.get("confidence") or 0.0) < threshold:
+    if not named:
         return None
-    name = str(family.get("value") or "")
-    if name == "none":
-        return None
-    tools = tools_for_family(name)
+    tools = tools_for_family(named)
     if tools is None:
         return None
     log.info("Jev read the turn as %r (confidence %.2f, %d tools offered)",
-             name, float(family.get("confidence") or 0.0), len(tools))
+             named, float(family.get("confidence") or 0.0), len(tools))
     return tools
 
 
@@ -5361,6 +5377,13 @@ class Connection(CameraClipReceiver):
         #: the model round started on it before the final transcript existed.
         self._draft_transcript = ''
         self._speculative: SpeculativeRound | None = None
+        #: Владелец 2026-09-23: «открывал приложения уже во время разговора».
+        #: Что раунд по черновику успел начать по-настоящему (только обратимые
+        #: «открыть/показать», см. ``hub.early_start.may_run_early``), и сколько
+        #: вызовов он честно отложил до подтверждённого транскрипта.
+        self._early_actions: list[tuple[str, dict[str, Any], Any]] = []
+        self._early_deferred = 0
+        self._speculative_draft = ''
         #: The answer of an accepted speculative round: the client that wrote
         #: it (the self-check continues on it) and its outcome.
         self._early_reply: Any = None
@@ -6045,13 +6068,18 @@ class Connection(CameraClipReceiver):
         runs, and the room hears nothing until :meth:`_reconcile_speculative`
         compares the draft with the finished transcript.
 
-        The round is deliberately given no tool executor: a request the speaker
-        is still finishing must not move a lamp or start an app. A model that
-        answers the draft with a tool call is rolled back at reconciliation
-        time and the ordinary turn does the work for real.
+        The round has a restricted executor, not the real one: it may START an
+        app or open a page (``hub.early_start.may_run_early``) and nothing else
+        — no lamp, no volume, no closing, no typing. Everything it defers is
+        rolled back at reconciliation time and the ordinary turn does that work
+        for real, with the already-started actions named in its prefix so they
+        are never done twice.
         """
         draft = self._draft_transcript.strip()
         self._draft_transcript = ''
+        self._early_actions = []
+        self._early_deferred = 0
+        self._speculative_draft = draft
         if not draft or not self._early_start_enabled() or self.session is None:
             return None
         if self._enroll_pending or self._enroll_ask_name or self._face_selection:
@@ -6078,17 +6106,64 @@ class Connection(CameraClipReceiver):
         return SpeculativeRound(draft=draft, task=task, started_at=started_at)
 
     async def _run_speculative_reply(self, draft: str, messages: list[dict[str, Any]]):
-        """One model round on the draft, with no tools behind it (P2-41)."""
+        """One model round on the draft, with the restricted executor (P2-41).
+
+        Владелец 2026-09-23: «открывал приложения уже во время разговора».
+        Поэтому раунд получает ``_early_execute_tool``: разрешённые ранние
+        действия (открыть приложение, открыть страницу) выполняются сразу, пока
+        человек ещё говорит, а всё остальное откладывается до подтверждённого
+        транскрипта и считается в ``_early_deferred``.
+        """
         try:
             chat, _route = await self._reply_model(draft)
             result = await self._gpu(PRIORITY_UTTERANCE, "llm-reply-early",
-                                     lambda: chat.generate(messages, None))
+                                     lambda: chat.generate(messages, self._early_execute_tool))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - an optional round never breaks a turn
             log.debug("The speculative round failed (%s)", exc)
             return None
-        return early_result_or_none(chat, result)
+        # Слова раннего раунда годятся, только если он ничего не откладывал:
+        # отложенный вызов означает, что просьба ещё не сказана целиком, и
+        # отвечать на неё словами рано.
+        return early_result_or_none(chat, result,
+                                    allow_tool_calls=bool(self._early_actions)
+                                    and self._early_deferred == 0)
+
+    async def _early_execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Исполнитель раунда по черновику: только ранние обратимые действия.
+
+        Разрешённое действие идёт через обычный ``_execute_tool`` — со всеми
+        проверками, трассами и записью в панель, как в настоящем ходу: ранний
+        старт не должен быть способом обойти правила. Отложенное возвращается
+        модели отказом с причиной, чтобы она не решила, что уже сделала дело, и
+        не сказала об этом вслух.
+        """
+        allowed, reason = may_run_early(self._speculative_draft, name, args)
+        if not allowed:
+            self._early_deferred += 1
+            log.info("Early round deferred %s (%s)", name, reason,
+                     extra={'utterance_id': self.utterance_id})
+            return {'ok': False, 'error': (
+                f'Not started yet: {reason}. The person is still speaking - '
+                f'Rowan does this after the request is finished.')}
+        result = await self._execute_tool(name, dict(args or {}))
+        self._early_actions.append((str(name), dict(args or {}), result))
+        log.info("Early round started %s (%s) while the person was still speaking",
+                 name, reason, extra={'utterance_id': self.utterance_id})
+        return result
+
+    def _early_actions_note(self) -> str:
+        """Строка для промпта: что уже начато по черновику, чтобы не начать дважды."""
+        if not self._early_actions:
+            return ''
+        lines = []
+        for name, args, result in self._early_actions:
+            ok = not (isinstance(result, dict) and result.get('ok') is False)
+            lines.append(f"{name}({args}) -> {'ok' if ok else 'failed'}")
+        return ('Already started for this request while the person was still '
+                'speaking; do not start it a second time, just finish the rest: '
+                + '; '.join(lines))
 
     async def _reconcile_speculative(self, text: str) -> None:
         """Compare the draft with the final transcript (P2-41).
@@ -6105,6 +6180,14 @@ class Connection(CameraClipReceiver):
         verdict = reconcile(round_.draft, text)
         if not verdict.matched:
             round_.discard(verdict.reason)
+            if self._early_actions:
+                # Ранние действия уже сделаны по-настоящему и отменить их
+                # нечем: честно говорим об этом в логе и в промпте обычного
+                # хода, чтобы он не открыл то же окно второй раз.
+                log.info("Early actions kept after the rollback (%s): %s",
+                         verdict.reason,
+                         '; '.join(name for name, _args, _result in self._early_actions),
+                         extra={'utterance_id': self.utterance_id})
             return
         outcome = await round_.take(timeout=EARLY_START_HOLD_S)
         if outcome is None:
@@ -6746,6 +6829,9 @@ class Connection(CameraClipReceiver):
         self._early_reply = None
         self._early_chat = None
         self._early_start_used = False
+        self._early_actions = []
+        self._early_deferred = 0
+        self._speculative_draft = ''
         self._control_id = str(payload.get('interrupt_id') or '')[:64]
         self._utterance_started_at = time.time()
         if not self._control_id and self._quiet_until_wake:
@@ -15177,6 +15263,10 @@ class Connection(CameraClipReceiver):
         # result is held until ``_reconcile_speculative`` accepts the draft.
         self._early_reply = self._early_chat = None
         self._early_start_used = False
+        #: Ранние действия нового хода: список пустой, но он общий с раундом
+        #: по черновику (``_early_execute_tool``), поэтому чистится здесь.
+        self._early_actions = []
+        self._early_deferred = 0
         #: ТЗ F-113: the dangerous question this turn opens (if any).
         self._confirmation_opened = None
         #: ТЗ F-208: the PIN question this turn opens (if any).
@@ -15743,7 +15833,13 @@ class Connection(CameraClipReceiver):
         # ТЗ 9.4 (F-414): the top facts for THIS utterance ride ahead of it, so
         # the model reads what is relevant now instead of whatever was said
         # last. The search runs off the loop (``_memory_block``).
-        prefixed = self._turn_prefix(started_at, text, live_view=room_text, note=enroll_note,
+        # Владелец 2026-09-23: раунд по черновику мог уже начать дело (открыть
+        # приложение, открыть страницу). Обычный ход должен об этом знать, иначе
+        # он откроет то же окно второй раз. Когда ранний ответ принят целиком,
+        # строка не нужна: модель уже ответила на сделанное.
+        early_note = '' if self._early_reply is not None else self._early_actions_note()
+        prefixed = self._turn_prefix(started_at, text, live_view=room_text,
+                                     note=' '.join(part for part in (enroll_note, early_note) if part),
                                      memory=await self._memory_block(text))
 
         # 2. LLM with the tool loop — tools are executed for real (SPEC §3, §5)

@@ -22,6 +22,7 @@ from hub.early_start import (
     MAX_TRAILING_TOKENS,
     SpeculativeRound,
     early_result_or_none,
+    may_run_early,
     reconcile,
     words,
 )
@@ -105,6 +106,53 @@ def test_an_early_answer_with_a_tool_call_is_never_spoken():
     assert early_result_or_none(object(), LlmResult(text="   ", rounds=1)) is None
     usable = LlmResult(text="It is raining.", rounds=1)
     assert early_result_or_none("client", usable)[1] is usable
+    # Исключение ровно одно: раунд сам выполнил разрешённое раннее действие и
+    # ничего не отложил — тогда его слова отвечают на уже сделанное дело.
+    assert early_result_or_none("client", result, allow_tool_calls=True)[1] is result
+
+
+# --- ранний старт действий (владелец 2026-09-23) ----------------------------
+
+
+def test_only_opening_an_app_or_a_page_may_start_from_the_draft():
+    """«люди делают так, чтобы он открывал приложения уже во время разговора»."""
+    ok, why = may_run_early('открой ютуб и включи видео', 'pc_control',
+                            {'command': 'open_app', 'app': 'youtube'})
+    assert ok, why
+    ok, why = may_run_early('open youtube and play mrbeast', 'browser_control',
+                            {'command': 'navigate', 'url': 'https://www.youtube.com/'})
+    assert ok, why
+
+
+@pytest.mark.parametrize('name,args', [
+    ('pc_control', {'command': 'close_app', 'app': 'chrome'}),
+    ('pc_control', {'command': 'volume_set', 'value': '30'}),
+    ('pc_control', {'command': 'type_text', 'text': 'hello'}),
+    ('pc_control', {'command': 'shutdown'}),
+    ('set_light', {'device': 'lamp', 'state': 'off'}),
+    ('run_command', {'command': 'format c:'}),
+    ('generate_image', {'prompt': 'a cat'}),
+    ('telegram_send', {'text': 'hi'}),
+])
+def test_everything_that_is_not_opening_waits_for_the_finished_sentence(name, args):
+    ok, why = may_run_early('open youtube and do that thing', name, args)
+    assert ok is False, f'{name} обязан ждать конца фразы'
+    assert 'waits for the finished sentence' in why
+
+
+def test_an_object_that_is_still_the_last_word_waits():
+    """Пока название договаривают, открывать его рано."""
+    ok, why = may_run_early('open you', 'pc_control',
+                            {'command': 'open_app', 'app': 'youtube'})
+    assert ok is False and 'last word' in why
+    # ...а как только человек пошёл дальше, действие уже можно начинать.
+    ok, _why = may_run_early('open youtube and play something', 'pc_control',
+                             {'command': 'open_app', 'app': 'youtube'})
+    assert ok is True
+    # Нечего открывать — тоже ожидание.
+    ok, _why = may_run_early('open something and then wait', 'pc_control',
+                             {'command': 'open_app'})
+    assert ok is False
 
 
 def test_a_stale_round_is_cancelled_and_never_waits_forever():
@@ -234,7 +282,10 @@ def test_the_draft_is_answered_while_the_final_transcript_is_still_decoded(tmp_p
     assert len(engines.calls) == 1, "a confirmed draft must not be paid for twice"
     assert engines.saw_stt_running is True, "the draft round ran while the STT pass was in flight"
     assert engines.calls[0]["messages"][-1]["content"].endswith("what is the weather like today")
-    assert engines.calls[0]["run_tool"] is None, "no tool may run for an unconfirmed draft"
+    # Владелец 2026-09-23: раунд по черновику больше не глухой — он получает
+    # СВОЙ исполнитель, который пускает только обратимые «открыть/показать»
+    # (см. ``may_run_early``), а остальное откладывает до конца фразы.
+    assert engines.calls[0]["run_tool"] == connection._early_execute_tool
     assert connection._early_start_used is True
     assert _spoken(socket) == ["It is raining."]
     assert any("Early start accepted" in record.getMessage() for record in caplog.records)
@@ -298,3 +349,83 @@ def test_a_turn_without_a_usable_draft_has_no_early_round(tmp_path, monkeypatch,
 
     assert len(engines.calls) == 1
     assert any("not usable" in record.getMessage() for record in caplog.records)
+
+
+# --- действие начинается, пока человек ещё говорит (владелец 2026-09-23) -----
+
+
+class _ActingEngines(_Engines):
+    """Раунд по черновику сам зовёт инструменты, как это делает модель."""
+
+    def __init__(self, *, script, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.script = list(script)
+        self.results: list[dict] = []
+
+    async def generate(self, messages, run_tool):
+        if not self.calls and run_tool is not None:
+            self.calls.append({"messages": [dict(message) for message in messages],
+                               "run_tool": run_tool})
+            self.saw_stt_running = self.saw_stt_running or not self.stt_finished
+            for name, args in self.script:
+                self.results.append(await run_tool(name, dict(args)))
+            return self.replies[0]
+        return await super().generate(messages, run_tool)
+
+
+def _acting_turn(tmp_path, monkeypatch, *, draft: str, script, final: str,
+                 replies: list[LlmResult], caplog=None):
+    engines = _ActingEngines(final=final, replies=replies, script=script)
+    connection, socket = _run_turn(tmp_path, monkeypatch, engines, draft=draft,
+                                   early_start=True)
+    ran: list[tuple[str, dict]] = []
+
+    async def fake_now(name, args):
+        ran.append((name, dict(args)))
+        return {'ok': True, 'output': 'started'}
+
+    monkeypatch.setattr(connection, '_execute_tool_now', fake_now)
+    asyncio.run(connection._handle_utterance(b"\x01" * 32000))
+    return engines, connection, socket, ran
+
+
+def test_an_app_opens_while_the_person_is_still_speaking(tmp_path, monkeypatch, caplog):
+    """«open youtube AND play mrbeast»: ютуб открывается, пока фраза продолжается."""
+    with caplog.at_level(logging.INFO, logger="jarvis.server.app"):
+        engines, connection, socket, ran = _acting_turn(
+            tmp_path, monkeypatch,
+            draft="open youtube and play mrbeast",
+            script=[('pc_control', {'command': 'open_app', 'app': 'youtube'})],
+            final="Open YouTube and play MrBeast.",
+            replies=[LlmResult(text="Opening YouTube.", tool_calls=[object()], rounds=1)])
+
+    assert ran == [('pc_control', {'command': 'open_app', 'app': 'youtube'})], \
+        'приложение открылось по черновику, не дожидаясь конца фразы'
+    assert engines.saw_stt_running is True, 'действие началось, пока STT ещё считает'
+    assert len(engines.calls) == 1, 'подтверждённый черновик не оплачивается дважды'
+    assert _spoken(socket) == ["Opening YouTube."]
+    assert any('Early round started pc_control' in record.getMessage()
+               for record in caplog.records)
+
+
+def test_a_deferred_step_keeps_the_opening_and_sends_the_words_to_the_real_turn(
+        tmp_path, monkeypatch, caplog):
+    """Громкость числом ждёт конца фразы; открытие уже сделано и не повторяется."""
+    with caplog.at_level(logging.INFO, logger="jarvis.server.app"):
+        engines, connection, socket, ran = _acting_turn(
+            tmp_path, monkeypatch,
+            draft="open youtube and make it louder at thirty",
+            script=[('pc_control', {'command': 'open_app', 'app': 'youtube'}),
+                    ('pc_control', {'command': 'volume_set', 'value': '30'})],
+            final="Open YouTube and make it louder at thirty.",
+            replies=[LlmResult(text="Done.", tool_calls=[object()], rounds=1),
+                     LlmResult(text="YouTube is open and it is louder now.", rounds=1)])
+
+    assert ran == [('pc_control', {'command': 'open_app', 'app': 'youtube'})], \
+        'громкость не трогали, пока человек не договорил'
+    assert len(engines.calls) == 2, 'отложенный шаг отдал слова настоящему ходу'
+    notes = ' '.join(str(message.get('content') or '')
+                     for message in engines.calls[1]['messages'])
+    assert 'Already started for this request' in notes, \
+        'настоящий ход обязан знать про уже открытое окно'
+    assert any('deferred pc_control' in record.getMessage() for record in caplog.records)

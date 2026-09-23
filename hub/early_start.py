@@ -29,6 +29,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,10 +57,75 @@ NEUTRAL_TAIL = frozenset({
 
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
 
+#: Что РАЗРЕШЕНО начать по черновику, пока человек ещё говорит (владелец
+#: 2026-09-23: «люди делают так, чтобы он открывал приложения уже во время
+#: разговора»). Только «открыть/показать», и только эти команды: такое действие
+#: обратимо (лишняя вкладка, лишнее окно) и не двигает ничего в комнате.
+#: Закрытие, блокировка, печать текста, деньги, звонки, свет и громкость числом
+#: ждут подтверждённого транскрипта: у них смысл стоит в КОНЦЕ фразы («громче
+#: на 30»), а не в начале, и ранешний запуск был бы угадыванием.
+EARLY_ACTION_TOOLS: dict[str, frozenset[str]] = {
+    "browser_control": frozenset({"navigate"}),
+    "pc_control": frozenset({"open_app"}),
+}
+
+#: Где в аргументах лежит объект действия («что открыть»). Пока это слово —
+#: последнее в черновике, оно ещё может досказываться («youtube» из «you»),
+#: поэтому такой вызов ждёт следующего слова. Ранний старт срабатывает ровно
+#: тогда, когда человек уже пошёл дальше по фразе.
+EARLY_OBJECT_ARGS: dict[str, tuple[str, ...]] = {
+    "browser_control": ("url",),
+    "pc_control": ("app", "target", "value"),
+}
+
 
 def words(text: str) -> list[str]:
     """The comparable words of a transcript (case, punctuation and pauses out)."""
     return [word.lower() for word in _WORD.findall(str(text or ""))]
+
+
+def may_run_early(draft: str, name: str, args: Mapping[str, Any] | None = None) -> tuple[bool, str]:
+    """Можно ли ВЫПОЛНИТЬ этот вызов по черновику, не дожидаясь конца фразы.
+
+    Возвращает ``(можно, причина)``. Три условия, и все три — про то, чтобы
+    раннее действие было обратимым и уже однозначным:
+
+    1. инструмент и его команда в списке ``EARLY_ACTION_TOOLS``;
+    2. объект действия назван в аргументах (открывать «что-то» нельзя);
+    3. объект НЕ последнее слово черновика — значит, человек его уже
+       проговорил и продолжает фразу. Если он всё-таки замолчал на объекте,
+       реплика закроется сама, и обычный ход сделает то же самое.
+
+    Причина возвращается человеческой строкой: она попадает в отказ модели и в
+    лог, чтобы было видно, почему именно действие не началось раньше.
+    """
+    tool = str(name or "")
+    commands = EARLY_ACTION_TOOLS.get(tool)
+    if commands is None:
+        return False, f"{tool or 'that tool'} waits for the finished sentence"
+    arguments = dict(args or {})
+    command = str(arguments.get("command") or "").strip().lower()
+    if command and command not in commands:
+        return False, f"{tool} {command} waits for the finished sentence"
+    draft_words = words(draft)
+    if not draft_words:
+        return False, "there is no draft to act on yet"
+    last = draft_words[-1]
+    object_value = ""
+    for key in EARLY_OBJECT_ARGS.get(tool, ()):
+        candidate = str(arguments.get(key) or "").strip()
+        if candidate:
+            object_value = candidate
+            break
+    if not object_value:
+        return False, f"{tool} has no object to open yet"
+    spoken = words(object_value)
+    # «open you…» — слово ещё договаривают: объект, который НАЧИНАЕТСЯ с
+    # последнего услышанного слова, считается недоговорённым («you» → «youtube»),
+    # как и в :func:`reconcile`.
+    if spoken and (spoken[-1] == last or spoken[-1].startswith(last)):
+        return False, "the object is still the last word being spoken"
+    return True, "the object is said and the person has moved on"
 
 
 @dataclass(frozen=True)
@@ -168,17 +234,24 @@ class SpeculativeRound:
         return outcome
 
 
-def early_result_or_none(client: Any, result: Any) -> tuple[Any, Any] | None:
+def early_result_or_none(client: Any, result: Any, *,
+                         allow_tool_calls: bool = False) -> tuple[Any, Any] | None:
     """Is this early result something the room may hear?
 
     A draft round has no tools behind it (nothing may be executed for a request
     the speaker may still be finishing), so a model that answered with a tool
     call did not answer the request at all.  Such a round is rolled back: the
     ordinary turn runs the tool and speaks its real result.
+
+    ``allow_tool_calls`` — исключение ровно для одного случая: раунд по
+    черновику сам выполнил разрешённые ранние действия (``may_run_early``) и
+    ничего не отложил. Тогда его слова отвечают на уже сделанное дело, и
+    подменять их нельзя — иначе комната услышит «не смог открыть» про
+    вкладку, которая в этот момент открывается.
     """
     if result is None:
         return None
-    if getattr(result, "tool_calls", None):
+    if getattr(result, "tool_calls", None) and not allow_tool_calls:
         log.info("Early answer rolled back: the draft needed %d tool call(s)",
                  len(result.tool_calls))
         return None
@@ -190,11 +263,14 @@ def early_result_or_none(client: Any, result: Any) -> tuple[Any, Any] | None:
 
 __all__ = [
     "EARLY_START_HOLD_S",
+    "EARLY_ACTION_TOOLS",
+    "EARLY_OBJECT_ARGS",
     "MAX_TRAILING_TOKENS",
     "NEUTRAL_TAIL",
     "Reconciliation",
     "SpeculativeRound",
     "early_result_or_none",
+    "may_run_early",
     "reconcile",
     "usable_draft",
     "words",

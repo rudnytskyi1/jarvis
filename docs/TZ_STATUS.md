@@ -1647,3 +1647,49 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   новый тест «двенадцать шагов подряд, ни один не потерян»;
   `Config.model_validate(config.openai.yaml)` → `max_tool_rounds 0`.
   **Чего нет:** живого длинного хода после перезапуска хаба.
+
+- **CU-PAUSE-01 / CU-EARLY-01 — паузы и ранний старт действий (23.09.2026).**
+  Владелец: «если я на секунду даже перестану говорить, то уже запись
+  остановится» и «люди делают так, чтобы он открывал приложения уже во время
+  разговора». Что изменено: `client/vad.py` получил удержание по смыслу
+  (`hold_while` + `UNFINISHED_TAIL_WORDS`, `client.vad.unfinished_hold_ms`),
+  окно тишины в живом конфиге 700 → 1500 мс, `max_utterance_s` 15 → 30 с;
+  раунд по черновику получил свой исполнитель (`hub/early_start.py::
+  may_run_early`) и может начать только обратимое «открыть приложение или
+  страницу», когда объект уже прозвучал; отложенный вызов откатывает слова
+  раннего раунда, а `Connection._early_actions_note` говорит настоящему ходу,
+  что уже начато. Живой конфиг: `streaming_reply.early_start: true`.
+  Проверено: `pytest tests/test_vad_machine.py tests/test_vad_endpoint.py -q`
+  → 14 passed; `pytest tests/test_early_start.py -q` → 33 passed.
+
+- **JE-01 — TypeSafe Jev: проверен живьём.** `python scripts/jev_probe.py` →
+  ответ за 0.62 с («включи свет на кухне»: `act=True 0.94`,
+  `family=devices 0.98`, `followup=False 0.89`);
+  `python scripts/jev_usage_report.py` → 5061 решение Decider'а, все от
+  `rules`, и ни одного события `understanding` в `turn_events` (901 запись).
+  Бюджет чтения поднят 900 → 2000 мс: 900 мс не покрывали холодный старт, и
+  чтение молча отбрасывалось. **Чего нет:** в Telegram-чате чтения Jev нет
+  вовсе (`hub/telegram_chat.py` → `llm.reply_text`) — задача AU-19.
+
+- **AU-03 — зрение и чтение Jev проверены живым прогоном (23.09.2026).**
+  Массовый аудит семейства `vision` (`--workers 6`, живая модель и живой Jev):
+  до правок `data/audit/runs/mass-07-vision-before.jsonl` — 81 из 116
+  (69.8 %), 32 падения из 35 — сужение Jev; после — 
+  `data/audit/runs/mass-12-vision-final.jsonl` — 114 из 114 разобранных
+  (100 %), `AU-0609`/`AU-0610` печатаются `SKIP` (в стенде нет вложения
+  Telegram, `inspect_photo` нечего смотреть; живой ход с фото — в комнате).
+  Что подтверждено: Jev выбирает семейство `vision` для «кто в комнате»,
+  «что на экране», «где мои ключи», «do you see my phone» и отдаёт модели
+  весь набор зрения даже при `act=false`; первый вызов — `look_at_camera`,
+  `look_at_screen` или `find_object` по смыслу просьбы. Что изменено:
+  `hub/jev_decider.py` (вопрос `act` считает взгляд действием, вопрос о
+  семействе разводит `vision`/`media`/`memory`/`people` примерами),
+  `hub/app.py::_narrow_tools_for` (названное семейство важнее ответа «ничего
+  не делать»), `hub/tools.py` (значения семейств и триггеры `find_object`),
+  `prompts/system.md`, `scripts/gen-audit-scenarios.py`. Тесты:
+  `tests/test_jev_understanding.py` (+3), `tests/audit/test_request_matrix.py`
+  (+4); отдельно прогнаны `pytest tests/audit/test_request_matrix.py -q` →
+  3193 passed и `pytest tests/test_jev_understanding.py -q` → 19 passed.
+  **Чего нет:** живого фото из
+  Telegram и комнатной камеры в песочнице — сценарии с вложением помечены
+  `bench_skip`, а глаз комнаты проверяется на ПК (AU-12).

@@ -93,7 +93,7 @@ from client.posture import PostureService
 from client.presence_buffer import PresenceBuffer
 from client.screen import SCREENSHOT_FORMAT, Capture, capture_jpeg
 from client.tts_cache import PhraseCache
-from client.vad import VadRecorder
+from client.vad import VadRecorder, sentence_unfinished
 from client.voice_controls import ConfirmedWakeDetector, SilenceDetector
 from client.wakeword import WakeWordDetector
 from client.ws_client import WAIT_FOREVER, WSClient, WSDisconnected
@@ -447,6 +447,12 @@ class JarvisClient:
         self.vad = VadRecorder(
             aggressiveness=int(vad_cfg.aggressiveness),
             silence_ms=int(vad_cfg.silence_ms),
+            # Владелец 2026-09-23: пауза на секунду не должна закрывать реплику.
+            # Хаб уже считает живую расшифровку и присылает её кадром
+            # ``transcript_partial``; если последнее слово — «и»/«потом»/«and»,
+            # запись терпит ещё ``unfinished_hold_ms`` тишины.
+            hold_ms=int(getattr(vad_cfg, "unfinished_hold_ms", 0) or 0),
+            hold_while=self._sentence_unfinished,
             max_utterance_s=float(vad_cfg.max_utterance_s),
             sample_rate=self.sample_rate,
             frame_ms=self.frame_ms,
@@ -476,6 +482,10 @@ class JarvisClient:
         self._notice_tts = False
         self._enrollment_until = 0.0
         self._live_turn_id = ''
+        #: Живая расшифровка текущей реплики (хаб присылает её как
+        #: ``transcript_partial``). По её последнему слову решается, терпеть ли
+        #: паузу: «открой ютуб и…» не должно закрываться на «и».
+        self._partial_text = ''
         self._recording_live = False
         self._selection_until = 0.0
         self._quiet_turn = False
@@ -1174,6 +1184,7 @@ class JarvisClient:
         if mtype == _protocol.MSG_TRANSCRIPT_PARTIAL:
             if (getattr(self, '_recording_live', False)
                     and msg.get('utterance_id') == self._live_turn_id):
+                self._partial_text = str(msg.get('text') or '')
                 self.overlay.transcript(msg)
             return
         if mtype == _protocol.MSG_HUB_STATUS:
@@ -1864,6 +1875,19 @@ class JarvisClient:
             raise _Stopping()
         return frame
 
+    def _sentence_unfinished(self) -> bool:
+        """Не договорил ли человек? Ответ по последнему слову живой расшифровки.
+
+        Владелец 2026-09-23: «если я на секунду даже перестану говорить, то уже
+        запись остановится». Пауза после слова-связки («и», «потом», «and») —
+        это раздумье, а не конец реплики, поэтому VAD терпит её дольше
+        (``client.vad.unfinished_hold_ms``). Расшифровку присылает хаб кадром
+        ``transcript_partial``: клиент не гадает по громкости, он читает то, что
+        уже понято. Пустая расшифровка — «не знаю», и тогда пауза закрывает
+        реплику как раньше.
+        """
+        return sentence_unfinished(getattr(self, '_partial_text', '') or '')
+
     def _split_frames(self, chunk: bytes) -> Iterator[bytes]:
         """Split buffered audio into ~30 ms pieces for streaming (SPEC §7 step 4)."""
         size = self.frame_bytes
@@ -1894,6 +1918,7 @@ class JarvisClient:
                 # this turn. The hub echoes the same id back.
                 self._live_turn_id = new_ulid()
                 self._recording_live = True
+                self._partial_text = ''
                 # ТЗ F-103: tell the hub whether this utterance came from the
                 # follow-up window, so D-02/D-11 can judge addressability with
                 # the fact only the client has - the microphone was already

@@ -77,9 +77,29 @@
   невозможны (`.git` только для чтения, у remote нет креденшелов) — список
   файлов для внешнего скрипта в `DECISIONS.md`, AUDIT-08f; `hub/tools.py`,
   этот файл и `DECISIONS.md` уже попали в чужие коммиты `7373aab`/`bd3323a`.
-- [ ] **AU-03 — зрение: «кто в комнате», «что на экране».** Живой прогон
-  `--family vision`; цель — Jev выбирает семейство `vision` и модель зовёт
-  `look_at_camera`/`look_at_screen` первым вызовом. Проверять и `offered`.
+- [x] **AU-03 — зрение: «кто в комнате», «что на экране».** Проверено: живой
+  прогон `--family vision --workers 6` (`data/audit/runs/mass-07-vision-before.jsonl`,
+  116 сценариев) — 81 прошло (69.8 %), 32 падения из 35 — Jev не предложил
+  нужный инструмент. Причина: Jev отвечал `act=false` и `family=vision` одним
+  чтением, а ветка «просто вопрос» отдавала только ядро; плюс значения
+  семейств не называли живые фразы. Сделано: вопрос `act` считает
+  «посмотреть/прочитать/найти» действием; названное семейство важнее
+  `act=false` (`hub/app.py`); `vision`/`media` в значениях и в вопросе Jev
+  разведены примерами (`hub/tools.py`, `hub/jev_decider.py`); `find_object`
+  получил триггеры «do you see my X»/«find my X» в промпте и описании; корпус
+  проверяет простое слово и принимает чтение окна браузера обоими
+  инструментами; фото Telegram помечено `bench_skip`. Итог:
+  `data/audit/runs/mass-12-vision-final.jsonl` — 114 из 114 разобранных
+  (100 %), `AU-0609`/`AU-0610` — `SKIP` (нет вложения). Тесты
+  `tests/test_jev_understanding.py` (+3), `tests/audit/test_request_matrix.py`
+  (+4, матрица 3193); `ruff check .` → All checks passed; `mypy common` →
+  Success; `pytest tests -q` → 9378 passed, 24 failed — все чужие (15
+  `test_guess_who.py` + 9 незавершённый офлайн-клиент), в зрении и Jev ноль.
+  Хаб перезапущен `scripts/run-openai-server.ps1` (`/health` → 200, комнаты
+  переподключились). `git add`/`push` из песочницы невозможны (`.git` только
+  для чтения, у remote нет креденшелов) — список файлов для внешнего коммита
+  в `DECISIONS.md`, AUDIT-09h. `client/` и `common/` не правились, обновление
+  комнатных ПК не требуется.
 - [ ] **AU-04 — люди: запись лица и голоса.** `--family people`. «Сохрани это
   лицо как X» обязан дойти до `enroll_face` (взгляд на кадр перед этим
   допустим); «кто ты знаешь» — до `list_people`.
@@ -139,3 +159,21 @@
   tests/test_llm_vllm_provider.py tests/test_config.py tests/test_stage_timeouts.py
   -q` → 60 passed; `Config.model_validate(config.openai.yaml)` →
   `max_tool_rounds 0`. Обоснование — `DECISIONS.md`, «CU-LIMIT-03».
+- [x] **AU-17 — разговор без обрывов и ранний старт действий (CU-PAUSE-01,
+  CU-EARLY-01).** Пауза 1.5 с не закрывает реплику, а после слова-связки
+  («и», «and») запись терпит ещё 3.5 с (`client.vad.unfinished_hold_ms`,
+  `sentence_unfinished`); раунд по черновику получил право НАЧАТЬ обратимое
+  «открыть приложение/страницу» (`may_run_early`), остальное ждёт
+  подтверждённого транскрипта. Проверено: `pytest tests/test_vad_machine.py
+  tests/test_vad_endpoint.py -q` → 14 passed; `pytest tests/test_early_start.py
+  -q` → 33 passed (в том числе «приложение открылось, пока STT ещё считает»).
+- [x] **AU-18 — TypeSafe Jev: отчёт числами и живой вызов (JE-01).** Проверено:
+  `python scripts/jev_probe.py` → ответ за 0.62 с (`family=devices 0.98`);
+  `python scripts/jev_usage_report.py` → 5061 решение, все `rules`; в
+  `turn_events` нет события `understanding`. Бюджет чтения поднят 900 → 2000 мс.
+- [ ] **AU-19 — Jev в Telegram-чате.** Открытая задача из JE-01: чтение Jev
+  (`_understand_turn`) стоит только на голосовом пути, а Telegram-чат идёт
+  через `hub/telegram_chat.py` → `llm.reply_text` без чтения и без сужения
+  инструментов. Владелец просил, чтобы в Telegram были те же возможности, что
+  и у голосового ассистента; сюда же — второй провайдер `jev` в цепочке решений
+  (сейчас всегда отвечает `rules`).
