@@ -1956,3 +1956,25 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_image_generation.py tests/test_digest.py tests/test_models_health.py
   tests/test_browser_recovery.py -q` → 116 passed; `python scripts/llm_probe.py`
   → предел 0, живой ответ 863 мс.
+
+- **API-06 — потолка нет и в живом хабе: сохранённое значение сброшено
+  (23.09.2026).** Владелец: «api allowance reached убери это, я не хочу».
+  Проверка живого хаба показала вторую половину причины: 15:28:59 владелец сам
+  поставил `server.llm.monthly_budget_usd = 100.0` в панели Telegram, значение
+  сохранилось в `data/telegram/admin.sqlite3`
+  (`telegram_settings.config:server.llm.monthly_budget_usd`) и применялось
+  при каждом старте (`hub/admin_settings.py::restore_overrides`), а процесс,
+  запущенный в 14:43, держал его в памяти. Что сделано: сохранённое значение
+  сброшено на `0`, хаб перезапущен на закоммиченном коде — в логе
+  `LLM: deepseek-flash via OpenAI Responses; monthly allowance none
+  (reporting only, no request is refused)`, после 15:39 ни одной строки
+  `allowance reached`; последняя пользовательская фраза со словом allowance
+  («This image is too large for the configured API allowance.») заменена на
+  «This picture is too large to send to the cloud. Send a smaller or cropped
+  photo.» (`hub/openai_responses.py`). Проверено: `python scripts/llm_probe.py`
+  → «предел расходов: нет (0)», живой ответ 843 мс («Yes, I'm working.»);
+  `/health` → 200, `telegram: true`, `telegram_error: null`, `llm: true`;
+  `pytest tests/test_openai_responses.py tests/test_api_budget.py
+  tests/test_vision_cloud.py -q` → 60 passed; `ruff check hub/openai_responses.py`
+  → All checks passed. `client/` и `common/` не правились — обновление
+  комнатных ПК не требуется. Решения — `DECISIONS.md`, API-06.

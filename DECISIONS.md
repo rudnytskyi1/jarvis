@@ -5207,3 +5207,34 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   отвечает `True` на все уровни; `python scripts/llm_probe.py` → «предел
   расходов: нет (0)», живой ответ 863 мс. Ссылка: ТЗ F-403; DECISIONS.md
   API-01…API-04.
+
+- **API-06 — потолок сброшен и там, где он жил: в сохранённых настройках
+  панели.** 2026-09-23, после API-05. Владелец: «api allowance reached убери
+  это, я не хочу». Живой хаб показал, что одной правки кода мало: в 15:28:59
+  владелец сам ввёл `server.llm.monthly_budget_usd = 100.0` в панели Telegram
+  (аудит — `data/telegram/audit.log`), значение легло в
+  `data/telegram/admin.sqlite3` как `telegram_settings.config:server.llm.
+  monthly_budget_usd = {"value": 100.0}` и переживало перезапуск: его
+  применяет `restore_overrides`, а процесс, стартовавший в 14:43, держал
+  потолок в памяти и продолжал отклонять ходы (`Cloud turn stopped: Monthly
+  API allowance reached` в 15:29 и 15:30). Выбран вариант: **сбросить
+  сохранённое значение на `0`** (потолка нет, расход только считается) и
+  перезапустить хаб. Обоснование: сам механизм отказа снят ещё в API-05, но
+  строка `monthly allowance $100.00` в стартовом логе и число в панели
+  читаются владельцем как ограничение, о котором он просил забыть; держать
+  «потолок, который ничего не запрещает» — источник будущей путаницы. Заодно
+  убрана последняя пользовательская фраза со словом allowance: на слишком
+  большое одиночное изображение `hub/openai_responses.py` отвечал «This image
+  is too large for the configured API allowance.» — теперь «This picture is
+  too large to send to the cloud. Send a smaller or cropped photo.» (шаг
+  `fit_for_api` и так сжимает кадр, так что этот отказ достижим только для
+  нечитаемого файла — важна формулировка, а не поведение). Проверено после
+  перезапуска: `data/server.log` → `monthly allowance none (reporting only, no
+  request is refused)`, ни одной `allowance reached` с 15:39; `python
+  scripts/llm_probe.py` → «предел расходов: нет (0)», живой ответ 843 мс
+  («Yes, I'm working.»); `/health` → 200 (`telegram: true`,
+  `telegram_error: null`, `llm: true`, `outbound.clients: 1`); `pytest
+  tests/test_openai_responses.py tests/test_api_budget.py
+  tests/test_vision_cloud.py -q` → 60 passed; `ruff check hub/openai_responses.py`
+  → All checks passed. Коммит `0d46894` в `origin/main`. Ссылка: ТЗ F-403;
+  DECISIONS.md API-01…API-05.
