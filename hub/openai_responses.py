@@ -146,7 +146,8 @@ class ResponsesClient:
             "service_tier": "default",
         }
         data = self._request(payload, key,
-                             too_long="This image is too large for the configured API allowance.")
+                             too_long="This picture is too large to send to the cloud. "
+                                      "Send a smaller or cropped photo.")
         texts = []
         for item in data.get("output", []):
             if item.get("type") == "message":
