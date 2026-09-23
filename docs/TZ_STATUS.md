@@ -1978,3 +1978,23 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_vision_cloud.py -q` → 60 passed; `ruff check hub/openai_responses.py`
   → All checks passed. `client/` и `common/` не правились — обновление
   комнатных ПК не требуется. Решения — `DECISIONS.md`, API-06.
+
+- **TG-ECHO-01 — «повторяй за мной» работает: следующий текст звучит в комнате
+  (23.09.2026).** Владелец: «я просил в телеге чтобы он за мной повторял
+  (следующие сообщения) а он не смог». Причина в логе живого хаба за 15:20:
+  режима повтора не существовало, поэтому на «Repeats after me» модель отвечала
+  «I'm not playing echo. Give me the actual words», а каждая следующая реплика
+  обрабатывалась как обычный запрос. Что добавлено: `hub/repeat_mode.py` (фразы
+  включения и выключения en/ru/es, окно 10 минут, лимит 60 сообщений, область
+  «чат + автор»), ветка повтора в `hub/telegram_chat.py` (пока режим включён,
+  модель не вызывается вовсе) и колбэк `hub/app.py::_repeat_in_room`, который
+  произносит фразу через тот же примитив, что и `say_in_room`
+  (`Connection._say_proactive`). Проверено: `pytest tests/test_repeat_mode.py
+  -q` → 40 passed; `pytest tests/test_repeat_mode.py tests/test_telegram_chat.py
+  tests/test_telegram_control.py tests/test_telegram_control_routing.py
+  tests/test_telegram.py tests/test_telegram_media.py tests/test_telegram_parallel.py
+  tests/test_telegram_delivery_guard.py tests/test_telegram_workflow.py -q`
+  → 414 passed; `ruff check hub/repeat_mode.py hub/telegram_chat.py hub/app.py
+  tests/test_repeat_mode.py` → All checks passed; `python -c "import hub.app"`
+  → ok. `client/` и `common/` не правились — обновление комнатных ПК не
+  требуется. Решения — `DECISIONS.md`, TG-ECHO-01.

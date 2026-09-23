@@ -201,6 +201,7 @@ from hub.telegram_admin import TelegramAdmin
 from hub.telegram_admin_state import TelegramAdminState
 from hub.telegram_chat import TelegramChat
 from hub.telegram_control import TelegramController
+from hub.telegram_control import room_busy as telegram_room_busy
 from hub.telegram_intent import picture_send_requested, telegram_send_requested
 from hub.telegram_media import PhotoInspector
 from hub.tools import (
@@ -2204,6 +2205,41 @@ def _selected_telegram_room(message):
         if room is not None:
             return room
     return _telegram_room()
+
+
+async def _repeat_in_room(text: str, message: dict) -> dict:
+    """Echo mode: say one Telegram message out loud in the room (owner, 23.09).
+
+    Владелец просил, чтобы бот повторял за ним следующие сообщения, а модель
+    отвечала «I'm not playing echo. Give me the actual words»: повтор — это
+    состояние и код, а не решение модели. Здесь та же речь, которой пользуется
+    инструмент ``say_in_room`` (``Connection._say_proactive`` — ``say`` плюс
+    синтез), только без единого обращения к LLM и без раунда инструментов.
+
+    Комната выбирается тем же правилом, что и остальные запросы из этого чата
+    (``_selected_telegram_room``, ТЗ F-701: имя ПК в сообщении, потом выбор в
+    ``/tools``, потом единственная подключённая). Отчёт честный: если сказать
+    некому, ответ так и говорит, а не делает вид, что комната услышала.
+    """
+    try:
+        room = _selected_telegram_room(message)
+    except Exception:  # noqa: BLE001 - a broken selector must not break the echo
+        room = None
+    if room is None or isinstance(room, str):
+        room = _telegram_room()
+    if room is None:
+        return {'ok': False, 'error': 'no room PC is connected'}
+    if telegram_room_busy(room):
+        return {'ok': False, 'error': 'the room is busy with another request'}
+    try:
+        spoken = await room._say_proactive(text)
+    except Exception as exc:  # noqa: BLE001 - the caller reports the failure
+        log.warning('Repeat mode could not say anything in the room (%s)', exc)
+        return {'ok': False, 'error': f'the room could not be reached ({type(exc).__name__})'}
+    if not spoken:
+        return {'ok': False, 'error': 'the room has no voice right now'}
+    log.info('Repeat mode said in the room: %r', text)
+    return {'ok': True}
 
 
 def _fold_place(value: Any) -> str:
@@ -4946,6 +4982,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _telegram_chat = TelegramChat(_telegram, cfg.server.telegram, _llm.reply_text,
             image_generator=_image_generator, image_store=_generated_images,
             folder=REPO_ROOT / 'data' / 'telegram', control_reply=controller, access=_telegram_access,
+            speak_in_room=_repeat_in_room,
             admin_handler=_TelegramHandlers(_telegram_admin, _guest_confirmations)
             if (_telegram_admin or _guest_confirmations) else None)
         _telegram_chat.start()

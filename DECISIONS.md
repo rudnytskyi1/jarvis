@@ -5238,3 +5238,39 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   tests/test_vision_cloud.py -q` → 60 passed; `ruff check hub/openai_responses.py`
   → All checks passed. Коммит `0d46894` в `origin/main`. Ссылка: ТЗ F-403;
   DECISIONS.md API-01…API-05.
+
+- **TG-ECHO-01 — «повторяй за мной» это режим, а не вопрос модели.** Владелец
+  2026-09-23: «я просил в телеге чтобы он за мной повторял (следующие
+  сообщения) а он не смог». Что было видно в логе живого хаба (15:20): на
+  «Repeats after me» модель отвечала «I'm not playing echo. Give me the actual
+  words», на «repeat what I say» — «There's nothing yet for me to repeat»:
+  состояния «повтор включён» не существовало, поэтому каждая следующая реплика
+  уходила в обычный путь «запрос → модель». Выбран вариант: **режим живёт в
+  коде, а не в промпте** (`hub/repeat_mode.py`): пока он включён, текст из телеги
+  произносится в комнате дословно тем же примитивом, что и инструмент
+  `say_in_room` (`Connection._say_proactive`), без обращения к LLM — иначе
+  повтор зависел бы от настроения модели, на чём он и падал. Включение и
+  выключение — фразами (en/ru/es): «repeat after me», «repeat what I say»,
+  «say what i say», «parrot mode», «повторяй за мной», «повторяй мои
+  сообщения», «повторяй всё, что я скажу», «repite lo que digo» и «stop
+  repeating», «хватит повторять», «перестань повторять», «не повторяй»,
+  «останови повтор», «deja de repetir». Область — «чат + автор», то есть повтор
+  в личке не превращает в попугая группу и чужие чаты. Предохранители: 10 минут
+  без новых реплик и 60 повторённых сообщений, потом режим закрывается сам
+  (пример из аудита: включённый по ошибке режим не должен съесть обычный
+  разговор). В чат уходит та же фраза, что услышала комната, а если сказать
+  некому (ПК не подключён, комната занята, речи нет) — честная строка об этом
+  рядом с текстом. Голосовой повтор в комнате НЕ включается намеренно: комната
+  услышала бы собственный голос и зациклилась (шумодав этого не гарантирует) —
+  это отдельная задача с защитой от самоповтора. Проверено: `pytest
+  tests/test_repeat_mode.py -q` → 40 passed (детекция фраз, окно и лимит,
+  интеграция с `TelegramChat`, колбэк `hub.app._repeat_in_room` на фейковой
+  комнате и честный отказ без комнаты); `pytest tests/test_repeat_mode.py
+  tests/test_telegram_chat.py tests/test_telegram_control.py
+  tests/test_telegram_control_routing.py tests/test_telegram.py
+  tests/test_telegram_media.py tests/test_telegram_parallel.py
+  tests/test_telegram_delivery_guard.py tests/test_telegram_workflow.py -q`
+  → 414 passed; `ruff check hub/repeat_mode.py hub/telegram_chat.py hub/app.py
+  tests/test_repeat_mode.py` → All checks passed; `python -c "import hub.app"`
+  → ok. Ссылка: ТЗ F-701 (комната выбирается тем же правилом, что и остальные
+  запросы из чата), F-417 (`say` + синтез для фразы, решённой хабом).

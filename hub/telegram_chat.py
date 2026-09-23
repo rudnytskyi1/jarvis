@@ -17,6 +17,8 @@ from pathlib import Path
 from hub.conversations import Conversations
 from hub.image_prompt import action_revoked, is_image_request, visual_request, visual_target
 from hub.image_subjects import person_named
+from hub.repeat_mode import RepeatMode
+from hub.repeat_mode import request as repeat_request
 from hub.telegram import TelegramError
 from hub.untrusted import TELEGRAM_SOURCE
 from hub.untrusted import wrap as wrap_untrusted
@@ -215,6 +217,34 @@ def _clip_text(text, maximum=4000):
     return raw[:maximum * 2].decode('utf-16-le', errors='ignore')
 
 
+def _is_russian(text) -> bool:
+    """Which of the two answers the sender gets (the hub writes both)."""
+    return bool(re.search('[А-Яа-яЁё]', str(text or '')))
+
+
+def _repeat_started_line(text) -> str:
+    """What the owner reads when echo mode opens (owner 2026-09-23)."""
+    if _is_russian(text):
+        return ('Повтор включён: следующие сообщения комната произнесёт вслух, '
+                'слово в слово. Скажи «хватит повторять», чтобы выключить.')
+    return ('Repeat mode is on: the next messages are said out loud in the room, '
+            'word for word. Say "stop repeating" to end it.')
+
+
+def _repeat_stopped_line(text, was_on: bool) -> str:
+    """Words for the end of echo mode, honest about whether it was running."""
+    if _is_russian(text):
+        return 'Повтор выключен.' if was_on else 'Повтор и так не был включён.'
+    return 'Repeat mode is off.' if was_on else 'Repeat mode was not on.'
+
+
+def _repeat_failed_line(text, reason: str) -> str:
+    """The words still reach the chat when the room could not say them."""
+    if _is_russian(text):
+        return f'{text}\n\nВ комнате сказать не получилось: {reason}.'
+    return f'{text}\n\nIt could not be said out loud in the room: {reason}.'
+
+
 def _update_chats(update):
     """Every group chat one update carries (ТЗ F-702 destination list).
 
@@ -254,10 +284,17 @@ _CHAT_REFRESH_S = 3600.0
 
 class TelegramChat:
     def __init__(self, provider, cfg, reply, image_generator=None, image_store=None,
-                 folder=Path('data/telegram'), *, control_reply=None, admin_handler=None, access=None):
+                 folder=Path('data/telegram'), *, control_reply=None, admin_handler=None, access=None,
+                 speak_in_room=None):
         self.provider, self.cfg, self.reply = provider, cfg, reply
         self.control_reply = control_reply
         self.admin_handler, self.access = admin_handler, access
+        #: Echo mode ("повторяй за мной"): the room says the next messages out
+        #: loud, word for word. The callback is app.py's own speech primitive
+        #: (the one ``say_in_room`` uses); ``None`` keeps the mode honest about
+        #: having nowhere to speak instead of pretending it did.
+        self.speak_in_room = speak_in_room
+        self.repeat = RepeatMode()
         self.image_generator, self.image_store = image_generator, image_store
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -881,6 +918,9 @@ class TelegramChat:
         message = await asyncio.to_thread(self._with_reply_photo, message)
         # Images retain their sender-specific provenance; textual chat is shared.
         owner = self._image_owner(message)
+        # Echo mode is per conversation per person: a repeat in one private chat
+        # must never turn the whole group (or another chat) into a parrot.
+        scope = f"{message['chat']['id']}:{message['from']['id']}"
         stamp = datetime.fromtimestamp(message['date'], UTC).isoformat()
         recent = await asyncio.to_thread(self._recent_group_context, message)
         turn = await asyncio.to_thread(self._begin_group_turn, message, stamp, text)
@@ -897,52 +937,73 @@ class TelegramChat:
             'from': message['from']['id'], 'text': text,
             'photo': bool(message.get('photo'))})
         try:
-            system_prompt = self.system_prompt
-            if message['chat']['type'] == 'private':
-                system_prompt += ('\nThis request is a private Telegram conversation with the current sender. '
-                                  'The supplied history belongs only to this private conversation; '
-                                  'no group history is provided or accessible here. '
-                                  'References above to shared group history do not apply to this route.')
-            messages = [{'role': 'system', 'content': system_prompt}, *recent,
-                        {'role': 'user', 'content': self._context_text(
-                            text or 'Hello.', stamp, self._author_metadata(message))}]
-            has_photo = isinstance(message.get('photo'), list) and bool(message['photo'])
-            if has_photo and not text.strip():
-                answer = 'Что сделать с фотографией: описать, найти объект, распознать человека или изменить изображение?'
-                sending = True
-                receipt = await self.provider.send_text(answer, **self._delivery_kwargs(message))
-                await asyncio.to_thread(self._remember_photo_reply, message, receipt)
-            elif self._control_message(message) and callable(self.control_reply):
-                # This callback is installed by the server and repeats the ID
-                # check there. Group content, names and quoted senders confer no
-                # authorization to enter the tool-enabled execution path.
-                answer = _clip_text(await self.control_reply(messages, message, text)).strip()
-                if not answer:
-                    answer = "I couldn't produce an answer to that request."
+            # Echo mode (owner 2026-09-23: "я просил в телеге чтобы он за мной
+            # повторял... а он не смог"). The mode is state plus a plain code
+            # path, not a model decision: while it is on, the room hears the
+            # message itself, word for word, and no model round runs at all.
+            echo = repeat_request(text)
+            if echo == 'start':
+                self.repeat.start(scope)
+                answer = _repeat_started_line(text)
                 sending = True
                 await self.provider.send_text(answer, **self._delivery_kwargs(message))
-            elif current_image_request(text, has_photo=has_photo):
-                if not self._allows(message['from']['id'], 'images'):
-                    raise TelegramInputError('Image generation is not enabled for this Telegram account.')
-                if self.image_generator is None or self.image_store is None:
-                    raise TelegramInputError('Image generation is not configured here yet.')
-                self.image_generator.check_ready()
-                prompt = visual_request(text)
-                reference, mime = await self._image_reference(message, prompt, owner)
-                if not self._can_chat(message) or not self._allows(message['from']['id'], 'images'):
-                    raise TelegramInputError('Image generation permission was revoked.')
-                generated = await self.image_generator.generate(prompt, reference, mime)
-                await asyncio.to_thread(self.image_store.save, owner, generated, self.image_generator.cfg.model)
-                await asyncio.to_thread(self._state, update_id, 'generated')
+            elif echo == 'stop':
+                answer = _repeat_stopped_line(text, self.repeat.stop(scope))
                 sending = True
-                await self.provider.send_image(generated.png, 'image/png', **self._delivery_kwargs(message))
-                answer = '[Generated image sent.]'
+                await self.provider.send_text(answer, **self._delivery_kwargs(message))
+            elif (self.repeat.active(scope) and text.strip()
+                  and not (isinstance(message.get('photo'), list) and message['photo'])):
+                self.repeat.note(scope)
+                answer = await self._repeat_message(text, message)
+                sending = True
+                await self.provider.send_text(answer, **self._delivery_kwargs(message))
             else:
-                answer = _clip_text(await self.reply(messages)).strip()
-                if not answer:
-                    answer = "I couldn't produce an answer to that message."
-                sending = True
-                await self.provider.send_text(answer, **self._delivery_kwargs(message))
+                system_prompt = self.system_prompt
+                if message['chat']['type'] == 'private':
+                    system_prompt += ('\nThis request is a private Telegram conversation with the current sender. '
+                                      'The supplied history belongs only to this private conversation; '
+                                      'no group history is provided or accessible here. '
+                                      'References above to shared group history do not apply to this route.')
+                messages = [{'role': 'system', 'content': system_prompt}, *recent,
+                            {'role': 'user', 'content': self._context_text(
+                                text or 'Hello.', stamp, self._author_metadata(message))}]
+                has_photo = isinstance(message.get('photo'), list) and bool(message['photo'])
+                if has_photo and not text.strip():
+                    answer = 'Что сделать с фотографией: описать, найти объект, распознать человека или изменить изображение?'
+                    sending = True
+                    receipt = await self.provider.send_text(answer, **self._delivery_kwargs(message))
+                    await asyncio.to_thread(self._remember_photo_reply, message, receipt)
+                elif self._control_message(message) and callable(self.control_reply):
+                    # This callback is installed by the server and repeats the ID
+                    # check there. Group content, names and quoted senders confer no
+                    # authorization to enter the tool-enabled execution path.
+                    answer = _clip_text(await self.control_reply(messages, message, text)).strip()
+                    if not answer:
+                        answer = "I couldn't produce an answer to that request."
+                    sending = True
+                    await self.provider.send_text(answer, **self._delivery_kwargs(message))
+                elif current_image_request(text, has_photo=has_photo):
+                    if not self._allows(message['from']['id'], 'images'):
+                        raise TelegramInputError('Image generation is not enabled for this Telegram account.')
+                    if self.image_generator is None or self.image_store is None:
+                        raise TelegramInputError('Image generation is not configured here yet.')
+                    self.image_generator.check_ready()
+                    prompt = visual_request(text)
+                    reference, mime = await self._image_reference(message, prompt, owner)
+                    if not self._can_chat(message) or not self._allows(message['from']['id'], 'images'):
+                        raise TelegramInputError('Image generation permission was revoked.')
+                    generated = await self.image_generator.generate(prompt, reference, mime)
+                    await asyncio.to_thread(self.image_store.save, owner, generated, self.image_generator.cfg.model)
+                    await asyncio.to_thread(self._state, update_id, 'generated')
+                    sending = True
+                    await self.provider.send_image(generated.png, 'image/png', **self._delivery_kwargs(message))
+                    answer = '[Generated image sent.]'
+                else:
+                    answer = _clip_text(await self.reply(messages)).strip()
+                    if not answer:
+                        answer = "I couldn't produce an answer to that message."
+                    sending = True
+                    await self.provider.send_text(answer, **self._delivery_kwargs(message))
             turn_trace.record('turn', 'answered', payload={'reply': answer})
             await asyncio.to_thread(self.history.finish, turn, answer)
             await asyncio.to_thread(self._state, update_id, 'sent')
@@ -966,6 +1027,27 @@ class TelegramChat:
             turn_trace.record('turn', 'answered', payload={'reply': answer}, ok=False)
             await asyncio.to_thread(self.history.finish, turn, answer)
             await asyncio.to_thread(self._state, update_id, state)
+
+    async def _repeat_message(self, text: str, message) -> str:
+        """Say one message out loud in the room, word for word (echo mode).
+
+        The chat gets the same words back, so the phone shows exactly what the
+        room heard. When nothing can speak, the answer says so instead of
+        pretending the room listened.
+        """
+        callback = self.speak_in_room
+        if not callable(callback):
+            return _repeat_failed_line(text, 'there is no room voice here yet')
+        try:
+            result = await callback(text, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the echo must answer, not die
+            log.warning('Repeat mode could not speak in the room (%s)', type(exc).__name__)
+            return _repeat_failed_line(text, f'the room could not be reached ({type(exc).__name__})')
+        if isinstance(result, dict) and result.get('ok') is not True:
+            return _repeat_failed_line(text, str(result.get('error') or 'the room did not answer'))
+        return text
 
     async def _image_reference(self, message, prompt, owner):
         message = await asyncio.to_thread(self._with_reply_photo, message)
