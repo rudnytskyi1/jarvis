@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hub.repeat_mode import MAX_MESSAGES, RepeatMode, request
+from hub.repeat_mode import MAX_MESSAGES, RepeatMode, request, soft_stop, wants_room_speech
 from hub.telegram_chat import TelegramChat
 
 
@@ -110,6 +110,37 @@ def test_one_chat_repeating_does_not_touch_another():
     assert not mode.active('7:7')
 
 
+@pytest.mark.parametrize('text', [
+    'повторяй за мной в комнате',
+    'повторяй за мной вслух',
+    'repeat after me out loud',
+    'repeat what i say in the room',
+    'repite lo que digo en voz alta',
+])
+def test_the_room_is_asked_for_in_words(text):
+    assert wants_room_speech(text) is True
+
+
+@pytest.mark.parametrize('text', [
+    'повторяй за мной',
+    'repeat after me',
+    'и вторая фраза',
+    'привет',
+])
+def test_a_plain_repeat_stays_in_the_chat(text):
+    """Владелец 2026-09-23: «повторяй за мной в чате а не озвучивай в комнате»."""
+    assert wants_room_speech(text) is False
+
+
+@pytest.mark.parametrize('text', ['хватит', 'хватит уже', 'да все хвтаит уже', 'стоп', 'stop', 'отмена'])
+def test_a_short_stop_word_ends_the_repeat(text):
+    assert soft_stop(text) is True
+
+
+def test_a_long_sentence_is_never_a_stop_word():
+    assert soft_stop('расскажи, что ты умеешь, и не забудь про напоминания') is False
+
+
 def _provider():
     return SimpleNamespace(get_me=AsyncMock(return_value={'id': 99, 'username': 'RowanBot', 'is_bot': True}),
                            get_webhook_info=AsyncMock(return_value={'url': ''}),
@@ -139,7 +170,7 @@ def _bot(tmp_path, *, speak=None, reply=None):
     return bot, transport
 
 
-def test_the_room_hears_the_next_messages_word_for_word(tmp_path):
+def test_the_next_messages_come_back_here_and_the_room_stays_silent(tmp_path):
     spoken = []
 
     async def speak(text, message):
@@ -151,12 +182,30 @@ def test_the_room_hears_the_next_messages_word_for_word(tmp_path):
         await bot.process_update(_message(1, 'повторяй за мной'))
         await bot.process_update(_message(2, 'привет, это проверка'))
         await bot.process_update(_message(3, 'и вторая фраза'))
-        assert spoken == ['привет, это проверка', 'и вторая фраза']
-        # The chat shows the same words, and no model round ran for them.
+        # Комната молчит: повтор идёт в тот же чат.
+        assert spoken == []
         sent = [call.args[0] for call in transport.send_text.await_args_list]
         assert 'привет, это проверка' in sent
         assert 'и вторая фраза' in sent
         assert bot.reply.await_count == 0
+
+    asyncio.run(run())
+
+
+def test_the_room_speaks_only_when_the_owner_asks_for_it(tmp_path):
+    spoken = []
+
+    async def speak(text, message):
+        spoken.append(text)
+        return {'ok': True}
+
+    async def run():
+        bot, transport = _bot(tmp_path, speak=speak)
+        await bot.process_update(_message(1, 'повторяй за мной в комнате'))
+        await bot.process_update(_message(2, 'привет'))
+        assert spoken == ['привет']
+        sent = [call.args[0] for call in transport.send_text.await_args_list]
+        assert 'привет' in sent  # и в чат тоже приходит
 
     asyncio.run(run())
 
@@ -174,7 +223,32 @@ def test_saying_stop_ends_the_repeat_and_the_model_takes_over(tmp_path):
         await bot.process_update(_message(2, 'hello there'))
         await bot.process_update(_message(3, 'stop repeating'))
         await bot.process_update(_message(4, 'what time is it?'))
-        assert spoken == ['hello there']
+        assert spoken == []  # повтор идёт в чат, комната молчит
+        assert bot.reply.await_count == 1
+        assert transport.send_text.await_args.args[0] == 'model answer'
+
+    asyncio.run(run())
+
+
+def test_a_short_stop_word_ends_the_repeat_even_with_a_typo(tmp_path):
+    """Владелец написал «да все хвтаит уже» — с опечаткой, но это стоп."""
+    async def run():
+        bot, transport = _bot(tmp_path)
+        await bot.process_update(_message(1, 'повторяй за мной'))
+        await bot.process_update(_message(2, 'раз'))
+        await bot.process_update(_message(3, 'да все хвтаит уже'))
+        await bot.process_update(_message(4, 'сколько времени?'))
+        assert bot.reply.await_count == 1
+        assert transport.send_text.await_args.args[0] == 'model answer'
+
+    asyncio.run(run())
+
+
+def test_a_stop_word_is_an_ordinary_request_when_the_repeat_is_off(tmp_path):
+    """Вне режима «stop the music» — просьба, а не выключение повтора."""
+    async def run():
+        bot, transport = _bot(tmp_path)
+        await bot.process_update(_message(1, 'stop the music'))
         assert bot.reply.await_count == 1
         assert transport.send_text.await_args.args[0] == 'model answer'
 
@@ -187,7 +261,7 @@ def test_an_honest_answer_when_the_room_cannot_speak(tmp_path):
 
     async def run():
         bot, transport = _bot(tmp_path, speak=speak)
-        await bot.process_update(_message(1, 'повторяй за мной'))
+        await bot.process_update(_message(1, 'повторяй за мной в комнате'))
         await bot.process_update(_message(2, 'привет'))
         answer = transport.send_text.await_args.args[0]
         assert 'привет' in answer

@@ -2034,3 +2034,16 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_models_health.py tests/test_utterance_route.py tests/test_multi_step.py
   tests/test_llm_vllm_provider.py tests/test_local_fast.py tests/test_api_budget.py
   tests/test_image_generation.py -q` → 153 passed.
+
+- **TG-ECHO-02 — повтор идёт в чат, а не вслух в комнате (23.09.2026).**
+  Владелец: «повторяй за мной в чате а не озвучивай в комнате». По умолчанию
+  режим повтора отвечает тем же текстом в тот же чат и НЕ трогает комнату;
+  комната произносит фразу только при явной просьбе («повторяй за мной в
+  комнате», «вслух», «out loud», «en voz alta»), и стартовая строка говорит,
+  куда идёт повтор. Выход стал простым: короткое «хватит»/«стоп»/«stop»/
+  «отмена» закрывает включённый повтор, включая опечатки («да все хвтаит уже» —
+  именно на этой фразе режим в живом хабе не выключился); вне режима такое слово
+  остаётся обычной просьбой («stop the music» уходит модели). Проверено:
+  `pytest tests/test_repeat_mode.py -q` → 59 passed; `ruff check
+  hub/repeat_mode.py hub/telegram_chat.py tests/test_repeat_mode.py` → All checks
+  passed. Решение — `DECISIONS.md`, TG-ECHO-02.

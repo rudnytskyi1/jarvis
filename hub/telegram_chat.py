@@ -17,7 +17,7 @@ from pathlib import Path
 from hub.conversations import Conversations
 from hub.image_prompt import action_revoked, is_image_request, visual_request, visual_target
 from hub.image_subjects import person_named
-from hub.repeat_mode import RepeatMode
+from hub.repeat_mode import RepeatMode, soft_stop, wants_room_speech
 from hub.repeat_mode import request as repeat_request
 from hub.telegram import TelegramError
 from hub.untrusted import TELEGRAM_SOURCE
@@ -222,13 +222,23 @@ def _is_russian(text) -> bool:
     return bool(re.search('[А-Яа-яЁё]', str(text or '')))
 
 
-def _repeat_started_line(text) -> str:
-    """What the owner reads when echo mode opens (owner 2026-09-23)."""
+def _repeat_started_line(text, *, spoken: bool = False) -> str:
+    """What the owner reads when echo mode opens (owner 2026-09-23).
+
+    Default is a repeat HERE, in the same chat; the room only hears anything
+    when the owner asked for it out loud ("повторяй за мной в комнате").
+    """
+    if spoken:
+        if _is_russian(text):
+            return ('Повтор включён: следующие сообщения произнесу вслух в комнате, '
+                    'слово в слово. Скажи «хватит», чтобы выключить.')
+        return ('Repeat mode is on: the next messages are said out loud in the room, '
+                'word for word. Say "stop" to end it.')
     if _is_russian(text):
-        return ('Повтор включён: следующие сообщения комната произнесёт вслух, '
-                'слово в слово. Скажи «хватит повторять», чтобы выключить.')
-    return ('Repeat mode is on: the next messages are said out loud in the room, '
-            'word for word. Say "stop repeating" to end it.')
+        return ('Повтор включён: следующие сообщения пришлю сюда же, слово в слово. '
+                'Скажи «хватит», чтобы выключить.')
+    return ('Repeat mode is on: the next messages come back here, word for word. '
+            'Say "stop" to end it.')
 
 
 def _repeat_stopped_line(text, was_on: bool) -> str:
@@ -942,9 +952,15 @@ class TelegramChat:
             # path, not a model decision: while it is on, the room hears the
             # message itself, word for word, and no model round runs at all.
             echo = repeat_request(text)
+            # Короткое «хватит»/«стоп» закрывает ВКЛЮЧЁННЫЙ повтор, но обычную
+            # просьбу («stop the music») не перехватывает: вне режима это слово
+            # значит ровно то, что значит.
+            if echo == '' and self.repeat.active(scope) and soft_stop(text):
+                echo = 'stop'
             if echo == 'start':
-                self.repeat.start(scope)
-                answer = _repeat_started_line(text)
+                spoken = wants_room_speech(text)
+                self.repeat.start(scope, spoken=spoken)
+                answer = _repeat_started_line(text, spoken=spoken)
                 sending = True
                 await self.provider.send_text(answer, **self._delivery_kwargs(message))
             elif echo == 'stop':
@@ -954,7 +970,12 @@ class TelegramChat:
             elif (self.repeat.active(scope) and text.strip()
                   and not (isinstance(message.get('photo'), list) and message['photo'])):
                 self.repeat.note(scope)
-                answer = await self._repeat_message(text, message)
+                # По умолчанию повтор идёт СЮДА, в тот же чат: владелец
+                # 2026-09-23 — «повторяй за мной в чате а не озвучивай в
+                # комнате». Комната услышит фразу только тогда, когда её об этом
+                # попросили словами («в комнате», «вслух», «out loud»).
+                answer = (await self._repeat_message(text, message)
+                          if self.repeat.spoken(scope) else text)
                 sending = True
                 await self.provider.send_text(answer, **self._delivery_kwargs(message))
             else:

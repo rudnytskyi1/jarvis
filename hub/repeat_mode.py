@@ -65,8 +65,33 @@ _STOP = (
     r'\bpara de repetir\b',
 )
 
+#: Короткое «хватит/стоп» тоже закрывает повтор — но только когда он включён.
+#: Владелец 2026-09-23 написал «да все хвтаит уже», и режим не выключился: в
+#: списке выше требуется слово «повтор». Опознаётся и опечатка, поэтому шаблон
+#: свободный: любое короткое сообщение, начинающееся с «хватит» в любой
+#: раскладке букв, со «стоп», «stop», «отмена», «cancel» или «замолчи».
+#: Короткое «хватит/стоп» тоже закрывает повтор — но только когда он включён.
+#: Владелец 2026-09-23 написал «да все хвтаит уже», и режим не выключился: в
+#: списке выше требуется слово «повтор». Поэтому перед стоп-словом разрешены
+#: короткие вводные («да», «ну», «всё»), а само слово ловится свободно — вместе
+#: с опечаткой: «хватит» в любой раскладке букв, «стоп», «stop», «отмена»,
+#: «cancel», «замолчи».
+_SOFT_STOP = re.compile(
+    r'^(?:(?:да|ну|всё|все|ok|okay|ладно)[,\s]+)*'
+    r'(?:хва\w+|хв[аеоиу]?\w*т\w*|стоп\w*|stop\w*|cancel|отмена|замолчи)',
+    re.IGNORECASE)
+
+#: Просьба повторять ВСЛУХ в комнате. По умолчанию повтор идёт текстом сюда же:
+#: владелец 2026-09-23 — «повторяй за мной в чате а не озвучивай в комнате».
+_SPOKEN = (
+    r'\bв комнате\b', r'\bвслух\b', r'\bголосом\b', r'\bчерез колонк', r'\bпо громкой\b',
+    r'\bin the room\b', r'\bout loud\b', r'\baloud\b', r'\bthrough the speakers?\b',
+    r'\ben la habitaci[oó]n\b', r'\ben voz alta\b',
+)
+
 _START_RE = re.compile('|'.join(_START), re.IGNORECASE)
 _STOP_RE = re.compile('|'.join(_STOP), re.IGNORECASE)
+_SPOKEN_RE = re.compile('|'.join(_SPOKEN), re.IGNORECASE)
 
 
 def request(text: str) -> str:
@@ -86,6 +111,20 @@ def request(text: str) -> str:
     return ''
 
 
+def wants_room_speech(text: str) -> bool:
+    """Просили ли повтор ВСЛУХ. Иначе повтор идёт текстом в тот же чат."""
+    cleaned = ' '.join(str(text or '').split()).casefold()
+    return bool(_SPOKEN_RE.search(cleaned))
+
+
+def soft_stop(text: str) -> bool:
+    """Короткое «хватит»/«стоп» — стоп для включённого повтора, не для чата."""
+    cleaned = ' '.join(str(text or '').split()).strip().casefold()
+    if not cleaned or len(cleaned) > 40:
+        return False
+    return bool(_SOFT_STOP.match(cleaned))
+
+
 class RepeatMode:
     """Which conversations repeat right now, and for how much longer.
 
@@ -101,8 +140,15 @@ class RepeatMode:
         self._clock = clock
         self._open: dict[str, dict[str, float]] = {}
 
-    def start(self, scope: str) -> None:
-        self._open[str(scope)] = {'until': self._clock() + self.window_s, 'count': 0.0}
+    def start(self, scope: str, *, spoken: bool = False) -> None:
+        """Начать повтор: ``spoken=False`` — текстом в чат (по умолчанию)."""
+        self._open[str(scope)] = {'until': self._clock() + self.window_s, 'count': 0.0,
+                                  'spoken': 1.0 if spoken else 0.0}
+
+    def spoken(self, scope: str) -> bool:
+        """Повторять ли вслух в комнате (только если владелец попросил это)."""
+        entry = self._open.get(str(scope))
+        return bool(entry and entry.get('spoken'))
 
     def stop(self, scope: str) -> bool:
         """Turn the mode off; ``True`` when it was on."""
