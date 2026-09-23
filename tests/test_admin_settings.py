@@ -62,7 +62,7 @@ def test_typed_input_validation_does_not_mutate_live_config(key, value, expected
 
 @pytest.mark.parametrize('key,value', [
     ('server.face.threshold', 1.01), ('server.face.threshold', 'nan'),
-    ('server.llm.monthly_budget_usd', 21), ('server.llm.monthly_budget_usd', 'inf'),
+    ('server.llm.monthly_budget_usd', -1), ('server.llm.monthly_budget_usd', 'inf'),
     ('server.telegram.poll_timeout_s', '0'), ('server.telegram.poll_timeout_s', 'twenty'),
     ('server.permissions_enabled', 'perhaps'), ('server.stt.hotwords', '[not json'),
     ('server.image_generation.model', 'unapproved-model'),
@@ -72,11 +72,18 @@ def test_invalid_values_are_rejected_by_actual_config_constraints(key, value):
         validated_value(Config(), key, value)
 
 
+def test_the_monthly_budget_has_no_upper_ceiling_and_zero_means_no_limit():
+    """DECISIONS.md API-01: the owner removed the $20 ceiling on 2026-09-22."""
+    cfg = Config()
+    assert validated_value(cfg, 'server.llm.monthly_budget_usd', 900) == 900
+    assert validated_value(cfg, 'server.llm.monthly_budget_usd', 0) == 0
+
+
 def test_restore_applies_live_and_pending_values_but_ignores_stale_and_protected_rows(tmp_path):
     state = TelegramAdminState(tmp_path / 'admin.sqlite3', OWNER)
     for key, value in [('server.face.threshold', .62), ('server.tts.speaker', 'en_1'),
                        ('server.telegram.control_user_id', 17), ('server.telegram.chat_id', -999),
-                       ('client.camera.index', 9), ('server.llm.monthly_budget_usd', 900)]:
+                       ('client.camera.index', 9), ('server.llm.monthly_budget_usd', -5)]:
         state.set_setting('config:' + key, {'value': value})
     state.set_setting('config:server.stt.language', ['malformed override'])
     cfg = Config()
@@ -89,12 +96,14 @@ def test_restore_applies_live_and_pending_values_but_ignores_stale_and_protected
     assert cfg.server.stt.language is None
 
 
-def test_live_updates_reach_copied_engine_fields_and_both_budget_providers():
+def test_live_updates_reach_copied_engine_fields_and_both_budget_providers(tmp_path):
     cfg = Config()
+    from hub.api_budget import ApiBudget
+    budget = ApiBudget(tmp_path / 'usage.sqlite3', 1.0, model='gpt-5.6-luna')
     runtime = dict(voices=SimpleNamespace(threshold=.4), face=SimpleNamespace(threshold=.45),
         stt=SimpleNamespace(default_language=None, allowed_languages=[], hotwords=''),
-        llm=SimpleNamespace(_responses=SimpleNamespace(budget=SimpleNamespace(limit=1))),
-        image_generator=SimpleNamespace(budget=SimpleNamespace(limit=1)))
+        llm=SimpleNamespace(_responses=SimpleNamespace(budget=budget)),
+        image_generator=SimpleNamespace(budget=budget))
     updates = [('server.speaker.threshold', .63), ('server.face.threshold', .64),
                ('server.stt.language', 'ru'), ('server.stt.allowed_languages', ['ru', 'en']),
                ('server.stt.hotwords', ['Rowan', 'Антон']), ('server.llm.monthly_budget_usd', 12.75)]
@@ -107,3 +116,17 @@ def test_live_updates_reach_copied_engine_fields_and_both_budget_providers():
     assert runtime['stt'].hotwords == 'Rowan, Антон'
     assert runtime['llm']._responses.budget.limit == 12_750_000
     assert runtime['image_generator'].budget.limit == 12_750_000
+
+
+def test_live_updates_can_remove_the_monthly_ceiling(tmp_path):
+    """DECISIONS.md API-01: 0 in the owner panel means "no ceiling"."""
+    cfg = Config()
+    from hub.api_budget import ApiBudget
+    budget = ApiBudget(tmp_path / 'usage.sqlite3', 12.0, model='gpt-5.6-luna')
+    runtime = dict(llm=SimpleNamespace(_responses=SimpleNamespace(budget=budget)),
+                   image_generator=SimpleNamespace(budget=budget))
+    apply_live(cfg, 'server.llm.monthly_budget_usd',
+               validated_value(cfg, 'server.llm.monthly_budget_usd', 0), runtime)
+    assert cfg.server.llm.monthly_budget_usd == 0
+    assert runtime['llm']._responses.budget.limit is None
+    assert budget.status()['limit_usd'] is None

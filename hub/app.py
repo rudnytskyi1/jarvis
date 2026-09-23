@@ -1270,7 +1270,12 @@ def cloud_budget_allows(level: str) -> bool:
                            monthly_usd=float(getattr(llm_cfg, "monthly_budget_usd", 18.0)),
                            model=entry.model if entry is not None else "gpt-5.4-mini")
         status = ledger.status()
-        return float(status["accounted_usd"]) < float(status["limit_usd"]) * 0.9
+        limit = status["limit_usd"]
+        if limit is None:
+            # The owner removed the monthly ceiling (DECISIONS.md API-01):
+            # accounting still runs, but nothing is held back for spending.
+            return True
+        return float(status["accounted_usd"]) < float(limit) * 0.9
     except Exception as exc:  # noqa: BLE001 - unknown budget means no spending
         log.warning("Cloud budget check is unavailable (%s) - replies stay local", exc)
         return False

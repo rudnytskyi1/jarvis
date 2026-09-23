@@ -58,12 +58,22 @@ def test_invalid_usage_preserves_reservation(tmp_path):
     assert budget.status()["unsettled_requests"] == 1
 
 
-@pytest.mark.parametrize("limit", [0, -1, 21])
-def test_budget_ceiling(limit, tmp_path):
+@pytest.mark.parametrize("limit", [-1, -0.01])
+def test_a_negative_ceiling_is_refused(limit, tmp_path):
     with pytest.raises(ValueError):
         ApiBudget(tmp_path / "ledger.db", limit)
 
 
+def test_zero_means_no_ceiling_and_a_big_number_is_allowed(tmp_path):
+    """DECISIONS.md API-01: the owner removed the $20 ceiling on 2026-09-22."""
+    unlimited = ApiBudget(tmp_path / "unlimited.db", 0)
+    assert unlimited.limit is None
+    assert unlimited.status()["limit_usd"] is None
+    # A month's worth of spending is never refused without a ceiling.
+    for _ in range(8):
+        unlimited.reserve(5_000_000, 2048)
+    assert unlimited.status()["accounted_usd"] > 20
+    assert ApiBudget(tmp_path / "big.db", 900).limit == 900_000_000
 def test_full_model_reservation_and_settlement_use_full_price(tmp_path):
     budget = ApiBudget(tmp_path / 'ledger.db', .04, model='gpt-5.4')
     key = budget.reserve(10_000, 600)

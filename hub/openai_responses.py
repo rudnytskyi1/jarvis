@@ -19,6 +19,20 @@ from hub.api_budget import ApiBudget, CloudUnavailable
 
 log = logging.getLogger(__name__)
 
+#: Where a shortened text stops being a text and starts being a fragment.
+TRUNCATION_MARKER = "\n[... middle of a very long turn omitted ...]\n"
+
+
+def shorten_text(text: str, limit: int) -> str:
+    """Keep the head and the tail of ``text`` inside ``limit`` UTF-8 bytes."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    keep = max(64, limit // 2)
+    tail = max(0, limit - keep - len(TRUNCATION_MARKER.encode("utf-8")))
+    return (raw[:keep] + TRUNCATION_MARKER.encode("utf-8") + (raw[-tail:] if tail else b"")).decode(
+        "utf-8", "ignore")
+
 
 def response_input(messages: list[dict]) -> list[dict]:
     items = []
@@ -115,12 +129,22 @@ class ResponsesClient:
         return "\n".join(texts).strip()
 
     def _request(self, payload: dict, key: str, *, too_long: str | None = None) -> dict:
-        """One charged round trip: reserve, post, settle, hand back the body."""
-        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        """One charged round trip: reserve, post, settle, hand back the body.
+
+        A body over ``max_input_bytes`` is TRIMMED, never refused (the owner
+        asked on 2026-09-22 — DECISIONS.md API-02): the oldest turns are
+        dropped and the newest request always survives, so a long conversation
+        keeps answering instead of saying "conversation is too long".
+        """
+        encoded = self._fit(payload)
+        if len(encoded) > self.max_input_bytes and too_long is not None:
+            # Only a single picture ends up here: a data URL cannot be
+            # truncated without sending broken bytes, so it is reported.
+            raise CloudUnavailable(too_long)
         if len(encoded) > self.max_input_bytes:
-            raise CloudUnavailable(too_long or
-                                   "Conversation is too long for the configured API allowance."
-                                   " Start a new conversation.")
+            log.warning(
+                "Request body is %d bytes over the configured %d; sending the trimmed body anyway",
+                len(encoded), self.max_input_bytes)
         # Conservative byte estimate plus framing/schema headroom. This is not
         # an exact tokenizer, and an image is charged by the API's own rules, so
         # the reservation stays generous on purpose.
@@ -149,6 +173,69 @@ class ResponsesClient:
         if data.get("status") != "completed":
             raise CloudUnavailable("The model did not finish its response; no partial tool calls were executed.")
         return data
+
+    # --- fitting one request into the owner's ceiling ----------------------
+
+    #: Text fields of an input item that may be shortened as a last resort.
+    _TEXT_KEYS = ("content", "output", "text")
+
+    def _fit(self, payload: dict) -> bytes:
+        """Make ``payload`` fit, in place, and return its encoded bytes."""
+        limit = self.max_input_bytes
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if len(encoded) <= limit:
+            return encoded
+        items = payload.get("input")
+        dropped = 0
+        if isinstance(items, list):
+            while len(items) > 2:
+                self._drop_oldest(items)
+                dropped += 1
+                encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                if len(encoded) <= limit:
+                    break
+        if dropped:
+            log.info("Trimmed %d older input item(s) so the request fits %d bytes",
+                     dropped, limit)
+        if len(encoded) > limit:
+            encoded = self._cap_texts(payload, limit)
+        return encoded
+
+    @staticmethod
+    def _drop_oldest(items: list) -> None:
+        """Forget the oldest turn, keeping function calls paired with results."""
+        victim = items[1]
+        call_id = victim.get("call_id") if isinstance(victim, dict) else None
+        doomed = [1]
+        if call_id is not None:
+            doomed += [index for index, item in enumerate(items)
+                       if index > 1 and isinstance(item, dict) and item.get("call_id") == call_id]
+        for index in sorted(doomed, reverse=True):
+            del items[index]
+
+    def _cap_texts(self, payload: dict, limit: int) -> bytes:
+        """Shorten the text of a body that has no whole turns left to drop."""
+        floor = 512
+        budget = max(floor, limit // 4)
+        while True:
+            self._truncate_texts(payload.get("input"), budget)
+            encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if len(encoded) <= limit or budget <= floor:
+                return encoded
+            budget = max(floor, budget // 2)
+
+    @classmethod
+    def _truncate_texts(cls, node: Any, budget: int) -> None:
+        """Cap every text field of ``node`` at ``budget`` bytes, in place."""
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in cls._TEXT_KEYS and isinstance(value, str):
+                    node[key] = shorten_text(value, budget)
+                elif key != "image_url":
+                    cls._truncate_texts(value, budget)
+        elif isinstance(node, list):
+            for item in node:
+                cls._truncate_texts(item, budget)
 
     def close(self):
         self.http.close()

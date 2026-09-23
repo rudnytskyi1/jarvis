@@ -207,8 +207,16 @@ class LLMConfig(_Strict):
     api_key: str = "ollama"
     #: Budgeted official API reads the key only from this environment variable.
     api_key_env: str = "OPENAI_API_KEY"
-    monthly_budget_usd: float = Field(default=18.0, gt=0, le=20)
-    max_input_bytes: int = Field(default=64000, ge=4096, le=128000)
+    #: Local spending guard for the cloud providers (ТЗ F-403). ``0`` means the
+    #: owner removed the ceiling entirely: usage is still counted and shown, but
+    #: no request is ever refused for spending too much. The owner asked for
+    #: that on 2026-09-22 ("убери все ограничения"); DECISIONS.md API-01.
+    monthly_budget_usd: float = Field(default=18.0, ge=0, allow_inf_nan=False)
+    #: Size of one request body before it goes out. A body over this number is
+    #: TRIMMED (the oldest turns are dropped) instead of refused — the owner
+    #: asked on 2026-09-22 that "conversation is too long" never be spoken
+    #: again. See ``hub.openai_responses.ResponsesClient._fit``.
+    max_input_bytes: int = Field(default=64000, ge=4096, le=8_000_000)
     #: None preserves the legacy Ollama URL. Required separately for cloud chat.
     vision_base_url: str | None = None
     prompt_file: str | None = None

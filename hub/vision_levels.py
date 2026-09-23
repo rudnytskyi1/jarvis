@@ -197,7 +197,11 @@ def build_cloud_vision(cfg: Any, *, ledger_path: Any = None) -> Any:
     from hub.vision_cloud import CloudVision
 
     llm_cfg = getattr(getattr(cfg, "server", None), "llm", None)
-    monthly = float(getattr(llm_cfg, "monthly_budget_usd", 18.0) or 18.0)
+    # 0 is the owner's "no ceiling" and must not become the $18 default here.
+    try:
+        monthly = float(getattr(llm_cfg, "monthly_budget_usd", 18.0))
+    except (TypeError, ValueError):
+        monthly = 18.0
     try:
         client = CloudVision(entry, monthly_budget_usd=monthly, ledger_path=ledger_path)
     except Exception as exc:  # noqa: BLE001 - the hub keeps running without the cloud

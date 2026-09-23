@@ -36,7 +36,12 @@ def test_a_spoken_event_becomes_a_real_event():
     assert event.title == "поход" and event.kind == "trip"
     assert event.created_by == "person-max"
     assert event.home_ids == ["livingroom", "office"]
-    assert event.when("UTC") == "завтра в 10:00"
+    # «завтра» здесь считается от NOW (12:00 UTC 22 сентября), а словами
+    # событие называется по настоящим часам: поздно вечером тот же момент
+    # читается как «сегодня». Проверяем сам момент и время в реплике.
+    assert datetime.fromtimestamp(event.starts_at, tz=ZoneInfo("UTC")) == datetime(
+        2026, 9, 23, 10, 0, tzinfo=ZoneInfo("UTC"))
+    assert event.when("UTC").endswith("в 10:00")
     assert "10" in shared_mod.created_answer(event, language="ru", tz="UTC")
 
 

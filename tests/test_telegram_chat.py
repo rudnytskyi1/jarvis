@@ -10,10 +10,10 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from PIL import Image
 
+from hub import telegram_chat
 from hub.image_generation import ImageStore, decode_image
 from hub.telegram import TelegramError
 from hub.telegram_admin_state import TelegramAdminState
-from hub import telegram_chat
 from hub.telegram_chat import TelegramChat, addressed_text, current_image_request
 from hub.untrusted import strip as strip_untrusted
 

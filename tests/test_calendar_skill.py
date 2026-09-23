@@ -27,9 +27,24 @@ def _local(moment: datetime) -> datetime:
 
 
 def _events(*, offset_hours=3, count=2, all_day=False, prefix="Встреча"):
+    """Events that are still ahead of ``NOW`` **and inside today's local day**.
+
+    A fixed ``now + 3h`` walks over midnight whenever the suite runs late in the
+    Chicago evening (22:30 + 3h is tomorrow), and the skill then honestly
+    answers "nothing today" — the test failed, the product was right. The slots
+    are spread over the remaining local day instead, so "today" always has
+    something to find.
+    """
+    local_now = _local(NOW)
+    end = local_now.replace(hour=23, minute=59, second=0, microsecond=0)
+    span = max(timedelta(minutes=count * 2), end - local_now)
+    step = span / (count + 1)
+    first = local_now + timedelta(hours=offset_hours)
+    if offset_hours < 24 and first + step * (count - 1) >= end:
+        first = local_now + step  # the requested slots walked over midnight
     items = []
     for index in range(count):
-        start = NOW + timedelta(hours=offset_hours + index * 2)
+        start = first + step * index
         local = _local(start).isoformat()
         items.append({"summary": f"{prefix} {index + 1}",
                       "start": {"date": _local(start).date().isoformat()} if all_day
@@ -126,9 +141,13 @@ def test_a_refresh_token_that_google_rejects_is_named_as_such():
 
 def test_reading_names_the_events_in_the_room_clock():
     module = _module()
-    handler = _answering({"calendars": _events()})
+    fixture = _events()
+    handler = _answering({"calendars": fixture})
     result = _run(module, _ctx(handler), what="today")
-    first = _local(NOW + timedelta(hours=3))
+    # The clock in the spoken line is the start of the event that was served,
+    # not "now + 3h": late in the evening the fixture keeps the events inside
+    # the same local day (see _events).
+    first = datetime.fromisoformat(fixture["items"][0]["start"]["dateTime"])
     assert "«Встреча 1»" in result.spoken
     assert f"{first.hour:02d}:{first.minute:02d}" in result.spoken
     assert "Room 14" not in result.spoken  # место в данных, но не в речи
@@ -304,8 +323,9 @@ def test_an_answer_without_an_event_list_is_an_error():
 
 def test_an_event_without_a_start_is_skipped_not_invented():
     module = _module()
+    later_today = _events(count=1)["items"][0]["start"]["dateTime"]
     handler = _answering({"calendars": {"items": [
-        {"summary": "Без времени"}, {"summary": "С временем", "start": {"dateTime": _local(NOW + timedelta(hours=2)).isoformat()}}]}})
+        {"summary": "Без времени"}, {"summary": "С временем", "start": {"dateTime": later_today}}]}})
     result = _run(module, _ctx(handler), what="today")
     assert "Без времени" not in result.spoken and "С временем" in result.spoken
     assert len(result.data["events"]) == 1

@@ -142,14 +142,17 @@ A 1K image uses approximately 1,120 image tokens: **$0.0672 for the image**,
 plus input and thinking. Retrieving, showing and saving the same image are local.
 
 Google and OpenAI requests share `data/api_usage.sqlite3` and the same
-`server.llm.monthly_budget_usd` allowance, currently $18/month. Images do not get
-an additional allowance. Before a call, $0.311296 is reserved conservatively
+`server.llm.monthly_budget_usd` allowance. Images do not get an additional
+allowance. The owner removed the ceiling on 2026-09-22 (DECISIONS.md API-01):
+the profile ships `0`, which counts the spending for the panel and the daily
+digest and never refuses a request. Any positive number puts a monthly limit
+back. Before a call, $0.311296 is reserved conservatively
 (the model's maximum input and the configured 4,096-token output cap at the
 highest output rate). Verified usage reduces the reservation to actual cost;
 missing or incomplete modality data is charged conservatively: output tokens
 without a known modality use the higher image rate. Invalid totals retain the
-full reservation. Near the limit a request may
-be refused even when the likely image cost would fit.
+full reservation. With a limit set, a request near it may be refused even when
+the likely image cost would fit.
 
 There is one image attempt per spoken request, one active image job per server,
 a 120-second timeout and no automatic retries. Cancellations/timeouts retain the

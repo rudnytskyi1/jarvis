@@ -277,10 +277,14 @@ def budget_samples(status: Mapping[str, Any] | None) -> list[Sample]:
         return []
     pairs = (("accounted", status.get("accounted_usd", 0.0)),
              ("settled", status.get("settled_estimate_usd", 0.0)),
-             ("reserved", status.get("reserved_usd", 0.0)),
-             ("limit", status.get("limit_usd", 0.0)))
+             ("reserved", status.get("reserved_usd", 0.0)))
     samples = [Sample(BUDGET_METRIC, "gauge", float(value), (("kind", kind),))
                for kind, value in pairs]
+    # A missing limit means the owner removed the ceiling (DECISIONS.md
+    # API-01); publishing 0.00 would read as "budget nearly used up".
+    limit = status.get("limit_usd")
+    if isinstance(limit, (int, float)):
+        samples.append(Sample(BUDGET_METRIC, "gauge", float(limit), (("kind", "limit"),)))
     samples.append(Sample(BUDGET_PENDING_METRIC, "gauge",
                           float(status.get("unsettled_requests", 0))))
     return samples

@@ -10,11 +10,14 @@ without brain code, API keys, personal settings, recordings or Git history.
 
 **Budgeted OpenAI mode:** see [setup and addressing behavior](docs/OPENAI_SETUP.md).
 It keeps speech, cameras and device execution local, uses a text-only API with
-a persistent $18/month allowance, and requires the wake word for every turn.
+persistent local accounting, and requires the wake word for every turn. The
+monthly allowance is a setting, not a wall: `0` counts the spending without
+ever refusing a request, and an oversized conversation is trimmed instead of
+being answered with "conversation is too long" (DECISIONS.md API-01/API-02).
 The original local-model configuration below remains available.
 
 **Nano Banana 2:** [image creation, photo editing and Gemini key setup](docs/IMAGE_GENERATION.md).
-Requested image edits send the selected photo to Google and share the same $18 allowance.
+Requested image edits send the selected photo to Google and share the same allowance.
 
 **Multiple speakers:** [local diarization setup and limitations](docs/MULTI_SPEAKER.md).
 Community-1 labels turns locally and selects the addressed speaker where possible.

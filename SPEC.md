@@ -653,8 +653,10 @@ cfg.server.diarization.min_identity_s                           # 1.5, range 0.8
 cfg.server.llm.{base_url, model, api_key, temperature, max_tokens, history_turns}
 cfg.server.llm.{provider, think, vision_model, max_tool_rounds} # "ollama_native"|"openai"|"openai_responses", bool, str, int
 cfg.server.llm.api_key_env           # "OPENAI_API_KEY": environment-only key for openai_responses
-cfg.server.llm.monthly_budget_usd    # 18.0, >0 and <=20; local UTC-month SQLite accounting
-cfg.server.llm.max_input_bytes      # 64000, 4096..128000; text request limit before sending
+cfg.server.llm.monthly_budget_usd    # 18.0, >=0 with no upper bound; 0 = no ceiling,
+                                     # local UTC-month SQLite accounting either way
+cfg.server.llm.max_input_bytes      # 64000, 4096..8000000; a larger request is trimmed
+                                    # (oldest turns dropped), not refused
 cfg.server.llm.vision_base_url      # null: legacy uses base_url; cloud defaults vision to local Ollama
 cfg.server.llm.prompt_file          # null: prompts/system.md; cloud profile uses prompts/cloud.md
 cfg.server.llm.verify_actions       # true for legacy; false in budgeted cloud profile

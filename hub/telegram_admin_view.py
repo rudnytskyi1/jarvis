@@ -46,6 +46,9 @@ def status_text(result):
             lines.append(f'Total usage estimate: ${settled:.2f}')
         if isinstance(amount, (int, float)) and isinstance(limit, (int, float)):
             lines.append(f'Budget counted incl. reserves: ${amount:.2f} / ${limit:.2f}')
+        elif isinstance(amount, (int, float)):
+            # The owner removed the monthly ceiling (DECISIONS.md API-01).
+            lines.append(f'Budget counted incl. reserves: ${amount:.2f} / no monthly limit')
         if budget.get('unsettled_requests'):
             lines.append('Unconfirmed reserves include requests with missing usage or interrupted responses.')
     alerts = result.get('notifications') or {}

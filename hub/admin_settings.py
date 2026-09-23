@@ -140,9 +140,9 @@ def apply_live(cfg, key, value, runtime):
         elif key.endswith('.hotwords'):
             stt.hotwords = ', '.join(value)[:1024]
     if key == 'server.llm.monthly_budget_usd':
-        from decimal import Decimal
         llm = runtime.get('llm')
         for target in (getattr(llm, '_responses', None), runtime.get('image_generator')):
             budget = getattr(target, 'budget', None)
             if budget is not None:
-                budget.limit = int(Decimal(str(value)) * 1_000_000)
+                # 0 is the owner's "no monthly ceiling" (DECISIONS.md API-01).
+                budget.set_limit(value)

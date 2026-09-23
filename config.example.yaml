@@ -133,8 +133,8 @@ server:
     model: millard-qwen4:latest           # Qwen3.6-35B-A3B multimodal; tool calling + vision verified
     api_key: ollama
     api_key_env: OPENAI_API_KEY  # openai_responses only; never put the real key in YAML
-    monthly_budget_usd: 18.0    # app allowance, <=20; persisted in data/api_usage.sqlite3
-    max_input_bytes: 64000      # cap cloud context before sending
+    monthly_budget_usd: 18.0    # monthly app allowance; 0 = no ceiling (still counted)
+    max_input_bytes: 64000      # an oversized cloud request is trimmed, never refused
     vision_base_url: null      # separate Ollama URL when chat uses OpenAI
     prompt_file: null          # cloud profile uses prompts/cloud.md
     think: false             # disable Qwen3 reasoning for fast voice replies

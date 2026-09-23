@@ -397,7 +397,7 @@ def test_a_safety_answer_or_words_instead_of_a_picture_are_never_retried(tmp_pat
                  response_image(candidates=[{'finishReason': 'STOP', 'content': {
                      'parts': [{'text': 'I cannot edit this.'}]}}])):
         handler = Mock(return_value=httpx.Response(200, json=data))
-        async def run():
+        async def run(handler=handler):
             client = generator(tmp_path, monkeypatch, handler)
             try:
                 with pytest.raises(CloudUnavailable) as failure:

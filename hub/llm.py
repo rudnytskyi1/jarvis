@@ -724,8 +724,9 @@ class LlmClient:
         if self.provider == PROVIDER_RESPONSES:
             self._responses = ResponsesClient(cfg_llm)
             self._reasoning_may_leak = False
-            log.info("LLM: %s via OpenAI Responses; monthly allowance $%.2f", self.model,
-                     self._responses.budget.limit / 1_000_000)
+            limit = self._responses.budget.limit
+            log.info("LLM: %s via OpenAI Responses; monthly allowance %s", self.model,
+                     "none (counting only)" if limit is None else f"${limit / 1_000_000:.2f}")
         elif self.provider == PROVIDER_OLLAMA_NATIVE:
             self._http = httpx.Client(timeout=REQUEST_TIMEOUT_S)
             log.info(

@@ -14,10 +14,8 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import ast
 import json
-import os
 import platform
 import sys
 import time
@@ -86,10 +84,12 @@ def _config():
 
 @check("client_imports")
 def _imports():
-    from client import main as client_main  # noqa: F401
-    from client.actions import dispatcher  # noqa: F401
-    from client.actions import browser_desktop  # noqa: F401
     from client import camera, screen  # noqa: F401
+    from client import main as client_main  # noqa: F401
+    from client.actions import (
+        browser_desktop,  # noqa: F401
+        dispatcher,  # noqa: F401
+    )
     return "client.main, dispatcher, browser_desktop, camera, screen"
 
 
@@ -135,8 +135,8 @@ def _capture():
 
 @check("yolo_detection")
 def _yolo():
-    from ultralytics import YOLO
     import cv2
+    from ultralytics import YOLO
     model_path = next((name for name in ("yolo11x.pt", "yolo11n.pt") if (ROOT / name).exists()), "")
     if not model_path:
         raise RuntimeError("модель YOLO не найдена")

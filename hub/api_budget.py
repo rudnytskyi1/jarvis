@@ -62,13 +62,16 @@ def microdollars(input_tokens: int, output_tokens: int, model: str = 'gpt-5.4-mi
 
 class ApiBudget:
     def __init__(self, path: Path, monthly_usd: float = 18.0, *, model: str = 'gpt-5.4-mini'):
-        if not 0 < monthly_usd <= 20:
-            raise ValueError("API monthly budget must be greater than zero and at most $20")
+        amount = Decimal(str(monthly_usd))
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("API monthly budget cannot be negative")
         if model not in OPENAI_TEXT_RATES and model not in IMAGE_MODEL_RATES:
             raise ValueError('Model pricing has not been reviewed')
         self.model = model
         self.path = Path(path)
-        self.limit = int(Decimal(str(monthly_usd)) * 1_000_000)
+        #: ``None`` is the owner's "no monthly ceiling" (DECISIONS.md API-01):
+        #: the ledger keeps counting, but nothing is refused for its amount.
+        self.limit: int | None = self._limit_from(monthly_usd)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -85,6 +88,20 @@ class ApiBudget:
             # moment is honestly left out of every day (see hub.digest).
             if 'created_at' not in {row[1] for row in db.execute('PRAGMA table_info(requests)')}:
                 db.execute("ALTER TABLE requests ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _limit_from(monthly_usd: float) -> int | None:
+        """Microdollars for a monthly allowance; ``None`` means no ceiling."""
+        amount = Decimal(str(monthly_usd))
+        if amount == 0:
+            return None
+        return int(amount * 1_000_000)
+
+    def set_limit(self, monthly_usd: float) -> None:
+        """Apply an owner change from the admin panel, including "no ceiling"."""
+        if not Decimal(str(monthly_usd)).is_finite() or Decimal(str(monthly_usd)) < 0:
+            raise ValueError("API monthly budget cannot be negative")
+        self.limit = self._limit_from(monthly_usd)
 
     @contextmanager
     def _connect(self):
@@ -108,7 +125,7 @@ class ApiBudget:
             db.execute("BEGIN IMMEDIATE")
             month = self.month()
             used = db.execute("SELECT COALESCE(SUM(amount), 0) FROM requests WHERE month=?", (month,)).fetchone()[0]
-            if used + amount > self.limit:
+            if self.limit is not None and used + amount > self.limit:
                 raise BudgetExceeded("Monthly API allowance reached; local commands remain available.")
             db.execute("INSERT INTO requests(id, month, amount, model, created_at) VALUES (?, ?, ?, ?, ?)",
                        (request_id, month, amount, self.model, self.now()))
@@ -164,5 +181,6 @@ class ApiBudget:
         # Preserve the conservative total used by the spending guard.
         return {'month': month, 'accounted_usd': (settled + reserved) / 1_000_000,
                 'settled_estimate_usd': settled / 1_000_000, 'reserved_usd': reserved / 1_000_000,
-                'limit_usd': self.limit / 1_000_000, 'unsettled_requests': pending,
+                'limit_usd': None if self.limit is None else self.limit / 1_000_000,
+                'unsettled_requests': pending,
                 'providers': breakdown, 'billing_synced': False}

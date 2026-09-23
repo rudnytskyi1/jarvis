@@ -82,13 +82,76 @@ def test_timeout_no_retry_and_retains_reservation(tmp_path, monkeypatch):
     client.close()
 
 
-def test_budget_and_input_limits_prevent_network(tmp_path, monkeypatch):
+def test_exhausted_budget_still_sends_nothing(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch, lambda r: pytest.fail("must not send"), monthly_budget_usd=0.0001)
     with pytest.raises(CloudUnavailable):
         client.complete([{"role": "user", "content": "hi"}], TOOLS)
-    with pytest.raises(CloudUnavailable, match="too long"):
-        client.complete([{"role": "user", "content": "x" * 65000}], [])
     assert client.budget.status()["accounted_usd"] == 0
+    client.close()
+
+
+def test_a_zero_budget_is_the_owners_no_ceiling(tmp_path, monkeypatch):
+    """DECISIONS.md API-01: 0 counts the spending instead of capping it."""
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=answer(
+            [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]))
+    client = make_client(tmp_path, monkeypatch, handler, monthly_budget_usd=0)
+    assert client.budget.status()["limit_usd"] is None
+    assert client.complete([{"role": "user", "content": "hi"}], TOOLS)[0] == "ok"
+    assert client.budget.status()["accounted_usd"] > 0
+    client.close()
+
+
+def test_a_long_conversation_is_trimmed_instead_of_refused(tmp_path, monkeypatch):
+    """DECISIONS.md API-02: an oversized request drops the oldest turns.
+
+    The owner asked that "conversation is too long for the configured API
+    allowance" never be spoken again: the newest request must survive, and the
+    call must still happen.
+    """
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=answer(
+            [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]))
+    client = make_client(tmp_path, monkeypatch, handler, max_input_bytes=8192)
+    history = [{"role": "system", "content": "s" * 512}]
+    for turn in range(20):
+        history.append({"role": "user", "content": f"turn {turn} " + "u" * 700})
+        history.append({"role": "assistant", "content": f"answer {turn} " + "a" * 700})
+    history.append({"role": "user", "content": "the last thing I asked"})
+    assert client.complete(history, [])[0] == "ok"
+    assert len(sent) == 1
+    kept = sent[0]["input"]
+    assert len(kept) < len(history)
+    assert kept[0]["role"] == "system"
+    assert kept[-1]["content"] == "the last thing I asked"
+    assert any(item.get("content", "").startswith("turn 19") for item in kept)
+    client.close()
+
+
+def test_a_tool_call_keeps_its_result_when_turns_are_dropped(tmp_path, monkeypatch):
+    """Trimming never orphans a function_call_output from its call."""
+    sent = []
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=answer(
+            [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]))
+    client = make_client(tmp_path, monkeypatch, handler, max_input_bytes=8192)
+    history = [{"role": "system", "content": "s" * 256}]
+    for turn in range(12):
+        history.append({"role": "assistant", "content": f"planning {turn} " + "a" * 500,
+                        "tool_calls": [{"id": f"call_{turn}", "type": "function",
+                                        "function": {"name": "pc_control", "arguments": "{}"}}]})
+        history.append({"role": "tool", "tool_call_id": f"call_{turn}", "content": "x" * 500})
+    history.append({"role": "user", "content": "now do it"})
+    assert client.complete(history, [])[0] == "ok"
+    kept = sent[0]["input"]
+    calls = {item["call_id"] for item in kept if item.get("type") == "function_call"}
+    outputs = {item["call_id"] for item in kept if item.get("type") == "function_call_output"}
+    assert calls == outputs
     client.close()
 
 
