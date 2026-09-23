@@ -104,6 +104,41 @@ def test_a_zero_budget_is_the_owners_no_ceiling(tmp_path, monkeypatch):
     client.close()
 
 
+def test_the_transport_follows_the_configured_base_url(tmp_path, monkeypatch):
+    """The owner moved the hub to DeepSeek on 2026-09-22.
+
+    DeepSeek speaks the same Responses API on its own host, so the transport
+    reads ``server.llm.base_url`` (and each level's own) instead of a hard-coded
+    api.openai.com. Verified live against https://api.deepseek.com/v1/responses
+    before this test was written.
+    """
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json=answer(
+            [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]))
+    client = make_client(tmp_path, monkeypatch, handler,
+                         base_url="https://api.deepseek.com/v1")
+    assert client.url == "https://api.deepseek.com/v1/responses"
+    assert client.service == "DeepSeek"
+    assert client.complete([{"role": "user", "content": "hi"}], [])[0] == "ok"
+    assert seen == ["https://api.deepseek.com/v1/responses"]
+    client.close()
+
+
+def test_a_hub_that_names_no_base_url_still_talks_to_openai(tmp_path, monkeypatch):
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json=answer(
+            [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]))
+    client = make_client(tmp_path, monkeypatch, handler)
+    assert client.url == "https://api.openai.com/v1/responses"
+    assert client.service == "OpenAI"
+    client.close()
+    assert seen == []
 def test_a_long_conversation_is_trimmed_instead_of_refused(tmp_path, monkeypatch):
     """DECISIONS.md API-02: an oversized request drops the oldest turns.
 

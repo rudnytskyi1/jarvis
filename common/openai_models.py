@@ -12,6 +12,11 @@ OPENAI_TEXT_RATES = {
     'gpt-5.4-mini': ('0.75', '4.50'),
     'gpt-5.4': ('2.50', '15.00'),
     'gpt-5.6-luna': ('0.20', '1.20'),
+    # DeepSeek's own Responses API (https://api.deepseek.com/v1/responses),
+    # the endpoint the owner's DEEPSEEK_API_KEY belongs to. Rates checked
+    # 2026-09-22 against OpenRouter's model list for deepseek/deepseek-v4.1-flash
+    # ($0.094 / $0.60 per million) - 2x cheaper than gpt-5.6-luna on both sides.
+    'deepseek-flash': ('0.094', '0.60'),
 }
 
 # GPT-5.6 cache writes cost more than ordinary input. Without usage details,

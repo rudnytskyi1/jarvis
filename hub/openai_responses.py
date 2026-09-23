@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -18,6 +19,27 @@ from common.openai_models import OPENAI_TEXT_RATES
 from hub.api_budget import ApiBudget, CloudUnavailable
 
 log = logging.getLogger(__name__)
+
+#: Where the OpenAI-shaped Responses API lives when the config names no base.
+DEFAULT_RESPONSES_BASE = "https://api.openai.com/v1"
+
+
+def responses_url(base_url: str | None) -> str:
+    """The one request URL of this transport, from the configured base URL.
+
+    The owner moved the hub from gpt-5.6-luna to DeepSeek on 2026-09-22, and
+    DeepSeek speaks the same Responses API at its own host
+    (``https://api.deepseek.com/v1/responses``, verified live). The transport
+    therefore follows ``server.llm.base_url`` (and each model level's own
+    ``base_url``) instead of a hard-coded host, so no code change is needed to
+    move a provider again.
+    """
+    base = str(base_url or "").strip() or DEFAULT_RESPONSES_BASE
+    base = base.rstrip("/")
+    if base.endswith("/responses"):
+        return base
+    return base + "/responses"
+
 
 #: Where a shortened text stops being a text and starts being a fragment.
 TRUNCATION_MARKER = "\n[... middle of a very long turn omitted ...]\n"
@@ -59,6 +81,10 @@ class ResponsesClient:
             raise ValueError("Budgeted OpenAI requires reviewed model pricing")
         self.model = cfg.model
         self.key_env = getattr(cfg, "api_key_env", "OPENAI_API_KEY")
+        self.url = responses_url(getattr(cfg, "base_url", ""))
+        #: The name the person hears when this provider cannot be reached. It
+        #: follows the configured host, so a DeepSeek hub does not blame OpenAI.
+        self.service = "DeepSeek" if "deepseek" in urlsplit(self.url).netloc else "OpenAI"
         self.max_output = min(int(cfg.max_tokens), 2048)
         self.max_input_bytes = int(getattr(cfg, "max_input_bytes", 64000))
         self.budget = ApiBudget(ledger_path or Path(__file__).resolve().parents[1] / "data" / "api_usage.sqlite3",
@@ -69,7 +95,8 @@ class ResponsesClient:
     def complete(self, messages: list[dict], tools: list[dict]) -> tuple[str, list[dict]]:
         key = os.environ.get(self.key_env, "").strip()
         if not key:
-            raise CloudUnavailable(f"Set {self.key_env} on the server to enable OpenAI. Local commands still work.")
+            raise CloudUnavailable(f"Set {self.key_env} on the server to enable "
+                                   f"{self.service}. Local commands still work.")
         # strict=False preserves optional arguments in the existing schemas.
         definitions = [{"type": "function", **t["function"], "strict": False} for t in tools]
         payload = {"model": self.model, "input": response_input(messages), "tools": definitions,
@@ -100,7 +127,7 @@ class ResponsesClient:
         """
         key = os.environ.get(self.key_env, "").strip()
         if not key:
-            raise CloudUnavailable(f"Set {self.key_env} on the server to enable OpenAI. "
+            raise CloudUnavailable(f"Set {self.key_env} on the server to enable {self.service}. "
                                    "Local commands still work.")
         if not jpeg:
             raise CloudUnavailable("There is no image to look at.")
@@ -155,14 +182,15 @@ class ResponsesClient:
         except Exception as exc:
             raise CloudUnavailable("API accounting is unavailable; no request was sent.") from exc
         try:
-            response = self.http.post("https://api.openai.com/v1/responses",
+            response = self.http.post(self.url,
                                       headers={"Authorization": f"Bearer {key}"}, json=payload)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
             # Keep the reservation even on timeout/disconnect: billing is unknown.
             log.warning("OpenAI request failed (%s); reservation retained", type(exc).__name__)
-            raise CloudUnavailable("OpenAI is unavailable. I couldn't finish this request.") from exc
+            raise CloudUnavailable(f"{self.service} is unavailable. "
+                                   "I couldn't finish this request.") from exc
         usage = data.get("usage") or {}
         try:
             self.budget.settle(reservation, usage["input_tokens"], usage["output_tokens"],

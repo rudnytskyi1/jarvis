@@ -267,6 +267,11 @@ class LLMConfig(_Strict):
         if self.provider == "openai_responses":
             if self.model not in OPENAI_TEXT_RATES:
                 raise ValueError("openai_responses requires a model with reviewed pricing: " + ', '.join(OPENAI_TEXT_RATES))
+            # The Ollama default is meaningless for a cloud transport: a config
+            # that names no base_url talks to OpenAI, exactly as before DeepSeek
+            # became an option (hub.openai_responses.responses_url).
+            if "11434" in self.base_url:
+                self.base_url = "https://api.openai.com/v1"
             if self.max_tokens > 2048:
                 raise ValueError("openai_responses max_tokens must not exceed 2048")
             if not self.api_key_env.strip():
