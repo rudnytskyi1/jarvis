@@ -895,17 +895,21 @@ class StageTimeouts(_Strict):
     #: False restores the pre-degradation behaviour: only the GPU-queue
     #: timeouts and ``server.diarization.timeout_s`` fire.
     enabled: bool = True
+    #: ``0`` у любого из бюджетов значит «предела нет» (владелец, 2026-09-23,
+    #: «никаких лимитов»): стадия получает суточный запас вместо счётчика
+    #: (`hub.app.UNBOUNDED_BUDGET_S`), а не мгновенный отказ.
     #: VAD end → final transcript (without diarization).
-    stt_ms: int = Field(default=700, ge=50, le=600000)
+    stt_ms: int = Field(default=700, ge=0, le=600000)
     #: The same deadline for the diarized path; overrunning it costs the
     #: speaker labels, not the transcript.
-    diarization_ms: int = Field(default=700, ge=50, le=600000)
+    diarization_ms: int = Field(default=700, ge=0, le=600000)
     #: Voice identification (the ReID step of a turn).
-    speaker_ms: int = Field(default=700, ge=50, le=600000)
-    #: The whole model round. This is a stuck-generation guard, not the
-    #: end-to-end latency budget: it is deliberately far above 15.1's 1.2 s so
-    #: a slow-but-working model is never cut off.
-    reply_ms: int = Field(default=20000, ge=1000, le=600000)
+    speaker_ms: int = Field(default=700, ge=0, le=600000)
+    #: The whole model round, tool calls included. This is a stuck-generation
+    #: guard, not the end-to-end latency budget: it is deliberately far above
+    #: 15.1's 1.2 s so a slow-but-working model is never cut off. ``0`` снимает
+    #: и его — владелец взял это себе выбором ``server.timeouts.reply_ms: 0``.
+    reply_ms: int = Field(default=20000, ge=0, le=600000)
 
 
 class JevProviderConfig(_Strict):

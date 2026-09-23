@@ -70,8 +70,9 @@
   «quiet please» модель читает как «замолчи», а не как `mute`. Тесты:
   `tests/audit/test_request_matrix.py` (матрица + вердикт стенда),
   `tests/test_web_page_guard.py` (промпт и защита хаба говорят одно и то же);
-  `pytest tests -q` → 60 failed только в чужом `tests/test_guess_who.py`,
-  `ruff check .` → All checks passed, `mypy common` → Success.
+  `pytest tests -q` → 9366 passed, 15 failed и все 15 — чужой
+  `tests/test_guess_who.py` (незавершённая чужая фича, в зачёт не идёт);
+  `ruff check .` → All checks passed; `mypy common` → Success.
 - [ ] **AU-03 — зрение: «кто в комнате», «что на экране».** Живой прогон
   `--family vision`; цель — Jev выбирает семейство `vision` и модель зовёт
   `look_at_camera`/`look_at_screen` первым вызовом. Проверять и `offered`.
@@ -121,3 +122,10 @@
   `ruff check .` → All checks passed; `mypy common` → Success. Обоснование —
   `DECISIONS.md`, «Лимит шагов computer_use снят». **Чего нет:** живого прогона
   длиннее пятнадцати шагов (появится после перезапуска хаба).
+- [x] **AU-15 — бюджет времени хода снят (CU-LIMIT-02).** Владелец: «никаких
+  лимитов». `server.timeouts.reply_ms` накрывал весь раунд модели вместе с
+  инструментами (20 с по умолчанию) — длинная задача обрывалась словами «не
+  успел придумать ответ». Проверено: `0` в бюджете = без предела
+  (`hub.app.UNBOUNDED_BUDGET_S` = 86400 с), `pytest tests/test_stage_timeouts.py
+  -q` → 17 passed; `Config.model_validate(config.openai.yaml)` → `reply_ms 0`.
+  Обоснование — `DECISIONS.md`, «CU-LIMIT-02».

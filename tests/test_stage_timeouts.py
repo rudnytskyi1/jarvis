@@ -69,6 +69,25 @@ def test_the_budget_and_the_fallback_are_both_available():
     assert off._stage_budget("stt_ms", 45.0) == 45.0
 
 
+def test_a_zero_budget_is_no_limit_not_an_instant_refusal():
+    """Владелец 2026-09-23: «никаких лимитов» — ``0`` снимает бюджет стадии."""
+    assert StageTimeouts(reply_ms=0).reply_ms == 0      # конфиг принимает 0
+    conn = _connection(_config(reply_ms=0, stt_ms=0))
+    budget = conn._stage_budget("reply_ms", 120.0)
+    assert budget == hub_app.UNBOUNDED_BUDGET_S
+    # Не бесконечность: у зависшей генерации остаётся суточный предохранитель,
+    # иначе очередь GPU не вернулась бы никогда.
+    assert 3600.0 <= budget < float("inf")
+    assert conn._stage_budget("stt_ms", 45.0) == hub_app.UNBOUNDED_BUDGET_S
+    # Ноль не превращается в мгновенный отказ, как было до этой правки.
+    assert conn._stage_budget("reply_ms", 120.0) != 0.05
+
+
+def test_the_owner_can_still_set_a_budget_when_he_wants_one():
+    conn = _connection(_config(reply_ms=90000))
+    assert conn._stage_budget("reply_ms", 120.0) == 90.0
+
+
 # --- diarization: a slow diarizer costs the labels, not the answer ----------
 
 

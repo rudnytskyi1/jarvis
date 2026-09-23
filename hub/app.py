@@ -382,6 +382,11 @@ VERIFY_TIMEOUT_S = 60.0
 #: Legacy ceiling on one model round. ``server.timeouts.reply_ms`` (ТЗ 4.5/15.1)
 #: is the budget that applies; this is the fallback when those are switched off.
 REPLY_TIMEOUT_S = 120.0
+#: Владелец 2026-09-23: «никаких лимитов». Бюджет стадии ``0`` в конфиге
+#: значит «предела нет» и превращается в этот запас, а не в бесконечность: у
+#: зависшей генерации всё-таки должен остаться предохранитель, иначе очередь
+#: GPU не вернётся никогда. Сутки заведомо больше любой настоящей задачи.
+UNBOUNDED_BUDGET_S = 24 * 3600.0
 #: Said when the model round had to be abandoned: a late answer is worth less
 #: than a spoken one, and silence is worth nothing (ТЗ 4.5, 15.1).
 DEGRADED_REPLY_TEXT = (
@@ -6661,7 +6666,12 @@ class Connection(CameraClipReceiver):
                       extra={'utterance_id': self.utterance_id})
 
     def _stage_budget(self, name: str, fallback_s: float) -> float:
-        """Seconds allowed for one pipeline stage (``server.timeouts``, ТЗ 15.1)."""
+        """Seconds allowed for one pipeline stage (``server.timeouts``, ТЗ 15.1).
+
+        ``0`` в конфиге — это «предела нет» (решение владельца 2026-09-23
+        «никаких лимитов»): стадия получает ``UNBOUNDED_BUDGET_S``. Раньше
+        ноль превращался в 0.05 с, то есть в мгновенный отказ — теперь нет.
+        """
         timeouts = getattr(self.cfg.server, 'timeouts', None)
         if timeouts is None or not getattr(timeouts, 'enabled', True):
             return float(fallback_s)
@@ -6669,6 +6679,8 @@ class Connection(CameraClipReceiver):
             milliseconds = int(getattr(timeouts, name))
         except (AttributeError, TypeError, ValueError):
             return float(fallback_s)
+        if milliseconds <= 0:
+            return UNBOUNDED_BUDGET_S
         return max(0.05, milliseconds / 1000.0)
 
     def _degrade(self, stage: str, reason: str) -> None:
