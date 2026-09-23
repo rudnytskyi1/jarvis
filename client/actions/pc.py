@@ -32,6 +32,7 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from ctypes import wintypes
+from pathlib import Path
 from typing import Any, NamedTuple
 
 from .apps import (
@@ -1069,6 +1070,67 @@ def _sync_scroll(notches: int) -> None:
         time.sleep(0.01)
 
 
+#: ``GetAncestor(..., GA_ROOT)``: the top-level frame a child window belongs to.
+_GA_ROOT = 2
+
+
+def _window_under_cursor() -> _WindowInfo | None:
+    """The top-level window the mouse wheel would turn right now."""
+    _require_windows()
+    user32 = _user32()
+    user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
+    user32.GetCursorPos.restype = wintypes.BOOL
+    point = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return None
+    user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+    user32.WindowFromPoint.restype = wintypes.HWND
+    hwnd = int(user32.WindowFromPoint(point) or 0)
+    if not hwnd:
+        return None
+    user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+    user32.GetAncestor.restype = wintypes.HWND
+    root = int(user32.GetAncestor(hwnd, _GA_ROOT) or hwnd)
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+    return _WindowInfo(hwnd=root, pid=int(pid.value), title=_window_title(root))
+
+
+def _window_browser(window: _WindowInfo | None) -> str:
+    """The browser name when the window belongs to a browser, else ``''``."""
+    if window is None or not window.pid:
+        return ""
+    try:
+        from .app_control import BROWSERS, process_path
+
+        image = Path(process_path(window.pid)).name.casefold()
+    except Exception as exc:  # noqa: BLE001 - naming the window must never fail the scroll
+        log.debug("could not name the process of window %s: %s", window.hwnd, exc)
+        return ""
+    return BROWSERS.get(image, ("", ()))[0]
+
+
+def _scroll_detail(label: str, window: _WindowInfo | None, browser: str = "") -> str:
+    """What was scrolled — and, over a browser, which tool can prove it.
+
+    The wheel goes to whatever window is under the cursor, so pc_control cannot
+    promise that a *page* moved: it used to answer a bare "scrolled down" even
+    when the cursor sat over something else entirely (live bench VE-10, 22.09,
+    where the room heard "Scrolled down." about a page nothing had touched).
+    Naming the window keeps the answer true, and over a browser it points at the
+    tool that focuses the page and reports the page it left.
+    """
+    title = (window.title if window is not None else "").strip()
+    if not title:
+        return (f"scrolled {label} at the cursor, but no window was under it — "
+                "nothing can be confirmed as moved")
+    if browser:
+        return (f"scrolled {label} over {title!r}, which is {browser}: scrolling a web "
+                "page is browser_control scroll, the tool that focuses the page and "
+                "proves the page really moved")
+    return f"scrolled {label} in {title!r}"
+
+
 def _sync_hotkey(modifiers: Sequence[int], keys: Sequence[tuple[int, bool]]) -> None:
     """Press modifiers, then the keys, and release everything in reverse order."""
 
@@ -1652,6 +1714,25 @@ def _parse_volume_value(value: Any) -> int:
     return max(0, min(100, int(round(number))))
 
 
+def _app_argument(value: Any, target: Any) -> Any:
+    """The application name for the app commands: ``value`` first, else ``target``.
+
+    The hub's schema keeps two name slots — ``value`` for open/close/minimize/
+    maximize/focus_app and ``target`` for move_to_monitor/app_volume — and the
+    model really does send ``{'command': 'focus_app', 'target': 'chrome'}``
+    (live bench VE-09, 22.09). Both slots are this PC's own vocabulary, so the
+    name is taken from either one instead of answering "no application name
+    given (value)" about a name the model just said. The hub does the same
+    normalisation before it forwards the call (``hub/tools.py``).
+    """
+    if value is not None and str(value).strip():
+        return value
+    if target is None or not str(target).strip():
+        return value
+    log.info("pc_control: the application name arrived in 'target' — using it")
+    return target
+
+
 class PCController:
     """Executes ``pc_control`` commands and ``run_command`` on the client machine."""
 
@@ -1803,19 +1884,19 @@ class PCController:
             return await self._scroll(value)
 
         if name == CMD_OPEN_APP:
-            return await self._open_app(value)
+            return await self._open_app(_app_argument(value, target))
 
         if name == CMD_MINIMIZE_APP:
-            return await self.minimize_app(value)
+            return await self.minimize_app(_app_argument(value, target))
 
         if name == CMD_FOCUS_APP:
-            return await self.focus_app(value)
+            return await self.focus_app(_app_argument(value, target))
 
         if name == CMD_MAXIMIZE_APP:
-            return await self.maximize_app(value)
+            return await self.maximize_app(_app_argument(value, target))
 
         # CMD_CLOSE_APP
-        return await self._close_app(value)
+        return await self._close_app(_app_argument(value, target))
 
     # -- run_command --------------------------------------------------------
 
@@ -1985,9 +2066,12 @@ class PCController:
     async def _scroll(self, value: Any) -> PCResult:
         """Turn the mouse wheel over whatever window is under the cursor."""
         notches, label = parse_scroll(value)
+        window = await asyncio.to_thread(_window_under_cursor)
         await asyncio.to_thread(_sync_scroll, notches)
-        log.info("pc_control: scrolled %s", label)
-        return PCResult(f"scrolled {label}")
+        browser = await asyncio.to_thread(_window_browser, window)
+        log.info("pc_control: scrolled %s over %r%s", label,
+                 window.title if window is not None else "", f" ({browser})" if browser else "")
+        return PCResult(_scroll_detail(label, window, browser))
 
     async def _resolve_window_app(self, value: Any) -> AppEntry:
         """Window operations resolve the running browser, not Start-menu aliases."""

@@ -27,14 +27,24 @@ Set-Location $repo
 $python = "C:\Users\Anton\anaconda3\envs\jarvis\python.exe"
 $report = Join-Path $repo "data\live-eval\last.json"
 $log = Join-Path $repo "loop-eval.log"
-$actions = if ($NoActions) { @() } else { @("--actions") }
+
+# ВАЖНО: аргументы собираются в типизированный массив и раскрываются через
+# @pyArgs. Со splat-ом обычного массива строк Windows PowerShell 5.1 при
+# запуске через -File разбирает "--actions" на отдельные символы, и
+# live-eval.py падает с "unrecognized arguments: - - a c t i o n s".
+$pyArgs = [string[]]@((Join-Path $repo "scripts\live-eval.py"))
+if (-not $NoActions) { $pyArgs += "--actions" }
+$pyArgs += @("--json", $report)
 
 for ($i = 1; $i -le $Rounds; $i++) {
     "=== eval run $i : $(Get-Date) ===" | Out-File -FilePath $log -Append -Encoding utf8
 
     # 1. Настоящий прогон на живом ПК: настоящая модель, настоящие инструменты.
-    & $python (Join-Path $repo "scripts\live-eval.py") @actions --json $report *>> $log
+    Write-Host "круг $i : прогоняю живой стенд на этом ПК..." -ForegroundColor Cyan
+    $block = @()
+    & $python @pyArgs 2>&1 | Tee-Object -Variable block
     $failed = $LASTEXITCODE
+    $block | Out-File -FilePath $log -Append -Encoding utf8
     "live-eval.py exit code: $failed" | Out-File -FilePath $log -Append -Encoding utf8
 
     if ($failed -eq 0) {
@@ -65,7 +75,11 @@ for ($i = 1; $i -le $Rounds; $i++) {
 Не отчитывайся вопросами: при неоднозначности выбери вариант, который делает
 живого ассистента честнее, и запиши выбор в DECISIONS.md.
 '@
-    codex exec --sandbox workspace-write --color never --model $Model $prompt *>> $log
+    Write-Host "круг $i : Codex ($Model) правит причину падения..." -ForegroundColor Cyan
+    $block = @()
+    codex exec --sandbox workspace-write --color never --model $Model $prompt 2>&1 |
+        Tee-Object -Variable block
+    $block | Out-File -FilePath $log -Append -Encoding utf8
 
     if (-not $NoCommit) {
         # hub/guess_who.py - чужая незаконченная задача (P5-21), не коммитим.

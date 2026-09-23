@@ -233,3 +233,66 @@ def test_pasting_what_is_already_there_is_one_keystroke(monkeypatch):
     monkeypatch.setattr(pc_mod, "_sync_clipboard_paste", lambda: order.append("paste"))
     asyncio.run(controller.execute("clipboard_paste"))
     assert order == ["paste"]
+
+
+# --- имя приложения из target (VE-09/VE-12, живой стенд 22.09) --------------
+
+
+def test_focus_app_takes_the_name_from_target(monkeypatch):
+    """The model sent ``{'command': 'focus_app', 'target': 'chrome'}`` and the
+    PC answered "no application name given (value)" about a name it had been
+    given. Both name slots are the PC's own vocabulary, so either one counts.
+    """
+    controller = _controller(monkeypatch)
+    asked: list[str] = []
+
+    async def resolve(name):
+        asked.append(name)
+        return SimpleNamespace(name=f"{name} app", process_name=lambda: f"{name}.exe")
+
+    monkeypatch.setattr(controller, "_resolve_app", resolve)
+    monkeypatch.setattr(pc_mod, "_sync_focus_app", lambda image, display: "Chrome")
+
+    result = asyncio.run(controller.execute("focus_app", None, "chrome"))
+
+    assert asked == ["chrome"]
+    assert "chrome" in result.detail
+
+
+def test_open_app_takes_the_name_from_target(monkeypatch):
+    controller = _controller(monkeypatch)
+    launched: list[str] = []
+
+    async def resolve(name):
+        return SimpleNamespace(
+            name=f"{name} app",
+            process_name=lambda: f"{name}.exe",
+            launch=lambda: launched.append(name) or f"{name}.exe",
+        )
+
+    monkeypatch.setattr(controller, "_resolve_app", resolve)
+
+    result = asyncio.run(controller.execute("open_app", None, "calculator"))
+
+    assert launched == ["calculator"]
+    assert "open" in result.detail.casefold()
+
+
+def test_an_app_command_with_no_name_anywhere_still_fails(monkeypatch):
+    controller = _controller(monkeypatch)
+    with pytest.raises(PCActionError):
+        asyncio.run(controller.execute("focus_app", None, None))
+
+
+def test_app_volume_still_reads_its_level_from_value_and_its_app_from_target(monkeypatch):
+    """``target`` is the application *and nothing else* for app_volume: the
+    normalisation must never turn its level into an application name.
+    """
+    controller = _controller(monkeypatch)
+    seen: list[tuple[str, float]] = []
+    monkeypatch.setattr(pc_mod, "_sync_app_volume",
+                        lambda process, level: seen.append((process, level)) or level)
+
+    asyncio.run(controller.execute("app_volume", 40, "spotify"))
+
+    assert seen == [("spotify.exe", 0.4)]

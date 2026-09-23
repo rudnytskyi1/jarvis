@@ -208,6 +208,7 @@ from hub.tools import (
     action_item,
     mouse_click_args,
     normalize_click_button,
+    normalize_pc_control_args,
 )
 from hub.training_archive import TrainingArchive
 from hub.tts import TtsCache, TtsEngine, split_text
@@ -9044,6 +9045,12 @@ class Connection(CameraClipReceiver):
             return {'ok': True, 'person': owner, 'exchanges': rows}
         args = dict(args)
         purpose = ' '.join(str(args.pop('purpose', '') or '').split())[:160]
+        # The model sometimes puts the application name in ``target`` (the slot
+        # the same schema uses for move_to_monitor/app_volume). The client and
+        # the app-choice flow below only read ``value``, so a name in the other
+        # slot used to vanish and the room heard a bogus "application rejected".
+        if name == 'pc_control':
+            args = normalize_pc_control_args(args)
         denial = await self._permission_check(name, args)
         if denial is not None:
             log.info(

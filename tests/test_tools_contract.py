@@ -8,6 +8,7 @@ from hub.tools import (
     is_client_tool,
     mouse_click_args,
     normalize_click_button,
+    normalize_pc_control_args,
 )
 
 
@@ -23,6 +24,47 @@ def test_browser_controls_existing_profile_and_atomic_search_contract():
     assert tool['parameters']['required'] == ['command']  # Enter may use the focused field.
     assert 'ordinary' in tool['description']
     assert 'Uses a separate persistent profile' not in tool['description']
+
+
+def test_page_scrolling_is_browser_controls_job_not_the_pcs():
+    """VE-10 (живой стенд 22.09): a bare "scroll down" is a page, not a key.
+
+    pc_control used to advertise "use scroll to move a page ... whenever the
+    user asks to see more, to go further down", which sent the request to the
+    mouse wheel over an unknown window while the page was never touched. The
+    contract now names browser_control for pages and keeps pc_control scroll
+    for app windows that have no page in them.
+    """
+    pc = next(t['function'] for t in TOOLS if t['function']['name'] == 'pc_control')
+    browser = next(t['function'] for t in TOOLS if t['function']['name'] == 'browser_control')
+
+    assert 'browser_control scroll' in pc['description']
+    assert 'Scroll whenever the user asks to see more' not in pc['description']
+    assert 'a web page' in pc['description'].casefold()
+    # The browser tool claims the bare request, even when no browser is named.
+    assert '"scroll down"' in browser['description']
+
+
+def test_pc_control_takes_the_application_name_from_either_slot():
+    """The model sends ``open_app``/``focus_app`` with the name in ``target``.
+
+    The client and the app-choice flow read ``value`` only, so such a call used
+    to reach the PC as "no application name given" (live bench VE-03/VE-09/
+    VE-12). The name is moved to ``value`` before the call is forwarded.
+    """
+    assert normalize_pc_control_args({"command": "open_app", "target": "chrome"}) == {
+        "command": "open_app", "value": "chrome"}
+    assert normalize_pc_control_args({"command": "focus_app", "value": " chrome "}) == {
+        "command": "focus_app", "value": " chrome "}
+    assert normalize_pc_control_args({"command": "open_app"}) == {"command": "open_app"}
+    # app_volume/app_volume-like commands keep their own meaning of both slots.
+    level = {"command": "app_volume", "value": 40, "target": "spotify"}
+    assert normalize_pc_control_args(level) == level
+    monitor = {"command": "move_to_monitor", "value": 2, "target": "chrome"}
+    assert normalize_pc_control_args(monitor) == monitor
+    # A non-app command is never touched, even if target looks like a name.
+    other = {"command": "type_text", "value": "hello", "target": "notepad"}
+    assert normalize_pc_control_args(other) == other
 
 
 def test_every_tool_exposed():
