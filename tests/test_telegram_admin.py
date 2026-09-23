@@ -423,13 +423,14 @@ def test_all_computers_remain_reachable_and_refresh_updates_online_state(tmp_pat
 def test_panel_status_and_rule_use_readable_text_without_json(tmp_path):
     async def run():
         admin, provider, _, _, _ = setup(tmp_path)
+        usage = dict(accounted_usd=2.5, settled_estimate_usd=1.5, reserved_usd=1, limit_usd=18,
+                     unsettled_requests=2, providers=[dict(provider='OpenAI', settled_estimate_usd=1.5,
+                                                          reserved_usd=1, unsettled_requests=2)])
         async def service(action, payload, actor):
             if action == 'status':
                 return dict(ok=True, profiles=5, llm_model='test-model', permissions_enabled=False,
                     workplaces=[dict(name='Living room', connected=True)],
-                    api_usage=dict(accounted_usd=2.5, settled_estimate_usd=1.5, reserved_usd=1, limit_usd=18,
-                        unsettled_requests=2, providers=[dict(provider='OpenAI', settled_estimate_usd=1.5,
-                            reserved_usd=1, unsettled_requests=2)]), notifications=dict(running=True, pending=0))
+                    api_usage=dict(usage), notifications=dict(running=True, pending=0))
             return dict(ok=True, items=[])
         admin.backend = service
         await admin.handle_update(message('/tools', chat=OWNER))
@@ -440,6 +441,12 @@ def test_panel_status_and_rule_use_readable_text_without_json(tmp_path):
         assert 'not provider billing' in text and '$2.50 used' not in text
         assert 'Living room' in text and 'Computers online: 1' in text
         assert not any(character in text for character in '{}[]')
+        # DECISIONS.md API-01: with the ceiling removed the panel says so
+        # instead of printing a made-up "$2.50 / 0.00".
+        usage['limit_usd'] = None
+        await admin.handle_update(message('/tools', chat=OWNER))
+        await admin.handle_update(callback(provider, button(provider, 'Status'), chat=OWNER))
+        assert 'Budget counted incl. reserves: $2.50 / no monthly limit' in provider.latest['text']
         await admin.handle_update(message('/tools', chat=OWNER))
         await admin.handle_update(callback(provider, button(provider, 'Notifications'), chat=OWNER))
         await admin.handle_update(callback(provider, button(provider, 'New rule'), chat=OWNER))
