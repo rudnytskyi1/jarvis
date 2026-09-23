@@ -19,6 +19,7 @@ from urllib import error, request
 from PIL import Image
 
 from common.config import TelegramConfig
+from hub.video_transcode import is_stream_ready
 
 MAX_TEXT_LENGTH = 4096
 MAX_CAPTION_LENGTH = 1024
@@ -364,6 +365,13 @@ class TelegramProvider:
         payload = self._reply({'chat_id': destination}, reply_to_message_id)
         if caption:
             payload['caption'] = caption
+        # Владелец 2026-09-23: «опять видео в телеге на мобилке не грузятся».
+        # Телефон играет клип сразу, только если метаданные стоят перед данными
+        # (``moov`` перед ``mdat``): тогда и говорим Telegram, что поток
+        # поддерживается. Обещать это для клипа с ``moov`` в конце нельзя —
+        # приложение скажет «не удалось воспроизвести».
+        if is_stream_ready(data):
+            payload['supports_streaming'] = True
         result = await self._call('sendVideo', payload, TelegramUpload('video', safe_name, mime, data))
         return self._sent(result, 'video', destination=destination)
 

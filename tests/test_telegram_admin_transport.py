@@ -24,6 +24,13 @@ def mp4():
     return box(b'ftyp', b'isom\0\0\0\0isommp42') + box(b'moov', b'header') + box(b'mdat', b'frames')
 
 
+def mp4_metadata_last():
+    """Клип, как его пишет PyAV: ``moov`` в конце, поток обещать нельзя."""
+    def box(kind, body):
+        return (len(body) + 8).to_bytes(4, 'big') + kind + body
+    return box(b'ftyp', b'isom\0\0\0\0isommp42') + box(b'mdat', b'frames') + box(b'moov', b'header')
+
+
 def test_send_keyboard_and_fixed_edit_use_exact_route_and_message():
     async def run():
         transport = Transport()
@@ -109,6 +116,19 @@ def test_malformed_video_has_no_network_effect(data):
     with pytest.raises(TelegramError):
         asyncio.run(TelegramProvider(cfg(), transport=transport).send_video(data))
     assert not transport.calls
+
+
+def test_only_a_clip_with_the_metadata_in_front_claims_streaming():
+    """Владелец 2026-09-23: «опять видео в телеге на мобилке не грузятся»."""
+    async def run():
+        transport = Transport()
+        provider = TelegramProvider(cfg(), transport=transport)
+        await provider.send_video(mp4())              # moov перед mdat, +faststart
+        assert transport.calls[0][1]['supports_streaming'] is True
+        await provider.send_video(mp4_metadata_last())  # как пишет PyAV
+        assert 'supports_streaming' not in transport.calls[1][1], \
+            'обещать поток для клипа с moov в конце нельзя'
+    asyncio.run(run())
 
 
 def test_markup_copy_is_detached_from_caller():

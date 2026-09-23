@@ -3833,3 +3833,1324 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   `docs/TZ_STATUS.md`, `DECISIONS.md`, `PROGRESS_AUDIT.md`. Артефакты прогона
   (`data/audit/scenarios.jsonl`, `data/audit/runs/mass-07…mass-12*.jsonl`,
   логи) в git не входят — это локальные данные аудита.
+
+## Массовый аудит, четвёртый заход: люди (AUDIT-10, 2026-09-23)
+
+- **AUDIT-10 — в стенде не было реестра людей, поэтому «люди» падали за хаб.**
+  Живой прогон `--family people` (`data/audit/runs/mass-13-people-before.jsonl`)
+  дал 39 из 81 (48.1 %), и почти все провалы начинались одинаково: модель
+  звала `list_people`, чтобы узнать, кого она знает, и получала
+  «speaker recognition is disabled». Причина не в модели: стенд публикует
+  движки хаба через модульные глобальные (`hub_app._vision`, `_memory`, `_tts`),
+  а `_voices` не создавал вовсе, поэтому `list_people`, `set_role`,
+  `rename_person` и `enroll_voice` в стенде всегда отвечали отказом
+  (`VoiceRegistry` is None). В живой комнате реестр есть
+  (`config.openai.yaml`: `server.speaker.enabled: true`), и те же просьбы
+  работают. Выбран вариант: стенд собирает такой же реестр на каждого воркера
+  (`scripts/live-eval.py::Bench._open_people_registry`) и наполняет его
+  фикстурами через собственный админский путь хаба
+  (`VoiceRegistry.admin_profile`), а не правкой файла руками. Обоснование:
+  «сделай Джона админом» — просьба о человеке, которого комната знает; на
+  пустом реестре верный ход модели («нет такого профиля») выглядел бы
+  провалом. Реестр стенда лежит в `data/live-eval/people/…`, данные владельца
+  не трогаются (TEST-DB-01). Ссылка: `tests/audit/test_request_matrix.py::
+  test_the_bench_room_knows_the_people_the_corpus_names`.
+- **AUDIT-10b — один реестр на все сценарии решал ответ за следующий
+  сценарий.** После AUDIT-10 осталось 74 из 81, и в отчёте было видно, почему:
+  «make John an admin» получал «он уже админ» (его повысил другой сценарий
+  того же прогона), а «change the name of John to Maximus» — «нет никого с
+  именем John, зато есть Maximus» (его переименовал другой сценарий). Это не
+  поведение комнаты, а состояние стенда. Выбран вариант: каждый сценарий
+  начинается в одной и той же комнате — шаблон фикстур пишется один раз на
+  воркера (`fixtures.json`) и копируется перед каждым сценарием
+  (`Bench._reset_people`). Обоснование: сценарии корпуса независимы, и
+  «не выдумывать числа» требует, чтобы приговор не зависел от того, что
+  успел сделать сосед. Ссылка: `scripts/live-eval.py`.
+- **AUDIT-10c — чужая комната видна через модульный глобал.** Ещё один источник
+  ошибки: `hub.app` держит ОДИН реестр в модульной глобальной, а стенд гоняет
+  несколько комнат в одном процессе: пока один воркер отвечал, другой
+  подменял `hub_app._voices`, и «make Theodric an admin» читал список людей
+  чужой комнаты (в отчёте — `Maximus` и чужой админ). Выбран вариант:
+  глобальная `hub_app._voices` в стенде — это `_RoomRegistries`, который
+  отвечает реестром той задачи, которая спрашивает (`asyncio.current_task`),
+  а каждый воркер привязывает свой реестр. Каждый реальный вызов по-прежнему
+  идёт в настоящий `VoiceRegistry` — выбирается только чей. Обоснование:
+  изоляция нужна стенду, а не продукту: в живом хабе дом один, и менять
+  `hub/app.py` ради аудита нельзя. Ссылка: `scripts/live-eval.py`.
+- **AUDIT-10d — запись по имени: инструмент, а не отказ за него.** Вторая
+  половина провалов была речью модели: «I want you to save this person as
+  John» → «I can't save a name for somebody like that…», «this is Max,
+  memorize his face» → «face enrollment only runs for the person standing in
+  front of the camera asking for it themselves», «Can you please enroll the
+  voice of John?» → «I can't enroll John's voice for him», «make John an
+  admin» → «only an admin can change roles, who's speaking?». ТЗ F-210 прямо
+  описывает обратное: владелец говорит «это Макс, друг», и Rowan записывает
+  гостя (голос, лицо, роль guest). Выбран вариант: промпт комнаты
+  (`prompts/system.md`, «Remembering somebody the speaker names») и описания
+  `enroll_face`/`enroll_voice`/`set_role` говорят, что инструмент И ЕСТЬ
+  запись, что «this person/this face» — тот, кто перед камерой, что имя
+  берётся слово в слово («my roommate» — тоже имя, отказывает только
+  инструмент и только на Guest/User/Friend), и что роль меняет система, а не
+  модель. Обоснование: инструкция модели и договор инструментов обязаны
+  говорить одно и то же — как в AUDIT-08 для сайтов. Ссылка:
+  `tests/audit/test_request_matrix.py::
+  test_the_prompt_sends_a_named_person_to_the_enrolment_tool`.
+- **AUDIT-10e — стенд посылал голую фразу, а комната посылает префикс.** Третья
+  часть: живой ход отдаёт модели `[at … | speaker: Anton | role: admin]
+  <реплика>` (ТЗ F-412, `hub/speaker_context.py`), а стенд посылал только
+  системный промпт и саму фразу. Поэтому модель спрашивала «кто говорит?» на
+  просьбах, которым нужен админ, и не могла сверить «your exam» с человеком.
+  Выбран вариант: стенд собирает префикс тем же живым вызовом
+  `Connection._turn_prefix` (fail-open: не собрался — посылается голая фраза,
+  как раньше), а Jev по-прежнему читает голую реплику — ровно как в
+  `hub/app.py`. Обоснование: аудит измеряет ту цепочку, что стоит в комнате;
+  своя копия префикса разошлась бы с `speaker_context.py`. Задача AU-06 станет
+  короче: останется снять `bench_skip` с устройств и скиллов и прогнать их.
+  Ссылка: `scripts/live-eval.py::Bench._prefixed`.
+- **AUDIT-10f — «модель не ответила» и «инструмент честно отказал» — разные
+  вещи.** Один сценарий (`AU-1085`) упал с «no model answered», потому что
+  модель дословно передала отказ инструмента: «Face recognition is unavailable
+  on the server». Список `INFRA_FAILURES` ловил любое «is unavailable», то
+  есть и ответ о комнате, в которой нет распознавания лиц. Выбран вариант:
+  список содержит только слова самого хаба о несостоявшемся ходе
+  (`couldn't finish this request`, `could not come up with an answer in time`,
+  `budget is exhausted`, `monthly api budget`) — по `hub/openai_responses.py`,
+  `hub/llm.py`, `hub.app.DEGRADED_REPLY_TEXT`. Обоснование: стенд обязан
+  падать на мёртвом ключе, но не на честном ответе. Ссылка:
+  `tests/audit/test_request_matrix.py::test_a_tool_refusal_is_not_read_as_a_dead_key`
+  и `::test_a_dead_model_still_fails_the_scenario`.
+- **AUDIT-10g — два места, где был неправ корпус, а не модель.**
+  (1) «change the name of John» без нового имени: `rename_person` требует ОБА
+  имени, и верный ход — спросить новое, а не звать инструмент с пустым
+  `new_name`; шаблон корпуса теперь называет новое имя («… to Maximus»), а
+  описание инструмента просит переспросить, если имя не названо.
+  (2) «save this person as Theodric» верно и лицом, и голосом: живой прогон
+  `AU-0811` записал голос с верным именем и упал на требовании «только
+  `enroll_face`»; формулировка принимает оба инструмента
+  (`scripts/gen-audit-scenarios.py::_phrase_any_of`, как AUDIT-08b). Ссылка:
+  `tests/audit/test_request_matrix.py::
+  test_a_save_this_person_request_accepts_a_face_or_a_voice` и
+  `::test_a_rename_request_names_the_new_name`.
+- **AUDIT-10h — хаб перезапускает внешний скрипт, не песочница.** `hub/tools.py`
+  и `prompts/system.md` изменены, значит хаб должен быть перезапущен
+  `scripts/run-openai-server.ps1`. Из песочницы это невозможно: живой хаб (PID
+  65804, `/health` → 200) принадлежит другой сессии, и `Stop-Process -Id 65804`
+  отвечает «Access is denied», `taskkill /PID 65804 /F` — «ERROR: Access denied»;
+  эскалации в этой песочнице нет (AGENTS.md, «Окружение»). Новые сессии комнат
+  читают `prompts/system.md` при подключении (`Session` строит промпт из файла),
+  поэтому новая инструкция вступит в силу при переподключении клиента, а новые
+  описания инструментов — при первом перезапуске хаба внешним скриптом; в
+  `PROGRESS_AUDIT.md` AU-04 это записано как открытый пункт. `git add`/`commit`/
+  `push` из песочницы по-прежнему невозможны (`fatal: Unable to create
+  '…/.git/index.lock': Permission denied`). Файлы AU-04 для внешнего коммита:
+  `hub/tools.py`, `prompts/system.md`, `scripts/live-eval.py`,
+  `scripts/gen-audit-scenarios.py`, `tests/audit/test_request_matrix.py`,
+  `PROGRESS_AUDIT.md`, `DECISIONS.md`. Артефакты прогона
+  (`data/audit/runs/mass-13…mass-21*.jsonl`, `data/audit/scenarios.jsonl`,
+  `data/live-eval/…`) в git не входят — локальные данные аудита.
+- **AUDIT-10i — что ещё видно по числам (для AU-08).** Тот же прогон по
+  памяти и ПК (`data/audit/runs/mass-21-regress-memory-pc.jsonl`, `--workers 6`)
+  дал pc 157 из 162 (96.9 % против 152/162 в `mass-02`) и память 74 из 90
+  (против 80/90). Семь «новых» провалов памяти — это ответы вида «уже
+  записано» / «записал» БЕЗ вызова `remember`: у стенда память одна на все
+  сценарии и живёт между прогонами, поэтому факт из соседнего сценария уже
+  лежит в хранилище. Проверено отдельно: те же семь сценариев в одиночном
+  прогоне проходят и с префиксом, и без него — значит, дело не в префиксе
+  (AUDIT-10e), а в общем состоянии стенда. Отсюда задача AU-08: у памяти
+  должен быть свой шаблон на воркера, как у людей (AUDIT-10b).
+
+## Массовый аудит, четвёртый заход: уведомления и правила (AUDIT-11)
+
+- **AUDIT-11 — стенд не записывал ход, и `telegram_send` отказывал честной
+  просьбе.** Живой ход кладёт слова человека в `hub.app._recording_turn`
+  (`Connection._process_utterance`) ДО вызова модели, и оттуда их читают
+  политики: `telegram_send` отправляет только когда ЭТОТ ход просит Telegram
+  (`hub/telegram_intent.py`), `generate_image` берёт буквальную формулировку.
+  `scripts/live-eval.py` звал `llm.generate` напрямую, ход не записывался, и
+  каждое явное «отправь в группу» получало «Sending to Telegram requires an
+  explicit user request in this turn» — стенд измерял хаб с пустым
+  транскриптом. Выбран вариант: стенд записывает тот же ход (`transcript`,
+  `speaker`, `request_id`) и снимает его в `finally`, как живой хаб. Видно по
+  числам: `AU-0921`/`AU-0922`/`AU-0923` в `mass-02` и в
+  `au-05-notify-before.jsonl` отвечали «Telegram отказал», а после правки
+  доходят до собственно отправки («Telegram is not configured on the brain
+  server» — у стенда нет токена бота, это факт стенда, а не модели).
+  Ссылка: `scripts/live-eval.py`,
+  `tests/audit/test_request_matrix.py::test_the_bench_records_the_turn_for_the_transcript_policies`.
+- **AUDIT-11b — «сообщи, когда откроется дверь»: правило, а не вопрос.**
+  Живой стенд `au-05-notify-before.jsonl`: `AU-0929` и `AU-0931` отвечали
+  вопросом («What should happen — a spoken heads-up or a phone
+  notification?»), хотя у правила уже есть подтверждение голосом (F-113), а
+  реплики-близнецы `AU-0932`/`AU-1104` вызывали `create_rule`. Дверь — это
+  зона кадра (F-309, `zone_entered(door)`), камера комнаты смотрит кадр, и
+  отдельный датчик не нужен. Выбран вариант: промпт комнаты и описание
+  `create_rule` говорят одно и то же — стоячая просьба кончается вызовом,
+  названное место становится зоной правила, а вопрос «как тебе сообщить?» не
+  задаётся. После правки все четыре дверных сценария дали `create_rule` с
+  `zone_entered` и зоной из просьбы
+  (`data/audit/runs/au-05-notify-final.jsonl`). Ссылка:
+  `prompts/system.md`, `hub/tools.py`,
+  `tests/audit/test_request_matrix.py::test_a_rule_request_is_a_call_and_not_a_question`.
+- **AUDIT-11c — личное имя — не адрес: корпус требовал вызов, который хаб
+  обязан отклонить.** «Скажи Джону, что я иду домой» стоял в корпусе как
+  `expect_tools=["telegram_send"]`, но у дома ОДИН общий чат, и
+  `hub.telegram_intent.telegram_send_requested` намеренно не читает личное
+  имя как адрес Telegram: хаб отказывает такому вызову («requires an explicit
+  user request»). Проверять вызов, который хаб обязан отклонить, значит
+  требовать фейк — и первый прогон именно это и делал: модель отвечала
+  «Said it out loud — John's been told» (`say_in_room`), а сценарий считался
+  не пройденным за «правильный» вызов. Выбран вариант: сценарий запрещает
+  `telegram_send` и ждёт честной фразы; описание `telegram_send` и промпт
+  прямо говорят, что второго канала нет и личное сообщение в группу не
+  уходит. После правки обе реплики отвечают «I can't send a private message to
+  John — I've only got the one group chat». Ссылка: `hub/tools.py`,
+  `prompts/system.md`, `scripts/gen-audit-scenarios.py::HONEST_REFUSALS`,
+  `tests/audit/test_request_matrix.py::test_a_private_message_is_not_posted_to_the_one_group_chat`.
+- **AUDIT-11d — «когда в комнате станет темно»: правило о темноте пришлось бы
+  выдумать.** В F-419 четыре триггера (присутствие, время, звук, состояние
+  устройства), датчика освещённости у дома нет (`config.openai.yaml`:
+  `devices: []`). Первый прогон считал такие сценарии ПРОЙДЕННЫМИ, когда
+  модель выдумывала устройство: `AU-0940` вызывал `create_rule` с
+  `device_state device_id="room_light"`, `capability="brightness"`, а
+  `AU-0937` вызывал правило и в той же реплике говорил, что сделать это
+  нельзя. Выбран вариант: корпус запрещает `create_rule` на эти реплики
+  (`HONEST_REFUSALS`) и ждёт честную фразу без вызова; прописано и в промпте
+  («триггер, которого комната не видит, не существует: скажи это одной фразой
+  и не подставляй вместо него часы или звук»). После правки все пять сценариев
+  отвечают «no light sensor in here, so I can't trigger on that». Ссылка:
+  `hub/tools.py`, `prompts/system.md`, `scripts/gen-audit-scenarios.py`,
+  `tests/audit/test_request_matrix.py::test_a_dark_room_is_an_honest_refusal`.
+- **AUDIT-11e — «эта/последняя картинка» в стенде без истории.**
+  `AU-0923`/`AU-0924` («send this photo / the last picture to the group»)
+  ссылаются на то, что уже было в комнате: в `mass-02` модель звала
+  `telegram_send`, в `au-05-notify-before.jsonl` — сначала `look_at_camera`,
+  в `au-05-notify-after.jsonl` — то `telegram_send`, то `look_at_screen`. У
+  стенда нет ни камеры, ни истории предыдущих ходов, поэтому «что именно
+  отправлять» решает отсутствующий контекст, а не модель. Выбран вариант
+  (как AUDIT-08d и AUDIT-07): помечать такие сценарии `needs_actions` и
+  печатать `SKIP` с причиной, а не считать выбор модели. Ссылка:
+  `scripts/gen-audit-scenarios.py` (`notify`, «send the last picture»).
+- **AUDIT-11f — итог AU-05.** Живой прогон одного семейства, `--workers 6`:
+  `data/audit/runs/au-05-notify-before.jsonl` — 18 из 26 (69.2 %, 8 падений);
+  `data/audit/runs/au-05-notify-final.jsonl` — **24 из 24 разобранных
+  (100 %)** против того же набора, два сценария про картинку напечатаны
+  `SKIP` (AUDIT-11e). Проверки: `pytest tests -q` → 9391 passed, 15 failed —
+  все 15 чужой `tests/test_guess_who.py` (незавершённая чужая фича, в зачёт не
+  идёт); `ruff check .` → All checks passed; `mypy common` → Success. Семья
+  `notify` закрыта; числа «до/после» писать в `docs/AUDIT_MASS.md` будет
+  задача AU-13.
+- **AUDIT-11g — хаб перезапускает внешний скрипт (повтор AUDIT-10h).**
+  `hub/tools.py` и `prompts/system.md` изменены, значит хаб надо перезапустить
+  `scripts/run-openai-server.ps1`. Из песочницы это невозможно: живой хаб (PID
+  65804, `/health` 8770 → 200, `llm_model: deepseek-flash`) принадлежит другой
+  сессии, `Stop-Process -Id 65804` → «Access is denied», эскалаций нет.
+  Новые сессии комнат читают `prompts/system.md` при подключении, а новые
+  описания инструментов вступят в силу при внешнем перезапуске. Файлы AU-05
+  для внешнего коммита: `scripts/live-eval.py`, `hub/tools.py`,
+  `prompts/system.md`, `scripts/gen-audit-scenarios.py`,
+  `tests/audit/test_request_matrix.py`, `PROGRESS_AUDIT.md`, `DECISIONS.md`.
+  Артефакты прогона (`data/audit/runs/au-05-*.jsonl|.log`,
+  `data/audit/scenarios.jsonl`) в git не входят. То же с коммитом: `git add --
+  scripts/live-eval.py hub/tools.py prompts/system.md
+  scripts/gen-audit-scenarios.py tests/audit/test_request_matrix.py
+  PROGRESS_AUDIT.md DECISIONS.md` отвечает `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied` — коммит
+  и пуш делает внешний скрипт (AGENTS.md: «`.git` в песочнице только для
+  чтения»). `client/` и `common/` не правились, обновление комнатных ПК не
+  требуется.
+
+## Массовый аудит, четвёртый заход: медиа (AUDIT-13)
+
+- **AUDIT-13 — «tell everyone …» — это сказать вслух, а не рассылка.** Живой
+  прогон `--family media --workers 6`
+  (`data/audit/runs/au-07-media-before.jsonl`, 115 сценариев) — 110 из 115;
+  одно из пяти падений: `AU-0714` «I want you to tell everyone that dinner is
+  ready» — модель прочитала слово «everyone» как рассылку и ответила «у меня
+  один общий чат, хочешь — напишу туда», не позвав `say_in_room`. Описание
+  инструмента называло «say TEST HELLO on the anton PC», но слов «announce»,
+  «tell everyone», «let the rooms know» в нём не было, а в промпте комнаты про
+  `say_in_room` не было ни строки. Выбран вариант: промпт получил раздел
+  «Saying things out loud» (объявление вслух — не Telegram; личное сообщение
+  одному человеку — тоже не Telegram-рассылка), описание `say_in_room`
+  называет «announce» и «tell everyone». Ссылка: `prompts/system.md`,
+  `hub/tools.py`; проверка —
+  `tests/audit/test_request_matrix.py::test_an_announcement_is_spoken_out_loud_and_not_messaged`.
+- **AUDIT-13b — «make that image the wallpaper» — один вызов `set_wallpaper`,
+  а не взгляд по сторонам.** Два сценария обоев (`AU-0711`/`AU-0712`) падали
+  не всегда одинаково: в прогонах `au-07-media-final-2.jsonl` и
+  `…-final-3.jsonl` модель сначала звала `look_at_screen`/`show_photo`
+  (стенд без `--actions` картинку не отдаёт), видела отказ и отвечала «нечего
+  ставить», хотя верный ход — позвать `set_wallpaper` и передать человеку ЕЁ
+  ответ («No generated image is available for this speaker»). Выбран вариант:
+  промпт называет два хода явно (`generate_image target=wallpaper` —
+  нарисовать; `set_wallpaper` — поставить готовую, source=generated/screen/
+  camera), прямо запрещает `look_at_screen`/`look_at_camera`/`show_photo`
+  «чтобы найти картинку» и требует звать `set_wallpaper` даже когда в этом
+  ходу ничего не снято и не нарисовано: ответ инструмента и есть правда,
+  которую передают человеку. Описание `set_wallpaper` говорит то же. Ссылка:
+  `prompts/system.md`, `hub/tools.py`; проверка —
+  `test_a_new_wallpaper_is_drawn_and_an_existing_one_is_installed`.
+- **AUDIT-13c — правка присланного фото в стенде непроверяема.** Пятнадцать
+  сценариев «edit this photo and make it warmer / change the attached picture
+  to cartoon» требовали `generate_image`, но у инструмента нет источника
+  «вложение»: `source` = none / camera / screen / last, а присланное фото
+  живёт только в Telegram-ходе (`hub/telegram_chat.py::_image_reference`).
+  В стенде фото нет, поэтому половину прогона модель честно отвечала
+  «вложения нет» (верный ход), а половину звала `generate_image` с источником
+  камеры (тоже не ошибка, но проверялось не то, что заявлено). Выбран
+  вариант: пометить эти сценарии `bench_skip` с причиной (как `inspect_photo`
+  в AUDIT-09d), а сам путь проверять там, где он живёт, —
+  `tests/test_telegram_edit_prompt.py`, `tests/test_telegram_reply_photo.py` и
+  телеграм-ходе живого хаба. Проверка —
+  `test_a_photo_edit_scenario_is_skipped_by_the_bench` (он же следит, чтобы
+  источник вложения не появился в договоре молча).
+- **AUDIT-13d — итог AU-07.** Живой прогон `--family media --workers 6`:
+  до правок `data/audit/runs/au-07-media-before.jsonl` — **110 из 115**
+  (пять падений: `AU-0677`, `AU-0680`, `AU-0682`, `AU-1066` — правка
+  присланного фото, и `AU-0714` — `say_in_room`); после правок
+  `au-07-media-final-4.jsonl` и `au-07-media-final-5.jsonl` — по **100 из
+  100** разобранных (15 сценариев правки присланного фото печатаются `SKIP`),
+  два прогона подряд. Разобранные 100 по ожиданиям: `generate_image` 92 (из
+  них 24 — обои через генерацию), `show_photo`/`say_in_room` 2,
+  `save_photo` 2, `set_wallpaper` 2, `say_in_room` 2. Промежуточные
+  прогоны `au-07-media-final.jsonl` (100/100), `…-final-2.jsonl` (98/100) и
+  `…-final-3.jsonl` (99/100) — это как раз то, что показало нестабильность
+  обоев из AUDIT-13b. Проверки: `tests/audit -q` → 3076 passed;
+  `pytest tests -q` → 9272 passed, 15 failed (все 15 — чужой
+  `tests/test_guess_who.py`, незавершённая чужая фича, в зачёт не идёт),
+  11 skipped (регрессионные реплики без аудио и named pipes); `ruff check .`
+  → All checks passed; `mypy common` → Success.
+- **AUDIT-13e — хаб перезапущен после правки `hub/tools.py`.** Старый процесс
+  остановлен (`Stop-Process -Id 78036`), хаб поднят
+  `scripts/run-openai-server.ps1` (`Start-Process -WindowStyle Hidden`),
+  новый PID 79620, `/health` на порту **8770** → 200,
+  `llm_model: deepseek-flash`, `image_generation: true`, `outbound.clients: 2`
+  — обе комнаты переподключились сами.
+- **AUDIT-13f — коммит и пуш AU-07 из песочницы невозможны.** Попытка
+  `git add -- prompts/system.md hub/tools.py scripts/gen-audit-scenarios.py
+  tests/audit/test_request_matrix.py PROGRESS_AUDIT.md DECISIONS.md
+  docs/AUDIT_MASS_AFTER.md` и `git commit -m "Mass audit AU-07: media family,
+  wallpaper and speaking out loud"` отвечают `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied` (`.git` в
+  песочнице только для чтения, эскалаций нет), `git push origin master:main` —
+  `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`. Поэтому
+  коммит и пуш делает внешний скрипт; файлы AU-07 для него: `prompts/system.md`,
+  `hub/tools.py`, `scripts/gen-audit-scenarios.py`,
+  `tests/audit/test_request_matrix.py`, `PROGRESS_AUDIT.md`, `DECISIONS.md`,
+  `docs/AUDIT_MASS_AFTER.md`. Артефакты прогона
+  (`data/audit/runs/au-07-media-*.jsonl`, `data/audit/scenarios.jsonl`) в git
+  не входят. `client/` и `common/` не правились, поэтому обновление комнатных
+  ПК (`update-room-pcs.ps1`) не требуется.
+- **AUDIT-13g — проверка соседнего семейства: notify снова нестабилен, но это
+  не правка AU-07.** После правок AU-07 прогнано чужое семейство (`--family
+  notify --workers 6`, 24 разобранных сценария) три раза:
+  `data/audit/runs/au-07-notify-regress.jsonl` — 23/24 (падал `AU-0933`),
+  `…-regress-2.jsonl` — 19/24 (`AU-0920`, `AU-0936`, `AU-1105`, `AU-0940`,
+  `AU-1106`), `…-regress-3.jsonl` — 21/24 (`AU-0936`, `AU-0940`, `AU-1106`).
+  AU-05 закрывал это семейство на 24/24 (`au-05-notify-final.jsonl`), а теперь
+  наборы падений почти не пересекаются — это недетерминизм модели
+  (`deepseek-flash`), а не следствие AU-07: в `prompts/system.md` и
+  `hub/tools.py` текст AU-07 говорит только о картинках, обоях и `say_in_room`,
+  правила (`create_rule`) и Telegram он не трогает. Стенд при этом полностью
+  внутрипроцессный и от живого хаба не зависит (проверено: `scripts/live-eval.py`
+  не делает ни одного HTTP-вызова), поэтому перезапуск хаба тут ни при чём.
+  Упорно повторяются два распознавателя: «if a stranger is in frame at night,
+  turn on the light» (`AU-0936`/`AU-1105` — модель спрашивает вместо правила) и
+  «notify me when the room gets dark» (`AU-0940`/`AU-1106` — модель зовёт
+  правило там, где датчика освещённости нет). Это предмет отдельной задачи
+  по семейству notify, а не AU-07; в отчёт AU-07 числа notify не входят.
+
+## Массовый аудит, пятый заход: приборы и скиллы (AUDIT-12, 2026-09-23)
+
+- **AUDIT-12 — стенд собирает живой блок `[home: …]`: приборы от комнаты,
+  скиллы от хаба.** Семейства `devices` и `skills` были помечены `bench_skip`
+  (AUDIT-07), потому что стенд не собирал префикс живого хода. К AU-06
+  `Connection._turn_prefix` уже звался, но комната стенда была пуста: `Session`
+  создавался с `devices=[]`, а `hub_app._skills` оставался `None`, поэтому
+  блок `[home: …]` не называл ни приборов, ни скиллов. Выбран вариант: стенд
+  берёт и то и другое из живого дома, а не из списка слов в корпусе.
+  `room_devices(cfg)` собирает тот же кадр `hello`, что и комната, тем же
+  кодом клиента (`client.main.build_hello(cfg.client)`); `Session(devices=…)`
+  отдаёт его в системный промпт, а `[home: …]` берёт список оттуда же;
+  `hub_app._skills` загружается настоящим `_skill_hot_reload(cfg)`, поэтому
+  `run_skill` действительно исполняется, а блок называет скиллы дома. В
+  отчёте об этом теперь видно построчно: `prefix`, `room_devices`,
+  `room_skills`. Живой пример из прогона: `[home: anton | skills: canvas,
+  games, weather]` (календарь выключен по F-421 и в блок не попадает).
+  Ссылка: `scripts/live-eval.py`, `tests/audit/test_request_matrix.py::
+  test_the_bench_room_takes_its_devices_from_the_room_itself`.
+- **AUDIT-12b — прибора, которого комната не назвала, у ассистента нет:
+  верный ход — сказать это словами.** Дом приборов не объявляет
+  (`config.openai.yaml`: `client.devices: []`), а корпус требовал
+  `set_light`/`set_switch` — вызов, который хаб обязан отклонить
+  («I don't know that device»). Первый прогон (``mass-01.jsonl``) на этом и
+  «падал»: все 64 сценария модель отвечала честно («No smart devices are set
+  up in this room yet»), а корпус считал это провалом. Выбран вариант: корпус
+  следует за списком приборов комнаты. `room_device_names()` читает
+  `client.devices` того же конфига, что и стенд, `_device_missing()` сверяет
+  слово из просьбы с именами приборов, и если прибора нет — сценарий запрещает
+  `set_light`/`set_switch`, требует честной фразы (`expect_no_claim`,
+  проверяется списком фраз самого хаба — `hub.llm.claims_completed_action`) и
+  несёт причину в `note`. Появится лампа в конфиге — тот же генератор снова
+  ждёт `set_light`: тест `test_the_device_scenarios_follow_the_devices_of_the_room`
+  проверяет обе стороны (`build_scenarios([])` и `build_scenarios(["Desk lamp"])`).
+  Ссылка: `scripts/gen-audit-scenarios.py`.
+- **AUDIT-12c — пустой список приборов говорит, что делать, а не только что
+  он пуст.** Даже с запретом в промпте и в описании инструмента два сценария
+  из 64 всё равно позвали инструмент: `AU-0872` («turn on the desk lamp») —
+  `set_light`, `AU-0904` («press the button on the kettle») — `set_switch`
+  (`data/audit/runs/au-06-devices-skills-before.jsonl`). Слот `{devices}`
+  говорил только «(no devices configured)». Выбран вариант: `NO_DEVICES_TEXT`
+  называет и вывод, и действие — приборов в комнате нет, ответ одной фразой,
+  `set_light`/`set_switch` не вызываются. После правки — 66 из 66.
+  Ссылка: `hub/session.py`, `tests/test_devices.py::
+  test_an_empty_device_list_tells_the_model_to_answer_in_words`.
+- **AUDIT-12d — Jev не относил вопрос о погоде к скиллам дома.** Живой прогон:
+  «hey rowan, will it rain tomorrow» → `family='pc'` с уверенностью **0.56**
+  (порог 0.65), сужение отдало модели одно ядро без `run_skill`, и модель
+  позвала `run_command` (десктопный прогон совпал с чтением стенда:
+  `scripts/jev_probe.py` → 0.56). Вторая реплика («what is the weather like
+  today») проходила только потому, что в ней уверенность семейства была 0.78.
+  `run_skill` живёт в семействе `pc` (`hub/tools.py::TOOL_FAMILIES`), значения
+  семейств скиллы называли, а вопрос `FAMILY_QUESTION` — нет. Выбран вариант:
+  вопрос тоже называет скиллы дома («and for one of the home's own skills -
+  the weather or the forecast, the schedule, a game»). Проверено живьём: то же
+  чтение даёт **1.00**, и девять реплик-представителей всех семейств
+  разобраны правильно (browser 0.81, pc 1.00, vision 1.00, media 1.00,
+  memory 1.00, people 0.86, devices 1.00, notify 0.97, none 1.00).
+  Ссылка: `hub/jev_decider.py`, `tests/test_jev_understanding.py::
+  test_the_family_question_names_the_homes_own_skills`.
+- **AUDIT-12e — итог AU-06.** Живой прогон `--family devices --family skills
+  --workers 6`: до правок `data/audit/runs/au-06-devices-skills-before.jsonl` —
+  63 из 66 (три падения: `AU-0872` `set_light`, `AU-0904` `set_switch`,
+  `AU-0942` `run_skill` не предложен и не вызван); после правок
+  `data/audit/runs/au-06-devices-skills-after.jsonl` — **66 из 66**.
+  Проверки: `pytest tests -q` → 9269 passed, 15 failed (все 15 — чужой
+  `tests/test_guess_who.py`, незавершённая чужая фича, в зачёт не идёт),
+  11 skipped (регрессионные реплики без аудио и named pipes, не связаны с
+  правкой); `tests/audit -q` → 3073 passed; `ruff check .` → All checks
+  passed; `mypy common` → Success.
+- **AUDIT-12f — хаб перезапущен; коммит и пуш из песочницы невозможны.**
+  `hub/session.py` и `hub/jev_decider.py` изменены, поэтому живой хаб
+  перезапущен: `Stop-Process -Id 65804` на этот раз прошёл, хаб поднят
+  `scripts/run-openai-server.ps1` (новый PID 78036, 03:02), `/health` 8770 →
+  **200**, `llm_model: deepseek-flash`, `outbound.clients: 2` — комнаты
+  переподключились. `git add -- <файлы>` отвечает `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied`
+  (`.git` в песочнице только для чтения), `git commit -m …` — то же самое, а
+  `git push origin master:main` — `schannel: AcquireCredentialsHandle failed:
+  SEC_E_NO_CREDENTIALS` (у remote нет креденшелов в песочнице), поэтому коммит
+  и пуш делает внешний скрипт; файлы AU-06 для него: `scripts/live-eval.py`,
+  `scripts/gen-audit-scenarios.py`, `hub/session.py`, `hub/jev_decider.py`,
+  `tests/audit/test_request_matrix.py`, `tests/test_devices.py`,
+  `tests/test_jev_understanding.py`, `PROGRESS_AUDIT.md`, `DECISIONS.md`.
+  Артефакты прогона (`data/audit/runs/au-06-*.jsonl|.log`,
+  `data/audit/scenarios.jsonl`) в git не входят. `client/` и `common/` не
+  правились, поэтому обновление комнатных ПК (`update-room-pcs.ps1`) не
+  требуется.
+
+
+## Массовый аудит, шестой заход: память (AUDIT-14, 2026-09-23)
+
+- **AUDIT-14 — стенд измерял память ВЛАДЕЛЬЦА, а не комнату сценария.** Живой
+  прогон семейства `memory` (`--workers 6`,
+  `data/audit/runs/au-08-memory-before.jsonl`) дал 70 из 90, и причина была не
+  в модели: в префиксе хода стояло `recent facts: "Anton likes tea."` —
+  комната сценария «помнила» то, чего сценарий не говорил, — и модель честно
+  отвечала «ты уже мне это говорил», не вызывая `remember`. Так писали два
+  вызова: `scripts/live-eval.py` строил `Memory()` без каталога (это
+  ``data/memory.jsonl`` владельца), а `hub.app` при первом же инструменте
+  лениво открывал ЖИВОЙ ``data/hub.db`` (`_hub_gateway` → `_hub_db_path`,
+  решение о соединении принято в P1-44) — оттуда `list_memory` читал таблицу
+  ``memories`` и в неё же писал ``remember``. Выбран вариант: у стенда свои
+  комнаты. Каждый воркер получает собственные ``people.json``, ``memory.jsonl``
+  и ``conversations.sqlite3`` (фикстуры + сброс на каждый сценарий), а база
+  хаба переезжает по СВОЕМУ же переключателю хаба `ROWAN_HUB_DB`
+  (`hub.app.HUB_DB_ENV`) в `data/live-eval/hub.db` и начинается пустой.
+  Обоснование: `TEST-DB-01` — прогон стенда не имеет права писать в живые
+  данные; изоляция по задаче уже применялась к реестру людей (AUDIT-10) и
+  теперь распространена на память и историю. Ссылка: `scripts/live-eval.py`
+  (`_RoomEngine`, `ROOM_MEMORY`, `ROOM_CONVERSATIONS`, `_build_room_fixtures`,
+  `_reset_room`), `tests/audit/test_request_matrix.py`.
+- **AUDIT-14b — проверка слова берётся из САМОЙ реплики.** Сценарий
+  «do you remember what I said about the exam» требовал слово ``dorm`` —
+  предмет соседней формулировки того же смысла. Верный ход модели
+  (``query: exam``) падал на ожидании, которого реплика не называла. Выбран
+  вариант: у смысла может быть своё слово на каждую формулировку
+  (`_checked_args`, `args_words`), а «what did we talk about yesterday» не
+  проверяет тему вовсе. Обоснование: то же правило, что у браузера
+  (AUDIT-08) — в аргументах ищется слово человека, а не слово корпуса.
+- **AUDIT-14c — «вчера» — это время, а не тема.** Модель передаёт
+  ``since``/``until`` и пустой ``query``; требовать при этом слово
+  «yesterday» значило бы ругать верный разбор просьбы. Сценарии про день
+  слова в аргументах не проверяют.
+- **AUDIT-14d — «забудь X» предполагает, что комната X знает.** С пустой
+  комнатой стенда модель отвечала «ничего такого у меня нет» — правду о
+  стенде, а не о себе. Выбран вариант: сценарий объявляет предусловие
+  (`assumes_fact`: `me` + предложение), стенд кладёт его в память комнаты
+  через сам хаб (`hub.storage.Memory.add`) перед ходом. Заодно у семейства
+  ``forget_fact`` снят «первый обязательный вызов»: сначала прочитать
+  (`list_memory`), потом удалять — верный план, а не откат на чужой
+  инструмент (AUDIT-08b).
+- **AUDIT-14e — час можно записать цифрами.** «Anton wakes up at 7:00» — тот
+  же факт, что «... at seven»; проверка слова «seven» ругала модель за верную
+  запись. Выбран вариант: проверяется предмет просьбы (`wake`), а не
+  написание числа.
+- **AUDIT-14f — `recall_conversation` объявляет то, что читает.**
+  `Connection._execute_tool_now` разбирает `person`, `since`, `until`,
+  `limit`, а схема инструмента объявляла один `query`: живой ход отбрасывал
+  даты модели как необъявленный аргумент (`hub/tool_args.py`), и «что мы
+  обсуждали вчера» искало по всему архиву. Выбран вариант: схема объявляет
+  все четыре поля (у них те же границы, что в разборе), тест сверяет
+  объявленное с читаемым.
+- **AUDIT-14g — сохранённый факт и разговор — разные вещи.** На «do you
+  remember what I said about the exam» модель отвечала фактом из
+  `list_memory`. Промпт («Saved facts are not a conversation») и описания
+  `recall_conversation`/`list_memory` теперь называют обе стороны явно, как
+  AUDIT-08 для сайтов и AUDIT-11 для правил.
+- **AUDIT-14h — уборка того, что стенд уже записал владельцу.** Пока стенд
+  писал в живые данные (до этой задачи), он оставил в памяти владельца
+  выдуманные факты: 190 строк в ``data/memory.jsonl`` и 324 строки в таблице
+  ``memories`` живого ``data/hub.db`` («Anton is allergic to peanuts.»,
+  «placeholder», «This person should be saved as Max.» и т. п.). Выбран
+  вариант: убрать их, сохранив копию всех 514 строк в
+  `data/audit/memory-bench-cleanup.jsonl`, потому что выдуманный факт в живой
+  памяти — ровно то, что запрещено («никаких фейков»). Оставлены только
+  собственные факты владельца (ключи в верхнем ящике, Chrome, кофе по утрам,
+  «Anton studies at nine.», джаз, правило про сворачивание окна). Уборка —
+  `scripts/clean-bench-memory.py` (есть `--write`, по умолчанию только
+  показывает). **Чего нет:** живого «да» на подтверждение удаления в стенде —
+  у `forget_fact` остаётся голосовой вопрос F-113, и все 32 сценария
+  «забудь …» доходят до него, но не подтверждаются (путь удаления закрыт
+  офлайн-тестами `tests/test_memory_admin.py`).
+- **AUDIT-14i — замечено, но не моя задача.** Русское «включи свет» ждёт
+  `set_light` (семейство `russian` корпуса), а комната конфига приборов не
+  имеет — то же расхождение, что AU-06/AUDIT-12 закрыл для семейства
+  `devices`; в живом прогоне модель дважды ответила честно и попала в провал
+  AU-1007/AU-1008. Это корпусная правка для AU-13 (итог), а не поведение
+  модели.
+- **AUDIT-14j — перезапуск хаба из песочницы снова не прошёл.**
+  `pwsh -File scripts/run-openai-server.ps1` поднял новый процесс, но старый
+  (PID держит порт 8770) остановить нельзя: `Stop-Process`/`Get-CimInstance`
+  → `Access denied`, новый инстанс упал на `[Errno 10048] ... bind on address
+  ('0.0.0.0', 8770)`, прежний хаб продолжает отвечать (`/health` → **200**,
+  `llm_model: deepseek-flash`, `outbound.clients: 2`). Новые описания
+  инструментов (`hub/tools.py`) и схема `recall_conversation` подхватятся
+  внешним перезапуском; сама уборка памяти (AUDIT-14h) действует сразу —
+  файл и БД читаются на каждом ходу.
+- **AUDIT-14k — коммит и пуш из песочницы невозможны (как в AU-03…AU-07).**
+  `git add -- <файлы>` и `git commit -m …` отвечают `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied` (`.git`
+  в песочнице только для чтения), `git push origin master:main` —
+  `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`. Коммит
+  делает внешний скрипт; файлы AU-08 для него: `hub/tools.py`,
+  `prompts/system.md`, `scripts/live-eval.py`,
+  `scripts/gen-audit-scenarios.py`, `scripts/clean-bench-memory.py` (новый),
+  `tests/audit/test_request_matrix.py`, `PROGRESS_AUDIT.md`, `DECISIONS.md`,
+  `docs/TZ_STATUS.md`. Артефакты прогонов (`data/audit/runs/au-08-*.jsonl|.log`,
+  `data/audit/scenarios.jsonl`, `data/audit/memory-bench-cleanup.jsonl`,
+  `data/live-eval/…`) лежат под `data/` и в git не входят.
+
+## Массовый аудит, седьмой заход: ПК (AU-09, 2026-09-23)
+
+- **AUDIT-15 — буфер обмена — это ПК, а не взгляд на экран.** Живой прогон
+  `--family pc` (`data/audit/runs/au-09-pc-before.jsonl`) дал 159 из 162, и
+  `AU-0503` («Rowan, read my clipboard») падал не по вине модели: Jev читал
+  слово «clipboard» как зрение, отдавал набор `vision`, и модель честно
+  отвечала «no tool for that». Выбран вариант: и значения семейств
+  (`hub/tools.py::TOOL_FAMILY_MEANINGS`: у `pc` назван буфер обмена, медиа-
+  клавиши и «сверни всё», у `vision` — что буфер это НЕ экран), и вопрос
+  `hub/jev_decider.py::FAMILY_QUESTION` называют буфер у ПК. Обоснование: то же
+  правило, что AUDIT-02/AUDIT-08 — верный ход модели не должен падать на
+  формулировке корпуса. Живая проверка: `scripts/jev_probe.py` дал
+  `family=pc` 1.00 на «read my clipboard», «minimize everything» и «put this
+  text in the clipboard». Ссылка: ТЗ F-511 (буфер обмена), `tests/audit/
+  test_request_matrix.py::test_the_clipboard_belongs_to_the_pc_and_not_to_sight`.
+- **AUDIT-15b — «сверни всё» — одно нажатие win+d.** `AU-0497` падал так:
+  сначала `run_command` со списком окон, потом `minimize_app` над chrome и
+  steam по отдельности — просьба про ВСЕ окна превращалась в догадку о двух
+  программах. Выбран вариант: промпт комнаты и описание `pc_control` требуют
+  `hotkey` `win+d` («minimize everything», «show me the desktop», «hide all the
+  windows» — это один вызов, окна через `run_command` не перечислять), а
+  `hub/tools.py::normalize_pc_control_args` переписывает `minimize_app` со
+  словами `all/everything/the desktop/windows` в тот же `win+d`. Обоснование:
+  у ПК нет приложения с именем «all» (`no installed application matches 'all'`,
+  docs/REQUESTS_AUDIT.md, задача UG-07), а win+d делает это одним действием.
+  Ссылка: ТЗ F-511, `tests/test_pc_secret_guard.py`.
+- **AUDIT-15c — «включи/поставь на паузу музыку» без сайта — медиаклавиша ПК.**
+  Третий прогон (`au-09-pc-final-2.jsonl`) показал `AU-0501`: модель открыла
+  `Start-Process https://www.youtube.com/results?search_query=…` на «play the
+  music» — пример из промпта («play some music on YouTube») читался без слов
+  «on YouTube». Выбран вариант: и промпт, и описание `pc_control` говорят, что
+  просьба БЕЗ названного сайта и страницы — это `media_play_pause` /
+  `media_next` / `media_prev`, а открытие сайта — только когда сайт назван, и
+  только через `browser_control`. Обоснование: «включи музыку» относится к
+  тому, что уже играет на ПК, а не к поиску в сети. Ссылка: ТЗ F-511
+  (медиаклавиши), `tests/audit/test_request_matrix.py::
+  test_a_vague_play_the_music_is_the_pc_media_key`.
+- **AUDIT-15d — пароль за человека не набирают.** `AU-0500` («I want you to
+  type my password into the field») требовал `pc_control` с `type_text`, то
+  есть пароль, которого модель не знает: вызов пришлось бы выдумать. ТЗ F-512
+  запрещает ввод паролей и платёжных данных в computer-use. Выбран вариант:
+  тот же запрет для `type_text` (`hub/tools.py::types_a_secret` берёт список из
+  `common/computer_use.SENSITIVE_RULES`, `hub/app.py` отказывает до отправки на
+  ПК), промпт и описание инструмента говорят это словами, а корпус объявляет
+  `no_secret_args` + `expect_no_claim` + `expect_reply: password` вместо вызова.
+  Обоснование: секрет, набранный один раз, уже утёк — в транскрипт, лог и
+  обучающий архив; отказ виден человеку, а выдуманное значение ещё и фейк.
+  Что подтверждено: модель отказывается сама во всех прогонах, хаб отклоняет
+  вызов, если она всё же попробует (`tests/test_pc_secret_guard.py`).
+  Ссылка: ТЗ F-512, `hub/tools.py::WRONG_TOOL_FOR_SECRETS`.
+- **AUDIT-15e — «положи ЭТОТ текст в буфер» без текста — вопрос, а не вызов.**
+  Сценарий `AU-0504` требовал `pc_control`, а модель отвечала «What text do you
+  want on the clipboard?» — верный ход, потому что содержимое буфера пришлось
+  бы выдумать. Выбран вариант: сценарий объявляет `may_ask`, и вердикт стенда
+  принимает ход без вызова, если ответ спрашивает (`?` или слова просьбы) и не
+  заявляет, что дело сделано (`hub.llm.claims_completed_action`). Обоснование:
+  тот же правило, что у «забудь …» с предусловием (AUDIT-14d) — сценарий
+  объявляет, чего в реплике нет, и не ругает модель за честный вопрос.
+  Ссылка: `scripts/live-eval.py::_asked_for_the_missing_word`.
+- **AUDIT-15f — русское «включи свет» следует за комнатой (перенос
+  AUDIT-14i).** `AU-1007`/`AU-1008` ждали `set_light`, хотя `config.openai.yaml`
+  объявляет `client.devices: []`, и честный ответ модели падал как провал.
+  Правка AUDIT-14i была записана задачей AU-13 (итог), но её пришлось сделать
+  здесь: `--family russian` входит в AU-09, и без неё прогон семейства
+  нечитаем. Теперь русская просьба о приборе проходит ту же проверку, что
+  семейство `devices` (`scripts/gen-audit-scenarios.py::
+  _russian_expectation`): нет лампы — честный отказ с запретом `set_light`,
+  есть лампа (`build_scenarios(["Bedroom light"])`) — снова `set_light`.
+- **AUDIT-15g — «secret» как канарейка приватности.** После правки промпта
+  упал чужой тест `tests/test_room_requests.py::
+  test_pipeline_restores_25_own_turns_and_archives_before_audio`: он проверяет,
+  что чужой приватный ход не попал в промпт, словом `secret` в тексте ответа —
+  а моя строка промпта «Never type a secret…» сама содержала это слово.
+  Выбран вариант: переписать промпт и описание конкретными словами («Never
+  type a password, a card number, a one-time code or a PIN»), канарейку не
+  трогать. Обоснование: тест проверяет настоящее свойство (чужое не течёт в
+  контекст), и ослаблять его ради формулировки нельзя. Проверено: в дереве
+  HEAD + тот же конфиг тест зелёный, с моими файлами — тоже
+  (`data/audit/runs/au-09-pytest*.log`).
+- **AUDIT-15h — что осталось незакрытым.** (1) `AU-1109` («paste what is in my
+  clipboard into the field») печатается `SKIP`: вставка идёт в окно в фокусе,
+  которого у стенда без `--actions` нет — та же причина, что у `fill` на
+  странице (AUDIT-08b), путь вставки проверяют `room_audit` RA-024…RA-026 на
+  живых ПК. (2) Русская `AU-1014` («отправь фото в группу») в третьем прогоне
+  ответила вопросом «Photo of what — the room, the screen, or something you
+  just made?» и упала; это чужое семейство (медиа/Telegram) и флейк 1 из 4 —
+  записано, чтобы AU-13 решил, нужен ли корпусу `may_ask` и там. (3) Дважды
+  прогон стенда падал на старте `PermissionError [WinError 5]` в
+  `hub/speaker.py::_save_locked` (`os.replace` файла `people.json` комнаты
+  стенда): повтор после удаления осиротевшего `.tmp` проходит, то есть это
+  внешняя блокировка файла (антивирус/сканер), а не поведение хаба.
+  Прогоны-артефакты: `data/audit/runs/au-09-pc-before.jsonl`,
+  `au-09-pc-after.jsonl`, `au-09-pc-final{,-2,-3}.jsonl` и их `.log`.
+- **AUDIT-15i — коммит и пуш из песочницы снова невозможны (как в AU-03…AU-08).**
+  `git add -- <файлы>` и `git commit -m …` отвечают `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied` (`.git` в
+  песочнице только для чтения), `git push origin master:main` —
+  `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`. Коммит
+  делает внешний скрипт; файлы AU-09 для него: `hub/app.py`, `hub/tools.py`,
+  `hub/jev_decider.py`, `prompts/system.md`,
+  `scripts/gen-audit-scenarios.py`, `scripts/live-eval.py`,
+  `tests/audit/test_request_matrix.py`, `tests/test_pc_secret_guard.py`
+  (новый), `PROGRESS_AUDIT.md`, `DECISIONS.md`. Артефакты прогонов
+  (`data/audit/runs/au-09-*.jsonl|.log`, `data/audit/scenarios.jsonl`,
+  `data/live-eval/…`) лежат под `data/` и в git не входят; `client/` и
+  `common/` не правились, поэтому `update-room-pcs.ps1` не нужен.
+
+## Массовый аудит, восьмой заход: две просьбы в одной реплике (AUDIT-16, 2026-09-23)
+
+- **AUDIT-16 — четвёртый вопрос Jev `single` и запрет сужения при «просьб
+  несколько».** Владелец жаловался, что вторая просьба в одной реплике теряется
+  (UG-08 в `PROGRESS_UNDERSTANDING.md`). Живой прогон AU-10 показал, почему:
+  Jev отвечает ОДНИМ семейством на ход, и на «turn on the light and play some
+  music» он говорил `devices` 0.93 — сужение отдавало набор без `pc_control`,
+  а на «open youtube and turn the volume up» отвечал `pc` 0.54, то есть ниже
+  порога 0.65, и спасал только fail-open. Выбран вариант: в тот же
+  batched-вызов добавлен четвёртый вопрос `single` («одна просьба или
+  несколько»), и при уверенном «несколько» (`value is False`, уверенность не
+  ниже `min_confidence`) `_narrow_tools_for` возвращает ``None`` — модель
+  видит все инструменты, как до сужения. Обоснование: сужение — оптимизация
+  («меньше похожих инструментов — меньше ошибок»), и она не имеет права
+  отнимать половину просьбы; цена ошибки здесь выше цены лишних 30 КБ схемы.
+  Живая проверка: `scripts/jev_probe.py` → «Rowan, open youtube and turn the
+  volume up» `single=False` 0.94, «save a photo and put it on my wallpaper»
+  0.90, «read my clipboard» `single=True` 0.94; ответ 489–522 мс при бюджете
+  1500 мс, то есть четвёртый вопрос не удлинил ход. Ссылка:
+  `hub/jev_decider.py`, `hub/app.py`, ТЗ 5.2/U-14.
+- **AUDIT-16b — пара просьб проверяется ОБЕИМИ половинами.** До AU-10 у семи из
+  десяти пар корпуса стоял один ожидаемый инструмент («turn on the light and
+  play some music» ждал `set_light`, «remember that I like tea and tell the
+  group» — `remember`), поэтому потерянная половина в вердикте не была видна
+  вовсе, и «19 из 20» ничего не говорило о UG-08. Выбран вариант: инструменты
+  пары обязаны быть вызваны все, порядок не навязывается (первым вызовом
+  «open chrome and search …» законно идёт запуск приложения, AU-0988), а
+  неоднозначная половина объявляется набором (`also_any`): «take a screenshot»
+  — это `show_photo`, `save_photo` или взгляд. Обоснование: просьба из двух
+  частей выполнена только тогда, когда сделаны обе; иначе аудит измеряет
+  вежливость ответа, а не работу. Ссылка: `scripts/gen-audit-scenarios.py::
+  PAIRS`, `tests/audit/test_request_matrix.py::
+  test_a_pair_of_requests_expects_both_halves`.
+- **AUDIT-16c — «сделай снимок и отправь его в группу» бывает одной командой.**
+  Модель звала `telegram_send` с `kind=image`, `source=screen`, `fresh=true` —
+  этот вызов и снимает экран, и отправляет его. Требовать рядом ещё и
+  `save_photo` значило бы ругать модель за то, что обе половины сделаны одной
+  командой (тот же класс, что AUDIT-08b). Выбран вариант: сценарий объявляет
+  `picture_in_the_send`, и вердикт принимает либо отдельный снимающий вызов,
+  либо `telegram_send`, в аргументах которого есть картинка. Обоснование:
+  проверять надо факт («снимок сделан и отправлен»), а не число вызовов.
+- **AUDIT-16d — остаток AU-10: пара «сохрани фото и поставь на обои».** В
+  четырёх прогонах из пяти модель делала ОДНУ половину и спрашивала про
+  вторую («Want me to set the wallpaper…?»), пятый прогон дал 20 из 20. Это
+  ход модели, а не сужение: `single=False` 0.90 оба раза, набор полный, обе
+  половины в корпусе. Промпт комнаты теперь требует обе половины прямо («do
+  BOTH in this turn … a half that failed, or that needed a question, is never a
+  reason to drop the other half»). **Чего нет:** самопроверки хода в стенде —
+  живой хаб после хода зовёт `verify` (`hub/app.py:16004`), и у него есть свой
+  детектор потерянного шага (`site_step_unfinished`, D-04: «открой chrome и
+  перейди на youtube»), но стенд этот проход не делает, поэтому числа AU-10 —
+  это ПЕРВЫЙ план модели. Стенд с самопроверкой — отдельная задача.
+- **AUDIT-16e — «сделано» поверх отказа — не выдумка.** Проверка
+  `expect_no_claim` в стенде читала «the PC controls are off right now» как
+  ложное «сделано» (фраза «are off» попадает в copula-frame списка
+  `hub.llm.DONE_CLAIM_PHRASES`), и `AU-0985` падал на честном ответе. Выбран
+  вариант: применять то же исключение, что и сам хаб — ответ, который прямо
+  говорит о провале (`hub.llm.reports_failure`), не считается заявкой о работе
+  (`hub/llm.py:1355`, коммент «A reply that already says the request failed is
+  honest»). Обоснование: правило хаба не должно быть строже в аудите, чем в
+  жизни.
+- **AUDIT-16f — коммит и пуш из песочницы снова невозможны.** `git add`/`git
+  commit` → `Unable to create .git/index.lock: Permission denied`, `git push` →
+  `SEC_E_NO_CREDENTIALS` (как в AU-03…AU-09). Файлы AU-10 для внешнего коммита:
+  `hub/app.py`, `hub/jev_decider.py`, `prompts/system.md`,
+  `scripts/gen-audit-scenarios.py`, `scripts/live-eval.py`,
+  `scripts/jev_probe.py`, `tests/audit/test_request_matrix.py`,
+  `tests/test_jev_understanding.py`, `PROGRESS_AUDIT.md`, `DECISIONS.md`.
+  Артефакты: `data/audit/runs/au-10-*.jsonl|.log` (под `data/`, в git не
+  входят). `client/` и `common/` не правились — обновление комнатных ПК не
+  требуется.
+
+## Латентность хода, AU-11 (23.09.2026)
+
+- **AUDIT-17 — откуда брать числа о латентности.** Ни один источник не видит
+  ход целиком, поэтому выбран вариант «три живых источника плюс проба»:
+  (1) отчёты стенда `data/audit/runs/*.jsonl` — модель и инструменты;
+  (2) база живого хаба `data/hub.db`, таблица `turn_events` — стадии
+  `stt`/`llm`/`tts`/`total`, которые пишет сам `hub/app.py`, плюс разбор
+  стадии `llm` на события (`prompt` → `llm` = раунд модели, `tool` =
+  ожидание инструмента, `understanding` = чтение Jev);
+  (3) `data/server.log`, строки `First audio N ms after the end of speech` —
+  это и есть замер F-101 «конец речи → первый звук»;
+  (4) `scripts/measure_voice_latency.py` — живой ход по настоящей записи
+  через `Connection._handle_utterance` с настоящими STT/Jev/моделью.
+  Обоснование: бюджет 15.1 считается от конца речи, а стенд речи не слышит и
+  не синтезирует; выдумывать «первый звук» из времени модели было бы
+  придумыванием числа. Сводку печатает `scripts/audit-latency.py`
+  (`docs/AUDIT_LATENCY.md`). Ссылка: ТЗ 15.1, F-101.
+- **AUDIT-17b — что именно заняло время (живые ходы, до правки AU-11).**
+  13 ходов комнаты с настоящим раундом модели (медианы): STT 1397 мс,
+  стадия `llm` 3808 мс (раунды модели 3280 из них, ожидание инструментов 1,
+  p95 2609), TTS 759 мс, весь ход 6367 мс; 82 живых замера первого звука —
+  медиана 4703 мс, 97.6 % позже бюджета 1200 мс и 79.3 % позже 2.5 с.
+  Значит, дело не в одном «медленном месте»: ход складывается из STT, чтения
+  Jev, раундов модели и синтеза, и правки нужны по всем четырём.
+- **AUDIT-17c — правка: соединение с Jev живёт между ходами.** `JevDecider`
+  создавал `httpx.AsyncClient` на каждый запрос и закрывал его вместе с пулом
+  соединений, то есть каждый ход платил за TCP + TLS до облака заново.
+  Выбран вариант: один клиент на провайдера (`_pooled_client`, пересоздаётся
+  при смене event loop — тесты поднимают свой на каждый случай), мёртвое
+  соединение отбрасывается и следующий ход открывает новое, `aclose()` на
+  выключении хаба. Обоснование: это единственная стадия, где задержка была
+  инженерной, а не сетевой по существу; модель, наоборот, уже держит
+  постоянный `httpx.Client` (`hub/llm.py`). Замер на тех же 12 сценариях:
+  чтение Jev 1247 → 257 мс (медиана, −79 %), «Jev + модель + инструменты»
+  3.86 → 2.68 с, доля ходов дольше 4 с 41.7 % → 0 %. Ссылка: `hub/jev_decider.py`,
+  `hub/app.py` (выключение), `tests/test_jev_decider.py` (+2 теста пула).
+- **AUDIT-17d — полный корпус после правки.** `data/audit/runs/au-11-full-after.jsonl`
+  (1106 сценариев, `--workers 6`, живая модель): 1077 ходов, 6 падений,
+  медиана хода 2.56 с (было 2.85 с в `au-08-full-after.jsonl` и 2.76 с в
+  `mass-01.jsonl`), доля ходов дольше 4 с 13.6 % (было 16.7 % и 29.4 %),
+  чтение Jev медиана 206 мс (p95 300), раунды модели медиана 2.
+- **AUDIT-17e — что осталось главным и почему бюджет 1.2 с не берётся.**
+  После правки ход держится на раундах модели: медиана 2564 мс, у 92.8 %
+  ходов раундов больше одного (вызов инструмента + ответ), а первый вызов
+  инструмента идёт через 1289 мс после старта модели. В конфиге
+  `models.enabled: true`, но `local_fast`/`local_strong` пусты, поэтому каждый
+  ход уходит в `deepseek-flash` — облако на критическом пути. ТЗ 15.1
+  говорит про ЛОКАЛЬНЫЕ модели, поэтому честный вывод: бюджет «первый звук
+  1.2 с» достижим только с локальным уровнем (или с ещё более ранним
+  стартом), а не подбором конфига облака. Это не закрыто и записано как
+  задача стенда (RTX 5090 + живая комната), а не помечено сделанным.
+- **AUDIT-17f — синтез в песочнице не поднимается, и это записано, а не
+  нарисовано.** Сам хаб при старте пишет `Could not load Silero TTS — replies
+  will be text only`: phonemizer копирует `espeak-ng.dll` во временный каталог,
+  а песочница запрещает запись в только что созданные временные подпапки и вне
+  рабочего каталога (`PermissionError` на `…\Temp\tmpXXXX\espeak-ng.dll`).
+  Поэтому `scripts/measure_voice_latency.py` измерил STT/LLM/Jev живьём
+  (`data/audit/voice-latency.json`: тёплые ходы STT 407…472 мс, LLM
+  1466…3276 мс; первый ход после старта — STT 7229 мс, то есть прогрев CUDA),
+  а `first_audio_ms` оставил пустым. TTS-стадия взята из трасс самого хаба
+  (медиана 759 мс). Обоснование: «нет данных» честнее нуля. Живой сквозной
+  замер «первого звука» после правки выполняется на стенде, где движок
+  синтеза поднимается; звук комнат на время аудита выключен (AU-00b).
+- **AUDIT-17g — хаб перезапущен.** PID 71508 остановлен, новый 81700
+  (`scripts/run-openai-server.ps1`), `/health` → 200, `llm_model:
+  deepseek-flash`, `outbound.clients: 2` (обе комнаты переподключились).
+  Оговорка та же, что в AUDIT-17f: у запущенного из песочницы хаба нет TTS,
+  как и у предыдущего процесса (у него `/health.tts` был `false` ещё до
+  правки). `client/` и `common/` не правились — обновление комнатных ПК не
+  требуется.
+- **AUDIT-17h — коммит и пуш из песочницы снова невозможны.** `git add` и
+  `git commit` → `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied`
+  (`.git` в песочнице только для чтения), `git push origin master:main` →
+  `fatal: unable to access 'https://github.com/rudnytskyi1/jarvis.git/':
+  schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`. Внешнему
+  скрипту для коммита AU-11: `hub/jev_decider.py` (пул соединения с Jev),
+  `hub/app.py` (время чтения Jev в трассе, закрытие соединения на выключении),
+  `scripts/live-eval.py` (стадии `understand_ms`/`model_ms`/`rounds`/
+  `first_call_ms`), `scripts/audit-latency.py`, `scripts/measure_voice_latency.py`,
+  `tests/test_jev_decider.py`, `tests/test_audit_latency.py`,
+  `docs/TZ_STATUS.md`, `docs/AUDIT_LATENCY.md`, `DECISIONS.md`,
+  `PROGRESS_AUDIT.md`. Артефакты прогонов — `data/audit/runs/au-11-*.jsonl|.log`
+  и `data/audit/voice-latency.json` (под `data/`, в git не входят).
+
+## Комнатные ПК после правки клиента, AU-12 (23.09.2026)
+
+- **AUDIT-18 — чем считается «комнатные ПК обновлены».** Правило владельца
+  (2026-09-22) требует после каждой правки клиента обновить и перезапустить его
+  на ВСЕХ комнатных ПК, а не только на своём. Выбран вариант: приёмка AU-12 —
+  это числа из живых прогонов, а не фраза «скрипт отработал»:
+  `update-room-pcs.ps1` должен напечатать «обновлён и перезапущен» вместе с
+  **совпадением SHA-256 `client/camera.py`** с этим рабочим каталогом,
+  состоянием задачи `Running` и `WINDOW=hidden`; `room-audit.ps1` — 57/57
+  настоящих действий на каждом ПК (громкость и её предел, буфер обмена,
+  открытие/закрытие приложения, переходы браузера по семи адресам, камера,
+  экран, 12 отказов). Обоснование: хэш доказывает, что на ПК лежит именно эта
+  сборка, а 57 действий — что она работает на настоящем рабочем столе, а не
+  только в тестах на хабе. Проверено 2026-09-23: пакет 331 КБ, оба ПК
+  «обновлён и перезапущен», хэш совпал, задача Running, окно hidden;
+  AntonDorm 57/57 (32.3 с), buro 56/57 (42.2 с), повтор на buro 57/57
+  (36.1 с). Артефакты — `data/room-eval/audit-AntonDorm.json`,
+  `audit-buro.json`, `audit-buro-rerun.json`. Ссылка:
+  `scripts/update-room-pcs.ps1`, `scripts/room-audit.ps1`,
+  `docs/ROOM_CLIENT_UPDATES.md`.
+- **AUDIT-18b — RA-035 на buro: гонка с дочитывающейся страницей, а не поломка
+  сборки.** У buro упало ровно одно действие: `browser_control navigate
+  www.google.com` сразу после перехода на `youtube.com`. Отчёт Firefox ещё
+  отдавал пустой список элементов («The page is loading or has no accessible
+  controls»), адресная строка не взяла текст, и за `NAVIGATE_WAIT_S` = 8 с
+  адрес не сменился («the address bar did not open google.com: the browser is
+  still on (871) YouTube»). Выбран вариант: по одному наблюдению код не
+  править, а повторить прогон — клиент уже делает две попытки ввода адреса и
+  ждёт загрузку 8 с. Обоснование: повторный прогон того же аудита на том же ПК
+  дал 57/57, и RA-035 занял 2.09 с (`https://www.google.com/`), то есть отказ
+  был транзиентным. ЕСЛИ гонка повторится в следующих прогонах — это отдельная
+  задача на `_navigate`: дождаться, пока текущая страница перестанет
+  «loading», прежде чем печатать новый адрес. Ссылка:
+  `client/actions/browser_desktop.py::_navigate`.
+- **AUDIT-18c — коммит и пуш из песочницы снова невозможны.** `git add`/`git
+  commit` → `fatal: Unable to create 'C:/Users/Anton/Desktop/jarvis/.git/
+  index.lock': Permission denied` (`.git` в песочнице только для чтения),
+  `git push origin master:main` → `schannel: AcquireCredentialsHandle failed:
+  SEC_E_NO_CREDENTIALS` — как в AU-03…AU-11. Файлы AU-12 для внешнего коммита:
+  `PROGRESS_AUDIT.md`, `DECISIONS.md`, `docs/AUDIT_MASS.md`. `client/` и
+  `common/` не правились, но правило AU-12 всё равно выполнено: комнатные ПК
+  обновлены и перезапущены, аудит на них прогнан. Артефакты прогонов
+  (`data/room-eval/audit-*.json`) лежат под `data/` и в git не входят.
+
+## Итог массового аудита (AUDIT-19, 2026-09-23)
+
+- **AUDIT-19 — чем считается «итог» массового аудита.** Владелец просил
+  проверить, что сломано, и починить. Выбран вариант: итог — не пересказ
+  прошлых прогонов, а НОВЫЙ полный живой прогон того же корпуса после всех
+  правок плюс проверка исполнения на комнатных ПК, с числами из файлов.
+  Сделано: `data/audit/runs/au-13-full-final.jsonl` — 1112 сценариев корпуса,
+  1077 разобрано, 35 `SKIP` с причиной, **1071 прошло (99.4 %)** против
+  812 из 1106 (73.4 %) в первом прогоне `mass-01.jsonl` той же ночи; сводка
+  пересчитана `scripts/audit-summary.py` по файлу отчёта, латентность —
+  `scripts/audit-latency.py` по четырём прогонам сразу. Обоснование: «было
+  73 %, стало 99 %» — это утверждение о системе, и оно должно опираться на
+  свежий прогон, а не на арифметику по прошлым файлам. Ссылка:
+  `docs/AUDIT_MASS.md`, `docs/AUDIT_LATENCY.md`, `docs/TZ_STATUS.md`
+  (раздел «Массовый аудит запросов»).
+- **AUDIT-19b — остаток разобран повторным прогоном, а не описан словами.**
+  Шесть упавших сценариев финального прогона собраны в отдельный файл
+  (`data/audit/scenarios.au-13-residual.jsonl`) и прогнаны ещё дважды
+  (`au-13-residual-1.jsonl`, `au-13-residual-2.jsonl`, `--workers 6`).
+  Результат: `AU-0462` («quit the file explorer now») прошёл оба раза —
+  в финальном прогоне модель оборвалась на «DeepSeek is unavailable», то
+  есть это сбой провайдера, а не логика; `AU-0971` («quiet please») и
+  `AU-0910` («press the button on the socket») прошли 1 и 2 раза из 2 —
+  разброс модели; `AU-0977` («picture of a dog») — 0 из 3 и `AU-0989`/
+  `AU-0990` («save a photo and put it on my wallpaper») — 0 из 3. Выбран
+  вариант: устойчивые три сценария (AU-0977 и пара AU-0989/AU-0990) объявить
+  задачами AU-20/AU-21, случайные три (сбой провайдера AU-0462 и два
+  разброса, AU-0971 и AU-0910) — записать как случайные, не считая их
+  поломками. Обоснование: без
+  повторного прогона «6 падений» одинаково выглядели бы и сбой сети, и
+  дефект. Ссылка: `docs/AUDIT_MASS.md`, раздел «Остаток».
+- **AUDIT-19c — «picture of a dog» без слова «нарисуй»: Jev прячет
+  `generate_image`.** Устойчивое (0 из 3): Jev называет для такой просьбы
+  другое семейство, и в наборе остаются `look_at_screen`, `find_object`,
+  `inspect_photo`, но не `generate_image`; модель ищет картинку, а не
+  рисует её. Выбран вариант: не править сейчас, а вынести отдельной задачей
+  AU-20, потому что правка значений семейств (просьба о картинке — это
+  создание изображения, а не поиск) затрагивает общий вопрос Jev и требует
+  своего живого прогона семейства `noisy`/`media`. Обоснование: в цикле
+  «одна задача за раз» правка чужого слоя без прогона — это и есть та
+  самая выдумка, которой аудит и занимался. Ссылка: `PROGRESS_AUDIT.md`,
+  AU-20.
+- **AUDIT-19d — пара «сохрани фото и поставь на обои»: ход модели, а не
+  сужение.** 0 из 3, но в трёх прогонах терялись РАЗНЫЕ половины (в одном
+  `save_photo`, в другом `set_wallpaper`), и в строке отчёта `offered`
+  пуст — значит сужение набора ни при чём, инструменты были у модели все.
+  Выбран вариант: записать задачей AU-21 (промпт/самопроверка хода) и
+  оставить числа как есть, а не править вердикт корпуса. Обоснование: это
+  тот же класс, что AUDIT-16d («модель делает одну половину и спрашивает
+  про вторую»), и «пара сделана» не должно означать «сделана половина».
+  Ссылка: `DECISIONS.md`, AUDIT-16 … AUDIT-16d.
+- **AUDIT-19e — `RA-035` повторился: это устойчивый дефект, а не гонка.**
+  В AU-12 действие `browser_control navigate www.google.com` сразу после
+  `youtube.com` упало на buro один раз и прошло на повторном прогоне, и
+  было решено считать это гонкой с дочитывающейся страницей. В AU-13 аудит
+  прогнан дважды на обоих ПК: AntonDorm — 57/57 и 57/57, buro — 56/57 и
+  56/57, оба раза с одной строкой «The address bar did not open
+  google.com: the browser is still on (871) YouTube». Выбран вариант:
+  задача AU-22 на `client/actions/browser_desktop.py::_navigate` — дождаться
+  окончания загрузки текущей страницы, прежде чем печатать новый адрес, —
+  потому что сработало ровно то условие, которое AUDIT-18b назвал
+  («если гонка повторится — это отдельная задача»). Обоснование: два
+  прогона подряд с одинаковым текстом отказа — это воспроизводимость.
+  Ссылка: `data/room-eval/audit-buro.json`, `audit-buro-au13-first.json`.
+- **AUDIT-19f — язык разделов: README остаётся английским, отчёты
+  аудита — русские.** Правило проекта говорит «документация — русский», но
+  `README.md` — лицо репозитория для внешнего читателя и целиком английский
+  (одна русская строка про «обычный режим» — это пример фразы). Выбран
+  вариант: раздела про аудит в README — английский, отчёты
+  (`docs/AUDIT_MASS.md`, `docs/AUDIT_LATENCY.md`, `docs/TZ_STATUS.md`,
+  `DECISIONS.md`) — русские, как и раньше. Обоснование: смешанный README
+  читается хуже, чем последовательно английский, а правило про русский
+  явно относится к рабочим отчётам и обоснованиям.
+- **AUDIT-19g — коммит и пуш из песочницы снова невозможны.** Проверено
+  2026-09-23: `git add …` → `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied`
+  (`.git` смонтирован только для чтения), `git push origin master:main` →
+  `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` — как в
+  AU-03…AU-12; текущая вершина ветки — `d230828`. Внешнему скрипту для
+  коммита AU-13: `README.md`, `docs/AUDIT_MASS.md`, `docs/TZ_STATUS.md`,
+  `docs/AUDIT_LATENCY.md`, `PROGRESS_AUDIT.md`, `DECISIONS.md`. Артефакты
+  прогонов (`data/audit/runs/au-13-*.jsonl|.log`,
+  `data/audit/scenarios.au-13-residual.jsonl`, `data/room-eval/audit-*.json`)
+  лежат под `data/` и в git не входят. `client/` и `common/` в самом AU-13
+  не правились, но клиент этой сборки развёрнут на оба ПК (VAD из AU-17 до
+  сих пор жил только в рабочем каталоге) и проверен живым аудитом.
+
+
+## Массовый аудит, девятый заход: Jev в Telegram-чате (AU-19)
+
+- **AUDIT-20 — почему в Telegram у хаба не было тех же возможностей?** Владелец
+  23.09: «в Telegram должны быть те же возможности, что и у голосового
+  ассистента», и в JE-01 это осталось открытым пунктом. Числа на входе (живая
+  `data/hub.db`, не память): 81 Telegram-ход в `turn_events` и **ноль** событий
+  `understanding`; в `decisions` 5087 строк и все от `rules`, ни одной от
+  `jev`. Причина не в ключе и не в пути (живой `scripts/jev_probe.py` отвечает
+  за 0.6 с), а в том, что чтение реплики стояло ровно в одном месте —
+  `hub/app.py::Connection._understand_turn`, — а чат идёт другим путём:
+  `hub/telegram_chat.py` → `control_reply` → `hub/telegram_control.py` →
+  `llm.generate(все инструменты)`. Выбрано: вынести чтение и сужение в
+  `hub/turn_reading.py` и звать оттуда оба пути (одна функция, один вопрос, одна
+  трасса), а читателя передать в контроллер параметром — `telegram_control` не
+  должен импортировать `hub/app.py`. Ссылки: ТЗ 5.2–5.5, JE-01,
+  `PROGRESS_AUDIT.md` AU-19, `tests/test_telegram_understanding.py`.
+- **AUDIT-20a — что именно видно в трассе Telegram-хода?** Событие
+  `understanding` с текстом реплики и всеми четырьмя ответами (`act`,
+  `family`, `single`, `followup`) и событие `tool` на каждый вызов — то же
+  самое, что у голосового хода, потому что это один код. Отказ чтения тоже
+  пишется (`ok=0`) — «Jev не ответил» не должно выглядеть как «Jev ответил
+  верно». Приёмка: `data/audit/runs/au-19-telegram.jsonl` (в каждой строке
+  `understood=true` и `understanding` в `turn_events`), тесты
+  `tests/test_telegram_understanding.py` (10).
+- **AUDIT-20b — второй провайдер в цепочке решений.** Порядок `[rules, jev]`
+  (ТЗ 5.2) до этой задачи означал «всегда `rules`»: правила отвечают на все
+  четыре типа, которые отданы Jev, и цепочка заканчивалась на их догадке
+  0.6–0.7. Выбрано: цепочка заканчивается только на ответе в полосе
+  `auto_above` (полоса «действуй») своего типа решения; ниже него следующий
+  провайдер получает тот же вопрос, а побеждает более уверенный ответ
+  (`hub/decider.py::_settled`). Типы без политики (`admin_rights`,
+  `injection`, `clarification`, `action_result`, `sight_claim`, `follow_up`)
+  ведут себя как раньше — первое слово первое: точки безопасности не тронуты.
+  Каждый ответ пишется в `decisions` (и переубеждённый тоже), так что панель
+  отвечает на вопрос «кто это решил». Живая проверка: `scripts/jev_probe.py` —
+  `addressed` → `jev -> True (0.83)` за 520 мс там, где правило говорило 0.6.
+  Ссылка: `tests/test_decider.py`, `tests/test_jev_decider.py`.
+- **AUDIT-20c — почему `route` остался с одним провайдером.** `route` решает
+  локальный роутер команд, и его ответ — факт о регулярках, а не о смысле
+  реплики: Jev, выбрав `fast_command`, всё равно приводит к вызову того же
+  роутера. Живой замер: второй вопрос в цепочке стоит **530 мс** на пути к
+  первому звуку, то есть цена без выгоды. Поэтому в `config.openai.yaml` (файл
+  владельца, в git не входит) стоит `route: [rules]`, а `[rules, jev]`
+  оставлены там, где вопрос действительно о тексте: `addressed`,
+  `hallucination`, `model_level`. Ссылка: ТЗ 15.1 (бюджет 400 мс на
+  «транскрипт → генерация»).
+- **AUDIT-20d — стенд обязан уметь спросить хаб по-телеграфному.** Живого
+  Telegram-чата у стенда нет (в чужой чат ночью не напечатать), поэтому в
+  `scripts/live-eval.py` добавлен `--telegram`: настоящий
+  `TelegramController` в комнате стенда, тот же `get_llm`, тот же читатель,
+  те же вердикты. Два побочных дефекта стенда нашлись сразу и оба исправлены:
+  (1) комната стенда не выглядела подключённой (`ws.client_state`), и весь
+  запрос отвечал «The room PC is offline»; (2) ответ на запрос кадра
+  отправлялся внутри `send_json`, то есть ДО того, как хаб создавал ожидание, —
+  успешный кадр это переживал (он ждал в `_image_incoming`), а отказ нет, и
+  каждый `look_at_screen` в телеграфном прогоне стоил 120 с таймаута. Теперь
+  отказ приходит как у настоящего клиента — отдельной задачей после возврата
+  из `send_json`. Плюс `--actions` off действует и в телеграфном пути: без него
+  стенд не отправляет запрос к экрану, как и голосовой стенд не зовёт
+  клиентские инструменты.
+- **AUDIT-20e — первые числа телеграфного пути.** Полный корпус, `--workers 6`:
+  `au-19-telegram.jsonl` — **1036 из 1077** разобранных (96.2 %), те же 35
+  `SKIP`; тот же корпус голосом в тот же час — **1068 из 1077** (99.2 %).
+  41 падение телеграфного прогона прогнано ещё дважды: с Jev **25 из 41**,
+  без Jev (`--no-understanding`) **21 из 41**, то есть сужение набора
+  инструментов в остатке не виновато (не предложен нужный инструмент ровно в
+  одном сценарии — `AU-0977`, задача AU-20). Устойчивых падений 11; девять из
+  них — вердикт корпуса, написанный для комнаты, а не для чата: «покажи
+  камеру» в чате показывает сам чат (`telegram_send kind=image`), запись лица
+  из чата требует фото или камеры комнаты, памяти у Telegram-аккаунта своё
+  пространство имён. Это записано задачами AU-23 и AU-24, а не спрятано словами
+  «в целом хорошо». Числа — `docs/AUDIT_MASS.md`, раздел «Telegram-путь целиком».
+- **AUDIT-20f — отчёт по Jev видел не всё.** `scripts/jev_usage_report.py`
+  искал таблицу трасс по именам `turn_trace`/`turns_trace` и запрос делал к
+  колонке `payload`, которой нет: на живой базе с 901 событием он печатал
+  «трассы: таблицы нет» и падал на выборке. Исправлено: таблица `turn_events`
+  (миграция 0031), колонка `payload_json`, и отдельная строка «из них голос /
+  Telegram» — теперь число читает именно то, что просил владелец.
+- **AUDIT-20g — коммит и пуш AU-19.** `git add`/`commit`/`push` из песочницы
+  не выполняются: `git add` отвечает
+  `fatal: Unable to create 'C:/Users/Anton/Desktop/jarvis/.git/index.lock':
+  Permission denied` — `.git` в песочнице только для чтения, а у remote нет
+  креденшелов (как в AUDIT-08f, AUDIT-09h, AUDIT-10h, AUDIT-12f, AUDIT-18c,
+  AUDIT-19g). Список файлов этой задачи для внешнего коммита:
+  `hub/turn_reading.py` (новый), `hub/app.py`, `hub/telegram_control.py`,
+  `hub/decider.py`, `scripts/live-eval.py`, `scripts/jev_probe.py`,
+  `scripts/jev_usage_report.py`, `tests/test_telegram_understanding.py`
+  (новый), `tests/test_decider.py`, `tests/test_jev_decider.py`,
+  `PROGRESS_AUDIT.md`, `DECISIONS.md`, `docs/TZ_STATUS.md`,
+  `docs/AUDIT_MASS.md`, `README.md`. `config.openai.yaml` — файл владельца (в
+  `.gitignore`), в коммит не входит, но без `route: [rules]` он даст лишние
+  0.5 с на ход. Артефакты прогонов (`data/audit/runs/au-19-*.jsonl|.log`,
+  `data/live-eval/*`) лежат под `data/` и в git не входят. `client/` и
+  `common/` не правились — обновление комнатных ПК не требуется.
+
+- **AUDIT-20h — проба цепочки писала решения в живую базу.** `scripts/
+  jev_probe.py` строит цепочку хаба и задаёт ей настоящий вопрос, поэтому
+  запись решения уходила в ту базу, которую хаб открывает по умолчанию, —
+  то есть в живую `data/hub.db` владельца (TEST-DB-01). Два первых прогона
+  AU-19 (07:09 и 07:10) оставили там пять строк калибровки (`route` ×3,
+  `addressed` ×2, из них две от `jev`); они честные — это настоящие ответы
+  настоящей цепочки, но не ходы комнаты, и стирать чужие строки без просьбы
+  владельца нельзя, поэтому они остались и записаны здесь. Исправлено:
+  проба ставит `ROWAN_HUB_DB` на свою базу (`data/audit/jev-probe-hub.db`,
+  тот же выключатель, что у `scripts/live-eval.py`) — проверено повторным
+  прогоном: живая база осталась 5092 `rules` / 2 `jev`, своя — 3 / 1.
+
+## Массовый аудит, остаток (AU-20…AU-24)
+
+- **AUDIT-21 — «picture of a dog» без глагола: просьба НАРИСОВАТЬ, а не
+  ПОСМОТРЕТЬ.** Последний устойчивый остаток большого корпуса (`AU-0977`,
+  `AU-0978`): просьба о картинке без слова «нарисуй» уходила в семейство
+  `vision`, сужение прятало `generate_image`, и модель искала картинку
+  (`look_at_screen`, `find_object`) вместо того, чтобы её нарисовать. Выбран
+  вариант: значения семейств (`hub/tools.py::TOOL_FAMILY_MEANINGS`) и вопрос о
+  семействе (`hub/jev_decider.py::FAMILY_QUESTION`) называют просьбу без
+  глагола словами человека — «picture of a dog», «a pic of my cat», «an image
+  of a dragon» — и прямо относят её к `media` («сделать картинку»), а `vision`
+  оставляют только тому, что уже существует: присланное фото, только что
+  нарисованная картинка, камера и экран. Обоснование: человек говорит «picture
+  of a dog», а не «нарисуй»; вопрос «что это за слово» задавать владельцу
+  бессмысленно, а цена ошибки известна — половина корпуса о картинках живёт
+  ровно на этих формулировках. Фейковых заглушек нет: поправлены слова, по
+  которым Jev выбирает семейство, а не подставлен ответ. Проверено живьём:
+  `--family noisy --family media --workers 6` до правки — 132/134
+  (`au-20-before.jsonl`, `AU-0977` упал: `offered` — `vision`), после — 132/134
+  дважды (`au-20-after.jsonl`, `au-20-after-2.jsonl`), `AU-0977` прошёл в обоих
+  (`offered` — `media` с `generate_image`); `python scripts/jev_probe.py
+  "picture of a dog"` — `family=media` 1.00 за 684 мс, соседние формулировки не
+  разъехались («describe the picture I sent», «who is in the room», «what is on
+  the screen» → `vision` 1.00; «put this picture on my wallpaper» → `media`).
+  Остаток этих прогонов (`AU-0710`, `AU-0622`, `AU-0971`) — ход модели:
+  `offered` там совпадает до и после правки. Ссылка: `docs/AUDIT_MASS.md`,
+  раздел «AU-20», `tests/test_jev_understanding.py::test_a_bare_request_for_a_picture_means_making_one_not_looking_at_one`.
+- **AUDIT-21b — коммит и пуш AU-20 снова невозможны из песочницы.**
+  `git add hub/tools.py …` отвечает
+  `fatal: Unable to create 'C:/Users/Anton/Desktop/jarvis/.git/index.lock':
+  Permission denied` — `.git` в песочнице только для чтения, а у remote нет
+  креденшелов (как в AUDIT-08f, AUDIT-09h, AUDIT-10h, AUDIT-12f, AUDIT-18c,
+  AUDIT-19g, AUDIT-20g). Список файлов этой задачи для внешнего коммита:
+  `hub/tools.py`, `hub/jev_decider.py`, `tests/test_jev_understanding.py`,
+  `docs/AUDIT_MASS.md`, `PROGRESS_AUDIT.md`, `DECISIONS.md`. Артефакты
+  прогонов (`data/audit/runs/au-20-*.jsonl|.log`) лежат под `data/` и в git не
+  входят. `client/` и `common/` не правились — обновление комнатных ПК не
+  требуется, `pwsh -File scripts/update-room-pcs.ps1` не запускался.
+
+- **AUDIT-22 — потерянная половина просьбы: проверяем по словам владельца, а не
+  по флагу (задача AU-21).** «Save a photo and put it on my wallpaper» в трёх
+  прогонах из трёх возвращался сделанным наполовину, и терялась каждый раз
+  РАЗНАЯ половина. Разбор показал две вещи. (1) Хаб после хода зовёт `verify`
+  (D-04) не всегда: гейт смотрит `changed_state`, `imperative_without_tool` и
+  `unfinished_step`, а потерянный шаг умел замечать только
+  `site_step_unfinished` («open chrome and go to youtube»); медиа-инструменты
+  (`save_photo`, `set_wallpaper`, `show_photo`) в `STATE_CHANGING_TOOLS` не
+  входят, поэтому хаб не считал такую пару незаконченной, а в живом конфиге
+  владельца ещё и `verify_actions: false` — рутинная проверка тоже не спасала.
+  (2) Стенд прохода самопроверки не делал ВООБЩЕ, поэтому числа корпуса по паре
+  были «первым планом модели», а не цепочкой комнаты — это и было записано
+  открытым в AUDIT-16d. Выбран вариант — продолжить правило TG-06, а не
+  включить флаг обратно: `verify_actions` выключает РУТИННУЮ проверку, но не
+  шаг, который доказанно не сделан. Детектор обобщён на шаги, названные самим
+  человеком (`hub/decision_points.py::named_step_unfinished`,
+  `any_step_unfinished`): «сохрани фото / save a photo», «обои / wallpaper»,
+  «покажи камеру / show the camera» — у каждого свой набор инструментов,
+  которые этот шаг выполняют (`save_photo`/`telegram_send`,
+  `set_wallpaper`/`generate_image`, `show_photo`/`say_in_room`), поэтому
+  «сделай обои из кота» одним `generate_image` и «покажи камеру» без картинки
+  не путаются. Хаб зовёт по нему самопроверку (`hub/app.py`), стенд получил тот
+  же гейт и тот же проход (`scripts/live-eval.py::self_check_needed`,
+  `Bench._after_turn`), а в промпт комнаты добавлено правило: «save a
+  screenshot / save the photo» — это `save_photo`, а не `look_at_screen`
+  (в AU-0996 модель звала взгляд вместо сохранения). Обоснование: гейт обязан
+  спрашивать по словам человека, а не по тому, попал ли инструмент в список
+  меняющих состояние; лишний круг LLM (в среднем 1.4 раунда) тратится только на
+  ходах, где шаг доказанно потерян. Проверено живьём (`--workers 6`): пара
+  «фото + обои» 2 из 4 в начале (`au-21-before.jsonl`, 18/20) → все четыре
+  пары (включая «камера + скриншот») проходят в `au-21-after-2.jsonl` и
+  `au-21-after-3.jsonl` (20/20); полный корпус `au-21-full-after.jsonl` —
+  1067/1077 (99.1 %), из них 265 ходов с самопроверкой и все 265 успешны.
+  Ссылка: `docs/AUDIT_MASS.md`, раздел «AU-21»; ТЗ 5.3 (D-04/D-05), F-114,
+  TG-06; `tests/test_lost_step.py` (новый), `tests/test_site_step.py`.
+- **AUDIT-22b — коммит и пуш AU-21 снова невозможны из песочницы.** `git add`
+  отвечает `fatal: Unable to create 'C:/Users/Anton/Desktop/jarvis/.git/
+  index.lock': Permission denied` (как в AUDIT-08f…AUDIT-21b). Список файлов
+  этой задачи для внешнего коммита: `hub/decision_points.py`, `hub/app.py`,
+  `scripts/live-eval.py`, `prompts/system.md`, `tests/test_lost_step.py`
+  (новый), `docs/AUDIT_MASS.md`, `PROGRESS_AUDIT.md`, `DECISIONS.md`.
+  Артефакты прогонов (`data/audit/runs/au-21-*.jsonl`) лежат под `data/` и в
+  git не входят. `client/` и `common/` не правились — обновление комнатных ПК
+  не требуется. Что осталось открытым и записано отдельно: **самопроверка
+  Telegram-пути** — `hub/telegram_control.py` зовёт модель напрямую и прохода
+  `verify` не имеет вовсе (задачи AU-23/AU-24).
+
+- **AUDIT-23 — `_navigate`: адрес в ещё грузящуюся страницу (задача AU-22).**
+  buro дважды подряд (56/57, `audit-buro-au13-first.json` и `audit-buro.json`)
+  падал на одном и том же действии: `browser_control navigate www.google.com`
+  сразу после `youtube.com`, «The address bar did not open google.com: the
+  browser is still on (871) YouTube». Причина — не сеть и не страница, а
+  момент ввода: окно ещё дочитывало тяжёлый YouTube, `Ctrl+L`/текст не доходили
+  до адресной строки (в отчёте текст в строке пуст), а `_navigate` ждал смены
+  документа ровно один раз. Выбран вариант из трёх частей, все три — в
+  `client/actions/browser_desktop.py`. (1) Перед вводом страница, на которой
+  окно уже стоит, получает до `NAVIGATE_SETTLE_S` = 2.5 с на то, чтобы
+  перестать меняться (сравниваются адрес и заголовок, а не runtime id: Chrome
+  выдаёт новый id на каждое чтение, см. `_page_point`). (2) Ввод повторяется
+  ЦЕЛИКОМ (`NAVIGATE_ROUNDS` = 2): один проглоченный `Ctrl+L` — гонка, о
+  неудаче комната слышит только если и второй ввод ничего не открыл; два круга
+  по 8 с укладываются в бюджет действия хаба (`ACTION_TIMEOUT_S` = 35 с).
+  (3) Если адресная строка вообще не нашлась в дереве, ввод повторяется (тот же
+  класс: дерево не отдало строку, потому что страница ещё строится) — при этом
+  текст ВСЁ РАВНО уходит в браузер, как и было решено 2026-09-22 (отказ «no URL
+  was typed» был ошибкой, его не возвращаем). Обоснование: проглатывание ввода
+  — свойство момента, а не ПК; повтор стоит ~2 с и только там, где адрес
+  действительно не открылся. Проверено тестами (`tests/test_browser_desktop.py`:
+  проглоченный ввод повторяется и открывается; два проглатывания подряд — отказ,
+  называющий страницу; старый случай 2026-09-22 обновлён под новый порядок
+  событий). Проверено живьём: `pwsh -File scripts\update-room-pcs.ps1` —
+  оба ПК «обновлён и перезапущен», SHA-256 `client/camera.py` совпал, задача
+  `Running`, окно `hidden`; `pwsh -File scripts\room-audit.ps1` — AntonDorm
+  **57/57** дважды (34.4 с и 37.8 с), и RA-035
+  (`navigate www.google.com` после `youtube.com`) прошёл за 1.2 с
+  (`https://www.google.com/`, `data/room-eval/audit-AntonDorm.json`). Ссылка:
+  ТЗ F-109, `data/room-eval/audit-buro.json`, AU-19e, `DECISIONS.md` AUDIT-23b
+  (почему задача осталась открытой).
+- **AUDIT-23b — buro не отвечает: AU-22 не закрыта, три падения подряд.**
+  Первый прогон `room-audit.ps1` (09:10 UTC-5) отдал AntonDorm 57/57, а на
+  buro повис: ssh-сессия к интерактивной задаче `RowanRoomAudit` стояла ~19
+  минут без обращений к сети (проверено `Get-Process ssh` — процесс жив, CPU
+  0.02 с), убита; отчёт на ПК так и не появился. Второй прогон: AntonDorm
+  снова 57/57, buro —
+  `ssh: connect to host 100.67.114.67 port 22: Connection timed out`. Три
+  прямые пробы (`ssh -o ConnectTimeout=8 … hostname`) — три раза таймаут;
+  `Test-NetConnection 100.67.114.67 -Port 22` → False, при этом AntonDorm
+  (`100.126.102.69:22`) → True; `/health` хаба показывает `outbound.clients=1`,
+  то есть клиент buro не на связи. Вывод: второй комнатный ПК выключен или без
+  сети, это не следствие правки (`client/` шёл на оба ПК, и в 09:09 buro
+  ответил «обновлён и перезапущен», хэш совпал, задача `Running`). Поэтому
+  AU-22 НЕ отмечена выполненной: её приёмка — 57/57 на ОБОИХ ПК. Что осталось
+  сделать, когда buro вернётся: `pwsh -File scripts\room-audit.ps1` и отметить
+  задачу, если оба ПК дают 57/57 (код на buro уже новый, повторное обновление
+  не нужно, достаточно аудита). Записано в `BLOCKED_AUDIT.md`; цикл остановлен
+  по правилу «три падения подряд».
+  `git add`/`commit`/`push` и этой задачи тоже невозможны из песочницы
+  (`fatal: Unable to create 'C:/Users/Anton/Desktop/jarvis/.git/index.lock':
+  Permission denied`, проверено 09:41). Список файлов AU-22 для внешнего
+  коммита: `client/actions/browser_desktop.py`,
+  `tests/test_browser_desktop.py`, `docs/AUDIT_MASS.md`, `BLOCKED_AUDIT.md`
+  (новый), `PROGRESS_AUDIT.md`, `DECISIONS.md`.
+
+- **AUDIT-23c — buro не вернулся: AU-22 пропускается, цикл идёт дальше
+  (правило владельца «если задача не сходится — запиши причину и переходи к
+  следующей»).** Новый запуск ночного цикла (09:54–10:24) снова начал с
+  AU-22 и снова упёрся в тот же внешний блокер: `Test-NetConnection
+  100.67.114.67 -Port 22` → **False** дважды, `Test-Connection` (ICMP) → **False**,
+  `ssh -i C:\Users\Anton\Desktop\keyburo\buro -o ConnectTimeout=8 … hostname` →
+  `Connection timed out` (проверено трижды за полчаса, 09:54 / 10:05 / 10:24),
+  при этом AntonDorm (`100.126.102.69:22`) отвечает **True**, а `/health`
+  хаба показывает `outbound.clients: 1` — комнаты buro в сети нет. Третий ПК
+  недоступен, эскалаций в песочнице нет, поэтому приёмку AU-22 («57/57 на
+  ОБОИХ ПК») выполнить нечем; код на buro при этом уже новый (обновлён в
+  09:09, хэш совпал), нужен только прогон аудита, когда ПК вернётся.
+  Решение: `BLOCKED_AUDIT.md` обновлён свежими пробами (остаётся
+  действующим для AU-22), AU-22 остаётся `[ ]`, цикл переходит к следующей
+  задаче (AU-23) — останавливать весь аудит из-за одного выключенного ПК
+  значило бы не сделать ни одной из трёх оставшихся задач. Как только buro
+  ответит: `pwsh -File scripts\room-audit.ps1`, и если оба ПК дают 57/57 —
+  отметить AU-22 и убрать `BLOCKED_AUDIT.md`.
+
+- **AUDIT-25 — чем верный ход в Telegram-чате отличается от голосового
+  (задача AU-23).** Тот же корпус спрашивается и голосом, и `--telegram`, но у
+  части просьб верный ход в чате другой, и корпус называл ошибкой верное
+  поведение: «покажи камеру» в чате — это присланное в разговор фото
+  (`telegram_send kind=image`; `show_photo` доставляет туда же,
+  `hub/telegram_control.py`), а не картинка на экране комнаты. Выбран вариант:
+  у сценария появился признак «в чате верный ход такой» —
+  `telegram_expect_tools` / `telegram_expect_any`
+  (`scripts/gen-audit-scenarios.py`), который читает ТОЛЬКО
+  `scripts/live-eval.py --telegram` (`telegram_scenario`). Голосовые ожидания
+  остаются на месте, поэтому прогоны сравнимы сценарий за сценарием, а второй
+  таблицы ожиданий в корпусе нет. Обоснование: вердикт обязан мерить ход
+  разговора, а не удобство стенда; там, где честных ходов два, корпус
+  принимает оба, а не требует один. Ссылка: `docs/AUDIT_MASS.md`, «AU-23»;
+  ТЗ F-703.
+- **AUDIT-25a — можно ли записать лицо и голос ИЗ ЧАТА, без вложения (ТЗ
+  F-210)?** Владелец в чате может написать «this is John, memorize his face»
+  или «save this person as my roommate». Выбран вариант: да, тем же
+  инструментом и без вложения, потому что источник — камера КОМНАТЫ (тот же
+  путь, что у голосовой просьбы): гостя записывает владелец своим словом, а
+  «этот человек» значит «тот, кто перед камерой комнаты». Инструмент сам
+  отвечает, что не видит лица, если никого нет, — это честный ответ
+  инструмента, а не отказ модели за него. Сделано: в промпт Telegram-хода
+  (`hub/telegram_control.py`) добавлено прямое правило — запись лица/голоса
+  по имени из чата это `enroll_face`/`enroll_voice`, камеру берёт комната,
+  отвечать «в этом чате нет камеры» нельзя, а имя берётся слово в слово
+  («my roommate» — это имя, а не повод спросить другое). Обоснование: ТЗ
+  F-210/F-703 разрешают владельцу записать гостя и требуют в Telegram тех же
+  возможностей, что и голосом; отказ модели был не про продукт, а про
+  формулировку. Проверено живьём: `AU-0819` FAIL→PASS (живой прогон
+  `au-23-final.jsonl`, `tools: enroll_face`), `AU-0802` проходит.
+- **AUDIT-25b — ночью стенд не пишет в чат владельца: кого подменяем?** В
+  `--telegram` телеграфный ход идёт по-настоящему (авторизация, снимок
+  камеры, работа с картинкой, текст ответа), но последний шаг — API Telegram
+  — ночью отправил бы сообщения владельцу. Выбран вариант: подменить ровно
+  этот последний шаг транспортом-двойником
+  (`scripts/live-eval.py::BenchTelegram`), как стенд уже подменяет входящее
+  сообщение, а сама отправка идёт с `ok` только когда картинка непустая; что
+  именно «уехало», пишется в строку отчёта полем `deliveries` (в финальном
+  прогоне — 11 квитанций). Обоснование: без этого весь путь доставки в чате
+  неизмерим (до правки `telegram_send` отвечал «Telegram is not configured»,
+  и верный ход модели выглядел как отказ), а писать в реальный чат ночью
+  нельзя. Это транспорт, а не логика: решения хаба, снимок камеры и текст
+  ответа выполняются настоящим кодом.
+- **AUDIT-25c — ход хаба, который сам смотрит в камеру, обязан быть виден в
+  цепочке.** На «кто в комнате?» Telegram-ход отвечает свежим кадром ДО
+  модели (`TelegramController` → `inspect_current_people`), и этот шаг не
+  проходил через `Connection._execute_tool`, поэтому в `turn_events` не было
+  ни одного события `tool`: панель владельца показывала ответ про комнату без
+  взгляда на камеру, а живой прогон считал такие ходы «инструмент не вызван»
+  и падал (`AU-0547` «who is in the room?», `AU-1011` «кто в комнате»).
+  Выбран вариант: записывать этот шаг в цепочку хода тем же событием `tool`
+  (`hub/telegram_control.py`, `source: current-people-question`), с честным
+  `ok=0`, когда камеры нет. Обоснование: цепочка хода — это то, что владелец
+  видит в панели и что меряет стенд; дырка делала обе картины неверными.
+  Проверено живьём: `AU-0547`/`AU-1011` FAIL→PASS (`tools: look_at_camera`);
+  тест `tests/test_telegram_understanding.py::
+  test_the_hubs_own_look_at_the_room_camera_is_written_to_the_turn_trace`.
+- **AUDIT-25d — перезапуск хаба и коммит из песочницы.** Хаб перезапущен
+  `scripts/run-openai-server.ps1`: старый PID 93564 остановлен, новый процесс
+  поднялся, `/health` → `status=ok`, `llm_model=deepseek-flash`,
+  `telegram=true`, `outbound.clients=1`. Сам лаунчер перед этим проверен на
+  отдельном порту (`tmp/config.port-check.yaml`, `port: 8899`): `/health` →
+  200, после проверки инстанс остановлен. `git add`/`commit`/`push` из
+  песочницы невозможны: `git add -n PROGRESS_AUDIT.md` →
+  `fatal: Unable to create 'C:/Users/Anton/Desktop/jarvis/.git/index.lock':
+  Permission denied` (`.git` только для чтения, у remote нет креденшелов; как
+  в AUDIT-08f…AUDIT-23b). Список файлов AU-23 для внешнего коммита:
+  `hub/telegram_control.py`, `scripts/gen-audit-scenarios.py`,
+  `scripts/live-eval.py`, `tests/audit/test_request_matrix.py`,
+  `tests/test_telegram_understanding.py`, `docs/AUDIT_MASS.md`,
+  `PROGRESS_AUDIT.md`, `DECISIONS.md`, `BLOCKED_AUDIT.md`. Артефакты прогонов
+  (`data/audit/runs/au-23-*.jsonl`, `data/audit/scenarios*.jsonl`,
+  `tmp/au-23-junit.xml`) под `data/` и `tmp/` и в git не входят. `client/` и
+  `common/` не правились — обновление комнатных ПК не требуется.
+
+- **AUDIT-26 — что видит в памяти аккаунт-владелец в Telegram (задача
+  AU-24).** `AU-1010` («что ты помнишь обо мне», `--telegram`) получал «ничего»:
+  вопрос не уходил в `list_memory`/`recall_conversation`, а модель отвечала из
+  промпта (это исправлено прогоном AU-23: в `au-24-memory.jsonl` вопрос уходит
+  в `list_memory` и отвечает фактами этого пространства имён). Открытым
+  оставался продуктовый вопрос: должен ли аккаунт-владелец видеть заметки
+  комнаты о себе? Выбран вариант: ДА, но только СВОИ и только в СВОЕЙ личке.
+  Профиль владельца берётся из конфигурации дома
+  (`homes[].owner_person_id`, ТЗ 14/F-701) и совпадает с профилем, под которым
+  владельца узнаёт ход в комнате (`hub/telegram_control.py::owner_memory_profile`);
+  посторонний аккаунт и группа остаются на пространстве имён чата
+  (`telegram:<чат>:<пользователь>`), поэтому личные заметки комнаты в чужой
+  чат не утекают — правило ТЗ F-415 остаётся. Обоснование: «чужой чат» и «своя
+  личка владельца» — разные вещи, а заметка, которую владелец сказал голосом,
+  обязана быть слышна ему и в его чате; дефолт — поле не задано, значит личка
+  живёт своим пространством имён и отвечает честно («пока ничего»), а не
+  выдумывает. Проверено живьём: `--telegram --family memory --family russian
+  --workers 6` (`data/audit/runs/au-24-memory.jsonl`) — **104 из 105**,
+  `AU-1010` PASS (10 фактов чата в ответе), единственное падение `AU-1007`
+  «включи свет» — известный разброс (`set_light` без лампы); отдельная проба с
+  временным конфигом, где дом назвал `owner_person_id: Anton`
+  (`data/audit/runs/au-24-owner-profile.jsonl`), показала, что личка владельца
+  читает ЕГО факт («ключи ты держишь в верхнем ящике»), чего раньше не видела.
+  Тесты: `tests/test_telegram_understanding.py` (+2). Ссылка: `docs/AUDIT_MASS.md`,
+  «AU-24».
+- **AUDIT-26b — коммит и пуш из песочницы снова невозможны.**
+  `git add …` отвечает `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied`
+  (проверено 11:1x; `.git` в песочнице только для чтения, как в
+  AUDIT-08f…AUDIT-25d). Список файлов AU-24 для внешнего коммита:
+  `hub/telegram_control.py`, `tests/test_telegram_understanding.py`,
+  `docs/AUDIT_MASS.md`, `docs/TZ_STATUS.md`, `PROGRESS_AUDIT.md`,
+  `DECISIONS.md`. Артефакты прогонов (`data/audit/runs/au-24-*.jsonl`,
+  `tmp/au-24-junit.xml`) в git не входят. `client/` и `common/` не правились —
+  обновление комнатных ПК не требуется.
+
+- **TG-10 — почему TG-09 перестал работать и что теперь вместо него.** Владелец
+  2026-09-23: «опять видео в телеге на мобилке не грузятся». Причина найдена по
+  логу, а не на глаз: `hub/video_transcode.py` перекодировал клип через
+  `subprocess.run([ffmpeg, …])`, и на живом хабе это падало с
+  `PermissionError` (в логе — «ffmpeg could not convert an alert video
+  (PermissionError)»), после чего запись уходила в Телеграм НЕперекодированной
+  (`mp4v`, MPEG-4 Part 2), который телефонные приложения не играют. Хаб,
+  перезапущенный агентом в песочнице, не имеет права ни запускать
+  `ffmpeg.exe`, ни писать в `%TEMP%` — а именно там лежали временные файлы
+  перекодирования, и `rmtree`/`chmod` на этом каталоге давал тот же
+  `WinError 5`, только уже ПОСЛЕ удачной конвертации: исключение из уборки
+  уносило готовый клип. Выбран вариант: (1) второй энкодер **PyAV (`av`,
+  libx264) прямо в процессе** — без дочернего процесса и без временных файлов,
+  он работает и в песочнице; (2) порядок обратный прежнему — сначала `ffmpeg`
+  (только он пишет `+faststart`, `moov` впереди), при его отказе PyAV;
+  (3) временные файлы ffmpeg теперь в своём подкаталоге, а уборка не имеет
+  права уронить результат (`shutil.rmtree(..., ignore_errors=True)` в
+  `finally`); (4) в `sendVideo` добавлен `supports_streaming: true`, но только
+  когда `is_stream_ready()` видит `moov` перед `mdat` — обещать поток для
+  клипа PyAV нельзя, телефон ответил бы «не удалось воспроизвести».
+  Обоснование: уведомление должно доходить и открываться на телефоне даже
+  тогда, когда хаб запущен из ограниченного окружения; качество (faststart)
+  остаётся, когда разрешён `ffmpeg`. Измерено 23.09: в песочнице `ffmpeg`
+  падает, PyAV даёт H.264 (2699 байт из 5528-байтного `mp4v`); вне песочницы
+  `ffmpeg` даёт H.264 + faststart (2520 байт). Ссылка: ТЗ F-702;
+  `hub/video_transcode.py`, `hub/telegram.py`, `scripts/video_probe.py`,
+  `tests/test_video_transcode.py`, `tests/test_telegram_admin_transport.py`.
