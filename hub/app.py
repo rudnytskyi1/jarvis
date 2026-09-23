@@ -10029,6 +10029,9 @@ class Connection(CameraClipReceiver):
         if not reminders_mod.is_reminder_request(text):
             return None
         lang = reminders_mod.language_of(language or self._memory_language())
+        # «Поставь будильник на семь утра» — та же запись F-417, но у неё нет
+        # «о чём»: вопрос и ответ говорят о будильнике, а не о напоминании.
+        alarm = reminders_mod.is_alarm_request(text)
         # ТЗ F-417/F-301: «напомни, когда приду домой» — это не срок, а
         # событие входа, и проверяется раньше времени: момента у него нет.
         arrival = reminders_mod.parse_arrival(text)
@@ -10038,7 +10041,7 @@ class Connection(CameraClipReceiver):
         if arrival is None and request is None:
             log.info("«Напомни» without a readable time: %r", text,
                      extra={'utterance_id': self.utterance_id})
-            return reminders_mod.missing_time_answer(lang)
+            return reminders_mod.missing_time_answer(lang, alarm=alarm)
         conn = _hub_conn
         if conn is None:
             return reminders_mod.storage_unavailable_answer(lang)
@@ -10093,7 +10096,7 @@ class Connection(CameraClipReceiver):
         if request is None:  # pragma: no cover - см. выше
             return reminders_mod.arrival_answer('', lang)
         return reminders_mod.scheduled_answer(
-            request, language=lang, tz=self._home_timezone())
+            request, language=lang, tz=self._home_timezone(), alarm=alarm)
 
     # --- ТЗ F-213: «забудь меня» ---------------------------------------------
 

@@ -183,8 +183,11 @@ _HALF_HOUR = re.compile(
 
 _CLOCK_PARTS: dict[str, int] = {
     "am": 0, "a.m.": 0, "утра": 0, "ночи": 0, "de la mañana": 0,
+    "in the morning": 0, "утром": 0,
     "pm": 12, "p.m.": 12, "дня": 12, "вечера": 12,
     "de la tarde": 12, "de la noche": 12,
+    "in the afternoon": 12, "in the evening": 12, "at night": 12,
+    "днём": 12, "вечером": 12,
 }
 _CLOCK_PART_PATTERN = "|".join(
     sorted((re.escape(part) for part in _CLOCK_PARTS), key=len, reverse=True))
@@ -208,6 +211,25 @@ _CLOCK = re.compile(
     rf"(?:(?P<part>{_CLOCK_PART_PATTERN})\b)?",
     re.IGNORECASE,
 )
+#: «an alarm for seven in the morning» / «будильник на семь утра»: будильник
+#: называет час после «for»/«на», которых обычный `_CLOCK` не знает.
+_ALARM_CLOCK = re.compile(
+    rf"\b(?:for|на)\s+(?P<hour>\d{{1,2}}|{_HOUR_WORD_PATTERN})"
+    rf"(?::(?P<minute>\d{{2}}))?\s*"
+    rf"(?:(?P<part>{_CLOCK_PART_PATTERN})\b)?",
+    re.IGNORECASE,
+)
+#: «будильник на 20 минут» / «an alarm for 2 hours» — это срок от сейчас, а не
+#: двадцать часов вечера.
+_ALARM_FOR = re.compile(
+    rf"\b(?:for|на)\s+"
+    rf"(?:(?P<count>{_NUMBER})|(?P<word>{_WORD_NUMBER_PATTERN}))\s*"
+    rf"(?P<unit>{_UNIT})\b",
+    re.IGNORECASE,
+)
+#: Единица измерения сразу после прочитанного часа («for 20 minutes») значит,
+#: что это была длительность, а не время суток.
+_UNIT_AFTER = re.compile(rf"\s*(?:{_UNIT})\b", re.IGNORECASE)
 
 _WEEKDAYS: dict[str, int] = {
     "понедельник": 0, "понедельника": 0, "monday": 0, "lunes": 0,
@@ -240,6 +262,42 @@ _REMIND_VERB = re.compile(
     r"\b(?:remind\s+me(?:\s+to)?|напомни(?:-ка)?|напомнить|recu[eé]rdame)\b",
     re.IGNORECASE,
 )
+#: «поставь будильник на семь утра» / «set an alarm for seven in the morning» —
+#: та же просьба F-417, только названная будильником. Живая комната говорила
+#: именно так, а `_REMIND_VERB` знал только «напомни»: реплика уходила дальше к
+#: модели, будильника у неё нет, и владелец слышал «I can't set alarms».
+#: Явная просьба: время у неё можно спросить.
+_ALARM_IMPERATIVE = re.compile(
+    r"\b(?:set|put|start)\s+(?:me\s+)?(?:an?\s+|the\s+)?alarms?\b"
+    r"|\b(?:поставь|заведи|установи)\s+(?:мне\s+)?будильник\w*\b"
+    r"|\bразбуди(?:\s+меня)?\b"
+    r"|\bpon(?:me)?\s+una\s+alarma\b|\bdespi[eé]rtame\b",
+    re.IGNORECASE,
+)
+#: «будильник на 7 утра» / «an alarm for seven»: без просьбы-глагола будильник
+#: узнаётся только вместе со сроком, иначе «будильник звонил в семь» стало бы
+#: новой просьбой поставить его.
+_ALARM_ASK = re.compile(
+    r"\b(?:alarms?|будильник\w*|alarma)\s+(?:for|at|on|на|в)\b"
+    r"|\bwake\s+me(?:\s+up)?\b",
+    re.IGNORECASE,
+)
+#: Служебные слова будильника: в текст напоминания они не попадают.
+_ALARM_SERVICE = re.compile(
+    r"\b(?:set|put|start)\s+(?:me\s+)?(?:an?\s+|the\s+)?alarms?\b"
+    r"|\bwake\s+me(?:\s+up)?\b"
+    r"|\b(?:поставь|заведи|установи)\s+(?:мне\s+)?будильник\w*\b"
+    r"|\bразбуди(?:\s+меня)?\b"
+    r"|\bpon(?:me)?\s+una\s+alarma\b|\bdespi[eé]rtame\b",
+    re.IGNORECASE,
+)
+#: Всё, что осталось от реплики про будильник, — сам будильник: своего текста у
+#: него нет, и выдумывать его нельзя (ТЗ раздел 1, «никаких фейков»).
+_ALARM_ONLY = frozenset({
+    "alarm", "alarms", "an alarm", "the alarm", "my alarm", "that alarm",
+    "будильник", "будильника", "мой будильник", "мне будильник",
+    "alarma", "una alarma", "la alarma",
+})
 #: «когда приду домой» — не срок, а событие входа F-301 (задача P3-23).
 _ARRIVAL = re.compile(
     r"\b(?:when\s+i\s+(?:get|come|am|arrive)\s+(?:back\s+)?home"
@@ -326,8 +384,8 @@ def _day_word(raw: str) -> re.Match[str] | None:
     return None
 
 
-def _locate(raw: str, moment: datetime, zone: ZoneInfo,
-            default_hour: int) -> tuple[When, int, int] | None:
+def _locate(raw: str, moment: datetime, zone: ZoneInfo, default_hour: int,
+            *, alarm: bool = False) -> tuple[When, int, int] | None:
     """Срок реплики вместе с местом его слов в тексте."""
     local_now = moment.astimezone(zone)
 
@@ -343,6 +401,17 @@ def _locate(raw: str, moment: datetime, zone: ZoneInfo,
                 duration.start(), duration.end())
 
     clock = _CLOCK.search(raw)
+    if clock is None and alarm:
+        # Будильник зовут и «на двадцать минут», и «на семь утра»: длительность
+        # проверяется первой, иначе «на 20 минут» стало бы 20:00.
+        for_duration = _ALARM_FOR.search(raw)
+        if for_duration is not None:
+            return (When(due_at=moment + timedelta(seconds=_seconds(for_duration)),
+                         matched=_clean(for_duration.group(0)), kind=WhenKind.DURATION),
+                    for_duration.start(), for_duration.end())
+        candidate = _ALARM_CLOCK.search(raw)
+        if candidate is not None and not _UNIT_AFTER.match(raw[candidate.end():]):
+            clock = candidate
     parts = _clock_parts(clock) if clock is not None else None
     if clock is not None and parts is None:
         clock = None
@@ -398,8 +467,22 @@ def parse_when(text: Any, *, now: datetime | None = None, tz: Any = "UTC",
 
 
 def is_reminder_request(text: Any) -> bool:
-    """Просит ли реплика напомнить («напомни», «remind me»)."""
-    return _REMIND_VERB.search(" ".join(str(text or "").split())) is not None
+    """Просит ли реплика напомнить («напомни») или поставить будильник."""
+    raw = " ".join(str(text or "").split())
+    return _REMIND_VERB.search(raw) is not None or is_alarm_request(raw)
+
+
+def is_alarm_request(text: Any) -> bool:
+    """Просит ли реплика будильник («поставь будильник на семь утра», F-417)."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return False
+    if _ALARM_IMPERATIVE.search(raw):
+        return True
+    if not _ALARM_ASK.search(raw):
+        return False
+    return _locate(raw, _aware(None), timezone_of("UTC"), DEFAULT_HOUR,
+                   alarm=True) is not None
 
 
 def parse(text: Any, *, now: datetime | None = None, tz: Any = "UTC",
@@ -413,7 +496,8 @@ def parse(text: Any, *, now: datetime | None = None, tz: Any = "UTC",
     raw = " ".join(str(text or "").split())
     if not raw or not is_reminder_request(raw):
         return None
-    located = _locate(raw, _aware(now), timezone_of(tz), int(default_hour))
+    located = _locate(raw, _aware(now), timezone_of(tz), int(default_hour),
+                      alarm=is_alarm_request(raw))
     if located is None:
         return None
     when, start, end = located
@@ -426,7 +510,12 @@ def _body(raw: str, start: int, end: int) -> str:
     body = _clean(f"{raw[:start]} {raw[end:]}")
     body = _REMIND_VERB.sub(" ", body, count=1)
     body = _ADDRESS.sub("", body, count=1)
-    return _clean(_BODY_PREFIX.sub(" ", body, count=1))[:500].rstrip()
+    body = _clean(_BODY_PREFIX.sub(" ", body, count=1))
+    # «set an alarm for seven» — служебные слова будильника, а не его текст.
+    body = _clean(_ALARM_SERVICE.sub(" ", body, count=1))
+    if body.casefold() in _ALARM_ONLY:
+        body = ""
+    return body[:500].rstrip()
 
 
 def is_arrival_request(text: Any) -> bool:
@@ -503,10 +592,19 @@ def spoken_when(due_at: datetime, *, tz: Any = "UTC",
 
 
 def scheduled_answer(request: ReminderRequest, *, language: Any = DEFAULT_LANGUAGE,
-                     tz: Any = "UTC", now: datetime | None = None) -> str:
-    """Что комната слышит после «напомни …» (F-417)."""
+                     tz: Any = "UTC", now: datetime | None = None,
+                     alarm: bool = False) -> str:
+    """Что комната слышит после «напомни …» или «поставь будильник …» (F-417)."""
     lang = language_of(language)
     when = spoken_when(request.due_at, tz=tz, language=lang, now=now)
+    if alarm:
+        # У будильника нет «о чём»: обещать напоминание о выдуманном предмете
+        # нельзя, поэтому он называется будильником.
+        if lang == "en":
+            return f"Alright, your alarm is set {when}."
+        if lang == "es":
+            return f"De acuerdo, tu alarma está puesta {when}."
+        return f"Хорошо, будильник поставлен {when}."
     what = f"«{request.text}»" if request.text else (
         "это" if lang == "ru" else "it" if lang == "en" else "eso")
     if lang == "en":
@@ -528,8 +626,17 @@ def arrival_answer(text: str, language: Any = DEFAULT_LANGUAGE) -> str:
     return f"Хорошо, скажу, когда ты придёшь домой: {what}."
 
 
-def missing_time_answer(language: Any = DEFAULT_LANGUAGE) -> str:
+def missing_time_answer(language: Any = DEFAULT_LANGUAGE, *, alarm: bool = False) -> str:
     lang = language_of(language)
+    if alarm:
+        if lang == "en":
+            return ("For what time should I set the alarm? Say a time, for example "
+                    "at seven in the morning.")
+        if lang == "es":
+            return ("¿Para qué hora pongo la alarma? Di una hora, por ejemplo "
+                    "a las siete de la mañana.")
+        return ("На какое время поставить будильник? Скажи, например, "
+                "«на семь утра».")
     if lang == "en":
         return "When should I remind you? Say a time, for example in 20 minutes or on Friday at nine."
     if lang == "es":

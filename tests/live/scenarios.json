@@ -222,12 +222,16 @@
     {
       "id": "VE-23",
       "said": "Rowan, set an alarm for seven in the morning",
-      "expect_any": [
-        "pc_control",
-        "remember",
-        "create_rule",
-        "run_skill"
-      ]
+      "hub_rule": "reminder",
+      "expect_hub": {
+        "reply_says": [
+          "07:00"
+        ],
+        "stored": 1,
+        "text": "",
+        "clock": "07:00"
+      },
+      "note": "An alarm is the hub's own turn (ТЗ F-417, _reminder_turn): the live room never sends it to the model. The bench runs that scripted turn through the hub's real code, so the scenario checks what the room actually does."
     },
     {
       "id": "VE-24",

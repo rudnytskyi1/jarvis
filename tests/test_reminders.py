@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -171,6 +172,65 @@ def test_a_timer_without_words_is_honest_about_its_empty_text():
     assert request.text == ""
 
 
+# --- будильник (та же запись F-417) ----------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "Rowan, set an alarm for seven in the morning",
+    "Rowan, wake me up at seven",
+    "Rowan, поставь будильник на семь утра",
+    "Rowan, будильник на 7 утра",
+    "Rowan, разбуди меня в семь утра",
+    "Rowan, pon una alarma a las siete",
+])
+def test_an_alarm_is_the_same_request_as_a_reminder(text):
+    """Владелец говорил «поставь будильник на семь утра», а хаб знал только
+    «remind me/напомни»: реплика уходила к модели, будильника у модели нет, и
+    комната слышала «I can't set alarms» (VOICE_EVAL.md, VE-23)."""
+    assert reminders.is_reminder_request(text)
+    assert reminders.is_alarm_request(text)
+
+
+def test_an_alarm_for_a_clock_is_placed_on_that_clock():
+    request = reminders.parse("Rowan, set an alarm for seven in the morning",
+                              now=MONDAY, tz=CHICAGO)
+    assert request is not None
+    # 07:00 в Чикаго уже прошло в понедельник 10:00 — будильник на завтра.
+    assert request.due_at == datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    assert request.kind is reminders.WhenKind.CLOCK
+    assert request.text == ""  # у будильника нет «о чём», выдумывать нечего
+
+
+def test_an_alarm_for_a_duration_is_counted_from_now():
+    request = reminders.parse("Rowan, set an alarm for 20 minutes",
+                              now=MONDAY, tz=CHICAGO)
+    assert request is not None
+    assert request.due_at == MONDAY + timedelta(minutes=20)
+    assert request.kind is reminders.WhenKind.DURATION and request.text == ""
+
+
+def test_an_alarm_without_a_time_asks_for_the_time_not_for_a_reminder():
+    assert reminders.is_reminder_request("Rowan, set an alarm")
+    assert reminders.parse("Rowan, set an alarm", now=MONDAY, tz=CHICAGO) is None
+    assert "alarm" in reminders.missing_time_answer("en", alarm=True)
+    assert "будильник" in reminders.missing_time_answer("ru", alarm=True)
+
+
+@pytest.mark.parametrize("text", [
+    "Rowan, wake me up",                     # без срока это не просьба
+    "мой будильник звонил в семь утра",      # рассказ, а не просьба
+])
+def test_a_sentence_about_an_alarm_is_not_a_new_request(text):
+    assert not reminders.is_reminder_request(text)
+    assert reminders.parse(text, now=MONDAY, tz=CHICAGO) is None
+
+
+def test_an_alarm_keeps_the_words_that_are_not_part_of_the_alarm():
+    request = reminders.parse("напомни купить будильник на семь утра",
+                              now=MONDAY, tz=CHICAGO)
+    assert request is not None and request.text == "купить будильник"
+
+
 # --- таблица `reminders` ----------------------------------------------------
 
 
@@ -295,6 +355,27 @@ def test_a_voice_reminder_lands_in_the_table(hub_db, monkeypatch, tmp_path):
     assert audit.rows[0]["detail"]["text"] == "купить молоко"
     assert audit.rows[0]["detail"]["tz"] == CHICAGO
 
+
+def test_a_voice_alarm_lands_in_the_table(hub_db, monkeypatch, tmp_path):
+    """VE-23 целиком: «set an alarm for seven in the morning» → строка F-417.
+
+    Падение этой реплики в живом хабе выглядело как «I can't set alarms on this
+    PC»: будильник не узнавался, и ход уходил к модели. Здесь проверяется, что
+    хаб ставит его сам, отвечает своим словом и хранит пустой текст (у будильника
+    нет «о чём»).
+    """
+    connection, audit = _connection(hub_db, monkeypatch, tmp_path)
+    line = asyncio.run(connection._reminder_turn(
+        "Rowan, set an alarm for seven in the morning", "en"))
+    assert line is not None
+    assert "alarm" in line and "07:00" in line
+    rows = reminders.ReminderStore(hub_db).pending(person_id="p-anton")
+    assert len(rows) == 1
+    assert rows[0].text == ""
+    assert rows[0].trigger is reminders.TriggerKind.TIME
+    assert rows[0].home_id == "livingroom"
+    assert rows[0].due_at.astimezone(ZoneInfo(CHICAGO)).hour == 7
+    assert [row["action"] for row in audit.rows] == ["reminder.scheduled"]
 
 def test_a_past_time_is_kept_as_it_is_not_moved(hub_db, monkeypatch, tmp_path):
     connection, _ = _connection(hub_db, monkeypatch, tmp_path)

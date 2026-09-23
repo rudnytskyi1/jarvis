@@ -37,6 +37,9 @@ if str(REPO_ROOT) not in sys.path:
 
 SCENARIOS = REPO_ROOT / "tests" / "live" / "scenarios.json"
 REPORTS = REPO_ROOT / "data" / "live-eval"
+#: Where a ``hub_rule`` scenario keeps its own tables. The owner's live
+#: ``data/hub.db`` is never written by the bench.
+RULE_DB = REPORTS / "hub-rule.db"
 
 #: Tools that change the world. Without ``--actions`` their result is an honest
 #: "the bench did not send this", so the model's choice is still measurable.
@@ -261,6 +264,96 @@ class Bench:
             "seconds": round(time.perf_counter() - started, 2),
         }
 
+    # --- the hub's own scripted turn ----------------------------------------
+
+    def _live_home_timezone(self) -> str:
+        """The live room's own clock, read read-only from the owner's hub.db."""
+        import sqlite3
+
+        live = REPO_ROOT / "data" / "hub.db"
+        if not live.is_file():
+            return "UTC"
+        try:
+            conn = sqlite3.connect(f"file:{live}?mode=ro", uri=True, timeout=2)
+            try:
+                row = conn.execute("SELECT tz FROM homes WHERE home_id=?",
+                                   (str(self.connection.home_id),)).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return "UTC"
+        return str(row[0] or "UTC") if row else "UTC"
+
+    def _rule_connection(self) -> Any:
+        """An isolated hub database with this room and its speaker in it.
+
+        ``_reminder_turn`` reads ``homes.tz`` and ``persons`` from the hub's own
+        connection, so a scenario that runs the scripted layer needs those rows.
+        They go into an evaluation database: the owner's live ``data/hub.db``
+        must stay untouched (DECISIONS.md TEST-DB-01).
+        """
+        from hub import migrations_runner
+        from hub.homes import ensure_home
+
+        RULE_DB.parent.mkdir(parents=True, exist_ok=True)
+        if RULE_DB.exists():
+            RULE_DB.unlink()
+        conn = migrations_runner.connect(str(RULE_DB))
+        migrations_runner.migrate(conn)
+        ensure_home(conn, str(self.connection.home_id), name=str(self.connection.home_id),
+                    tz=self._live_home_timezone())
+        conn.execute("INSERT INTO persons(person_id, display_name) VALUES (?, ?)",
+                     ("live-eval", str(self.connection._known_speaker_name() or "Anton")))
+        conn.commit()
+        return conn
+
+    async def run_hub_rule(self, scenario: dict[str, Any]) -> dict[str, Any]:
+        """A request the hub answers itself, before any model sees it.
+
+        «Поставь будильник на семь утра» is the hub's own turn (ТЗ F-417,
+        ``hub.app.Connection._reminder_turn``): the live room never sends it to
+        the model, so a bench that drives only the model measures a chain the
+        room does not take. This runs the hub's real scripted turn instead.
+        """
+        from hub import app as hub_app
+        from hub import reminders as reminders_mod
+
+        started = time.perf_counter()
+        reply, error = "", ""
+        stored: list[dict[str, Any]] = []
+        conn = self._rule_connection()
+        zone = reminders_mod.timezone_of(self._live_home_timezone())
+        keep_conn, keep_audit = hub_app._hub_conn, hub_app._audit_log
+        hub_app._hub_conn, hub_app._audit_log = conn, lambda: None
+        try:
+            reply = await self.connection._reminder_turn(str(scenario["said"]), "en") or ""
+            for row in reminders_mod.ReminderStore(conn).pending(person_id="live-eval"):
+                local = row.due_at.astimezone(zone) if row.due_at else None
+                stored.append({"text": row.text, "trigger": str(row.trigger),
+                               "home_id": row.home_id,
+                               "due_at": row.due_at.isoformat() if row.due_at else "",
+                               "clock": local.strftime("%H:%M") if local else ""})
+        except Exception as exc:  # noqa: BLE001 - a broken turn is a failed scenario
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            hub_app._hub_conn, hub_app._audit_log = keep_conn, keep_audit
+            conn.close()
+        self.calls = [{"tool": f"hub:{scenario['hub_rule']}",
+                       "args": {"said": scenario["said"]},
+                       "result": {"ok": not error, "output": reply},
+                       "ms": int((time.perf_counter() - started) * 1000)}]
+        return {
+            "id": scenario["id"],
+            "said": scenario["said"],
+            "reply": reply,
+            "error": error,
+            "hub_rule": scenario["hub_rule"],
+            "stored": stored,
+            "tools": [call["tool"] for call in self.calls],
+            "calls": self.calls,
+            "seconds": round(time.perf_counter() - started, 2),
+        }
+
 
 def judge(scenario: dict[str, Any], run: dict[str, Any]) -> tuple[bool, list[str]]:
     """Did the chain do what the scenario asked for, and say so honestly?"""
@@ -288,6 +381,36 @@ def judge(scenario: dict[str, Any], run: dict[str, Any]) -> tuple[bool, list[str
     for word in scenario.get("expect_reply") or []:
         if str(word).casefold() not in str(run["reply"]).casefold():
             problems.append(f"the reply never says {word!r}")
+    return (not problems), problems
+
+
+def judge_hub_rule(scenario: dict[str, Any], run: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Did the hub's own scripted turn do the request and say what it stored?
+
+    The request never reaches the model (ТЗ F-417), so the check is the hub's
+    answer plus the row it kept - exactly what the room would hear and keep.
+    """
+    problems: list[str] = []
+    wanted = scenario.get("expect_hub") or {}
+    if run["error"]:
+        problems.append(f"the hub turn failed: {run['error']}")
+    reply = str(run["reply"] or "")
+    if not reply.strip() and not run["error"]:
+        problems.append("the hub answered nothing: the request was not handled")
+    for word in wanted.get("reply_says") or []:
+        if str(word).casefold() not in reply.casefold():
+            problems.append(f"the hub reply never says {word!r}")
+    stored = list(run.get("stored") or [])
+    count = int(wanted.get("stored", 1))
+    if len(stored) != count:
+        problems.append(f"the hub stored {len(stored)} reminder(s), not {count}")
+    for row in stored:
+        for field, expected in (("text", wanted.get("text")),
+                                ("clock", wanted.get("clock"))):
+            if expected is None:
+                continue
+            if str(row.get(field) or "") != str(expected):
+                problems.append(f"the stored reminder has {field}={row.get(field)!r}, not {expected!r}")
     return (not problems), problems
 
 
@@ -326,8 +449,14 @@ async def main() -> int:
     report: list[dict[str, Any]] = []
     try:
         for scenario in wanted:
-            run = await bench.run(scenario)
-            ok, problems = judge(scenario, run)
+            if scenario.get("hub_rule"):
+                # The hub answers these itself, before the model: the bench has
+                # to run that scripted turn, not only the model chain.
+                run = await bench.run_hub_rule(scenario)
+                ok, problems = judge_hub_rule(scenario, run)
+            else:
+                run = await bench.run(scenario)
+                ok, problems = judge(scenario, run)
             run["ok"], run["problems"] = ok, problems
             report.append(run)
             mark = "PASS" if ok else "FAIL"
