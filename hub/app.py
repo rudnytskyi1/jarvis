@@ -976,6 +976,82 @@ def _decision_chain(wake_words):
     return _decider or None
 
 
+#: The one Jev client of this hub, built on first use (U-14). It is shared by
+#: every room: one reading of one utterance is a pure question about that text,
+#: and the room's own permission travels in the context of every call.
+_jev_client: Any = None
+
+
+def _understanding_settings() -> Any:
+    """``server.decider.understanding`` or a stand-in with the defaults."""
+    settings = getattr(getattr(get_config().server, "decider", None), "understanding", None)
+    if settings is None:
+        from common.config import UnderstandingConfig
+
+        return UnderstandingConfig()
+    return settings
+
+
+def _batched_jev():
+    """The shared Jev client for the batched call, or ``None`` (U-10).
+
+    Built at most once: :func:`_jev_provider` logs its configuration, and a
+    client per utterance would fill the log with the same line.
+    """
+    global _jev_client
+    if _jev_client is None:
+        settings = _understanding_settings()
+        if not bool(getattr(settings, "enabled", True)):
+            _jev_client = False
+            log.info("The batched Jev reading of a turn is switched off by the config")
+        else:
+            try:
+                _jev_client = _jev_provider(
+                    max(0.05, float(getattr(settings, "timeout_ms", 900)) / 1000.0)) or False
+            except Exception as exc:  # noqa: BLE001 - decisions must not break a turn
+                log.warning("The batched Jev reading is unavailable (%s)", exc)
+                _jev_client = False
+    return _jev_client or None
+
+
+def _narrow_tools_for(understanding: Mapping[str, Any]) -> list[dict] | None:
+    """The tool list one utterance is answered with (U-14), or ``None`` for all.
+
+    Only two answers are used, and only above the configured confidence:
+    ``act`` (is anything to be done at all) and ``family`` (which family of
+    tools). Everything else - no Jev, a timeout, an unusable answer, a family
+    that is not one of ours, a low confidence - returns ``None``, and the model
+    gets every tool exactly as it did before this change.
+    """
+    from hub.tools import CORE_TOOLS, TOOLS, tools_for_family
+
+    settings = _understanding_settings()
+    threshold = float(getattr(settings, "min_confidence", 0.65))
+    if not isinstance(understanding, Mapping):
+        return None
+    act = understanding.get("act")
+    # A turn Jev is sure is only a question needs no device tool at all; the
+    # core set (remember, recall, speak, message) stays, so the model can still
+    # save or recall the very thing it is answering about. The bar is higher
+    # than for a family, because being wrong here costs an action.
+    if (isinstance(act, Mapping) and act.get("value") is False
+            and float(act.get("confidence") or 0.0) >= max(0.9, threshold)):
+        allowed = set(CORE_TOOLS)
+        return [tool for tool in TOOLS if tool["function"]["name"] in allowed]
+    family = understanding.get("family")
+    if not isinstance(family, Mapping) or float(family.get("confidence") or 0.0) < threshold:
+        return None
+    name = str(family.get("value") or "")
+    if name == "none":
+        return None
+    tools = tools_for_family(name)
+    if tools is None:
+        return None
+    log.info("Jev read the turn as %r (confidence %.2f, %d tools offered)",
+             name, float(family.get("confidence") or 0.0), len(tools))
+    return tools
+
+
 def _decision_cache():
     """The decision cache of ТЗ 5.4, or ``None`` when it is switched off."""
     settings = getattr(get_config().server, "decider", None)
@@ -6484,6 +6560,44 @@ class Connection(CameraClipReceiver):
             ok=bool(outcome.get('ok')), actions=1, t_start=t_start,
             status='Admin action confirmed by the challenge word')
         return True
+
+    async def _understand_turn(self, text: str) -> list[dict[str, Any]] | None:
+        """Jev reads the whole utterance in ONE batched call (U-10…U-14).
+
+        Returns the tool list this turn should be answered with, or ``None``
+        for "all of them". The call is fail-open on purpose: no Jev, no key, a
+        room that is not allowed to use cloud decisions, a timeout, an
+        unusable answer or a low confidence all leave the turn exactly as it
+        was (ТЗ раздел 1, «не ломать работающее»).
+        """
+        client = _batched_jev()
+        if client is None:
+            return None
+        from hub import turn_trace
+        from hub.tools import TOOL_FAMILY_MEANINGS, TOOL_FAMILY_NAMES
+
+        settings = _understanding_settings()
+        context = {
+            'home_id': str(getattr(self, 'home_id', '') or ''),
+            'room': str(getattr(self, 'client_id', '') or ''),
+            'text': ' '.join(str(text or '').split())[:1000],
+        }
+        try:
+            found = await client.understand(
+                context, families=list(TOOL_FAMILY_NAMES),
+                meanings=TOOL_FAMILY_MEANINGS,
+                timeout_s=max(0.05, float(getattr(settings, 'timeout_ms', 900)) / 1000.0))
+        except Exception as exc:  # noqa: BLE001 - a reading never breaks a turn
+            log.info("The batched Jev reading is unavailable (%s); every tool stays available",
+                     exc, extra={'utterance_id': self.utterance_id})
+            return None
+        turn_trace.record("understanding", str(getattr(client, 'model', '') or 'jev'), payload={
+            'text': context['text'],
+            'answers': {name: {'value': item['value'],
+                               'confidence': round(float(item['confidence']), 2)}
+                        for name, item in found.items()},
+        })
+        return _narrow_tools_for(found)
 
     async def _decide(self, decision_type: str, *, question: str, context: dict[str, Any],
                       heuristic: Any, method: str = 'yes_no',
@@ -15645,11 +15759,17 @@ class Connection(CameraClipReceiver):
                             "GPU queue overflow (%.1f s predicted): the reply goes to %s",
                             route.queue_wait_s, route.level,
                         )
+                    # U-14: Jev reads the turn once and the model is given the
+                    # tools of that family (plus the core ones). None keeps
+                    # every tool, which is what the turn did before this call.
+                    turn_tools = await self._understand_turn(text)
+                    tool_kwargs = {"tools": turn_tools} if turn_tools else {}
                     try:
                         result = await asyncio.wait_for(
                             self._gpu(PRIORITY_UTTERANCE, "llm-reply",
                                       lambda: chat.generate(session.messages(prefixed),
-                                                            self._execute_tool)),
+                                                            self._execute_tool,
+                                                            **tool_kwargs)),
                             timeout=self._stage_budget('reply_ms', REPLY_TIMEOUT_S),
                         )
                     except TimeoutError:

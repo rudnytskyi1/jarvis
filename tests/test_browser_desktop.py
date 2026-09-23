@@ -33,6 +33,9 @@ class FakeDesktop:
         self.element = object()
         #: Windows whose accessibility tree holds no page document at all.
         self.pageless = set()
+        #: Windows that hold a document element without any address: the shape
+        #: live Chrome answered with in VE-07...VE-11 ("Search icon", url "").
+        self.no_address = set()
 
     def windows(self):
         return self.inventory
@@ -43,17 +46,26 @@ class FakeDesktop:
     def focus(self, window, stop):
         self.active = window['hwnd']
 
+    def _page(self, *, url, title, caption, document):
+        """A page dict shaped like the backend's, with the real blank rule."""
+        return {'key': ((1,), url, title), 'url': url, 'typed': '',
+                'caption': caption, 'blank': browser_desktop._blank_url(url),
+                'title': title, 'document': document, 'root': object()}
+
     def page(self, window, stop):
         if window['hwnd'] in self.pageless:
-            return {'key': ((), '', window['title']), 'url': '', 'caption': window['title'],
-                    'typed': '', 'blank': True, 'title': window['title'],
-                    'document': None, 'root': object()}
-        return {'key': ((1,), self.url, 'YouTube'), 'url': self.url, 'typed': '',
-                'caption': 'YouTube - Google Chrome', 'blank': False, 'title': 'YouTube',
-                'document': object(), 'root': object()}
+            return self._page(url='', title=window['title'],
+                              caption=window['title'], document=None)
+        if window['hwnd'] in self.no_address:
+            return self._page(url='', title='Search icon',
+                              caption='Search icon', document=object())
+        return self._page(url=self.url, title='YouTube',
+                          caption='YouTube - Google Chrome', document=object())
 
     def elements(self, page, stop):
-        if page.get('document') is None:
+        # Live Chrome exposes no controls in a window that holds no page: the
+        # VE-07...VE-11 snapshots were empty in every field but the caption.
+        if page.get('document') is None or not page.get('url'):
             return [], ''
         return [(self.element, {'role': 'input', 'text': 'Search', 'disabled': False,
             'bounds': (10, 10, 100, 40), 'signature': self.signature})], 'Videos'
@@ -144,7 +156,68 @@ def test_a_caption_change_is_not_proof_the_address_loaded(monkeypatch):
     asyncio.run(run())
 
 
-def test_a_window_that_shows_no_page_is_not_reported_as_a_loading_page():
+def _sequence_pages(backend, states):
+    """Answer ``page`` with a sequence of states, then with the last one."""
+    left = list(states)
+
+    def page(window, stop):
+        return left.pop(0) if len(left) > 1 else left[0]
+
+    return page
+
+
+def test_the_browser_start_page_is_not_the_site_that_was_typed(monkeypatch):
+    """VE-01: "open YouTube" was reported as done on Chrome's own start page.
+
+    The window held no page when the address was typed, so the first document
+    Chrome handed over was its own new tab page - filled in, with the address
+    ``chrome://new-tab-page/``. "A different document appeared" counted as
+    proof, and the room heard "YouTube search results for MrBeast are open"
+    while the browser had not opened the site at all.
+    """
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_WAIT_S', 2.0)
+    monkeypatch.setattr(browser_desktop, 'PAGE_READ_PAUSE_S', 0)
+    url = 'https://www.youtube.com/results?search_query=MrBeast'
+
+    async def run():
+        backend = FakeDesktop()
+        states = [
+            backend._page(url='', title='', caption='Google Chrome', document=None),
+            backend._page(url='chrome://new-tab-page/', title='New Tab',
+                          caption='New Tab - Google Chrome', document=object()),
+            backend._page(url=url, title='MrBeast - YouTube',
+                          caption='MrBeast - YouTube - Google Chrome', document=object()),
+        ]
+        backend.page = _sequence_pages(backend, states)
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        data = json.loads(await browser.execute({'command': 'navigate', 'url': url}))
+        assert data['url'] == url  # the site, not the browser's start page
+        assert backend.events == [('navigate', url)]
+        await browser.close()
+    asyncio.run(run())
+
+
+def test_a_start_page_that_never_leaves_is_a_failure_at_the_address_bar(monkeypatch):
+    """Being left on Chrome's new tab page is not "the site is open"."""
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_WAIT_S', 0.2)
+    monkeypatch.setattr(browser_desktop, 'PAGE_READ_PAUSE_S', 0)
+
+    async def run():
+        backend = FakeDesktop()
+        states = [
+            backend._page(url='', title='', caption='Google Chrome', document=None),
+            backend._page(url='chrome://new-tab-page/', title='New Tab',
+                          caption='New Tab - Google Chrome', document=object()),
+        ]
+        backend.page = _sequence_pages(backend, states)
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        with pytest.raises(ValueError, match='did not open youtube.com'):
+            await browser.execute({'command': 'navigate', 'url': 'https://www.youtube.com'})
+        await browser.close()
+    asyncio.run(run())
+
+
+def test_a_window_that_shows_no_page_is_not_reported_as_a_loading_page(monkeypatch):
     """A window with no document is a failure, not a page to wait for.
 
     VE-07...VE-11 answered the room from a Chrome window whose accessibility
@@ -152,6 +225,8 @@ def test_a_window_that_shows_no_page_is_not_reported_as_a_loading_page():
     while still reporting ``ok``; the model then told the owner "the page isn't
     loaded" and gave up on ``type MrBeast in the search box and press enter``.
     """
+    monkeypatch.setattr(browser_desktop, 'PAGE_READ_PAUSE_S', 0)
+
     async def run():
         backend = FakeDesktop()
         backend.inventory[0]['title'] = 'Search icon'
@@ -166,13 +241,40 @@ def test_a_window_that_shows_no_page_is_not_reported_as_a_loading_page():
     asyncio.run(run())
 
 
-def test_the_window_that_really_shows_a_page_is_used_instead():
+def test_a_document_without_an_address_is_not_a_page_to_read_or_act_on(monkeypatch):
+    """Live Chrome exposes a document element for a window that holds no page.
+
+    VE-07/VE-11 in ``data/live-eval/last.json``: every ``read`` answered
+    ``ok`` with ``url: ""`` and ``title: "Search icon"``, and ``back`` was sent
+    into that window as if a page were there. A document element alone is not a
+    page - without an address there is nothing to read, click or go back from.
+    """
+    monkeypatch.setattr(browser_desktop, 'PAGE_READ_PAUSE_S', 0)
+
+    async def run():
+        backend = FakeDesktop()
+        backend.no_address = {10}
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        with pytest.raises(ValueError, match='not showing a readable page'):
+            await browser.execute({'command': 'read'})
+        with pytest.raises(ValueError, match='not showing a readable page'):
+            await browser.execute({'command': 'back'})
+        assert backend.events == []  # no alt+left went into a window with no page
+        await browser.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('shape', ['no_document', 'document_without_address'])
+def test_the_window_that_really_shows_a_page_is_used_instead(shape):
     """The page can be open next to a page-less window of the same browser."""
     async def run():
         backend = FakeDesktop()
         backend.inventory.insert(0, {'hwnd': 11, 'pid': 20, 'name': 'Google Chrome',
                                      'image': 'chrome.exe', 'title': 'Search icon'})
-        backend.pageless = {11}
+        if shape == 'no_document':
+            backend.pageless = {11}
+        else:
+            backend.no_address = {11}
         backend.active = 11  # the page-less window is in the foreground
         browser = DesktopBrowserController(backend_factory=lambda: backend)
         data = json.loads(await browser.execute({'command': 'read'}))
@@ -386,3 +488,43 @@ def test_navigation_rejects_control_characters_before_desktop_input():
         assert not backend.events
         await browser.close()
     asyncio.run(run())
+
+
+def test_the_address_is_typed_even_when_uia_never_reports_the_focus():
+    """The owner's own PC, 2026-09-22 23:16.
+
+    ``data/server.log``: ``Action result a1 ... ok=False error=Could not focus
+    the browser address bar; no URL was typed.`` for an ordinary "open YouTube
+    and search for ...". Ctrl+L had focused the omnibox; UIA simply had not
+    caught up, and the old code refused to type at all. The page that loads is
+    still the proof (``_navigate``), so the text goes in.
+    """
+    backend = object.__new__(_WindowsUIA)
+    events = []
+    backend.guard = lambda window, stop: None
+    backend.key = lambda window, key, stop: events.append(key)
+    backend._type = lambda window, text, stop: events.append(('type', text))
+    backend._address = lambda root, stop: None  # no address bar in the tree
+    backend._uia = SimpleNamespace(ElementFromHandle=lambda hwnd: object())
+    window, stop = {'hwnd': 10, 'pid': 20}, threading.Event()
+    backend.navigate(window, 'https://www.youtube.com/', stop)
+    assert events == ['ctrl+l', ('type', 'https://www.youtube.com/'), 'enter']
+
+
+def test_an_address_bar_that_did_not_take_the_text_is_typed_again_once():
+    """One honest retry instead of a failure when the omnibox stayed empty."""
+    backend = object.__new__(_WindowsUIA)
+    events = []
+    values = iter(['', 'youtube.com'])
+    field = SimpleNamespace(CurrentIsPassword=False)
+    backend.guard = lambda window, stop: None
+    backend.key = lambda window, key, stop: events.append(key)
+    backend._type = lambda window, text, stop: events.append(('type', text))
+    backend._address = lambda root, stop: field
+    backend._focused_within = lambda window, element, stop: element
+    backend._value = lambda element: next(values)
+    backend._uia = SimpleNamespace(ElementFromHandle=lambda hwnd: object())
+    window, stop = {'hwnd': 10, 'pid': 20}, threading.Event()
+    backend.navigate(window, 'https://www.youtube.com/', stop)
+    assert events == ['ctrl+l', ('type', 'https://www.youtube.com/'),
+                      'ctrl+l', ('type', 'https://www.youtube.com/'), 'enter']

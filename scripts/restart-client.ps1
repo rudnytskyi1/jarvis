@@ -9,10 +9,16 @@ $Root = "C:\Users\Anton\Desktop\jarvis"
 $TaskName = "JarvisRoomClient"
 
 Write-Host "== stopping the running client =="
-Get-Process python -ErrorAction SilentlyContinue | ForEach-Object {
-    Write-Host ("  killing pid {0}" -f $_.Id)
-    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-}
+# Only the room client, never every python of this PC: the hub runs from the
+# same folder and in the same interpreter, so a blanket "kill python" here
+# would take the brain down with the client (2026-09-22). The client is the
+# process whose command line names client.main.
+Get-CimInstance Win32_Process -Filter "Name='python.exe' or Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*client.main*' -or $_.CommandLine -like '*client\main.py*' } |
+    ForEach-Object {
+        Write-Host ("  killing client pid {0}" -f $_.ProcessId)
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 Start-Sleep -Seconds 2
 
 Write-Host "== (re)registering the interactive task =="

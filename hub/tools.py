@@ -892,6 +892,68 @@ for _tool in TOOLS:
     _tool['function']['parameters']['properties']['purpose'] = {
         'type': 'string', 'description': 'Brief plain-English status explaining this step to the user, e.g. Opening the channel and looking for its latest uploads. Displayed while the action runs.'}
 
+#: Which tools one request plausibly needs, as families (docs/PLAN_UNDERSTANDING.md
+#: U-12). Jev answers "which family is this?" in one typed question, and the
+#: model is then given that family instead of all 28 tools: fewer look-alike
+#: tools is fewer wrong choices, and about 30 KB less schema per round.
+#: Every name in :data:`TOOL_NAMES` belongs to exactly one family — a test
+#: fails when a new tool is added without a family, so the map cannot rot.
+TOOL_FAMILIES: dict[str, tuple[str, ...]] = {
+    'browser': ('browser_control',),
+    'pc': ('pc_control', 'run_command', 'computer_use', 'click_screen', 'run_skill'),
+    'vision': ('look_at_screen', 'look_at_camera', 'find_object', 'inspect_photo'),
+    'media': ('show_photo', 'save_photo', 'generate_image', 'set_wallpaper', 'say_in_room'),
+    'memory': ('remember', 'forget_fact', 'list_memory', 'recall_conversation'),
+    'people': ('list_people', 'rename_person', 'set_role', 'enroll_voice', 'enroll_face'),
+    'devices': ('set_light', 'set_switch'),
+    'notify': ('telegram_send', 'create_rule'),
+}
+
+#: The family names Jev is asked to choose from, plus ``none`` meaning "this is
+#: an ordinary answer, no device or PC is involved".
+TOOL_FAMILY_NAMES: tuple[str, ...] = (*TOOL_FAMILIES, 'none')
+
+#: What each family means, in the words System One is given as the ``criteria``
+#: of the choice question. The SDK's own example pairs every option with a
+#: description ("billing": "Charges and refunds"); without them Jev answered a
+#: plainly browser-shaped request with confidence 0.56 (live probe 2026-09-22),
+#: which is honest but not enough to narrow anything.
+TOOL_FAMILY_MEANINGS: dict[str, str] = {
+    'browser': 'A web page, a search, a video site, or anything inside the browser',
+    'pc': 'Programs, windows, the desktop, files, typing text or pressing keys - '
+          'not a picture that Rowan itself put on the screen',
+    'vision': 'Looking at the screen or the camera, finding an object, inspecting a photo',
+    'media': 'Showing, saving, drawing or editing a picture, hiding a picture that is '
+             'already on the screen, or setting the wallpaper',
+    'memory': 'Remembering something, forgetting it, or recalling what was said',
+    'people': 'Faces, voices, names and roles of the people in the rooms',
+    'devices': 'The lights and switches of the room',
+    'notify': 'Sending a message to the owner, or making a rule that watches something',
+    'none': 'Nothing is to be done: an ordinary question, remark or conversation',
+}
+
+#: What every turn keeps whatever the family is: saving and recalling what the
+#: person said, hearing it in the room and sending the result to the owner. A
+#: misjudged family must cost a tool the model can live without, never the
+#: ability to remember the request or to answer the person.
+CORE_TOOLS: tuple[str, ...] = (
+    'remember', 'forget_fact', 'list_memory', 'recall_conversation',
+    'say_in_room', 'telegram_send', 'create_rule',
+)
+
+
+def tools_for_family(family: str) -> list[dict[str, Any]] | None:
+    """The tools of one family, or ``None`` when the family is not one of ours.
+
+    ``None`` means "keep every tool": an unknown answer from a decision
+    provider changes nothing (fail-open).
+    """
+    names = TOOL_FAMILIES.get(str(family or '').strip().casefold())
+    if names is None:
+        return None
+    wanted = set(names) | set(CORE_TOOLS)
+    return [tool for tool in TOOLS if tool["function"]["name"] in wanted]
+
 #: Tools executed by the client, forwarded as protocol action items (SPEC §5).
 CLIENT_TOOLS: frozenset[str] = frozenset(
     {"set_light", "set_switch", "pc_control", "run_command", "browser_control"}

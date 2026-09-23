@@ -200,7 +200,27 @@ def test_choice_carries_the_offered_labels_as_criteria():
                                           {"text": "x", "home_id": "livingroom"},
                                           decision_type="route"))
     question = json.loads(seen[0].content)["questions"]["answer"]
-    assert question["criteria"] == {"fast_command": None, "llm": None}
+    # Every offered label is a criterion of its own. A description supplied by
+    # the caller replaces the placeholder (U-10: the families carry theirs, and
+    # without them Jev answered an obvious request with 0.56 confidence).
+    assert question["criteria"] == {"fast_command": "fast_command", "llm": "llm"}
+
+
+def test_a_choice_question_carries_the_descriptions_it_was_given():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"answers": {
+            "family": {"type": "choice", "choice": "browser", "confidence": 0.9}}})
+
+    provider = _provider(handler)
+    asyncio.run(provider.understand(
+        {"text": "open YouTube", "home_id": "livingroom"},
+        families=["browser", "devices"],
+        meanings={"browser": "A web page", "devices": "The lights"}))
+    question = json.loads(seen[0].content)["questions"]["family"]
+    assert question["criteria"] == {"browser": "A web page", "devices": "The lights"}
 
 
 def test_score_stays_inside_the_scale():

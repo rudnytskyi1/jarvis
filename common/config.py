@@ -934,6 +934,26 @@ class DeciderProvidersConfig(_Strict):
     jev: JevProviderConfig = Field(default_factory=JevProviderConfig)
 
 
+class UnderstandingConfig(_Strict):
+    """Jev's one batched reading of an utterance (docs/PLAN_UNDERSTANDING.md).
+
+    One System One request answers three typed questions - is this a request to
+    do something, which family of tools does it need, and is it a continuation
+    of the last turn - and the answer narrows the tool list the model is given.
+    Everything here is fail-open: a timeout, an unusable answer, a confidence
+    below ``min_confidence`` or ``enabled: false`` all leave the turn exactly
+    as it was before (ТЗ раздел 1, «не ломать работающее»).
+    """
+
+    enabled: bool = True
+    #: The whole batched call. The reply path has a 1.2 s budget (ТЗ 15.1) and
+    #: a measured Jev answer takes 0.45-0.65 s, so this is a hard ceiling.
+    timeout_ms: int = Field(default=900, ge=100, le=10000)
+    #: Jev answers a formally correct question with 0.5-0.6 when it is unsure;
+    #: below this the answer is recorded but nothing is narrowed (ТЗ 5.4).
+    min_confidence: float = Field(default=0.65, ge=0.0, le=1.0)
+
+
 class DeciderConfig(_Strict):
     """Which provider answers which decision, and how long it may think.
 
@@ -949,6 +969,8 @@ class DeciderConfig(_Strict):
     timeout_ms: int = Field(default=400, ge=50, le=10000)
     #: Decision type → providers, best first.
     order: dict[str, list[str]] = Field(default_factory=dict)
+    #: The batched understanding call of one utterance (U-10…U-14).
+    understanding: UnderstandingConfig = Field(default_factory=UnderstandingConfig)
     #: ТЗ 5.4: the same question is answered once for this long (0 = no cache).
     cache_ttl_s: float = Field(default=60.0, ge=0.0, le=3600.0)
     cache_max_entries: int = Field(default=256, ge=1, le=10000)

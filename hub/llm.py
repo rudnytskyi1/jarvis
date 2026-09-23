@@ -766,7 +766,8 @@ class LlmClient:
         )
 
     def _chat_native(
-        self, messages: list[dict[str, Any]], with_tools: bool
+        self, messages: list[dict[str, Any]], with_tools: bool,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[ToolCall]]:
         """Blocking ``POST /api/chat`` against Ollama's own API."""
         http = self._http
@@ -786,7 +787,7 @@ class LlmClient:
         if self._send_think:
             payload["think"] = self.think
         if with_tools:
-            payload["tools"] = TOOLS
+            payload["tools"] = list(tools) if tools else TOOLS
 
         url = f"{self.native_url}/api/chat"
         try:
@@ -850,10 +851,11 @@ class LlmClient:
         return text, calls
 
     def _chat_openai(
-        self, messages: list[dict[str, Any]], with_tools: bool
+        self, messages: list[dict[str, Any]], with_tools: bool,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[ToolCall]]:
         """Blocking completion through the OpenAI-compatible endpoint."""
-        raw_content, message, finish_reason = self._completion_raw(messages, with_tools)
+        raw_content, message, finish_reason = self._completion_raw(messages, with_tools, tools=tools)
         text = clean_reply(raw_content)
         truncated = finish_reason == "length"
         if text and self._reasoning_may_leak and looks_like_unfinished_reasoning(raw_content, truncated):
@@ -871,6 +873,7 @@ class LlmClient:
         messages: list[dict[str, Any]],
         with_tools: bool,
         response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, Any, str]:
         """One OpenAI-compatible call; returns ``(content, message, finish_reason)``.
 
@@ -890,7 +893,7 @@ class LlmClient:
             "max_tokens": self.max_tokens,
         }
         if with_tools:
-            base["tools"] = TOOLS
+            base["tools"] = list(tools) if tools else TOOLS
 
         modes = ["off"] if response_format is None else [self._structured_mode, "guided_json", "off"]
         completion: Any = None
@@ -1008,7 +1011,8 @@ class LlmClient:
         return probabilities
 
     async def _chat(
-        self, messages: list[dict[str, Any]], with_tools: bool
+        self, messages: list[dict[str, Any]], with_tools: bool,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[ToolCall]]:
         """One completion, executed in a worker thread.
 
@@ -1016,17 +1020,28 @@ class LlmClient:
         (``/admin/turns``) sees the exact prompt that left the hub: the system
         prompt, the room facts, the tool results and the current request, with
         long texts clipped (``hub.turn_trace``).
+
+        ``tools`` is the list this turn was narrowed to (``hub.tools.
+        tools_for_family``, docs/PLAN_UNDERSTANDING.md U-14). ``None`` keeps
+        the full :data:`TOOLS`, which is the behaviour every turn had before.
         """
         from hub import turn_trace
 
+        offered = list(tools) if (with_tools and tools) else (TOOLS if with_tools else [])
         turn_trace.record("prompt", str(getattr(self, "model", "") or "llm"), payload={
-            "provider": str(self.provider), "tools": bool(with_tools), "messages": messages})
+            "provider": str(self.provider), "tools": bool(with_tools),
+            "tool_names": [tool["function"]["name"] for tool in offered],
+            "messages": messages})
+        # The narrowed list is passed on only when there is one: a transport
+        # double (or a caller) that knows the two-argument form keeps working,
+        # and "no narrowing" stays exactly the call it was before U-13.
+        narrowed = {"tools": offered} if (with_tools and tools) else {}
         if self.provider == PROVIDER_OLLAMA_NATIVE:
-            return await asyncio.to_thread(self._chat_native, messages, with_tools)
+            return await asyncio.to_thread(self._chat_native, messages, with_tools, **narrowed)
         if self.provider == PROVIDER_RESPONSES:
-            text, calls = await asyncio.to_thread(self._responses.complete, messages, TOOLS if with_tools else [])
+            text, calls = await asyncio.to_thread(self._responses.complete, messages, offered)
             return clean_reply(text), normalize_tool_calls(calls)
-        return await asyncio.to_thread(self._chat_openai, messages, with_tools)
+        return await asyncio.to_thread(self._chat_openai, messages, with_tools, **narrowed)
 
     async def reply_text(self, messages: list[dict[str, Any]]) -> str:
         """One budgeted text reply without granting room/PC tool access."""
@@ -1142,9 +1157,16 @@ class LlmClient:
         self,
         messages: list[dict[str, Any]],
         executor: ToolExecutor | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> LlmResult:
-        """Run one utterance through the tool loop and return the spoken reply."""
+        """Run one utterance through the tool loop and return the spoken reply.
+
+        ``tools`` narrows what the model may call this turn (U-14). ``None`` is
+        the full list, so an utterance that was not understood by a decision
+        provider behaves exactly as before.
+        """
         history: list[dict[str, Any]] = list(messages)
+        offered = list(tools) if tools else None
         executed: list[ToolCall] = []
         #: ТЗ F-114: how many actions arrived as one structured output.
         plan_steps = 0
@@ -1175,8 +1197,12 @@ class LlmClient:
                     browser_recovery.requested = True
                     history.append({'role': 'user', 'content': BROWSER_REPAIR_MESSAGE})
             completed_rounds = round_index
+            # ``tools`` is passed only when this turn was actually narrowed
+            # (U-13): a caller or a test double that only knows the two-argument
+            # form keeps working, and "no narrowing" stays the old call.
+            round_tools = {"tools": offered} if offered else {}
             try:
-                text, calls = await self._chat(history, with_tools=True)
+                text, calls = await self._chat(history, with_tools=True, **round_tools)
             except CloudUnavailable as exc:
                 log.warning("Cloud turn stopped: %s", exc)
                 text = ("I couldn't finish the request. Some actions may already have completed. "
@@ -1194,7 +1220,7 @@ class LlmClient:
                 # spoken. One re-ask usually produces a proper call.
                 artifact_retried = True
                 log.warning("Malformed inline tool call in the reply - retrying the round")
-                text, calls = await self._chat(history, with_tools=True)
+                text, calls = await self._chat(history, with_tools=True, **round_tools)
             if not calls:
                 # ТЗ F-114: a multi-step command may arrive as ONE structured
                 # output - the whole list of actions in a single reply - for

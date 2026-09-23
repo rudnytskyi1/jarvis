@@ -152,12 +152,21 @@ class JevDecider:
 
     @staticmethod
     def _question(mode: str, question: str, options: list[str] | None,
-                  scale: list[int] | None) -> dict[str, Any]:
-        """The typed question of one Decider operation."""
+                  scale: list[int] | None,
+                  meanings: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """The typed question of one Decider operation.
+
+        ``meanings`` are the ``criteria`` descriptions of a choice question -
+        the SDK's own example pairs every option with one ("billing": "Charges
+        and refunds"), and without them the server answers an obvious question
+        with a confidence too low to act on (see TOOL_FAMILY_MEANINGS).
+        """
         if mode == "yes_no":
             return {"type": "noul", "instructions": str(question or "")}
         if mode == "choose":
-            offered = {str(option): None for option in (options or [])}
+            known = dict(meanings or {})
+            offered = {str(option): known.get(str(option)) or str(option)
+                       for option in (options or [])}
             if not offered:
                 raise DecisionUnavailable("a choice question needs options")
             return {"type": "choice", "instructions": str(question or ""),
@@ -180,6 +189,16 @@ class JevDecider:
         answer = answers.get("answer")
         if not isinstance(answer, Mapping):
             raise DecisionUnavailable("jev did not answer the question")
+        return self._answer_item(mode, answer, options=options, scale=scale)
+
+    def _answer_item(self, mode: str, answer: Mapping[str, Any], *,
+                     options: list[str] | None, scale: list[int] | None) -> tuple[Any, float]:
+        """One answer of one typed question, validated against what was asked.
+
+        Split out of :meth:`_answer_of` so the batched call can check each
+        question on its own: an unusable answer to one question must not throw
+        away the answers to the others (U-10).
+        """
         kind = str(answer.get("type") or "")
         if mode == "yes_no":
             if kind != "noul":
@@ -229,9 +248,87 @@ class JevDecider:
             raise DecisionUnavailable(f"jev reported confidence {confidence}, outside 0..1")
         return confidence
 
+    # --- one batched reading of a whole utterance (U-10) --------------------
+
+    #: The three questions of one "understanding" call. They are asked together
+    #: because System One answers every question from the same reading of
+    #: ``state``: three separate calls cost three times the latency for the
+    #: same judgement, and the turn's budget is 1.2 s (ТЗ 15.1).
+    ACT_QUESTION = (
+        "Is the person asking Rowan to DO something - to use a device, a computer, "
+        "a camera, a picture, the browser, or to send a message - rather than just "
+        "asking a question or making a remark?"
+    )
+    FAMILY_QUESTION = (
+        "Which kind of action does this request need? Choose browser for a web page "
+        "or a search, pc for programs, windows, files or typing on the computer, "
+        "vision for looking at the screen or the camera, media for showing, saving, "
+        "drawing or editing a picture, memory for remembering or recalling, people "
+        "for faces, voices and roles, devices for lights and switches, notify for "
+        "sending a message or making a rule, none when no action is asked for."
+    )
+    FOLLOWUP_QUESTION = (
+        "Is this request a continuation of what Rowan was just doing or talking "
+        "about (\"it\", \"that\", \"again\", \"the same\", \"close it\"), rather "
+        "than a new request with no reference to the previous turn?"
+    )
+
+    async def understand(self, context: Mapping[str, Any], *, families: Sequence[str],
+                         meanings: Mapping[str, str] | None = None,
+                         timeout_s: float | None = None,
+                         decision_type: str = "understanding") -> dict[str, Any]:
+        """The whole reading of one utterance in ONE typed request (U-10).
+
+        Returns ``{name: {"value": ..., "confidence": ...}}`` for the questions
+        Jev answered. A question that is missing, of the wrong type, or outside
+        the offered options is simply absent: the caller keeps its own
+        behaviour for it, which is what makes this safe to put in front of
+        every turn (docs/PLAN_UNDERSTANDING.md, section 3).
+        """
+        options = [str(name) for name in families] or ["none"]
+        payload = {
+            "model": self.model,
+            "state": self._state("", context, decision_type=decision_type),
+            "questions": {
+                "act": self._question("yes_no", self.ACT_QUESTION, None, None),
+                "family": self._question("choose", self.FAMILY_QUESTION, options, None,
+                                         meanings=meanings),
+                "followup": self._question("yes_no", self.FOLLOWUP_QUESTION, None, None),
+            },
+        }
+        body = await self._post(payload, context, timeout_s=timeout_s)
+        answers = body.get("answers")
+        if not isinstance(answers, Mapping):
+            raise DecisionUnavailable("jev answered without answers")
+        found: dict[str, Any] = {}
+        for name, mode, offered in (("act", "yes_no", None),
+                                    ("family", "choose", options),
+                                    ("followup", "yes_no", None)):
+            item = answers.get(name)
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                value, confidence = self._answer_item(mode, item, options=offered, scale=None)
+            except DecisionUnavailable as exc:
+                log.info("Jev did not answer %s (%s); that part keeps the old behaviour",
+                         name, exc)
+                continue
+            found[name] = {"value": value, "confidence": confidence}
+        if not found:
+            raise DecisionUnavailable("jev answered none of the understanding questions")
+        return found
+
     async def _ask(self, mode: str, question: str, context: Mapping[str, Any], *,
                    options: list[str] | None = None, scale: list[int] | None = None,
                    decision_type: str = "") -> tuple[Any, float]:
+        payload = self._payload(mode, question, context, options=options, scale=scale,
+                                decision_type=decision_type)
+        body = await self._post(payload, context, timeout_s=None)
+        return self._answer_of(mode, body, options=options, scale=scale)
+
+    async def _post(self, payload: Mapping[str, Any], context: Mapping[str, Any], *,
+                    timeout_s: float | None = None) -> Mapping[str, Any]:
+        """One System One request, with the room's permission checked first."""
         home = str(dict(context or {}).get("home_id") or "")
         if not home or not self.allowed_for(home):
             raise DecisionUnavailable(
@@ -241,11 +338,9 @@ class JevDecider:
         if not self._api_key:
             raise DecisionUnavailable("no Jev API key is available in the environment")
         url = f"{self.base_url}{self.path if self.path.startswith('/') else '/' + self.path}"
-        payload = self._payload(mode, question, context, options=options, scale=scale,
-                                decision_type=decision_type)
+        budget = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
         try:
-            async with httpx.AsyncClient(transport=self._transport,
-                                         timeout=self.timeout_s) as client:
+            async with httpx.AsyncClient(transport=self._transport, timeout=budget) as client:
                 response = await client.post(
                     url, json=payload,
                     headers={"Authorization": f"Bearer {self._api_key}",
@@ -261,7 +356,7 @@ class JevDecider:
             raise DecisionUnavailable("jev answered something that is not a decision") from exc
         if not isinstance(body, Mapping):
             raise DecisionUnavailable("jev answered something that is not a decision")
-        return self._answer_of(mode, body, options=options, scale=scale)
+        return body
 
 
 __all__ = ["DEFAULT_MODEL", "DEFAULT_PATH", "JevDecider"]

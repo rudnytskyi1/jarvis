@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import json
+import logging
 import threading
 import time
 import uuid
@@ -19,6 +20,8 @@ from urllib.parse import urlsplit
 from . import pc
 from .app_control import BROWSERS, matches, visible_apps
 from .browser import web_url
+
+log = logging.getLogger(__name__)
 
 _COMMANDS = {'navigate', 'read', 'click', 'fill', 'press', 'back', 'scroll'}
 _KEYS = {'Enter': 'enter', 'Escape': 'esc', 'Tab': 'tab',
@@ -33,9 +36,22 @@ _CHANGED = 'The element changed. Read the page again.'
 #: Enter instantly and loads afterwards, so reading the document once (as the
 #: first version did, 0.45 s later) sees the page that was already there.
 NAVIGATE_WAIT_S = 8.0
-#: Titles of the browser's own blank page: a "URL" next to one of these is the
-#: text that was typed, not a page that loaded.
+#: How long a window that shows no page at all is asked again before the tool
+#: admits it cannot read it. Chrome hands the document of a page it is still
+#: building over a moment after the first query, so one empty answer is not
+#: proof that there is nothing to read.
+PAGE_READ_ATTEMPTS = 4
+PAGE_READ_PAUSE_S = 0.5
+#: Titles of the browser's own blank page: an address next to one of these is
+#: the browser's start page (or the text that was typed), not a loaded site.
 _BLANK_TITLES = {'new tab', 'новая вкладка', 'новый tab', ''}
+#: Addresses of the browser's own start pages. Chrome fills its new tab page
+#: in, so its address is not empty and "no URL at all" does not catch it.
+_BLANK_URL_PREFIXES = ('about:', 'chrome://newtab', 'chrome://new-tab-page',
+                       'chrome://welcome', 'chrome-search://local-ntp',
+                       'edge://newtab', 'edge://new-tab-page')
+#: Schemes that belong to the browser itself, never to a site.
+_INTERNAL_SCHEMES = {'about', 'chrome', 'chrome-search', 'edge', 'brave', 'opera', 'vivaldi'}
 
 #: COM hiccups that mean "ask again", not "the browser is broken". UI Automation
 #: raises these while Chrome re-parents its accessibility tree, and the room
@@ -73,6 +89,35 @@ def _host(url: str) -> str:
     """The host a navigation targets, without ``www.``; '' when there is none."""
     host = str(urlsplit(str(url)).netloc or '').casefold()
     return host[4:] if host.startswith('www.') else host
+
+
+def _blank_url(url: object) -> bool:
+    """Is this address the browser's own start page - or no address at all?
+
+    A window with no document address is not a page that is still loading; it
+    is a window Chrome has not handed a page over for. Chrome's own new tab
+    page is the other half of the same problem: it is filled in (shortcuts,
+    "Customize Chrome") and has an address, so the old "empty address" test
+    accepted it as the YouTube the room had just asked for (VE-01 in
+    ``data/live-eval/last.json``: ``ok`` with ``url: "chrome://new-tab-page/"``).
+    """
+    text = str(url or '').strip().casefold()
+    if not text:
+        return True
+    return text.startswith(_BLANK_URL_PREFIXES)
+
+
+def _has_address(page) -> bool:
+    """True when this window really exposes the address of a page.
+
+    A ``Document`` element alone is not a page: for its own popups and helper
+    windows Chrome exposes a document-typed element with an empty address and
+    the accessibility name "Search icon". The live bench read such a window as
+    the page the room asked about (VE-07...VE-11), answered with an empty
+    snapshot, and the model then told the owner "the page isn't loaded" and
+    gave up on "type MrBeast in the search box and press enter".
+    """
+    return bool(str(page.get('url') or '').strip())
 
 
 def _no_page_error(page) -> ValueError:
@@ -256,9 +301,13 @@ class _WindowsUIA:
         caption = str(window.get('title') or '') or str(root.CurrentName or '')
         title = page_title or caption
         runtime = tuple(doc.GetRuntimeId()) if doc else ()
-        # No document at all means "not a page", not "a page that is loading";
-        # an empty page title keeps that state in the blank set.
-        blank = not document_url and page_title.strip().casefold() in _BLANK_TITLES
+        # Blank means "the browser's own start page, or no page at all" - never
+        # the site somebody asked for. Both halves are needed: Chrome's new tab
+        # page arrives filled in with an address, while a popup exposes no
+        # document at all.
+        internal = urlsplit(document_url).scheme.casefold() in _INTERNAL_SCHEMES
+        blank = _blank_url(document_url) or (
+            internal and page_title.strip().casefold() in _BLANK_TITLES)
         return {'key': (runtime, document_url, title), 'url': document_url,
                 'typed': typed, 'blank': blank, 'title': title, 'caption': caption,
                 'document': doc, 'root': root}
@@ -364,14 +413,38 @@ class _WindowsUIA:
             pc._send_input_batch(events[start:start + pc.TYPE_CHUNK_EVENTS])
 
     def navigate(self, window, url, stop):
-        self.key(window, 'ctrl+l', stop)
-        stop.wait(.05)
-        self.guard(window, stop)
-        root = self._uia.ElementFromHandle(window['hwnd'])
-        address = self._address(root, stop)
-        if not address or not self._focused_within(window, address, stop):
-            raise ValueError('Could not focus the browser address bar; no URL was typed.')
-        self._type(window, url, stop)
+        """Type the address, and prove it landed instead of demanding UIA agree.
+
+        The old version refused to type at all unless UIA reported focus on the
+        address bar within a second. On 2026-09-22 23:16 that answered "Could
+        not focus the browser address bar; no URL was typed." to an ordinary
+        "open YouTube and search for ..." on the owner's own PC: Ctrl+L had
+        focused the omnibox (it is a browser shortcut, not a page action), but
+        the accessibility tree had not caught up yet. Typing is still proved,
+        in two places: the address bar is read back after the text is sent, and
+        ``_navigate`` accepts only a page that really loaded.
+        """
+        for attempt in (1, 2):
+            self.key(window, 'ctrl+l', stop)
+            stop.wait(.05)
+            self.guard(window, stop)
+            root = self._uia.ElementFromHandle(window['hwnd'])
+            address = self._address(root, stop)
+            if address is None:
+                log.warning('The address bar was not found; typing into the focused browser anyway')
+            elif not self._focused_within(window, address, stop):
+                log.info('UIA did not report the address bar as focused; typing anyway')
+            self._type(window, url, stop)
+            if attempt == 1 and address is not None:
+                typed = self._value(address).strip()
+                host = _host(url)
+                # An address bar that reports something else (including
+                # nothing) did not take the text: ask for the focus once more.
+                if host and host not in typed.casefold():
+                    log.warning('The address bar shows %r after typing; pressing Ctrl+L again',
+                                typed[:60])
+                    continue
+            break
         self.key(window, 'enter', stop)
 
     def act(self, window, page, command, element, args, stop):
@@ -598,7 +671,7 @@ class DesktopBrowserController:
         if command == 'navigate':
             page = self._navigate(window, page, str(args['url']), stop)
         else:
-            if page.get('document') is None:
+            if not _has_address(page):
                 raise _no_page_error(page)
             self._backend.act(window, page, command, element, args, stop)
             stop.wait(.45)
@@ -608,12 +681,13 @@ class DesktopBrowserController:
     def _showing_a_page(self, candidates, window, page, stop):
         """Prefer, among the candidates, a window that really shows a page.
 
-        Chrome keeps windows whose accessibility tree holds no document at all
-        (its own popups, and windows whose renderer has not handed a tree over).
-        Reading one of those made the room hear "the page isn't loaded" while
-        the page it asked about was open in the next window of the same browser.
+        Chrome keeps windows that hold no page: its own popups (a document
+        element with no address) and windows whose renderer has not handed a
+        tree over (no document at all). Reading one of those made the room hear
+        "the page isn't loaded" while the page it asked about was open in the
+        next window of the same browser.
         """
-        if page.get('document') is not None or len(candidates) < 2:
+        if _has_address(page) or len(candidates) < 2:
             return window, page
         for other in candidates:
             if (other['hwnd'], other['pid']) == (window['hwnd'], window['pid']):
@@ -623,7 +697,7 @@ class DesktopBrowserController:
                 probe = attempt(lambda current=other: self._backend.page(current, stop))
             except Exception:  # noqa: BLE001 - a window that cannot be read is skipped
                 continue
-            if probe.get('document') is not None:
+            if _has_address(probe):
                 self._backend.focus(other, stop)
                 return other, probe
         return window, page
@@ -632,17 +706,17 @@ class DesktopBrowserController:
         """One honest page snapshot, giving a loading document a moment to exist.
 
         New and hydrating documents can expose nothing on the first UIA query,
-        so a missing document is asked about again. It is never reported as a
-        page that is loading: a window with no document at all is a failure the
-        model has to know about, not a page it should wait for.
+        so a window with no page is asked about again. It is never reported as
+        a page that is loading: a window that still exposes no address is a
+        failure the model has to know about, not an empty page to wait for.
         """
-        for _retry in range(3):
+        for _retry in range(PAGE_READ_ATTEMPTS):
             _cancelled(stop)
             snapshot = attempt(lambda current=page: self._snapshot(window, current, stop))
             data = json.loads(snapshot)
-            if data['elements'] or data['text'] or page.get('document') is not None:
+            if data['elements'] or data['text'] or _has_address(page):
                 return snapshot
-            stop.wait(.3)
+            stop.wait(PAGE_READ_PAUSE_S)
             page = attempt(lambda: self._backend.page(window, stop))
         raise _no_page_error(page)
 
@@ -659,7 +733,9 @@ class DesktopBrowserController:
         caption that changed - and Chrome re-creating its accessibility tree,
         which hands out a new runtime id on every read - used to count as proof:
         the room heard "YouTube is open" while the window was still showing the
-        page (or the popup) it had before.
+        page (or the popup) it had before. Neither does every new document: a
+        window that held no page yet renders its own new tab page first, and
+        that start page was reported as the site that had just opened.
         """
         wanted = _host(url)
         attempt(lambda: self._backend.navigate(window, url, stop), attempts=2)
@@ -676,17 +752,30 @@ class DesktopBrowserController:
                 continue
             loaded = str(page.get('url') or '').strip()
             landed = bool(wanted) and wanted in loaded.casefold()
-            moved = bool(loaded) and loaded != str(before.get('url') or '').strip()
+            moved = (bool(loaded) and loaded != str(before.get('url') or '').strip()
+                     and not _blank_url(loaded))
             if landed or moved:
                 return page
             if time.monotonic() >= deadline:
                 break
-        still = str(page.get('title') or page.get('caption') or '').strip() or 'a page with no readable document'
+        still = self._still_on(page)
         typed = str(page.get('typed') or '').strip()
         raise ValueError(
             f'The address bar did not open {wanted or url}: the browser is still on '
             f'{still}' + (f' with {typed!r} typed in the address bar' if typed else '')
             + '. Focus that browser window and retry.')
+
+    @staticmethod
+    def _still_on(page) -> str:
+        """What to tell the model about the page the address bar did not leave."""
+        caption = str(page.get('caption') or page.get('title') or '').strip()
+        url = str(page.get('url') or '').strip()
+        if not url:
+            return ('a window with no loaded page'
+                    + (f' ({caption})' if caption else ''))
+        if _blank_url(url):
+            return f'the browser start page {url!r}'
+        return str(page.get('title') or caption or 'a page with no readable title').strip()
 
     async def close(self):
         if self._stop is not None:
