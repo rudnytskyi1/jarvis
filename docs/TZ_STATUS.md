@@ -2047,3 +2047,20 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   `pytest tests/test_repeat_mode.py -q` → 59 passed; `ruff check
   hub/repeat_mode.py hub/telegram_chat.py tests/test_repeat_mode.py` → All checks
   passed. Решение — `DECISIONS.md`, TG-ECHO-02.
+
+- **TG-ECHO-03 — просьба про режим повтора управляет им, а не повторяется эхом
+  (23.09.2026).** Владелец прислал скриншот («это бред»): «повторяй за мной» →
+  включён повтор текстом; «а можешь повторять озвучкой в комнату?» → бот
+  повторил саму просьбу вместо переключения; «хватит» в кавычках не выключило
+  режим; последний вопрос модель закрыла ответом «I didn't actually do anything
+  there…». Что сделано: слова «в комнату/вслух/озвучкой/голосом/out loud» и
+  «в чат/текстом/in the chat» вместе со словом про повтор теперь переключают
+  режим; кавычки и знаки по краям сообщения срезаются (`«хватит»` = `хватит`);
+  стопом считается только короткое сообщение (до четырёх слов), поэтому
+  «хватит, можешь озвучкой в комнату повторять?» переключает в комнату; просьба
+  про комнату при выключенном режиме сразу включает повтор в комнате.
+  Проверено: `pytest tests/test_repeat_mode.py -q` → 77 passed; `pytest
+  tests/test_repeat_mode.py tests/test_telegram_chat.py tests/test_telegram_control.py
+  tests/test_telegram.py tests/test_telegram_media.py tests/test_telegram_parallel.py
+  tests/test_telegram_workflow.py -q` → 407 passed; `ruff check` по изменённым
+  файлам → All checks passed. Решение — `DECISIONS.md`, TG-ECHO-03.

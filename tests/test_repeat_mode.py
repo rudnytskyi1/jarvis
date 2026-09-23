@@ -12,7 +12,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hub.repeat_mode import MAX_MESSAGES, RepeatMode, request, soft_stop, wants_room_speech
+from hub.repeat_mode import (
+    MAX_MESSAGES,
+    RepeatMode,
+    is_repeat_request,
+    request,
+    soft_stop,
+    wants_chat_speech,
+    wants_room_speech,
+)
 from hub.telegram_chat import TelegramChat
 
 
@@ -132,13 +140,41 @@ def test_a_plain_repeat_stays_in_the_chat(text):
     assert wants_room_speech(text) is False
 
 
-@pytest.mark.parametrize('text', ['хватит', 'хватит уже', 'да все хвтаит уже', 'стоп', 'stop', 'отмена'])
+@pytest.mark.parametrize('text', ['хватит', 'хватит уже', 'да все хвтаит уже', 'стоп', 'stop', 'отмена',
+                                  '«хватит»', '"хватит"', 'Хватит!', '  хватит  ', 'хватит, пожалуйста'])
 def test_a_short_stop_word_ends_the_repeat(text):
     assert soft_stop(text) is True
 
 
 def test_a_long_sentence_is_never_a_stop_word():
     assert soft_stop('расскажи, что ты умеешь, и не забудь про напоминания') is False
+
+
+def test_a_long_ask_is_not_a_stop_word_but_a_mode_request():
+    """«хватит, можешь озвучкой в комнату повторять?» — это переключение."""
+    text = 'хватит, можешь озвучкой в комнату повторять?'
+    assert soft_stop(text) is False
+    assert is_repeat_request(text) is True
+    assert wants_room_speech(text) is True
+
+
+@pytest.mark.parametrize('text', ['повторяй за мной текстом', 'повторяй в чат', 'repeat here in the chat'])
+def test_the_chat_can_be_asked_for_too(text):
+    assert wants_chat_speech(text) is True
+
+
+@pytest.mark.parametrize('text', [
+    'повторяй за мной в комнате',
+    'а можешь повторять озвучкой в комнату?',
+    'можешь повторять голосом?',
+])
+def test_a_mode_request_is_recognized(text):
+    assert is_repeat_request(text) is True
+
+
+@pytest.mark.parametrize('text', ['привет, как дела?', 'и вторая фраза', 'покажи фото с камеры'])
+def test_a_plain_phrase_is_not_a_mode_request(text):
+    assert is_repeat_request(text) is False
 
 
 def _provider():
@@ -206,6 +242,58 @@ def test_the_room_speaks_only_when_the_owner_asks_for_it(tmp_path):
         assert spoken == ['привет']
         sent = [call.args[0] for call in transport.send_text.await_args_list]
         assert 'привет' in sent  # и в чат тоже приходит
+
+    asyncio.run(run())
+
+
+def test_a_request_about_the_mode_switches_it_instead_of_being_echoed(tmp_path):
+    """Скриншот владельца: «а можешь повторять озвучкой в комнату?» вернулось эхом."""
+    spoken = []
+
+    async def speak(text, message):
+        spoken.append(text)
+        return {'ok': True}
+
+    async def run():
+        bot, transport = _bot(tmp_path, speak=speak)
+        await bot.process_update(_message(1, 'повторяй за мной'))
+        await bot.process_update(_message(2, 'а можешь повторять озвучкой в комнату?'))
+        await bot.process_update(_message(3, 'привет'))
+        sent = [call.args[0] for call in transport.send_text.await_args_list]
+        assert sent[1].startswith('Теперь повторяю вслух')
+        assert not any('озвучкой' in item for item in sent)  # просьба не повторяется эхом
+        assert spoken == ['привет']  # и дальше повтор идёт в комнате
+
+    asyncio.run(run())
+
+
+def test_a_room_request_while_the_mode_is_off_starts_the_room_repeat(tmp_path):
+    spoken = []
+
+    async def speak(text, message):
+        spoken.append(text)
+        return {'ok': True}
+
+    async def run():
+        bot, transport = _bot(tmp_path, speak=speak)
+        await bot.process_update(_message(1, 'можешь повторять озвучкой в комнату?'))
+        await bot.process_update(_message(2, 'раз два три'))
+        sent = [call.args[0] for call in transport.send_text.await_args_list]
+        assert sent[0].startswith('Повтор включён')
+        assert spoken == ['раз два три']
+
+    asyncio.run(run())
+
+
+def test_stop_in_quotes_ends_the_repeat(tmp_path):
+    """«хватит» в кавычках владельца режим не выключило — теперь выключает."""
+    async def run():
+        bot, transport = _bot(tmp_path)
+        await bot.process_update(_message(1, 'повторяй за мной'))
+        await bot.process_update(_message(2, '«хватит»'))
+        await bot.process_update(_message(3, 'сколько времени?'))
+        assert bot.reply.await_count == 1
+        assert transport.send_text.await_args.args[0] == 'model answer'
 
     asyncio.run(run())
 

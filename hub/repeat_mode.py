@@ -81,17 +81,45 @@ _SOFT_STOP = re.compile(
     r'(?:хва\w+|хв[аеоиу]?\w*т\w*|стоп\w*|stop\w*|cancel|отмена|замолчи)',
     re.IGNORECASE)
 
-#: Просьба повторять ВСЛУХ в комнате. По умолчанию повтор идёт текстом сюда же:
-#: владелец 2026-09-23 — «повторяй за мной в чате а не озвучивай в комнате».
-_SPOKEN = (
-    r'\bв комнате\b', r'\bвслух\b', r'\bголосом\b', r'\bчерез колонк', r'\bпо громкой\b',
-    r'\bin the room\b', r'\bout loud\b', r'\baloud\b', r'\bthrough the speakers?\b',
-    r'\ben la habitaci[oó]n\b', r'\ben voz alta\b',
+#: Слова про повтор ВСЛУХ (комната) и про повтор ТЕКСТОМ (этот чат). Оба
+#: намерения ищутся вместе со словом «повтор», иначе «поставь это в комнату»
+#: переключало бы режим вместо того, чтобы быть повторённым. Владелец
+#: 2026-09-23: «повторяй за мной в чате а не озвучивай в комнате», и через
+#: минуту — «а можешь повторять озвучкой в комнату?»: пока режим включён, такая
+#: просьба ДОЛЖНА переключать режим, а не повторяться.
+_ROOM = (
+    r'\bв комнат\w*', r'\bвслух\b', r'\bозвуч\w*', r'\bголосом\b', r'\bчерез колонк',
+    r'\bпо громкой\b', r'\bin the room\b', r'\bout loud\b', r'\baloud\b',
+    r'\bthrough the speakers?\b', r'\ben la habitaci[oó]n\b', r'\ben voz alta\b',
 )
+_CHAT = (
+    r'\bв чат\w*', r'\bв телег\w*', r'\bтекстом\b', r'\bздесь же\b',
+    r'\bin the chat\b', r'\btext only\b', r'\bas text\b',
+)
+#: Слово, по которому видно, что речь вообще про режим повтора.
+_REPEAT_WORD = re.compile(r'повтор\w*|повт\w*|rep(?:ea|i|e|í)t\w*|echo\b|parrot',
+                          re.IGNORECASE)
+_ROOM_RE = re.compile('|'.join(_ROOM), re.IGNORECASE)
+_CHAT_RE = re.compile('|'.join(_CHAT), re.IGNORECASE)
+
+#: Что считать «просьбой», а не фразой, которую просят повторить: короткое
+#: сообщение и слова-просьбы. Фраза «можешь повторять озвучкой в комнату?»
+#: включает режим, а «скажи это в комнату» — просто повторяется.
+_REQUEST = re.compile(r'можешь|можно|давай|включи|включай|сделай|can you|could you|'
+                      r'please|start|turn on|switch|хочу|будешь', re.IGNORECASE)
 
 _START_RE = re.compile('|'.join(_START), re.IGNORECASE)
 _STOP_RE = re.compile('|'.join(_STOP), re.IGNORECASE)
-_SPOKEN_RE = re.compile('|'.join(_SPOKEN), re.IGNORECASE)
+
+#: Кавычки, скобки и знаки на краях сообщения: «хватит» и "хватит" — то же
+#: слово, что и хватит (владелец отправил «хватит» в кавычках, и режим не
+#: выключился).
+_EDGES = "«»„“”‘’\"'()[]{}.,!?:;*#—–-…"
+
+
+def _clean(text: str) -> str:
+    """Одна строка без краёв-пунктуации, в нижнем регистре."""
+    return ' '.join(str(text or '').split()).strip().strip(_EDGES).strip().casefold()
 
 
 def request(text: str) -> str:
@@ -103,7 +131,7 @@ def request(text: str) -> str:
     cleaned = ' '.join(str(text or '').split()).strip()
     if not cleaned or len(cleaned) > 200:
         return ''
-    lowered = cleaned.casefold().strip('!.?,…-')
+    lowered = _clean(cleaned)
     if _STOP_RE.search(lowered):
         return 'stop'
     if _START_RE.search(lowered):
@@ -113,14 +141,38 @@ def request(text: str) -> str:
 
 def wants_room_speech(text: str) -> bool:
     """Просили ли повтор ВСЛУХ. Иначе повтор идёт текстом в тот же чат."""
-    cleaned = ' '.join(str(text or '').split()).casefold()
-    return bool(_SPOKEN_RE.search(cleaned))
+    cleaned = _clean(text)
+    return bool(_REPEAT_WORD.search(cleaned) and _ROOM_RE.search(cleaned))
+
+
+def wants_chat_speech(text: str) -> bool:
+    """Просили ли повтор ТЕКСТОМ (сюда же, в этот чат)."""
+    cleaned = _clean(text)
+    return bool(_REPEAT_WORD.search(cleaned) and _CHAT_RE.search(cleaned))
+
+
+def is_repeat_request(text: str) -> bool:
+    """Похоже ли сообщение на просьбу «повторяй, как я скажу» (а не на фразу).
+
+    Только такие просьбы включают и переключают режим; всё остальное, пока режим
+    включён, повторяется дословно.
+    """
+    cleaned = _clean(text)
+    if not cleaned or len(cleaned) > 120:
+        return False
+    return bool(_REPEAT_WORD.search(cleaned) and
+                (_ROOM_RE.search(cleaned) or _CHAT_RE.search(cleaned) or _REQUEST.search(cleaned)))
 
 
 def soft_stop(text: str) -> bool:
-    """Короткое «хватит»/«стоп» — стоп для включённого повтора, не для чата."""
-    cleaned = ' '.join(str(text or '').split()).strip().casefold()
-    if not cleaned or len(cleaned) > 40:
+    """Короткое «хватит»/«стоп» — стоп для включённого повтора, не для чата.
+
+    Стопом считается только КОРОТКОЕ сообщение (до четырёх слов): владелец
+    написал «хватит, можешь озвучкой в комнату повторять?» — это просьба
+    переключить режим в комнату, а не выключить его, и она переключает.
+    """
+    cleaned = _clean(text)
+    if not cleaned or len(cleaned) > 40 or len(cleaned.split()) > 4:
         return False
     return bool(_SOFT_STOP.match(cleaned))
 
@@ -149,6 +201,14 @@ class RepeatMode:
         """Повторять ли вслух в комнате (только если владелец попросил это)."""
         entry = self._open.get(str(scope))
         return bool(entry and entry.get('spoken'))
+
+    def set_spoken(self, scope: str, spoken: bool) -> bool:
+        """Переключить «вслух/текстом» у включённого режима; ``False`` — он не включён."""
+        entry = self._open.get(str(scope))
+        if entry is None:
+            return False
+        entry['spoken'] = 1.0 if spoken else 0.0
+        return True
 
     def stop(self, scope: str) -> bool:
         """Turn the mode off; ``True`` when it was on."""
