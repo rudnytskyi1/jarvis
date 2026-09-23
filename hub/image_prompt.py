@@ -162,7 +162,20 @@ _VISUAL_ACTION = re.compile(
     r'(?:red|blue|green|yellow|black|white|purple|orange|realistic|photorealistic|cartoon|bigger|smaller)\b|'
     r'\b(?:edit|modify|change|remove|replace|add|put|give|make)\b[^.!?]{0,100}'
     r'\b(?:picture|image|photo|portrait|face|head|hat|cap|hair|clothes|shirt|costume|sky|eyes|glasses|crown|wallpaper|background|next\s+to\s+me)\b|'
+    # «Сделай это реалистичным» / «make this drawing realistic»: владелец и его
+    # друзья просят картинку именно так, а инструмент такие слова не считал
+    # запросом на изображение и отказывал («The current message does not request
+    # creating or editing an image») — с приложенным рисунком это выглядело как
+    # «бот не умеет редактировать фото» (2026-09-22 и 2026-09-23).
+    r'\b(?:make|turn|convert|render|redo|recreate|rework)\b[^.!?]{0,60}'
+    r'\b(?:realistic|photorealistic|photo-?real|lifelike|real\s+photo|\b3d)\b|'
+    r'\b(?:realistic|photorealistic|lifelike)\b[^.!?]{0,40}'
+    r'\b(?:image|picture|photo|drawing|sketch|scene|version|art)\b|'
     r'\b(?:нарисуй|нарисовать|изобрази|изобразить|сгенерируй|сгенерировать|дорисуй|дорисовать|отредактируй)\b|'
+    r'\b(?:сделай|сделать|преврати|превратить|переделай|переделать)\b[^.!?]{0,60}'
+    r'\b(?:реалистичн\w*|фотореалистичн\w*|настоящ\w*\s+(?:фото|картинк\w*|изображени\w*))\b|'
+    r'\b(?:реалистичн\w*|фотореалистичн\w*)\b[^.!?]{0,40}'
+    r'\b(?:картинк\w*|изображени\w*|фото|рисун\w*|набросок|сцен\w*)\b|'
     r'\b(?:сделай|сделать|преврати|превратить|добавь|добавить|надень|надеть|поставь|убери|замени|измени)\b'
     r'[^.!?]{0,100}\b(?:меня|его|её|ее|нас|изображение|картинку|фото|шляпу|шапку|голову|голове|лицо|фон|рядом)\b', re.I)
 _NEGATIVE_PREFIX = re.compile(r'(?:\b(?:do\s+not|don[’\x27]t|never|не)\s+)$', re.I)

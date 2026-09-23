@@ -1514,8 +1514,9 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   checks passed; `mypy common` → Success. **Чего нет:** живого Telegram/голоса в
   песочнице (комнаты подставные); названо в `DECISIONS.md` (P5-19).
 
-- **F-608 (P5-20) — игры между комнатами: квиз по темам сделан, «угадай, кто
-  сказал» и таймер-соревнование — P5-21.** Каркас — скилл с состоянием F-407:
+- **F-608 (P5-20, P5-21) — игры между комнатами: квиз по темам, «угадай, кто
+  сказал» по голосам с согласия и таймер-соревнование.** Каркас — скилл с
+  состоянием F-407:
   `skills/games/` (`start`/`answer`/`score`/`stop`) поверх `hub/games.py`
   (`QuizEngine` с `SkillStateStore` и `SkillScheduler`, `LlmQuizGenerator`
   через `structured_json`, `answers_match` по границам слов). Партия живёт в
@@ -1536,7 +1537,146 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   passed; `mypy common` → Success; `python -c "import hub.app, client.main"` →
   ok. **Чего нет:** живого микрофона и голоса в песочнице (комнаты подставные,
   генератор вопросов подставной, настоящий путь проверен на подставной
-  модели); межкомнатный голос «угадай, кто сказал» — P5-21.
+  модели).
+
+  «Угадай, кто сказал» и таймер-соревнование (P5-21) живут в
+  `hub/guess_who.py` (`GuessEngine` с `GuessRound`/`GuessVerdict`/`GuessClose`).
+  Согласие даёт ЧЕЛОВЕК по паре «дом + человек» голосом («разрешаю использовать
+  мой голос в игре») и оно переживает перезапуск; согласие на клон голоса
+  (F-111) игру НЕ открывает, без согласия партия не начинается. Загадка —
+  НАСТОЯЩАЯ запись голоса: WAV в медиах хаба (F-304, kind `audio`), длина
+  0.5–20 с измеряется (короткая отвергается, длинная честно обрезается), и
+  играет именно запись, а не синтез. Догадки сверяются с именем человека по
+  границам слов и алиасам «полное имя / первое слово» (уменьшительные не
+  выдумываются). Таймер-соревнование: `speed_points` считает очки по остатку
+  времени (минимум 1), а партию закрывает `SkillScheduler.in_` (F-407); комната
+  говорящего и повторная догадка очка не получают, партия кончается, когда
+  угадали все остальные. Партия живёт в состоянии `hub:games` (ключ `mystery`)
+  и переживает рестарт; хаб входит в игру через `Connection._guess_turn` в
+  быстром пути до wake-проверки, `_guess_play` проигрывает запись остальным
+  комнатам настоящим PCM (`play_audio`) и честно считает, скольким дошло
+  (никому — партия закрывается, а не молчит), `/health.games.guess` показывает
+  партию и счёт; секция `server.games` дополнена `guess_window_s` и
+  `guess_points`. Проверено: `pytest tests/test_guess_who.py -q` → 25 passed;
+  `pytest tests -q` → 9475 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app, hub.guess_who,
+  client.main"` → ok. **Найдено и исправлено по пути:** сохранение записи шло
+  через `asyncio.to_thread`, а соединение хаба с SQLite живёт в потоке цикла —
+  15 из 25 тестов падали на `sqlite3.ProgrammingError: SQLite objects created
+  in a thread can only be used in that same thread`; теперь запись идёт на
+  потоке хаба, как и остальная работа с медиа (F-304/F-305). **Чего нет:**
+  живого микрофона, голоса и второй комнаты в песочнице (комнаты подставные,
+  запись — настоящий WAV, идентификация говорящего — существующий F-204);
+  названо в `DECISIONS.md` (P5-21).
+
+- **F-609 (P5-22) — голосовые заметки друг другу: запись на 7 дней и выдача при
+  появлении получателя.** Сделано: migration `0032_voice_notes` (таблица
+  `voice_notes` — дом ПОЛУЧАТЕЛЯ, автор, `media_ref`, срок, состояния
+  `queued`/`played`/`expired`), `hub/notes.py`. Разбор просьбы
+  (`note_request`) понимает «оставь Максу голосовое», «запиши голосовую
+  заметку для Макса», «leave Max a voice note», «deja un mensaje de voz a Max»;
+  местоимения («мне», «ему») получателем не считаются, а «поставь голосовое» —
+  это проиграть, не оставить. Заметка — НАСТОЯЩАЯ запись голоса: WAV в медиаха
+  хаба (`kind="note"`, собственный TTL `server.media.note_ttl_days` = 7 дней,
+  тогда как кадр живёт 3), длина 0.5–60 с измеряется (короткая отвергается,
+  длинная честно обрезается), пересказ синтезом запрещён. Очередь
+  (`VoiceNoteStore`) ограничена `server.notes.queue_limit`, срок вышел → строка
+  помечается `expired`, а не исчезает молча. Доставка
+  (`VoiceNoteDeliveryTask`, job `notes.deliver`) отдаёт заметки дома человеку,
+  который в нём появился (F-301), от старой к новой; отказавшая комната
+  оставляет заметку в очереди, просроченная не звучит вовсе, каждый показ
+  пишет строку `note.play` в аудит (F-706). Заметка идёт через ТОТ ЖЕ гейт
+  согласия, что интерком (`_interhome_gate`, F-602), но не тратит лимит
+  частоты F-603: он про сказанное сейчас, а заметка прозвучит позже. Хаб:
+  `Connection._notes_turn` в быстром пути ДО игры F-608 («оставь Максу
+  голосовое» открывает окно `ARM_WINDOW_S`, заметкой становится СЛЕДУЮЩАЯ
+  реплика человека; короткая реплика окно держит, другая команда закрывает и
+  уходит своей ветке), при появлении получателя комната слышит «Тебе голосовое
+  от …» и затем саму запись через `play_audio` — протокол не менялся, клиент
+  уже умел это с F-608; `/health.notes` показывает флаг, TTL, счётчики очереди
+  и число выданных; секция `server.notes` в `common/config.py`, `config.yaml` и
+  `config.example.yaml`. Общее: помощники WAV (`pcm_to_wav`/`wav_pcm`/
+  `wav_seconds`) переехали в `hub/media.py` и переиспользуются игрой F-608.
+  Проверено: `pytest tests/test_notes.py -q` → 36 passed;
+  `pytest tests -q` → 9511 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app, hub.notes,
+  client.main"` → ok. **Обновление комнатных ПК (правило владельца):**
+  `pwsh -File scripts/update-room-pcs.ps1` → AntonDorm «обновлён и перезапущен»,
+  SHA-256 `client/camera.py` совпадает, задача `Running`, окно `hidden`;
+  **buro НЕ ОТВЕЧАЕТ** (`user@100.67.114.67`), обновление НЕ выполнено — это
+  открытый пункт, записан в `DECISIONS.md` (P5-22), а не «выполнено».
+  **Чего нет:** живого микрофона, голоса и второй комнаты в песочнице (комнаты
+  подставные, запись — настоящий WAV); buro остаётся на прежней сборке, пока
+  ПК не поднимется.
+
+- **F-610 (P5-23) — общий список покупок и дел: голос из любой комнаты,
+  Telegram и HUD.** Сделано: migration `0033_shopping_items` (таблица
+  `shopping_items` — группа, текст, `status` `open`/`done`, автор, комната,
+  время), `hub/shopping.py` (`shopping_command` понимает «добавь в список
+  покупок молоко», «добавь молоко в список», «add milk to the shopping list»,
+  «añade leche a la lista de la compra», «что в списке покупок?», «покажи
+  список дел», «купил молоко», «убери молоко из списка», «очисти список
+  покупок»; `ShoppingStore` с `add`/`open_items`/`done_items`/`find`/
+  `mark_done`/`remove`/`clear`/`counts`; строки и карточка на ru/en/es).
+  Список принадлежит ГРУППЕ домов (`server.shopping.homes`, пусто — все дома
+  хаба). Хаб: `Connection._shopping_turn` в быстром пути, общая точка
+  `_shopping_apply` для голоса и инструмента, `_show_shopping_in_homes`
+  показывает обновлённый список карточкой `MSG_CARD` (kind `shopping`) в каждой
+  комнате группы — читать список можно на HUD, а протокол и клиент не менялись
+  (карточка есть с P4-08/F-709); инструмент `shopping_list` (`hub/tools.py`,
+  `SERVER_TOOLS`, новое семейство `lists`) даёт то же чтение и запись в
+  Telegram (модель отвечает настоящими строками таблицы, а не по памяти);
+  `shopping.add/done/remove/clear` пишутся в аудит (F-706);
+  `/health.shopping` показывает флаг, группу и состояния; секция
+  `server.shopping` (`enabled`, `homes`, `list_limit`, `max_items`) в
+  `common/config.py`, `config.yaml` и `config.example.yaml`. Вычеркнуть можно
+  только то, что в списке есть (поиск по границам слов: «молоко» ≠ «молоток»),
+  иначе честный отказ; вычеркнутое не исчезает, а переходит в `done`.
+  Проверено: `pytest tests/test_shopping.py -q` → 30 passed;
+  `pytest tests -q` → 9543 passed, 11 skipped; `ruff check .` → All checks
+  passed; `mypy common` → Success; `python -c "import hub.app, hub.shopping,
+  hub.notes, client.main"` → ok. **Найдено и исправлено по пути:**
+  `_shopping_store()` звал `_hub_gateway()`, когда соединение ещё не задано, а
+  шлюз ОТКРЫВАЕТ СВОЮ базу — отладочный прогон увёл строку списка в живую
+  `data/hub.db` (строка удалена тем же прогоном); теперь живой `_hub_conn`
+  берётся первым, и то же исправлено в `_notes_store()` (см. `DECISIONS.md`,
+  P5-23). **Обновление комнатных ПК:** `pwsh -File
+  scripts/update-room-pcs.ps1` → AntonDorm «обновлён и перезапущен», SHA-256
+  `client/camera.py` совпадает, задача `Running`; **buro НЕ ОТВЕЧАЕТ** —
+  открытый пункт из `DECISIONS.md` (P5-22/P5-23). **Чего нет:** живого Telegram
+  и второй комнаты в песочнице (получатели подставные, список — настоящие
+  строки SQLite).
+
+- **F-611 (P5-24) — статус «не беспокоить» между комнатами.** Сделано:
+  migration `0034_do_not_disturb` (одна строка на человека: `until`, заметка,
+  дом, время), `hub/do_not_disturb.py` — `dnd_command` понимает «я занят до
+  18», «я занята до 18:30», «не беспокоить до 18», «I am busy until 6 pm»,
+  «estoy ocupado hasta las 18», «я свободен»/«я не занят» (снять) и «кто
+  сейчас занят» (прочитать); срок считает тот же парсер, что напоминания F-417
+  (`reminders.parse_when`: «до 18» приводится к «в 18»), а без срока хаб
+  СПРАШИВАЕТ, а не выбирает час сам. `DoNotDisturbStore` хранит текущий статус
+  (просроченный перестаёт быть статусом), `busy()` отвечает, кто сейчас занят,
+  строки — на ru/en/es. Хаб: `Connection._dnd_turn` ставит и снимает статус
+  ТОЛЬКО у узнанного человека (гость получает честный отказ) и пишет
+  `dnd.set`/`dnd.clear` в аудит (F-706); `_home_intercom_quiet` считает статус
+  наравне с тихими часами, поэтому интерком (F-601) и вопросы опросов (F-604)
+  КОПЯТСЯ и прозвучат после названного часа; интерком человеку в статусе
+  отвечает отправителю «занят до 18» и оставляет сообщение в очереди; вопрос
+  «Макс дома?» про такого человека отвечает статусом, но только на том же
+  праве взаимного согласия (F-602); `/health.do_not_disturb` показывает, кто
+  сейчас «не беспокоить»; секция `server.do_not_disturb` (`enabled`) в
+  `common/config.py`, `config.yaml`, `config.example.yaml`. Проверено:
+  `pytest tests/test_do_not_disturb.py -q` → 21 passed; `pytest tests -q` →
+  9564 passed, 11 skipped; `ruff check .` → All checks passed; `mypy common` →
+  Success; `python -c "import hub.app, hub.do_not_disturb, hub.shopping,
+  client.main"` → ok. **Обновление комнатных ПК:** `pwsh -File
+  scripts/update-room-pcs.ps1` → AntonDorm «обновлён и перезапущен», SHA-256
+  совпадает, задача `Running`; **buro НЕ ОТВЕЧАЕТ** — открытый пункт
+  `DECISIONS.md` (P5-22). Отдельно проверено (`DECISIONS.md`, P5-24b), что
+  прогоны скрипта не уронили ни один python-процесс этой машины: все PID
+  старше первого прогона, последняя запись `loop.log` — за 20 минут до него.
+  **Чего нет:** живого Telegram и второй комнаты в песочнице (получатели
+  подставные, статус — настоящие строки SQLite).
 
 - **F-705 — панель владельца включена, и в ней видна цепочка каждого запроса
   (в том числе из Telegram).** Вопрос владельца был прямой: «хочу админ-панель,
@@ -2064,3 +2204,18 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_telegram.py tests/test_telegram_media.py tests/test_telegram_parallel.py
   tests/test_telegram_workflow.py -q` → 407 passed; `ruff check` по изменённым
   файлам → All checks passed. Решение — `DECISIONS.md`, TG-ECHO-03.
+
+- **PHOTO-01 — рисунок из телеги: вложение названо и признано запросом
+  (23.09.2026).** Владелец: в группу пришёл рисунок с подписью «Generate a
+  realistic image of this thing in the drawing, ignore the math», бот ответил
+  «The current message doesn't have the drawing attached». В трассе хода
+  `"photo": true`, то есть вложение дошло. Что сделано: `attached_photo_note()`
+  и `current_request_line()` в `hub/telegram_control.py` называют вложение в
+  самом запросе и требуют брать источник через
+  `generate_image source=last fresh=false target=display` (без «нет картинки»,
+  без переспроса, без `telegram_send` для ответа); `hub/image_prompt.py`
+  признаёт запросом на картинку формы «make this drawing realistic»,
+  «make … realistic images», «сделай это реалистичным». Проверено: `pytest
+  tests/test_photo_request_wording.py -q` → 18 passed; набор
+  telegram/image тестов → 379 passed; `ruff check` по изменённым файлам →
+  All checks passed. Решение — `DECISIONS.md`, PHOTO-01.
