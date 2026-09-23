@@ -228,7 +228,10 @@ class LLMConfig(_Strict):
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=1)
     #: How many tool-call rounds one utterance may take before a final answer.
-    max_tool_rounds: int = Field(default=4, ge=1)
+    #: ``0`` снимает счётчик раундов (владелец, 2026-09-23, «никаких лимитов»):
+    #: ход идёт, пока модель не закончит, с одним огромным предохранителем
+    #: (`hub.llm.UNLIMITED_TOOL_ROUNDS`). Число больше нуля — предел владельца.
+    max_tool_rounds: int = Field(default=4, ge=0)
     #: v1.7: how long the VISION model stays in VRAM after a question.
     #: Separate from keep_alive because it is big (8.4 GB resident) and
     #: rarely used, and that memory is what SAM3 needs.

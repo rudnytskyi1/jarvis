@@ -67,6 +67,13 @@ OPENAI_COMPATIBLE = frozenset({PROVIDER_OPENAI, PROVIDER_VLLM})
 REQUEST_TIMEOUT_S = 180.0
 MAX_RETRIES = 0
 
+#: Владелец 2026-09-23: «никаких лимитов, все что его попросили — делает».
+#: ``server.llm.max_tool_rounds: 0`` снимает счётчик раундов: он больше не
+#: обрывает многошаговую задачу на середине. Предохранитель остаётся один и он
+#: огромный — запутанная модель, которая ходит по кругу, всё-таки остановится,
+#: иначе один ход выедал бы бюджет бесконечно.
+UNLIMITED_TOOL_ROUNDS = 1000
+
 #: Result handed to the model when no tool executor is wired up.
 NO_EXECUTOR_RESULT: dict[str, Any] = {
     "ok": False,
@@ -716,9 +723,14 @@ class LlmClient:
         except (TypeError, ValueError):
             self.max_tokens = 1024
         try:
-            self.max_tool_rounds = max(1, int(getattr(cfg_llm, "max_tool_rounds", 4)))
+            configured_rounds = int(getattr(cfg_llm, "max_tool_rounds", 4))
         except (TypeError, ValueError):
-            self.max_tool_rounds = 4
+            configured_rounds = 4
+        # 0 (или меньше) = счётчик снят: ``UNLIMITED_TOOL_ROUNDS`` вместо
+        # прежнего «максимум 1». Так реплика владельца от 2026-09-23 работает и
+        # для раундов модели, а не только для шагов агента.
+        self.max_tool_rounds = (UNLIMITED_TOOL_ROUNDS if configured_rounds <= 0
+                                else max(1, configured_rounds))
         self.api_key = str(getattr(cfg_llm, "api_key", "") or "ollama")
         #: How long Ollama keeps the chat model loaded after a request. The
         #: default 5 m would make the first command after a quiet spell pay a

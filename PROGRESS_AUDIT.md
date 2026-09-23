@@ -70,9 +70,13 @@
   «quiet please» модель читает как «замолчи», а не как `mute`. Тесты:
   `tests/audit/test_request_matrix.py` (матрица + вердикт стенда),
   `tests/test_web_page_guard.py` (промпт и защита хаба говорят одно и то же);
-  `pytest tests -q` → 9366 passed, 15 failed и все 15 — чужой
+  `pytest tests -q` → 9368 passed, 15 failed и все 15 — чужой
   `tests/test_guess_who.py` (незавершённая чужая фича, в зачёт не идёт);
-  `ruff check .` → All checks passed; `mypy common` → Success.
+  `ruff check .` → All checks passed; `mypy common` → Success. Хаб перезапущен
+  `scripts/run-openai-server.ps1` (`/health` → 200). Коммит/пуш из песочницы
+  невозможны (`.git` только для чтения, у remote нет креденшелов) — список
+  файлов для внешнего скрипта в `DECISIONS.md`, AUDIT-08f; `hub/tools.py`,
+  этот файл и `DECISIONS.md` уже попали в чужие коммиты `7373aab`/`bd3323a`.
 - [ ] **AU-03 — зрение: «кто в комнате», «что на экране».** Живой прогон
   `--family vision`; цель — Jev выбирает семейство `vision` и модель зовёт
   `look_at_camera`/`look_at_screen` первым вызовом. Проверять и `offered`.
@@ -129,3 +133,9 @@
   (`hub.app.UNBOUNDED_BUDGET_S` = 86400 с), `pytest tests/test_stage_timeouts.py
   -q` → 17 passed; `Config.model_validate(config.openai.yaml)` → `reply_ms 0`.
   Обоснование — `DECISIONS.md`, «CU-LIMIT-02».
+- [x] **AU-16 — счётчик раундов инструментов снят (CU-LIMIT-03).** `0` в
+  `server.llm.max_tool_rounds` = без счётчика (`UNLIMITED_TOOL_ROUNDS` = 1000
+  как предохранитель от зацикливания). Проверено: `pytest tests/test_multi_step.py
+  tests/test_llm_vllm_provider.py tests/test_config.py tests/test_stage_timeouts.py
+  -q` → 60 passed; `Config.model_validate(config.openai.yaml)` →
+  `max_tool_rounds 0`. Обоснование — `DECISIONS.md`, «CU-LIMIT-03».

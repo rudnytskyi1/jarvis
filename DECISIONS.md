@@ -3596,6 +3596,22 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   `tests/test_stage_timeouts.py` (17 passed), `config.example.yaml`,
   `config.openai.yaml` (локальный, в git не попадает).
 
+- **CU-LIMIT-03 — счётчик раундов инструментов: 8 → 40 → «без предела».**
+  Третий счётчик на том же пути: `server.llm.max_tool_rounds` обрывает реплику
+  после N раундов «модель → инструмент» и просит финальный ответ без
+  инструментов (`hub/llm.py`, «Tool round cap reached»). Для агента это тот же
+  потолок шагов, только в других единицах: 40 раундов — это примерно 40 шагов
+  computer-use. Выбран вариант: `0` (или отрицательное) значит «счётчика нет» и
+  превращается в `hub.llm.UNLIMITED_TOOL_ROUNDS` (1000) — предохранитель от
+  зацикленной модели остаётся, но ни одна настоящая задача в него не упирается;
+  поле в `common/config.py` принимает `ge=0`; живой конфиг ставит
+  `max_tool_rounds: 0`. Обоснование: владелец просил «никаких лимитов, все что
+  его попросили — делает», и оставлять 40 шагов, сняв 15, значило бы отдать ему
+  ту же стену под другим именем. Ссылка: `tests/test_multi_step.py::
+  test_a_cap_of_zero_means_the_chain_is_not_cut_short` (12 шагов подряд, ни один
+  не потерян), `tests/test_llm_vllm_provider.py::
+  test_the_owner_can_take_the_round_cap_off`, `config.example.yaml`.
+
 ## Массовый аудит, второй заход: браузер (AUDIT-08)
 
 - **AUDIT-08 — почему модель открывала сайты командой оболочки, если хаб это
@@ -3649,3 +3665,17 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   находкой для задач AU-09 (ПК) и AU-03 (зрение), четвёртая — честная
   двусмысленность самой фразы. Обоснование: правило «не выдумывать числа»
   важнее круглой доли успеха. Ссылка: `docs/AUDIT_MASS_AFTER.md`.
+- **AUDIT-08f — коммит и пуш AU-02 делал не я.** `git add`/`git commit` из
+  песочницы исполнителя падают с `fatal: Unable to create
+  'C:/Users/Anton/Desktop/jarvis/.git/index.lock': Permission denied` (`.git`
+  только для чтения, эскалаций нет), а `git push origin master:main` — с
+  `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` (креденшелов
+  remote у песочницы нет). Это ровно случай из `AGENTS.md`, п. 1: «коммиты
+  делает внешний скрипт после каждого запуска, отсутствие коммита не считается
+  падением задачи». Что должно попасть в коммит AU-02 (перечислено для
+  внешнего скрипта): `docs/AUDIT_MASS_AFTER.md`, `prompts/system.md`,
+  `scripts/gen-audit-scenarios.py`, `scripts/live-eval.py`,
+  `tests/audit/test_request_matrix.py`, `tests/test_web_page_guard.py`;
+  `hub/tools.py`, `PROGRESS_AUDIT.md`, `DECISIONS.md` уже оказались в
+  `7373aab`/`bd3323a` (чужие коммиты забрали рабочее дерево целиком).
+  Ссылка: `AGENTS.md`, «Режим цикла», п. 1 и 5.

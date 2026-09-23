@@ -9,6 +9,7 @@ import pytest
 from hub.llm import (
     PROVIDER_OLLAMA_NATIVE,
     PROVIDER_VLLM,
+    UNLIMITED_TOOL_ROUNDS,
     LlmClient,
     StructuredUnavailable,
     _json_object,
@@ -68,6 +69,21 @@ def test_vllm_is_its_own_provider_on_the_openai_surface():
         assert instance.max_tool_rounds == 4
     finally:
         instance.close()
+
+
+def test_the_owner_can_take_the_round_cap_off():
+    """Владелец 2026-09-23: «никаких лимитов» — ``max_tool_rounds: 0`` снимает счётчик."""
+    instances = [client(max_tool_rounds=0), client(max_tool_rounds=-5),
+                 client(max_tool_rounds=7), client(max_tool_rounds=1)]
+    try:
+        assert instances[0].max_tool_rounds == UNLIMITED_TOOL_ROUNDS
+        assert instances[1].max_tool_rounds == UNLIMITED_TOOL_ROUNDS
+        # Своё число владельца читается как есть, а не превращается в ноль.
+        assert instances[2].max_tool_rounds == 7
+        assert instances[3].max_tool_rounds == 1
+    finally:
+        for instance in instances:
+            instance.close()
 
 
 def test_an_unknown_provider_still_falls_back_to_ollama():

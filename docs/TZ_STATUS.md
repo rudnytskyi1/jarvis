@@ -1634,3 +1634,16 @@ MiniFASNet) в сборке нет.** ТЗ F-214 называет модель, 
   `Config.model_validate` на живом `config.openai.yaml` → `reply_ms 0`;
   `hub.app.UNBOUNDED_BUDGET_S` → 86400.0. **Чего нет:** живого длинного хода
   после перезапуска хаба — он и покажет, что модель доводит дело до конца.
+
+- **CU-LIMIT-03 — счётчик раундов инструментов снят (23.09.2026).**
+  `server.llm.max_tool_rounds` обрывал реплику после N раундов «модель →
+  инструмент» и этим повторял ту же стену, что и лимит шагов (40 раундов ≈ 40
+  шагов агента). Что изменено: `0` (или отрицательное) значит «счётчика нет» —
+  `hub/llm.py::UNLIMITED_TOOL_ROUNDS` = 1000 как предохранитель от зацикленной
+  модели, поле в `common/config.py` принимает `ge=0`, живой конфиг ставит
+  `max_tool_rounds: 0`, `config.example.yaml` объясняет ноль в комментарии.
+  Проверено: `pytest tests/test_multi_step.py tests/test_llm_vllm_provider.py
+  tests/test_config.py tests/test_stage_timeouts.py -q` → 60 passed, среди них
+  новый тест «двенадцать шагов подряд, ни один не потерян»;
+  `Config.model_validate(config.openai.yaml)` → `max_tool_rounds 0`.
+  **Чего нет:** живого длинного хода после перезапуска хаба.

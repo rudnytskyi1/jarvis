@@ -141,7 +141,7 @@ server:
     vision_model: qwen2.5vl:7b        # fast NON-thinking vision model (coexists with the chat model)
     temperature: 0.3         # low keeps tool use disciplined (no claimed-but-not-done actions)
     max_tokens: 1024
-    max_tool_rounds: 10      # tool-call rounds per utterance (a computer-use chain needs ~8)
+    max_tool_rounds: 10      # tool-call rounds per utterance (0 = no cap; a chain needs ~8)
     history_turns: 25        # latest exchanges for this person; older ones remain searchable
     keep_alive: 4h           # keep the CHAT model in VRAM (Ollama unloads after 5 m otherwise)
     vision_keep_alive: 10m   # the vision model holds ~8.4 GB; give it back when idle

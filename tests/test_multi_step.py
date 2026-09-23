@@ -263,6 +263,43 @@ def test_a_lonely_json_object_in_prose_is_not_executed():
     result = _run_generate([('The room shows {"lights": 2}.', [])], executor)
     assert calls == []
     assert result.text == 'The room shows {"lights": 2}.'
+
+
+def test_a_cap_of_zero_means_the_chain_is_not_cut_short():
+    """Владелец 2026-09-23: ``max_tool_rounds: 0`` снимает счётчик раундов.
+
+    С прежним пределом (``max(1, 0)`` = 1) двенадцать шагов подряд оборвались
+    бы на первом же раунде и комната услышала бы «не успел». Теперь раунды
+    идут, пока модель не закончит; предохранитель — ``UNLIMITED_TOOL_ROUNDS``.
+    """
+    from hub.llm import UNLIMITED_TOOL_ROUNDS, ToolCall
+
+    client = _client(max_tool_rounds=0)
+    assert client.max_tool_rounds == UNLIMITED_TOOL_ROUNDS
+    calls: list[str] = []
+
+    async def executor(tool, args):
+        calls.append(tool)
+        return {'ok': True}
+
+    replies = [(f'step {step}', [ToolCall(id=f's{step}', name='pc_control',
+                                           arguments={'command': 'media_next'},
+                                           raw_arguments='{}')])
+               for step in range(12)]
+    replies.append(('All twelve steps are done.', []))
+    remaining = iter(replies)
+
+    async def fake_chat(history, with_tools):  # noqa: ARG001 - matches _chat
+        return next(remaining)
+
+    client._chat = fake_chat  # type: ignore[method-assign]
+    try:
+        result = asyncio.run(client.generate([{"role": "user", "content": "hi"}], executor))
+    finally:
+        client.close()
+
+    assert len(calls) == 12, 'ни один шаг цепи не потерян'
+    assert result.text == 'All twelve steps are done.'
     assert result.plan_steps == 0
 
 
