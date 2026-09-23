@@ -181,6 +181,28 @@ def test_multiple_browser_apps_require_choice_even_when_one_is_foreground():
     asyncio.run(run())
 
 
+def test_navigate_to_an_address_picks_a_window_instead_of_asking_which_one():
+    """Two Chrome windows are open and the owner says "open YouTube".
+
+    The live bench heard "Which Chrome window should I use: Example Domain or
+    Outlook?" - an explicit address does not depend on the page that is already
+    open, so the tool must take a window and load the site.
+    """
+    async def run():
+        backend = FakeDesktop()
+        backend.inventory.append({'hwnd': 30, 'pid': 40, 'name': 'Google Chrome',
+                                  'image': 'chrome.exe', 'title': 'Outlook'})
+        backend.active = 999  # The foreground application is not one of them.
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        data = json.loads(await browser.execute(
+            {'command': 'navigate', 'url': 'https://www.youtube.com'}))
+        assert data.get('needs_choice') is None
+        assert backend.events == [('navigate', 'https://www.youtube.com')]
+        assert backend.active == 10
+        await browser.close()
+    asyncio.run(run())
+
+
 def test_no_browser_requires_existing_app_selection_instead_of_launching_another_profile():
     async def run():
         backend = FakeDesktop()

@@ -8,13 +8,15 @@
 #   pwsh -File run-eval.ps1                 # до 25 кругов
 #   pwsh -File run-eval.ps1 -Rounds 3       # короче
 #   pwsh -File run-eval.ps1 -NoActions      # только выбор инструментов, без действий
+#   pwsh -File run-eval.ps1 -ThenRunMain    # после кругов сразу передать ход run.ps1
 #
 [CmdletBinding()]
 param(
     [int]$Rounds = 25,
     [string]$Model = "deepseek-flash",
     [switch]$NoActions,
-    [switch]$NoCommit
+    [switch]$NoCommit,
+    [switch]$ThenRunMain
 )
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -71,4 +73,11 @@ for ($i = 1; $i -le $Rounds; $i++) {
         git commit -m "auto: eval run $i $(Get-Date -Format s)" 2>&1 | Out-Null
     }
     Start-Sleep -Seconds 5
+}
+
+if ($ThenRunMain) {
+    "=== eval loop done, handing over to run.ps1 : $(Get-Date) ===" |
+        Out-File -FilePath $log -Append -Encoding utf8
+    Write-Host "Цикл проверок закончен - запускаю run.ps1" -ForegroundColor Cyan
+    & (Join-Path $repo "run.ps1")
 }

@@ -476,7 +476,7 @@ class DesktopBrowserController:
             finally:
                 self._stop = None
 
-    def _select(self, windows, args, stop):
+    def _select(self, windows, args, stop, command=''):
         selector = str(args.get('browser') or '').strip()
         if selector:
             windows = [w for w in windows if matches(w['name'], selector)]
@@ -498,6 +498,12 @@ class DesktopBrowserController:
         focused = [w for w in windows if w['hwnd'] == active]
         if len({w['name'].casefold() for w in windows}) == 1 and len(focused) == 1:
             return focused[0]
+        if command == 'navigate':
+            # An explicit address does not depend on whatever page is already
+            # open: any ordinary browser window can take it. Asking "which
+            # window?" for "open YouTube" is exactly the kind of question the
+            # owner should never hear.
+            return focused[0] if focused else windows[0]
         _cancelled(stop)
         self._choices.clear()
         choices = []
@@ -532,7 +538,7 @@ class DesktopBrowserController:
         if self._backend is None:
             self._backend = self._factory()
         windows = self._backend.windows()
-        window = self._select(windows, args, stop)
+        window = self._select(windows, args, stop, command=args['command'])
         if window is None:
             raise ValueError('No matching ordinary browser window is open. Use open_app to choose and open a browser first.')
         if 'choices' in window:
