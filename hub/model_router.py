@@ -346,6 +346,11 @@ def build_level_client(entry: ModelLevelConfig) -> Any:
         max_tokens=entry.max_tokens,
         think=entry.think,
         extra_body=entry.extra_body,
+        # Владелец 2026-09-23: «никаких лимитов». Раньше эта настройка в уровень
+        # не попадала, и ``hub/llm.py`` брал свой запасной ``4`` — голосовой ход
+        # обрывался на четырёх раундах инструментов, хотя ``server.llm.
+        # max_tool_rounds: 0`` снимает счётчик совсем.
+        max_tool_rounds=entry.max_tool_rounds,
     )
     return LlmClient(chat)
 

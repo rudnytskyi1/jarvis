@@ -735,6 +735,13 @@ class ModelLevelConfig(_Strict):
     max_tokens: int = Field(default=1024, ge=1, le=32768)
     think: bool = False
     extra_body: dict[str, Any] = Field(default_factory=dict)
+    #: ТЗ F-401: сколько раундов инструментов даётся одному ходу на этом
+    #: уровне. Владелец 2026-09-23 («никаких лимитов») оставил в
+    #: ``server.llm.max_tool_rounds`` значение ``0`` — без предела. Уровень
+    #: раньше не знал этой настройки вовсе, и ``hub/llm.py`` брал свой запасной
+    #: ``4``: в трассе хода появлялось «round 1/4», то есть голосовой ход
+    #: обрывался после четырёх кругов, хотя в конфиге предела нет.
+    max_tool_rounds: int = Field(default=0, ge=0)
 
     @property
     def ready(self) -> bool:

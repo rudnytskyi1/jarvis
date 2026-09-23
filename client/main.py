@@ -357,7 +357,17 @@ def clip_output(value: Any) -> str | None:
 
 
 def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
-    """Build the ``hello`` payload from the client config (SPEC §4.1)."""
+    """Build the ``hello`` payload from the client config (SPEC §4.1).
+
+    Владелец 2026-09-23: «что за фигня? всм cloud decisions выключены?». Комната
+    подключалась БЕЗ токена вообще, поэтому хаб не знал её ``home_id`` — и молча
+    выключал всё, что к дому привязано: облачное чтение реплики (Jev), запись
+    лиц, тела и убеждений (ТЗ 4.3), облачный взгляд на кадр, тихие часы. Токен
+    читается из переменной окружения, имя которой стоит в конфиге
+    (``client.token_env``): сам секрет живёт только в окружении или в ``.env``
+    рядом с конфигом. Без токена всё остаётся как было — v1 ``hello``, который
+    хаб принимает до конца фазы 2.
+    """
     kind = str(_attr(cfg_client, "kind") or "room_pc")
     if kind not in {"room_pc", "phone", "sensor_node"}:
         kind = "room_pc"
@@ -378,7 +388,7 @@ def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
     capabilities = ["voice_confirmation", "live_transcript"]
     if kind == "room_pc":
         capabilities.append(_protocol.CAP_CAMERA_CLIP)
-    return {
+    payload = {
         "type": MSG_HELLO,
         "client_id": str(_attr(cfg_client, "client_id") or "client"),
         "kind": kind,
@@ -393,6 +403,24 @@ def build_hello(cfg_client: Any, *, privacy: bool = False) -> dict[str, Any]:
         # него на самом деле (а не хаб угадывает по своим воспоминаниям).
         "privacy": bool(privacy),
     }
+    token = _client_token(cfg_client)
+    if token:
+        payload["token"] = token
+        # ТЗ 13: v2 hello; ``home_id`` хаб берёт из токена, а не из тела, поэтому
+        # кадр несёт только клиента, которого этот токен и подтвердит.
+        payload["proto"] = 2
+        home = _opt_str(_attr(cfg_client, "home_id"))
+        if home:
+            payload["home_id"] = home
+    return payload
+
+
+def _client_token(cfg_client: Any) -> str:
+    """The hub token of this client from the environment, or ``''`` (ТЗ 4.3)."""
+    name = str(_attr(cfg_client, "token_env") or "").strip()
+    if not name:
+        return ""
+    return str(os.environ.get(name, "") or "").strip()
 
 
 def resolve_path(raw: Any) -> Path:

@@ -1998,3 +1998,39 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   tests/test_repeat_mode.py` → All checks passed; `python -c "import hub.app"`
   → ok. `client/` и `common/` не правились — обновление комнатных ПК не
   требуется. Решения — `DECISIONS.md`, TG-ECHO-01.
+
+- **CD-01 — cloud decisions больше не переключаются, и у комнаты есть дом
+  (23.09.2026).** Владелец: «всм cloud decisions выключены? что это за мусор?
+  убери включение выключение этих cloud decisions, я хочу чтобы работало».
+  Трасса хода показывала `understanding jev-latest failed: DecisionUnavailable:
+  cloud decisions are switched off for this room` при `cloud_decisions: true` в
+  конфиге. Две причины: порог в `hub/jev_decider.py::_post` требовал непустой
+  `home_id`, а `home_id` у комнаты не было вовсе — `client/main.py::build_hello`
+  никогда не отправлял токен (поле `client.token_env` в конфиге было, код его не
+  читал), поэтому хаб писал «Client … is not bound to a home» и молча выключал
+  запись лиц, тела и убеждений, облачный взгляд на кадр и тихие часы.
+  Что сделано: флаг `homes[].cloud_decisions` больше ни на что не влияет
+  (`_home_allows_cloud_decisions` → `True`); `_home_for_decisions` называет
+  облаку единственный дом хаба, когда у комнаты своего нет; клиент отправляет
+  токен и `proto: 2`; `scripts/run-client.ps1` читает git-ignored `.env`;
+  `scripts/issue-client-token.py` выдаёт токен (в базе — только хеш).
+  Проверено живьём: `Client livingroom authenticated for home livingroom`,
+  `python scripts/jev_probe.py` → Jev ответил за 749 мс, `pytest
+  tests/test_cloud_decisions_always.py tests/test_client_hello_token.py -q` → 10
+  passed, `ruff check .` → All checks passed. Комнатный ПК AntonDorm обновлён и
+  перезапущен (`scripts/update-room-pcs.ps1`: «обновлён и перезапущен, совпадает,
+  Running, hidden»); buro не отвечает по сети — ему токен ещё не выдан (его
+  клиент остаётся v1 и без дома до ближайшего обновления). Токен на ПК лежит в
+  `.env` (`ROWAN_CLIENT_TOKEN`), в git и логи не попадает. Решения —
+  `DECISIONS.md`, CD-01/CD-02.
+
+- **CD-02 — на уровнях моделей нет предела в 4 раунда инструментов
+  (23.09.2026).** В той же трассе `llm deepseek-flash … round 1/4`: уровни
+  собирались без `max_tool_rounds`, и `hub/llm.py` брал запасные `4` вместо
+  конфигурного «без предела». Добавлено `ModelLevelConfig.max_tool_rounds = 0`
+  и передаётся в `LLMConfig` из `hub/model_router.py::build_level_client`.
+  Проверено: `build_level_client(...).max_tool_rounds` → `1000`
+  (`UNLIMITED_TOOL_ROUNDS`), `pytest tests/test_config.py tests/test_model_router.py
+  tests/test_models_health.py tests/test_utterance_route.py tests/test_multi_step.py
+  tests/test_llm_vllm_provider.py tests/test_local_fast.py tests/test_api_budget.py
+  tests/test_image_generation.py -q` → 153 passed.

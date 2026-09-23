@@ -88,6 +88,35 @@ $python = Resolve-Python
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
+# Секреты клиента живут в окружении, а не в конфиге (ТЗ 4.3). Владелец
+# 2026-09-23: комната подключалась к хабу без токена вообще, поэтому у хаба не
+# было её ``home_id`` — и облачное чтение реплики, запись лиц, тела и убеждений,
+# облачный взгляд на кадр молча выключались. Токен выдаёт хаб один раз
+# (`scripts/issue-client-token.py`), на ПК комнаты он попадает строкой
+# ``ROWAN_CLIENT_TOKEN=...`` в ``.env`` рядом с конфигом; имя переменной берётся
+# из ``client.token_env``. Уже заданная в окружении переменная важнее файла.
+$jarvisDotEnv = Join-Path $RepoRoot '.env'
+if (Test-Path -LiteralPath $jarvisDotEnv) {
+    $jarvisLoaded = @()
+    foreach ($line in [IO.File]::ReadAllLines($jarvisDotEnv)) {
+        $text = $line.Trim()
+        if (-not $text -or $text.StartsWith('#')) { continue }
+        $split = $text.IndexOf('=')
+        if ($split -lt 1) { continue }
+        $name = $text.Substring(0, $split).Trim()
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { continue }
+        $value = $text.Substring($split + 1).Trim().Trim('"').Trim("'")
+        if (-not $value) { continue }
+        if (-not [Environment]::GetEnvironmentVariable($name)) {
+            Set-Item -Path "env:$name" -Value $value
+            $jarvisLoaded += $name
+        }
+    }
+    if ($jarvisLoaded.Count -gt 0) {
+        Write-Host ('Loaded from .env: ' + ($jarvisLoaded -join ', ')) -ForegroundColor Green
+    }
+}
+
 $voskDir = Join-Path $RepoRoot "models"
 if (-not (Test-Path $voskDir)) {
     Write-Warning "The models\ directory is missing - the Vosk model was not downloaded. Run: scripts\download-models.ps1"

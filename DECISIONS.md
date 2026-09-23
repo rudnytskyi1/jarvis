@@ -5274,3 +5274,53 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   tests/test_repeat_mode.py` → All checks passed; `python -c "import hub.app"`
   → ok. Ссылка: ТЗ F-701 (комната выбирается тем же правилом, что и остальные
   запросы из чата), F-417 (`say` + синтез для фразы, решённой хабом).
+
+- **CD-01 — переключателя cloud decisions больше нет, а у комнаты появился дом.**
+  Владелец 2026-09-23: «что за фигня? всм cloud decisions выключены? что это за
+  мусор? убери включение выключение этих cloud decisions, я хочу чтобы
+  работало». В трассе хода (панель `/admin/turns`) стояло
+  `understanding jev-latest failed: DecisionUnavailable: cloud decisions are
+  switched off for this room`, хотя в `config.openai.yaml` у дома
+  `cloud_decisions: true`. Причина оказалась двойной. (1) Порог стоял в
+  `hub/jev_decider.py::_post`: он требовал и непустой `home_id`, и разрешение
+  дома. (2) `home_id` у комнаты НЕ БЫЛО ВООБЩЕ: клиент комнаты подключался
+  v1-кадром `hello` без токена, потому что `client/main.py::build_hello` токен
+  не отправлял никогда (в конфиге клиента поле `token_env` было, а код его не
+  читал), и хаб честно писал «Client … is not bound to a home (a v1 hello
+  without a token)» — вместе с этим молча выключались запись лиц, тела и
+  убеждений (ТЗ 4.3), облачный взгляд на кадр и тихие часы. Выбрано:
+  **убрать переключатель и выдать комнате настоящий дом.** (1)
+  `hub/app.py::_home_allows_cloud_decisions` теперь всегда `True` — флаг
+  `homes[].cloud_decisions` оставлен в схеме (его пишут существующие конфиги),
+  но ни на что не влияет; (2) `hub/app.py::_home_for_decisions` называет облаку
+  единственный дом хаба, когда у комнаты своего ещё нет (на хабе с несколькими
+  домами пустое значение остаётся честным «не знаю» — угадывать чужой дом
+  нельзя); (3) `client/main.py` отправляет токен из переменной, имя которой
+  стоит в `client.token_env`, и вместе с ним `proto: 2`; (4)
+  `scripts/run-client.ps1` читает git-ignored `.env` рядом с конфигом (тем же
+  форматом, что хаб), поэтому токен не попадает ни в git, ни в логи; (5)
+  `scripts/issue-client-token.py` выдаёт токен один раз и печатает его в stdout
+  — в базе хаба остаётся только хеш (ТЗ 4.3). Живая проверка: комната
+  подключилась с токеном, в логе `Client livingroom authenticated for home
+  livingroom` (15:54:41 и после каждого перезапуска), строки «not bound to a
+  home» после этого больше нет; `python scripts/jev_probe.py` → живой ответ Jev
+  за 749 мс (`act 0.95`, `family browser 0.92`, `followup false 0.84`) и в
+  цепочке решений `addressed … jev -> True (0.92)`. Ссылка: ТЗ 4.3 (токен и
+  `home_id`), 5.5, F-404; DECISIONS.md API-01…API-06.
+
+- **CD-02 — у уровней моделей больше нет четырёх раундов инструментов.** Та же
+  трасса показала `llm deepseek-flash … round 1/4`: голосовой ход отвечал
+  уровнем модели (`cloud_strong`), а `hub/model_router.py::build_level_client`
+  собирал `LLMConfig` БЕЗ `max_tool_rounds` — и `hub/llm.py` брал свой запасной
+  `4`, хотя в конфиге стоит `server.llm.max_tool_rounds: 0` («счётчика нет»).
+  Выбрано: **настройка едет в уровень, и по умолчанию её нет** — в
+  `common/config.py::ModelLevelConfig` добавлено `max_tool_rounds: int = 0`
+  (`0` = без предела, `hub.llm.UNLIMITED_TOOL_ROUNDS` остаётся предохранителем
+  от зацикливания), `build_level_client` его передаёт. Проверено живьём:
+  `build_level_client(ModelLevelConfig(provider='openai_responses',
+  model='deepseek-flash', …)).max_tool_rounds` → `1000`; `pytest tests/test_config.py
+  tests/test_model_router.py tests/test_models_health.py tests/test_utterance_route.py
+  tests/test_multi_step.py tests/test_llm_vllm_provider.py tests/test_local_fast.py
+  tests/test_api_budget.py tests/test_image_generation.py -q` → 153 passed;
+  `ruff check .` → All checks passed. Ссылка: ТЗ F-401, раздел 1 («никаких
+  лимитов»); DECISIONS.md CU-LIMIT-01…03.

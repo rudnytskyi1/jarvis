@@ -3751,11 +3751,33 @@ def _home_allows_pc_unlock(home_id: str) -> bool:
 def _home_allows_cloud_decisions(home_id: str) -> bool:
     """ТЗ 5.5: уходит ли текст ЭТОГО дома к облачному провайдеру решений.
 
-    По умолчанию — нет: ``homes[].cloud_decisions`` выключен, и Jev для такой
-    комнаты не зовётся вовсе (цепочка идёт к локальным провайдерам).
+    Владелец 2026-09-23: «убери включение выключение этих cloud decisions, я
+    хочу чтобы работало». Переключатель убран: ``homes[].cloud_decisions``
+    больше ни на что не влияет, и текст реплики уходит в Jev всегда. Именно
+    этот флаг вместе с комнатой без ``home_id`` давал в логе живого хаба
+    «The batched Jev reading is unavailable (cloud decisions are switched off
+    for this room); every tool stays available», после чего ход шёл вообще без
+    чтения, а ``homes[].cloud_decisions`` в конфиге стоял ``true``.
+    """
+    return True
+
+
+def _home_for_decisions(home_id: str) -> str:
+    """Какой дом назвать облаку, если у комнаты его ещё нет (ТЗ 4.3, 5.5).
+
+    Комната, которая не авторизовалась (v1 ``hello`` без токена), не имеет
+    ``home_id`` вообще, и облачное чтение реплики отказывалось работать: без
+    дома непонятно, чей текст уходит наружу. Хаб с ОДНИМ домом знает ответ
+    точно — другого дома у него нет, — поэтому такой комнате он называет этот
+    дом. На хабе с несколькими домами пустая строка остаётся честным «не знаю»,
+    и текст наружу не уходит: угадывать чужой дом нельзя.
     """
     home = _home_config_of(str(home_id or ''))
-    return bool(getattr(home, 'cloud_decisions', False))
+    if home is not None:
+        return str(getattr(home, 'home_id', '') or '')
+    homes = [str(getattr(entry, 'home_id', '') or '') for entry in (getattr(_config, 'homes', None) or [])]
+    homes = [item for item in homes if item]
+    return homes[0] if len(homes) == 1 else ''
 
 
 def _role_for_person(person_id: str) -> str:
@@ -6691,7 +6713,9 @@ class Connection(CameraClipReceiver):
         settings = _understanding_settings()
         return await turn_tools(
             _batched_jev(), text,
-            home_id=str(getattr(self, 'home_id', '') or ''),
+            # Владелец 2026-09-23: комната без home_id больше не остаётся без
+            # чтения — на хабе с одним домом это и есть её дом.
+            home_id=_home_for_decisions(getattr(self, 'home_id', '')),
             room=str(getattr(self, 'client_id', '') or ''),
             threshold=float(getattr(settings, 'min_confidence', 0.65)),
             timeout_s=max(0.05, float(getattr(settings, 'timeout_ms', 900)) / 1000.0),
@@ -6710,8 +6734,10 @@ class Connection(CameraClipReceiver):
         payload = dict(context)
         payload['heuristic'] = heuristic
         # ТЗ 5.5: провайдеры, уходящие наружу (Jev), смотрят на флаг дома —
-        # без комнаты в контексте облако не зовётся вовсе.
-        payload.setdefault('home_id', str(getattr(self, 'home_id', '') or ''))
+        # без комнаты в контексте облако не зовётся вовсе. Комната без home_id
+        # берёт единственный дом хаба (владелец 2026-09-23: «я хочу чтобы
+        # работало»): иначе облачный провайдер отказывался читать её ходы.
+        payload.setdefault('home_id', _home_for_decisions(getattr(self, 'home_id', '')))
         chain = _decision_chain(self._wake_words())
         if chain is None:
             return heuristic
@@ -13139,7 +13165,9 @@ class Connection(CameraClipReceiver):
 
     def _cloud_vision_allowed(self) -> bool:
         """Does THIS home allow a cloud look at its pictures (ТЗ F-404)?"""
-        home = str(getattr(self, "home_id", "") or "")
+        # Тот же дом, что и у решений: комната без home_id на одно-домном хабе
+        # всё равно подчиняется настройке своей комнаты, а не молчаливому «нет».
+        home = _home_for_decisions(getattr(self, "home_id", ""))
         if not home:
             return False
         source = getattr(self, "cfg", None) or _config
