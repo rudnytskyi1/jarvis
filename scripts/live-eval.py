@@ -19,6 +19,16 @@ Usage:
     python scripts/live-eval.py --actions             # let it really act
     python scripts/live-eval.py --scenario VE-01
     python scripts/live-eval.py --json data/live-eval/last.json
+
+Mass audit (thousands of generated scenarios, DECISIONS.md AUDIT-01):
+    python scripts/live-eval.py --scenarios data/audit/scenarios.jsonl \
+        --workers 6 --jsonl data/audit/runs/last.jsonl
+    python scripts/live-eval.py --scenarios data/audit/scenarios.jsonl --family browser
+
+Every turn now goes through the hub's own understanding step
+(``Connection._understand_turn``), so the report tells apart two very
+different failures: the model chose the wrong tool, or the family narrowing
+never offered the right one. The narrowed list is written as ``offered``.
 """
 from __future__ import annotations
 
@@ -71,12 +81,23 @@ def scenarios() -> list[dict[str, Any]]:
     return list(json.loads(SCENARIOS.read_text(encoding="utf-8"))["scenarios"])
 
 
+def load_scenarios(path: Path) -> list[dict[str, Any]]:
+    """Scenarios из файла руками (``.json``) или из собранного корпуса (``.jsonl``)."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".jsonl":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return list(json.loads(text)["scenarios"])
+
+
 class Bench:
     """One room's turn, run for real, with the client's actions on tap."""
 
-    def __init__(self, cfg: Any, *, actions: bool) -> None:
+    def __init__(self, cfg: Any, *, actions: bool, understanding: bool = True) -> None:
         self.cfg = cfg
         self.actions = actions
+        #: Jev reads the turn and narrows the tool list, exactly as the live hub
+        #: does (``--no-understanding`` runs the same scenarios without it).
+        self.understanding = understanding
         self.calls: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self._dispatcher: Any = None
@@ -91,6 +112,10 @@ class Bench:
         from hub.session import Session
         from hub.vision_levels import build_cloud_vision, build_vision
 
+        # Everything the hub reads through ``get_config()`` - Jev's settings,
+        # the device lists, the skill directories - has to be the config this
+        # bench loaded, not whatever ``config.yaml`` happens to hold.
+        hub_app.configure(self.cfg)
         # The bench judges understanding and actions, not the identity gate of
         # ТЗ F-208 (that one needs a real voice and a face). Without this every
         # privileged tool would answer with the "say apple" challenge instead of
@@ -221,8 +246,19 @@ class Bench:
         started = time.perf_counter()
         record: dict[str, Any] = {"tool": name, "args": dict(args or {})}
         if name in CLIENT_TOOLS and not self.actions:
-            record["result"] = {"ok": False,
-                                "error": "the bench did not send this to a PC (--actions is off)"}
+            # The hub's own refusals still apply with the bench's hands tied:
+            # a shell command that opens a page is the wrong tool in a room and
+            # in a bench alike (docs/AUDIT_MASS.md, DECISIONS.md AUDIT-02), and a
+            # bench that skipped this would report the model's wrong choice as
+            # if the hub had let it through.
+            from hub.tools import WRONG_TOOL_FOR_PAGES, opening_a_web_page
+
+            if name == "run_command" and opening_a_web_page(dict(args or {})):
+                record["result"] = {"ok": False, "wrong_tool": True,
+                                    "error": WRONG_TOOL_FOR_PAGES}
+            else:
+                record["result"] = {"ok": False,
+                                    "error": "the bench did not send this to a PC (--actions is off)"}
         else:
             try:
                 record["result"] = await self.connection._execute_tool(name, dict(args or {}))
@@ -245,22 +281,38 @@ class Bench:
     async def run(self, scenario: dict[str, Any]) -> dict[str, Any]:
         self.calls = []
         self.messages = []
+        said = str(scenario["said"])
         prompt = self.connection.session.system_prompt
         request = [{"role": "system", "content": prompt},
-                   {"role": "user", "content": str(scenario["said"])}]
+                   {"role": "user", "content": said}]
+        # The live hub asks Jev to read the whole utterance once and hands the
+        # model only that family of tools (U-10…U-14). A bench that skipped this
+        # would measure a chain the room no longer has.
+        turn_tools: list[dict[str, Any]] | None = None
+        if self.understanding:
+            try:
+                turn_tools = await self.connection._understand_turn(said)
+            except Exception as exc:  # noqa: BLE001 - understanding never breaks a turn
+                print(f"note: the understanding step failed ({type(exc).__name__}: {exc})")
+                turn_tools = None
+        offered = [tool["function"]["name"] for tool in turn_tools] if turn_tools else None
         started = time.perf_counter()
         try:
-            result = await self._llm.generate(request, self.execute)
+            if turn_tools:
+                result = await self._llm.generate(request, self.execute, tools=turn_tools)
+            else:
+                result = await self._llm.generate(request, self.execute)
             reply, error = str(result.text or ""), ""
         except Exception as exc:  # noqa: BLE001 - a broken turn is a failed scenario
             reply, error = "", f"{type(exc).__name__}: {exc}"
         return {
             "id": scenario["id"],
-            "said": scenario["said"],
+            "said": said,
             "reply": reply,
             "error": error,
             "tools": [call["tool"] for call in self.calls],
             "calls": self.calls,
+            "offered": offered,
             "seconds": round(time.perf_counter() - started, 2),
         }
 
@@ -372,6 +424,14 @@ def judge(scenario: dict[str, Any], run: dict[str, Any]) -> tuple[bool, list[str
     for banned in scenario.get("forbid_tools", []):
         if banned in tools:
             problems.append(f"the model called {banned} when it should not")
+    # For a request with exactly one right tool, the first call is the honest
+    # measure of understanding: a fallback after the bench refused to act must
+    # not be read as a success (the generated corpus sets this, DECISIONS.md
+    # AUDIT-02).
+    first = tools[0] if tools else None
+    for wanted in scenario.get("expect_first", []):
+        if first != wanted:
+            problems.append(f"the first tool called was {first!r}, not {wanted!r}")
     for tool, words in (scenario.get("expect_args") or {}).items():
         seen = json.dumps([call["args"] for call in run["calls"] if call["tool"] == tool],
                           ensure_ascii=False).casefold()
@@ -381,6 +441,18 @@ def judge(scenario: dict[str, Any], run: dict[str, Any]) -> tuple[bool, list[str
     for word in scenario.get("expect_reply") or []:
         if str(word).casefold() not in str(run["reply"]).casefold():
             problems.append(f"the reply never says {word!r}")
+    # The family narrowing may only take tools away, never the one the request
+    # needs: a turn that never offered ``browser_control`` is a Jev bug, one
+    # that offered it and did not call it is a model bug. Keep them apart.
+    offered = run.get("offered")
+    if offered:
+        for wanted in scenario.get("expect_tools", []):
+            if wanted not in offered:
+                problems.append(f"the family narrowing never offered {wanted} "
+                                f"(it offered: {', '.join(offered)})")
+        if scenario.get("expect_any") and not (set(scenario["expect_any"]) & set(offered)):
+            problems.append("the family narrowing offered none of "
+                            + ", ".join(scenario["expect_any"]))
     return (not problems), problems
 
 
@@ -414,10 +486,103 @@ def judge_hub_rule(scenario: dict[str, Any], run: dict[str, Any]) -> tuple[bool,
     return (not problems), problems
 
 
+async def run_one(bench: Bench, scenario: dict[str, Any]) -> dict[str, Any]:
+    """One scenario through the bench, judged; a crash is a failed scenario."""
+    try:
+        if scenario.get("hub_rule"):
+            # The hub answers these itself, before the model: the bench has to
+            # run that scripted turn, not only the model chain.
+            run = await bench.run_hub_rule(scenario)
+            ok, problems = judge_hub_rule(scenario, run)
+        else:
+            run = await bench.run(scenario)
+            ok, problems = judge(scenario, run)
+    except Exception as exc:  # noqa: BLE001 - the report must carry the reason
+        run = {"id": scenario.get("id", "?"), "said": scenario.get("said", ""), "reply": "",
+               "error": f"{type(exc).__name__}: {exc}", "tools": [], "calls": [],
+               "offered": None, "seconds": 0.0}
+        ok, problems = False, [f"the bench crashed: {type(exc).__name__}: {exc}"]
+    run["family"] = scenario.get("family", "")
+    run["ok"], run["problems"] = ok, problems
+    return run
+
+
+def print_run(run: dict[str, Any], *, verbose: bool) -> None:
+    mark = "PASS" if run["ok"] else "FAIL"
+    if run["ok"] and not verbose:
+        return
+    print(f"{mark} {run['id']}  {run['said']}")
+    print(f"      tools: {', '.join(run['tools']) or '-'}   {run['seconds']}s")
+    if run.get("offered"):
+        print(f"      jev offered: {', '.join(run['offered'])}")
+    print(f"      reply: {run['reply'][:160]}")
+    for problem in run["problems"]:
+        print(f"      ! {problem}")
+
+
+async def run_pool(cfg: Any, wanted: list[dict[str, Any]], *, actions: bool,
+                   understanding: bool, workers: int, jsonl: Path | None,
+                   verbose: bool, progress_every: int) -> list[dict[str, Any]]:
+    """Every scenario through its own bench worker, results written as they land.
+
+    ``workers`` benches share the hub's module-level engines (vision, memory,
+    speech) exactly as several room connections do in the live hub. The JSONL
+    file is appended after each scenario, so a run that is interrupted still
+    leaves every verdict it reached.
+    """
+    benches = [Bench(cfg, actions=actions, understanding=understanding)
+               for _ in range(max(1, int(workers)))]
+    for bench in benches:
+        await bench.start()
+    queue: asyncio.Queue = asyncio.Queue()
+    for scenario in wanted:
+        queue.put_nowait(scenario)
+    report: list[dict[str, Any]] = []
+    lock = asyncio.Lock()
+    handle = jsonl.open("a", encoding="utf-8") if jsonl else None
+
+    async def worker(bench: Bench) -> None:
+        while True:
+            try:
+                scenario = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            run = await run_one(bench, scenario)
+            async with lock:
+                report.append(run)
+                if handle is not None:
+                    handle.write(json.dumps(run, ensure_ascii=False) + "\n")
+                    handle.flush()
+                print_run(run, verbose=verbose)
+                if progress_every and len(report) % progress_every == 0:
+                    passed = sum(1 for item in report if item["ok"])
+                    print(f"... {len(report)}/{len(wanted)} done, {passed} passed")
+
+    try:
+        await asyncio.gather(*(worker(bench) for bench in benches))
+    finally:
+        if handle is not None:
+            handle.close()
+        for bench in benches:
+            await bench.close()
+    return report
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.openai.yaml")
     parser.add_argument("--scenario", action="append", default=[])
+    parser.add_argument("--scenarios", default="",
+                        help="свой файл сценариев: .json со ключом scenarios или .jsonl")
+    parser.add_argument("--family", action="append", default=[],
+                        help="только это семейство собранного корпуса (можно несколько)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="сколько сценариев идёт одновременно")
+    parser.add_argument("--jsonl", default="", help="куда писать вердикт после каждого сценария")
+    parser.add_argument("--no-understanding", action="store_true",
+                        help="не звать Jev: модель видит все инструменты")
+    parser.add_argument("--quiet", action="store_true", help="печатать только падения")
+    parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--actions", action="store_true",
                         help="let client tools really run on this PC")
     parser.add_argument("--dangerous", action="store_true",
@@ -430,8 +595,14 @@ async def main() -> int:
     from common.config import load_config
 
     cfg = load_config(str(REPO_ROOT / args.config))
-    wanted = [item for item in scenarios()
-              if not args.scenario or item["id"] in args.scenario]
+    source = Path(args.scenarios) if args.scenarios else SCENARIOS
+    if not source.is_absolute():
+        source = REPO_ROOT / source
+    corpus = load_scenarios(source)
+    wanted = [item for item in corpus if not args.scenario or item["id"] in args.scenario]
+    if args.family:
+        families = {name.casefold() for name in args.family}
+        wanted = [item for item in wanted if str(item.get("family", "")).casefold() in families]
     skipped = [item for item in wanted if item.get("live_only") and not args.dangerous]
     skipped += [item for item in wanted if item.get("bench_skip") and item not in skipped]
     wanted = [item for item in wanted if item not in skipped]
@@ -444,39 +615,36 @@ async def main() -> int:
         print("no scenarios selected")
         return 2
 
-    bench = Bench(cfg, actions=args.actions)
-    await bench.start()
-    report: list[dict[str, Any]] = []
-    try:
-        for scenario in wanted:
-            if scenario.get("hub_rule"):
-                # The hub answers these itself, before the model: the bench has
-                # to run that scripted turn, not only the model chain.
-                run = await bench.run_hub_rule(scenario)
-                ok, problems = judge_hub_rule(scenario, run)
-            else:
-                run = await bench.run(scenario)
-                ok, problems = judge(scenario, run)
-            run["ok"], run["problems"] = ok, problems
-            report.append(run)
-            mark = "PASS" if ok else "FAIL"
-            print(f"{mark} {run['id']}  {run['said']}")
-            print(f"      tools: {', '.join(run['tools']) or '-'}   {run['seconds']}s")
-            print(f"      reply: {run['reply'][:160]}")
-            for problem in problems:
-                print(f"      ! {problem}")
-    finally:
-        await bench.close()
+    jsonl = None
+    if args.jsonl:
+        jsonl = Path(args.jsonl)
+        if not jsonl.is_absolute():
+            jsonl = REPO_ROOT / jsonl
+        jsonl.parent.mkdir(parents=True, exist_ok=True)
+    report = await run_pool(cfg, wanted, actions=args.actions,
+                            understanding=not args.no_understanding,
+                            workers=max(1, args.workers), jsonl=jsonl,
+                            verbose=not args.quiet, progress_every=args.progress_every)
 
     passed = sum(1 for item in report if item["ok"])
     print(f"\n{passed}/{len(report)} scenarios passed"
           + ("" if args.actions else " (client actions off: the model's choice was judged)"))
+    failures: dict[str, int] = {}
+    for item in report:
+        if item["ok"]:
+            continue
+        for problem in item["problems"]:
+            key = problem.split(":")[0][:70]
+            failures[key] = failures.get(key, 0) + 1
+    for key, count in sorted(failures.items(), key=lambda pair: -pair[1])[:15]:
+        print(f"  {count:5d}  {key}")
     if args.json:
         target = Path(args.json)
         if not target.is_absolute():
             target = REPO_ROOT / target
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps({"at": time.time(), "actions": args.actions,
+                                      "scenarios": str(source),
                                       "passed": passed, "total": len(report),
                                       "runs": report}, ensure_ascii=False, indent=2),
                           encoding="utf-8")

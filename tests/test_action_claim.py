@@ -10,8 +10,10 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from hub.action_completion import check_action_claim, failed_tool_results
-from hub.llm import LlmClient, claims_completed_action
+from hub.llm import LlmClient, claims_completed_action, reports_failure
 
 
 def history(*messages: dict) -> list[dict]:
@@ -83,6 +85,45 @@ def test_the_claim_phrases_are_the_ones_the_loop_uses():
     assert claims_completed_action("Done, the lamp is on.")
     assert claims_completed_action("I have closed the window.")
     assert not claims_completed_action("Shall I turn the lamp on?")
+
+
+@pytest.mark.parametrize("text", [
+    "Spotify didn't open - the PC control channel is off right now.",
+    "No luck, unfortunately - both the browser tool and shell commands came back "
+    "disabled, so nothing opened on the PC.",
+    "I could not turn the lamp on: there is no such device.",
+    "The browser refused it, so the page is not open.",
+    "Nothing happened - the switch is offline.",
+])
+def test_an_honest_failure_is_recognised(text):
+    """A reply that reports the failure is not the lie these guards hunt."""
+    assert reports_failure(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Done, the lamp is on.",
+    "The photo is no longer displayed on the screen.",
+    "I'll open YouTube now.",
+    "The volume is now at thirty.",
+])
+def test_a_claim_is_not_excused_by_the_failure_guard(text):
+    assert not reports_failure(text)
+
+
+def test_an_honest_failure_is_not_sent_back_for_another_round():
+    """The forced retry must not fire over "it didn't open".
+
+    Live audit of 2026-09-23: "Spotify didn't open - the PC control channel is
+    off" matched the copula frame ("is off") as a completed state, so every such
+    turn paid for a second model round. That round is the person's waiting time.
+    """
+    script = _Script(call("pc_control", {"command": "volume_up"}),
+                     "Spotify didn't open - the PC control channel is off right now, "
+                     "so nothing reached the machine.")
+    executor = _Executor({"ok": False, "error": "the PC did not run this action"})
+    result = run(script, executor)
+    assert len(script.requests) == 2, "честный отказ не должен стоить лишнего круга"
+    assert "didn't open" in result.text
 
 
 # --- the real loop ---------------------------------------------------------

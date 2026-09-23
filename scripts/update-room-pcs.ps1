@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Обновить клиент Rowan на ВСЕХ комнатных ПК и перезапустить его там.
 
@@ -65,8 +65,17 @@ function New-ClientPackage {
 function Invoke-Remote {
     param([object]$Pc, [string]$Script)
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
-    $out = & $sshExe -i $Pc.key -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 `
-        "$($Pc.user)@$($Pc.host)" "powershell -NoProfile -EncodedCommand $encoded" 2>&1
+    # Один массив аргументов вместо продолжения строки обратной кавычкой:
+    # Windows PowerShell 5.1 в этом месте передавал ssh путь к ключу как имя
+    # хоста, и обновление комнатных ПК падало с "Could not resolve hostname
+    # C:\...\buro" (найдено аудитом 2026-09-23).
+    $arguments = @('-i', [string]$Pc.key, '-o', 'BatchMode=yes',
+                   '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
+                   "$($Pc.user)@$($Pc.host)",
+                   "powershell -NoProfile -EncodedCommand $encoded")
+    $shown = $arguments | ForEach-Object { $_.Substring(0, [Math]::Min(40, $_.Length)) }
+    Write-Verbose ("ssh " + ($shown -join ' '))
+    $out = & $sshExe @arguments 2>&1
     return @{ code = $LASTEXITCODE; lines = @($out | ForEach-Object { "$_" }) }
 }
 
@@ -79,7 +88,13 @@ function Get-Line {
 }
 
 $localCamera = (Get-FileHash -LiteralPath (Join-Path $repo 'client\camera.py') -Algorithm SHA256).Hash
-$pcs = @(Get-Content -LiteralPath $Inventory -Raw | ConvertFrom-Json)
+# Windows PowerShell 5.1 writes a parsed JSON array as one object, so @(...)
+# produced a single "PC" whose properties were arrays of every key, user and
+# host: ssh was told to use both keys and to reach both hosts at once and the
+# update fell over with "Could not resolve hostname C:\...\buro" (audit
+# 2026-09-23). foreach enumerates the array in both 5.1 and 7.
+$inventoryJson = Get-Content -LiteralPath $Inventory -Raw | ConvertFrom-Json
+$pcs = @(foreach ($item in $inventoryJson) { $item })
 $results = @()
 
 $zip = $null

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from difflib import get_close_matches
 from typing import Any, Literal, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
@@ -102,6 +103,39 @@ def _model_for(name: str, parameters: Mapping[str, Any]) -> type[BaseModel]:
     return create_model(f"ToolArgs_{name}", __config__=ConfigDict(extra="forbid"), **fields)
 
 
+def drop_undeclared(name: str, model: type[BaseModel],
+                    args: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the declared arguments, drop a stray extra one with a warning.
+
+    The model does send an argument that belongs to a different tool — the live
+    audit of 2026-09-23 caught ``pc_control`` arriving with the ``url`` of the
+    browser call it had just made. Refusing the whole call for that cost a
+    retry and, often, the request itself: the room heard "it didn't work" about
+    a command that was one key away from running. The declared fields are still
+    validated strictly, so a wrong command, a bad enum value or a missing
+    required field is still handed back to the model.
+    """
+    declared = set(model.model_fields)
+    extra = sorted(key for key in args if key not in declared)
+    if not extra:
+        return dict(args)
+    log.warning("Tool %s: dropping undeclared argument(s) %s", name, ", ".join(extra))
+    return {key: value for key, value in args.items() if key in declared}
+
+
+def _misspelled_field(key: str, declared: set[str]) -> str:
+    """The declared field ``key`` was probably meant to be, or ``""``.
+
+    A stray field that belongs to another tool is noise and goes away
+    (AUDIT-02). A field that is one letter away from a real one is a typo, and
+    dropping it would run the call with a default the person never asked for:
+    ``{"brightnesss": 50}`` on a light would turn it on at full brightness. That
+    one still goes back to the model to fix.
+    """
+    matches = get_close_matches(key, sorted(declared), n=1, cutoff=0.8)
+    return matches[0] if matches else ""
+
+
 #: Built once, at import: an unsupported schema fails loudly here, not per turn.
 TOOL_ARGUMENT_MODELS: dict[str, type[BaseModel]] = {
     tool["function"]["name"]: _model_for(tool["function"]["name"],
@@ -130,8 +164,15 @@ def validate_args(name: str, args: Mapping[str, Any] | None) -> tuple[dict[str, 
     model = TOOL_ARGUMENT_MODELS.get(name)
     if model is None:
         return {}, f"unknown tool: {name}"
+    declared = set(model.model_fields)
+    misspelled = {key: _misspelled_field(key, declared)
+                  for key in (args or {}) if key not in declared}
+    misspelled = {key: fixed for key, fixed in misspelled.items() if fixed}
+    if misspelled:
+        return {}, "; ".join(f"{key} is not a field of {name} (did you mean {fixed}?)"
+                             for key, fixed in sorted(misspelled.items()))
     try:
-        validated = model.model_validate(dict(args or {}))
+        validated = model.model_validate(drop_undeclared(name, model, dict(args or {})))
     except ValidationError as error:
         return {}, _first_errors(error)
     except Exception as exc:  # noqa: BLE001 - a broken call must not raise here
@@ -148,6 +189,7 @@ def tool_argument_schemas() -> dict[str, dict[str, Any]]:
 __all__ = [
     "MAX_ARGUMENT_RETRIES",
     "TOOL_ARGUMENT_MODELS",
+    "drop_undeclared",
     "tool_argument_schemas",
     "validate_args",
 ]

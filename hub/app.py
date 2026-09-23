@@ -205,10 +205,12 @@ from hub.telegram_media import PhotoInspector
 from hub.tools import (
     CLIENT_TOOLS,
     MOUSE_CLICK_TOOL,
+    WRONG_TOOL_FOR_PAGES,
     action_item,
     mouse_click_args,
     normalize_click_button,
     normalize_pc_control_args,
+    opening_a_web_page,
 )
 from hub.training_archive import TrainingArchive
 from hub.tts import TtsCache, TtsEngine, split_text
@@ -8698,6 +8700,11 @@ class Connection(CameraClipReceiver):
         # необратимое действие. Обычные шаги вопроса не задают.
         if name == 'computer_use':
             return computer_use_mod.changes_system(args)
+        if name == 'run_command' and opening_a_web_page(args):
+            # The call never runs - opening a page is browser_control's job (see
+            # ``_execute_tool``) - so asking the room to confirm it would ask for
+            # a yes to nothing.
+            return ""
         return dangerous_call(name, args, tools=settings.tools,
                               pc_commands=settings.pc_commands)
 
@@ -9235,6 +9242,17 @@ class Connection(CameraClipReceiver):
                 self._app_choices = ApplicationChoices()
             result = await self._run_client_action(name, args)
             return self._app_choices.observe_browser_result(self, args, result)
+        if name == 'run_command':
+            # The prompt forbids opening a page with the shell, and the mass
+            # audit of 2026-09-23 (docs/AUDIT_MASS.md) found the model doing it
+            # anyway on a quarter of the browser requests: nothing could be read
+            # back, so the room was told a page opened that nobody had checked.
+            # The refusal names the tool that does it properly.
+            page = opening_a_web_page(args)
+            if page:
+                log.info("run_command refused: it was opening %s", page)
+                return {'ok': False, 'wrong_tool': True,
+                        'error': WRONG_TOOL_FOR_PAGES}
         if name in CLIENT_TOOLS:
             return await self._run_client_action(name, args)
         if name == "look_at_screen":

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -826,7 +827,10 @@ TOOLS.append({'type': 'function', 'function': {
         'where Monday is 0), sound (sound, min_confidence), device_state (device_id, '
         'capability, value). Action kinds: scene (scene), say (text), notify (text, '
         'optional critical), skill (skill, args). Use only names the person said; '
-        'never invent a device, scene or skill.'),
+        'never invent a device, scene or skill. "Tell me when someone comes in" is a '
+        'presence rule and needs no extra hardware: the room watches its own camera, '
+        'so propose the rule instead of saying the room has no sensors. Only an action '
+        'that names a device the home does not have is impossible.'),
     'parameters': {'type': 'object', 'properties': {
         'rule': {'type': 'string', 'description': 'The rule as a JSON object string, e.g. {"name": "warm light", "trigger": {"kind": "presence", "event": "person_entered"}, "actions": [{"kind": "scene", "scene": "warm"}]}.'},
         'spoken': {'type': 'string', 'description': 'One short line naming the rule for the spoken confirmation.'},
@@ -919,14 +923,25 @@ TOOL_FAMILY_NAMES: tuple[str, ...] = (*TOOL_FAMILIES, 'none')
 #: plainly browser-shaped request with confidence 0.56 (live probe 2026-09-22),
 #: which is honest but not enough to narrow anything.
 TOOL_FAMILY_MEANINGS: dict[str, str] = {
-    'browser': 'A web page, a search, a video site, or anything inside the browser',
-    'pc': 'Programs, windows, the desktop, files, typing text or pressing keys - '
-          'not a picture that Rowan itself put on the screen',
-    'vision': 'Looking at the screen or the camera, finding an object, inspecting a photo',
+    'browser': 'A web page, a site by name, a search, a video site, a tab, or '
+               'anything inside the browser window',
+    'pc': 'Programs and windows on the PC, the desktop, files, folders, typing '
+          'text, pressing keys, the volume and the sound, or running one of the '
+          "home's own skills such as the weather - not a picture that Rowan "
+          'itself put on the screen',
+    # "who is in the room", "what do you see", "read the screen" and "where are
+    # my keys" were read as memory or people questions by Jev (mass audit
+    # 2026-09-23) and lost the camera and screen tools entirely. The meaning now
+    # says out loud that this is about looking right now.
+    'vision': 'Looking right now: what or who is in the room, what the camera '
+              'sees, who is standing in front of it, reading the screen, '
+              'finding a thing that is visible, inspecting an attached photo',
     'media': 'Showing, saving, drawing or editing a picture, hiding a picture that is '
              'already on the screen, or setting the wallpaper',
     'memory': 'Remembering something, forgetting it, or recalling what was said',
-    'people': 'Faces, voices, names and roles of the people in the rooms',
+    'people': 'The saved people and their profiles: who Rowan knows, the list '
+              'of names, enrolling or remembering a face or a voice, renaming '
+              'someone, giving someone a role',
     'devices': 'The lights and switches of the room',
     'notify': 'Sending a message to the owner, or making a rule that watches something',
     'none': 'Nothing is to be done: an ordinary question, remark or conversation',
@@ -1055,6 +1070,52 @@ PC_APP_COMMANDS: frozenset[str] = frozenset(
     {"open_app", "close_app", "minimize_app", "maximize_app", "focus_app"}
 )
 
+#: ``pc_control`` commands whose one real argument is ``value``: the model
+#: sends it in ``target`` often enough ("set the volume to 50" arriving as
+#: ``{'command': 'volume_set', 'target': '50'}``) that the hub puts it back.
+PC_VALUE_COMMANDS: frozenset[str] = frozenset(
+    {"volume_set", "type_text", "hotkey", "clipboard_write", "clipboard_paste", "scroll"}
+)
+
+#: A shell command that opens a web page, a search or a browser. The prompt
+#: forbids exactly this ("Never open a website, a search or a video with it"),
+#: and the mass audit of 2026-09-23 found the model doing it anyway on a quarter
+#: of the browser requests: "open gmail" arrived as ``Start-Process`` instead of
+#: ``browser_control navigate``, so nothing could be read back or confirmed.
+_WEB_URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
+_SHELL_OPENER_RE = re.compile(
+    r"\b(?:start|start-process|invoke-item|ii|explorer(?:\.exe)?|iex|"
+    r"invoke-expression|open)\b", re.IGNORECASE)
+_BROWSER_NAME_RE = re.compile(
+    r"\b(?:chrome|msedge|edge|firefox|brave|opera|browser)\b", re.IGNORECASE)
+
+#: What the room hears (and the model reads) when the shell is used for a page.
+WRONG_TOOL_FOR_PAGES = (
+    "run_command did not run: opening a web page is browser_control's job. "
+    "Call browser_control with command=navigate and the site URL.")
+
+
+def opening_a_web_page(args: dict[str, Any] | None) -> str:
+    """The piece of a ``run_command`` that opens a page, or ``""``.
+
+    ``run_command`` exists for the work no narrower tool covers. Opening a
+    website is covered - ``browser_control navigate`` drives the person's own
+    browser and reads the page back - so a shell command that tries it is the
+    wrong tool twice over: nothing is verified, and the room is told a page
+    opened when no one checked.
+    """
+    command = str((args or {}).get("command") or "")
+    if not command:
+        return ""
+    url = _WEB_URL_RE.search(command)
+    browser = _BROWSER_NAME_RE.search(command)
+    opener = _SHELL_OPENER_RE.search(command)
+    if url and (opener or browser):
+        return url.group(0)
+    if opener and browser:
+        return "a browser launch"
+    return ""
+
 
 def normalize_pc_control_args(args: dict[str, Any]) -> dict[str, Any]:
     """Put the application name where the PC client looks for it.
@@ -1064,15 +1125,25 @@ def normalize_pc_control_args(args: dict[str, Any]) -> dict[str, Any]:
     name given (value)`` (``focus_app``) about a name the model had just passed
     — live bench VE-03/VE-09/VE-12, 22.09. The client accepts the name in either
     slot too (``client/actions/pc.py``); this keeps the forwarded call clean.
+
+    The same slip happens with the value of a command
+    (``{'command': 'volume_set', 'target': '50'}``); one argument in the wrong
+    slot must not turn into "the PC refused" when the person is one word away
+    from what they asked for.
     """
     cleaned = dict(args)
     command = str(cleaned.get("command") or "").strip().casefold()
-    if command not in PC_APP_COMMANDS:
-        return cleaned
     if str(cleaned.get("value") or "").strip():
         return cleaned
     target = str(cleaned.get("target") or "").strip()
     if not target:
+        return cleaned
+    if command in PC_VALUE_COMMANDS:
+        log.info("pc_control %s: the value arrived in 'target' — using it as 'value'", command)
+        cleaned["value"] = target
+        cleaned.pop("target", None)
+        return cleaned
+    if command not in PC_APP_COMMANDS:
         return cleaned
     log.info("pc_control %s: the application name arrived in 'target' — using it as 'value'",
              command)
@@ -1196,6 +1267,8 @@ __all__ = [
     "CLICK_BUTTONS",
     "DEFAULT_CLICK_BUTTON",
     "normalize_click_button",
+    "opening_a_web_page",
+    "WRONG_TOOL_FOR_PAGES",
     "mouse_click_args",
     "is_client_tool",
     "action_item",

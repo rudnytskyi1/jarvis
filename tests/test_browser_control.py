@@ -8,10 +8,29 @@ from hub.speaker import check_permission
 from hub.tools import actions_from_tool_calls
 
 
-@pytest.mark.parametrize('url', ['file:///secret', 'javascript:alert(1)', 'data:text/html,x', 'https://user:secret@example.com', 'chrome://settings', 'example.com'])
+@pytest.mark.parametrize('url', ['file:///secret', 'javascript:alert(1)', 'data:text/html,x', 'https://user:secret@example.com', 'chrome://settings', 'yt', 'open youtube'])
 def test_browser_rejects_non_web_or_credential_urls(url):
     with pytest.raises(ValueError):
         web_url(url)
+
+
+@pytest.mark.parametrize('said,expected', [
+    ('youtube.com', 'https://youtube.com'),
+    ('youtube .com', 'https://youtube.com'),
+    ('www . youtube . com', 'https://www.youtube.com'),
+    ('  youtube.com  ', 'https://youtube.com'),
+    ('localhost:8770/admin', 'http://localhost:8770/admin'),
+    ('example.com:8080', 'https://example.com:8080'),
+    ('https://youtube.com/watch?v=1', 'https://youtube.com/watch?v=1'),
+])
+def test_browser_completes_a_bare_host(said, expected):
+    """The model sends what the person said: the address loses its scheme.
+
+    Owner's report of 2026-09-22: "open youtube .com" ended in "the browser
+    rejected the URL" because a written scheme was required and a space where
+    the dot belongs was not a typo the client knew about.
+    """
+    assert web_url(said) == expected
 
 
 def test_browser_preserves_authorization_and_client_routing():

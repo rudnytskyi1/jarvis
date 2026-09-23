@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Поднять (или остановить) локальный мониторинг Rowan: Prometheus + Grafana.
 

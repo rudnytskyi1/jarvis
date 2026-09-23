@@ -1,4 +1,4 @@
-# Снятие автозапуска Rowan (ТЗ 4.9). Ничего не удаляет, кроме самих задач.
+﻿# Снятие автозапуска Rowan (ТЗ 4.9). Ничего не удаляет, кроме самих задач.
 $ErrorActionPreference = 'Continue'
 foreach ($name in @('RowanHub', 'RowanClient')) {
     if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {

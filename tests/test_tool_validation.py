@@ -257,3 +257,23 @@ def test_the_tool_gets_the_validated_arguments():
     executor = _Executor()
     _, calls = run(script, executor)
     assert calls == [("set_light", {"device": "lamp", "state": "on", "brightness": 70})]
+
+
+def test_a_field_belonging_to_another_tool_is_dropped_not_fatal():
+    """Так выглядел живой лог 2026-09-23: `pc_control` приехал с полем `url`.
+
+    Модель только что звала браузер и приписала его аргумент к следующему
+    вызову. Отказ по всему вызову стоил повтора и часто самой просьбы
+    (DECISIONS.md AUDIT-02), поэтому лишнее поле отбрасывается, а объявленные
+    проверяются как прежде.
+    """
+    arguments, problem = validate_args("pc_control", {"command": "volume_up", "url": "youtube.com"})
+    assert problem == ""
+    assert arguments == {"command": "volume_up"}
+
+
+def test_a_misspelled_field_is_still_named_with_its_fix():
+    arguments, problem = validate_args("set_light", {"device": "lamp", "state": "on",
+                                                     "brightnesss": 50})
+    assert arguments == {}
+    assert "brightnesss" in problem and "brightness" in problem

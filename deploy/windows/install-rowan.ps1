@@ -1,4 +1,4 @@
-# Автозапуск Rowan на Windows (ТЗ 4.9): планировщик задач, при наличии — NSSM.
+﻿# Автозапуск Rowan на Windows (ТЗ 4.9): планировщик задач, при наличии — NSSM.
 #
 #   powershell -ExecutionPolicy Bypass -File deploy\windows\install-rowan.ps1 -Hub
 #   powershell -ExecutionPolicy Bypass -File deploy\windows\install-rowan.ps1 -Client

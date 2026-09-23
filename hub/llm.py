@@ -336,6 +336,32 @@ def claims_completed_action(text: str) -> bool:
     return _DONE_CLAIM_RE.search(text) is not None
 
 
+#: A reply that reports the failure outright is not the lie these guards exist to
+#: catch. "Spotify didn't open - the PC control channel is off" describes the
+#: room, not a finished request, but the copula frame above reads "is off" as a
+#: completed state and the turn was sent back to the model for another round.
+#: That round is real latency for the person waiting, so an honest failure is
+#: exempt here. The different question - a success claim over a tool that FAILED
+#: - is still answered by ``check_action_claim``.
+_FAILURE_REPORT_RE = re.compile(
+    r"\b(?:did\s*n['\u2019]?t|did\s+not|does\s*n['\u2019]?t|do\s+not|"
+    r"can\s*n['\u2019]?t|cannot|can\s+not|could\s*n['\u2019]?t|could\s+not|"
+    r"won['\u2019]?t|will\s+not|"
+    r"unable|failed|failure|nothing|no\s+luck|is\s+n['\u2019]?t\s+\w+ing|"
+    r"isn['\u2019]?t\s+(?:open|closed|done|ready|available|working)|"
+    r"aren['\u2019]?t\s+(?:open|closed|done|ready|available|working)|"
+    r"was\s+n['\u2019]?t|were\s+n['\u2019]?t|refused|not\s+possible)\b",
+    re.IGNORECASE,
+)
+
+
+def reports_failure(text: str) -> bool:
+    """True when ``text`` says outright that the request did not happen."""
+    if not text:
+        return False
+    return _FAILURE_REPORT_RE.search(text) is not None
+
+
 #: Verbs that ask for a CHANGE, in imperative position. Every other guard in
 #: this module reads the ASSISTANT's wording, and that side of the conversation
 #: re-words itself the moment a phrase list catches it - which is how "the photo
@@ -1311,6 +1337,10 @@ class LlmClient:
                     # either way the words are not backed by a result.
                     and (not executed or failed_tools)
                     and (promised or claimed)
+                    # A reply that already says the request failed is honest,
+                    # not a false claim: another round would only cost the
+                    # person waiting (see reports_failure).
+                    and not reports_failure(text)
                 ):
                     forced_act_retried = True
                     log.warning(

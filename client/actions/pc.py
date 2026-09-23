@@ -413,6 +413,7 @@ class _WindowInfo(NamedTuple):
 _dll_lock = threading.Lock()
 _user32_dll: Any = None
 _dwmapi_dll: Any = None
+_kernel32_dll: Any = None
 
 
 def _require_windows() -> None:
@@ -495,6 +496,32 @@ def _user32() -> Any:
             dll.SetClipboardData.restype = wintypes.HANDLE
             _user32_dll = dll
         return _user32_dll
+
+
+def _kernel32() -> Any:
+    """Return a configured ``kernel32`` (loaded once, thread-safe).
+
+    The clipboard hands out ``HGLOBAL`` values, which are pointer-sized. Without
+    ``argtypes`` ctypes converts such a handle through a 32-bit C int, and every
+    clipboard call died with "OverflowError: int too long to convert" — the real
+    room audit of 2026-09-23 (RA-024…RA-026) caught it on 64-bit Windows.
+    """
+
+    global _kernel32_dll
+    _require_windows()
+    with _dll_lock:
+        if _kernel32_dll is None:
+            dll = ctypes.WinDLL("kernel32", use_last_error=True)
+            dll.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+            dll.GlobalAlloc.restype = wintypes.HGLOBAL
+            dll.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+            dll.GlobalLock.restype = ctypes.c_void_p
+            dll.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+            dll.GlobalUnlock.restype = wintypes.BOOL
+            dll.GlobalFree.argtypes = (wintypes.HGLOBAL,)
+            dll.GlobalFree.restype = wintypes.HGLOBAL
+            _kernel32_dll = dll
+        return _kernel32_dll
 
 
 def _dwmapi() -> Any:
@@ -766,7 +793,7 @@ def _sync_clipboard_read() -> str:
     """The clipboard as text; ``""`` when it holds none (ТЗ F-511)."""
     _require_windows()
     user32 = _user32()
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _kernel32()
     if not user32.OpenClipboard(None):
         raise PCActionError("could not open the clipboard")
     try:
@@ -775,7 +802,6 @@ def _sync_clipboard_read() -> str:
         handle = user32.GetClipboardData(CF_UNICODETEXT)
         if not handle:
             return ""
-        kernel32.GlobalLock.restype = ctypes.c_void_p
         pointer = kernel32.GlobalLock(handle)
         if not pointer:
             return ""
@@ -791,15 +817,12 @@ def _sync_clipboard_write(text: str) -> None:
     """Put ``text`` on the clipboard (the second half of «прочитать/вставить»)."""
     _require_windows()
     user32 = _user32()
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _kernel32()
     data = str(text or "")
     size = (len(data) + 1) * ctypes.sizeof(ctypes.c_wchar)
-    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
-    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
     if not handle:
         raise PCActionError("could not allocate clipboard memory")
-    kernel32.GlobalLock.restype = ctypes.c_void_p
     pointer = kernel32.GlobalLock(handle)
     if not pointer:
         kernel32.GlobalFree(handle)
