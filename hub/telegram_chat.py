@@ -68,6 +68,21 @@ _VISUAL_COMMAND = re.compile(
     r'преврати|превратить|превратите|добавь|добавить|надень|надеть|поставь|убери|замени|'
     r'посади|посадить)\b'
     r'(?P<detail>[\s\S]*)', re.I)
+#: Editing words people really type, including the half-typed and misspelled
+#: forms the anchored commands above miss: "Отредактирцй фото чтобы он сидел на
+#: диване" was refused as "not an image request" on 2026-09-22 although the
+#: attached photo and the change were both named in it.
+_EDIT_STEM = re.compile(
+    r'(?:отредакт\w*|редакт\w*|ретуш\w*|фотошоп\w*|photoshop\w*|retouch\w*|edit\w{0,4})', re.I)
+#: The picture an attached-photo message is about.
+_IMAGE_NOUN = re.compile(
+    r'\b(?:фото|фотк\w*|снимок|снимк\w*|картинк\w*|изображени\w*|кадр\w*|'
+    r'photo|picture|image|shot)\b', re.I)
+#: A refusal in front of an editing word, however it is typed.
+_NEGATED_EDIT = re.compile(
+    r'(?:\b(?:do\s+not|don\W?t|never|no)\b|\bне\b|\bні\b)'
+    r'[^.!?]{0,24}?(?:отредакт\w*|редакт\w*|ретуш\w*|фотошоп\w*|photoshop\w*|'
+    r'retouch\w*|edit\w{0,4})', re.I)
 _NONVISUAL_DRAW = re.compile(
     r'^\s*(?:(?:me|us)\s+)?(?:(?:a|an|the|some|any|no|your|our|my)\s+)?'
     r'(?:conclusions?|comparisons?|analogies|analogy|inferences?|distinctions?|attention|'
@@ -106,6 +121,13 @@ def current_image_request(text, *, has_photo=False, people=()):
     if action_revoked(value):
         return False
     if _capture_then_edit(value, people):
+        return True
+    # An attached photo plus a named picture plus an editing word is a real
+    # edit even when the verb is typed wrong ("Отредактирцй фото чтобы он сидел
+    # на диване", "Photoshop this picture"). A negation in front of that word
+    # ("Do not edit this photo") is still not a request.
+    if (has_photo and _IMAGE_NOUN.search(value) and _EDIT_STEM.search(value)
+            and not _NEGATED_EDIT.search(value)):
         return True
     command = _VISUAL_COMMAND.match(value)
     if command is None or not re.search(r'\w', command['detail']):

@@ -310,6 +310,29 @@ def test_reshaping_wording_without_a_target_is_still_not_an_edit(wording):
 
 
 @pytest.mark.parametrize('wording', [
+    # The owner's own typing on 2026-09-22: the verb was misspelled, and the
+    # gate answered "The current message does not request creating or editing
+    # an image." although the photo and the change were both named in it.
+    'Отредактирцй фото чтобы он сидел на диване',
+    'отредактруй это фото',
+    'edit teh photo please',
+    'Photoshop this picture',
+])
+def test_a_misspelled_edit_verb_on_an_attached_photo_is_still_an_edit(wording):
+    assert current_image_request(wording, has_photo=True)
+
+
+@pytest.mark.parametrize('wording', [
+    'Do not edit this photo',
+    "don't edit this picture",
+    'не редактируй это фото',
+    'why is this photo dark?',
+])
+def test_a_refusal_or_a_question_about_the_photo_is_not_an_edit_request(wording):
+    assert not current_image_request(wording, has_photo=True)
+
+
+@pytest.mark.parametrize('wording', [
     # The owner's own wording, which the gate refused on 2026-09-22: the
     # capture wording comes first, so the edit verb is not the first word.
     "Take a picture of buro's room and make theodric sit in the couch",

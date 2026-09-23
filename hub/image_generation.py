@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 from PIL import Image, ImageOps
@@ -32,6 +33,12 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 4096
 MAX_INPUT_TOKENS = 131072
+#: Gemini finished the request and produced no image. That is not a refusal:
+#: measured on the owner's own photo edits, the SAME request produced the image
+#: on the next try, and the identical prompt succeeded a minute later. One
+#: automatic retry is therefore allowed - and only then is the failure reported.
+NO_IMAGE_RETRIES = 1
+NO_IMAGE_RETRY_DELAY_S = 1.0
 MAX_NAMED_REFERENCE_PEOPLE = 2
 MAX_NAMED_REFERENCE_IMAGES = 4
 MAX_REFERENCE_INPUT_BYTES = 16 * 1024 * 1024
@@ -115,6 +122,13 @@ def decode_image(raw: bytes, mime: str) -> GeneratedImage:
         raise
     except Exception as exc:
         raise CloudUnavailable('The returned image could not be decoded safely.') from exc
+
+
+def _counted_tokens(value: Any, field: str) -> int:
+    """One non-negative integer token count from a Gemini usage report."""
+    if type(value) is not int or value < 0:
+        raise ValueError(f'invalid usage field {field}')
+    return value
 
 
 def _reference_inputs(reference: bytes | None, mime: str,
@@ -246,22 +260,49 @@ class ImageGenerator:
             raise CloudUnavailable('Another image is being generated. Please wait for it to finish.')
 
     def _settle(self, reservation: str, data: dict) -> None:
+        """Charge what Google reported, including a request that made no image.
+
+        A request that ends without an image is still billed, and a missing
+        field is not a reason to hold the whole cap: the old code kept the FULL
+        reservation whenever ANY field was absent, so 18 such requests held
+        $3.92 of the $18 monthly allowance and image generation ran out of
+        budget while it was working perfectly.
+        """
+        usage = data.get('usageMetadata') if isinstance(data, dict) else None
+        if not isinstance(usage, dict) or not usage:
+            log.warning('Gemini reported no usage metadata; the reservation stays as the upper bound')
+            return
         try:
-            usage = data['usageMetadata']
-            incoming, candidates = usage['promptTokenCount'], usage['candidatesTokenCount']
-            thoughts = usage.get('thoughtsTokenCount', 0)
-            if any(type(n) is not int or n < 0 for n in (incoming, candidates, thoughts)):
-                raise ValueError('invalid usage')
+            incoming = _counted_tokens(usage.get('promptTokenCount', 0), 'promptTokenCount')
+            thoughts = _counted_tokens(usage.get('thoughtsTokenCount', 0), 'thoughtsTokenCount')
             # The candidate detail list does not include thinking tokens.
             details = usage.get('candidatesTokensDetails')
+            counts: dict[str, int] = {}
+            if details is not None:
+                for detail in details:
+                    modality = detail.get('modality')
+                    if modality not in {'IMAGE', 'TEXT'}:
+                        raise ValueError('invalid modality usage')
+                    counts[modality] = counts.get(modality, 0) + _counted_tokens(
+                        detail.get('tokenCount', 0), 'tokenCount')
+            reported = usage.get('candidatesTokenCount')
+            if reported is None:
+                # An answer with no picture can still omit the candidate total.
+                # The input count IS known, so charge it exactly and the output
+                # at the FULL image cap instead of holding a reservation built
+                # from 131072 input tokens that were never sent: 18 such rows
+                # held $3.92 of the $18 monthly allowance and image generation
+                # looked broken while it worked perfectly.
+                if 'promptTokenCount' not in usage:
+                    raise ValueError('no token counts')
+                self.budget.settle(reservation, incoming, MAX_OUTPUT_TOKENS,
+                                   image_output_tokens=MAX_OUTPUT_TOKENS)
+                log.info('Gemini reported input tokens only (%d); output charged at the image cap',
+                         incoming)
+                return
+            candidates = _counted_tokens(reported, 'candidatesTokenCount')
             image_tokens = None
             if details is not None:
-                counts = {}
-                for detail in details:
-                    modality, count = detail['modality'], detail['tokenCount']
-                    if modality not in {'IMAGE', 'TEXT'} or type(count) is not int or count < 0:
-                        raise ValueError('invalid modality usage')
-                    counts[modality] = counts.get(modality, 0) + count
                 detailed = sum(counts.values())
                 if detailed > candidates:
                     raise ValueError('modality usage exceeds output total')
@@ -274,9 +315,73 @@ class ImageGenerator:
                 if detailed < candidates:
                     log.info('Gemini usage: %d unclassified output tokens accounted at image rate',
                              candidates - detailed)
-            self.budget.settle(reservation, incoming, candidates + thoughts, image_output_tokens=image_tokens)
+            self.budget.settle(reservation, incoming, candidates + thoughts,
+                               image_output_tokens=image_tokens)
         except Exception as exc:
-            log.warning('Gemini usage not reconciled (%s); reservation retained', type(exc).__name__)
+            log.warning('Gemini usage not reconciled (%s: %s); reservation retained',
+                        type(exc).__name__, exc)
+
+    @staticmethod
+    def _reply_text(data: dict) -> str:
+        """What Google said instead of making a picture, in its own words."""
+        candidates = data.get('candidates') or []
+        parts = (candidates[0].get('content') or {}).get('parts', []) if candidates else []
+        return ' '.join(str(part['text']).strip() for part in parts
+                        if isinstance(part, dict) and part.get('text')).strip()
+
+    @classmethod
+    def _retryable_no_image(cls, data: dict) -> str:
+        """``'NO_IMAGE'`` when Google finished with no picture and no explanation.
+
+        Measured on the owner's own edits: the identical request that answered
+        NO_IMAGE produced the picture on the next try, and the same prompt
+        succeeded a minute later. A safety answer (IMAGE_SAFETY, SAFETY,
+        PROHIBITED_CONTENT) or an answer that came with words instead of a
+        picture is never retried - it is reported exactly as it arrived.
+        """
+        if (data.get('promptFeedback') or {}).get('blockReason'):
+            return ''
+        candidates = data.get('candidates') or []
+        if not candidates:
+            return ''
+        if str(candidates[0].get('finishReason') or '') != 'NO_IMAGE':
+            return ''
+        return '' if cls._reply_text(data) else 'NO_IMAGE'
+
+    async def _send(self, payload: dict) -> dict:
+        """One metered POST to Gemini; the caller decides about a retry."""
+        try:
+            reservation = self.budget.reserve(MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS)
+        except CloudUnavailable:
+            raise
+        except Exception as exc:
+            raise CloudUnavailable('API accounting is unavailable; no image request was sent.') from exc
+        try:
+            async with asyncio.timeout(self.cfg.timeout_s):
+                async with self.http.stream('POST',
+                        f'https://generativelanguage.googleapis.com/v1/models/{self.cfg.model}:generateContent',
+                        headers={'x-goog-api-key': os.environ[self.cfg.api_key_env]}, json=payload) as response:
+                    if response.status_code in {401, 403}:
+                        raise CloudUnavailable('Google rejected the Gemini key or model access. Check the key and billing in AI Studio.')
+                    if response.status_code == 429:
+                        raise CloudUnavailable('Google image quota is exhausted. Check Gemini billing or try later.')
+                    if response.status_code != 200:
+                        raise CloudUnavailable(f'Google image generation failed (HTTP {response.status_code}). No image was returned.')
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > MAX_RESPONSE_BYTES:
+                            raise CloudUnavailable('Google returned an image response that is too large.')
+                    data = json.loads(body)
+        except CloudUnavailable:
+            raise
+        except Exception as exc:
+            log.warning('Gemini request failed (%s); reservation retained', type(exc).__name__)
+            raise CloudUnavailable('Nano Banana could not finish the request. No image is ready; it was not retried.') from exc
+        if not isinstance(data, dict):
+            raise CloudUnavailable('Google returned an invalid image response.')
+        self._settle(reservation, data)
+        return data
 
     async def generate(self, prompt: str, reference: bytes | None = None,
                        mime: str = 'image/jpeg', *,
@@ -323,39 +428,22 @@ class ImageGenerator:
                 'candidateCount': 1, 'maxOutputTokens': MAX_OUTPUT_TOKENS,
                 'responseModalities': ['IMAGE'], 'imageConfig': image_config,
                 'thinkingConfig': {'thinkingLevel': 'MINIMAL', 'includeThoughts': False}}}
-            try:
-                # Reserve the model's full input limit, and all output at the
-                # maximum image rate. Usage settles this down after completion.
-                reservation = self.budget.reserve(MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS)
-            except CloudUnavailable:
-                raise
-            except Exception as exc:
-                raise CloudUnavailable('API accounting is unavailable; no image request was sent.') from exc
-            try:
-                async with asyncio.timeout(self.cfg.timeout_s):
-                    async with self.http.stream('POST',
-                            f'https://generativelanguage.googleapis.com/v1/models/{self.cfg.model}:generateContent',
-                            headers={'x-goog-api-key': os.environ[self.cfg.api_key_env]}, json=payload) as response:
-                        if response.status_code in {401, 403}:
-                            raise CloudUnavailable('Google rejected the Gemini key or model access. Check the key and billing in AI Studio.')
-                        if response.status_code == 429:
-                            raise CloudUnavailable('Google image quota is exhausted. Check Gemini billing or try later.')
-                        if response.status_code != 200:
-                            raise CloudUnavailable(f'Google image generation failed (HTTP {response.status_code}). No image was returned.')
-                        body = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            body.extend(chunk)
-                            if len(body) > MAX_RESPONSE_BYTES:
-                                raise CloudUnavailable('Google returned an image response that is too large.')
-                        data = json.loads(body)
-            except CloudUnavailable:
-                raise
-            except Exception as exc:
-                log.warning('Gemini request failed (%s); reservation retained', type(exc).__name__)
-                raise CloudUnavailable('Nano Banana could not finish the request. No image is ready; it was not retried.') from exc
-            if not isinstance(data, dict):
-                raise CloudUnavailable('Google returned an invalid image response.')
-            self._settle(reservation, data)
+            # The same request that comes back empty usually works on the next
+            # try (the identical edit "Add kiss marks around anton" answered
+            # NO_IMAGE at 20:24 and produced the picture here in the live check),
+            # so one retry is allowed. A real refusal is never retried: it
+            # carries promptFeedback.blockReason and is reported as it is.
+            data = await self._send(payload)
+            reason = self._retryable_no_image(data)
+            for _attempt in range(NO_IMAGE_RETRIES if reason else 0):
+                log.info('Gemini finished without a picture (%s); asking once more', reason)
+                await asyncio.sleep(NO_IMAGE_RETRY_DELAY_S)
+                data = await self._send(payload)
+                reason = self._retryable_no_image(data)
+                if not reason:
+                    break
+            reason = reason or str(((data.get('candidates') or [{}])[0]).get('finishReason')
+                                   or 'no candidates')
             if (data.get('promptFeedback') or {}).get('blockReason'):
                 turn_trace.record('image', 'declined', ok=False, payload={
                     'reason': str((data.get('promptFeedback') or {}).get('blockReason')),
@@ -363,11 +451,17 @@ class ImageGenerator:
                 raise CloudUnavailable('Google declined this image request. No image was created. Do not retry or rephrase it automatically.')
             candidates = data.get('candidates') or []
             if not candidates or candidates[0].get('finishReason') != 'STOP':
+                said = self._reply_text(data)
                 turn_trace.record('image', 'declined', ok=False, payload={
                     'reason': str((candidates[0] if candidates else {}).get('finishReason')
                                   or 'no candidates'),
+                    'said': said[:300],
                     'model': self.cfg.model, 'prompt': prompt})
-                raise CloudUnavailable('Google did not complete this image request. No image is ready; do not retry automatically.')
+                detail = f' Google itself said: "{said[:300]}".' if said else ''
+                raise CloudUnavailable(
+                    'Google finished this image request without a picture'
+                    f' ({reason or "no image"}).{detail}'
+                    ' Nothing was changed. Say what to change in other words, or use another photo.')
             for part in (candidates[0].get('content') or {}).get('parts', []):
                 if part.get('thought'):
                     continue
@@ -378,7 +472,10 @@ class ImageGenerator:
                     except (ValueError, KeyError, TypeError) as exc:
                         raise CloudUnavailable('Google returned invalid image data.') from exc
                     return await asyncio.to_thread(decode_image, raw, inline.get('mimeType', ''))
-            raise CloudUnavailable('Google returned no image. Do not claim the photo was edited or retry automatically.')
+            said = self._reply_text(data)
+            raise CloudUnavailable(
+                'Google returned no image.' + (f' It said: "{said[:300]}".' if said else '')
+                + ' Nothing was changed; do not claim the photo was edited.')
 
     async def close(self) -> None:
         await self.http.aclose()

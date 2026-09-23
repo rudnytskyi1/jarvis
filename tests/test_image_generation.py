@@ -368,3 +368,68 @@ def test_the_image_prompt_and_a_google_refusal_reach_the_owner_panel(tmp_path, m
     assert steps[0]['payload']['model'] == 'gemini-3.1-flash-image'
     assert steps[1]['ok'] is False
     assert steps[1]['payload']['reason'] == 'PROHIBITED_CONTENT'
+
+
+def test_an_answer_with_no_picture_is_asked_once_more_and_the_second_one_is_used(tmp_path, monkeypatch):
+    """The owner's "Отредактирцй фото чтобы он сидел на диване" heard "Google не смог".
+
+    Google answers HTTP 200 with ``finishReason: NO_IMAGE`` and no text at all,
+    and the SAME request produced the picture when it was repeated by hand a
+    minute later. One repeat is therefore allowed - and only that one.
+    """
+    answers = [httpx.Response(200, json=response_image(candidates=[
+                   {'finishReason': 'NO_IMAGE', 'content': {'parts': []}}])),
+               httpx.Response(200, json=response_image())]
+    handler = Mock(side_effect=answers)
+    async def run():
+        client = generator(tmp_path, monkeypatch, handler)
+        try:
+            result = await client.generate('Make him sit on the couch', fixture_image(), 'image/png')
+            assert (result.width, result.height) == (32, 24)
+            assert handler.call_count == 2
+        finally:
+            await client.close()
+    asyncio.run(run())
+
+
+def test_a_safety_answer_or_words_instead_of_a_picture_are_never_retried(tmp_path, monkeypatch):
+    for data in (response_image(candidates=[{'finishReason': 'IMAGE_SAFETY'}]),
+                 response_image(candidates=[{'finishReason': 'STOP', 'content': {
+                     'parts': [{'text': 'I cannot edit this.'}]}}])):
+        handler = Mock(return_value=httpx.Response(200, json=data))
+        async def run():
+            client = generator(tmp_path, monkeypatch, handler)
+            try:
+                with pytest.raises(CloudUnavailable) as failure:
+                    await client.generate('Draw a square')
+                assert handler.call_count == 1
+                assert any(phrase in str(failure.value) for phrase in
+                           ('without a picture', 'declined', 'returned no image'))
+            finally:
+                await client.close()
+        asyncio.run(run())
+
+
+def test_an_input_only_usage_report_does_not_hold_the_whole_reservation(tmp_path, monkeypatch):
+    """A request with no picture still names its input tokens.
+
+    Holding the whole reservation charged 131072 input tokens that were never
+    sent: 18 such rows kept $3.92 of the owner's $18 monthly allowance, and
+    image generation then looked broken although nothing was wrong with it.
+    """
+    handler = Mock(return_value=httpx.Response(200, json=response_image(
+        candidates=[{'finishReason': 'STOP', 'content': {'parts': []}}],
+        usageMetadata={'promptTokenCount': 100})))
+    async def run():
+        client = generator(tmp_path, monkeypatch, handler)
+        try:
+            with pytest.raises(CloudUnavailable):
+                await client.generate('Draw a square')
+            status = client.budget.status()
+            assert status['unsettled_requests'] == 0
+            # Exact input plus the FULL image output cap: never cheaper than the
+            # real bill, and never the input limit that was never sent.
+            assert status['accounted_usd'] == 0.24581
+        finally:
+            await client.close()
+    asyncio.run(run())

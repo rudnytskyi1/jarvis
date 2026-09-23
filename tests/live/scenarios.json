@@ -345,6 +345,172 @@
         "click_screen",
         "computer_use"
       ]
+    },
+    {
+      "id": "VE-36",
+      "said": "Rowan, turn off the fan",
+      "expect_any": ["set_switch", "set_light", "pc_control"],
+      "note": "a second switch, not the light: the chain has to pick set_switch"
+    },
+    {
+      "id": "VE-37",
+      "said": "Rowan, turn the volume up",
+      "expect_any": ["pc_control"],
+      "expect_args": {"pc_control": ["volume"]}
+    },
+    {
+      "id": "VE-38",
+      "said": "Rowan, mute the sound",
+      "expect_any": ["pc_control"]
+    },
+    {
+      "id": "VE-39",
+      "said": "Rowan, make the screen dimmer",
+      "expect_any": ["pc_control"]
+    },
+    {
+      "id": "VE-40",
+      "said": "Rowan, run ipconfig and tell me my IP address",
+      "expect_any": ["run_command", "pc_control"],
+      "note": "a command whose output the room never saw: reading it is a real request"
+    },
+    {
+      "id": "VE-41",
+      "said": "Rowan, what is on my screen right now?",
+      "expect_any": ["look_at_screen", "pc_control"]
+    },
+    {
+      "id": "VE-42",
+      "said": "Rowan, remember that I park in spot twelve",
+      "expect_any": ["remember", "say_in_room"],
+      "note": "the hub asks for a spoken yes (F-113) before it stores a fact"
+    },
+    {
+      "id": "VE-43",
+      "said": "Rowan, what do you remember about me?",
+      "expect_any": ["list_memory", "recall_conversation"]
+    },
+    {
+      "id": "VE-44",
+      "said": "Rowan, who do you know in this house?",
+      "expect_any": ["list_people"]
+    },
+    {
+      "id": "VE-45",
+      "said": "Rowan, show me the last picture again",
+      "expect_any": ["show_photo"],
+      "forbid_tools": ["generate_image"],
+      "note": "showing a stored image must never pay for a new one"
+    },
+    {
+      "id": "VE-46",
+      "said": "Rowan, who is in the room right now?",
+      "expect_any": ["look_at_camera"]
+    },
+    {
+      "id": "VE-47",
+      "said": "Rowan, find my water bottle on the camera",
+      "expect_any": ["find_object", "look_at_camera"]
+    },
+    {
+      "id": "VE-48",
+      "said": "Rowan, what did we talk about earlier today?",
+      "expect_any": ["recall_conversation", "list_memory"]
+    },
+    {
+      "id": "VE-49",
+      "said": "Rowan, tell me a joke",
+      "forbid_tools": ["pc_control", "browser_control", "generate_image", "telegram_send"],
+      "note": "plain talk must not touch the PC or spend money"
+    },
+    {
+      "id": "VE-50",
+      "said": "Rowan, thank you, that worked",
+      "forbid_tools": ["pc_control", "browser_control", "generate_image"]
+    },
+    {
+      "id": "VE-51",
+      "said": "Rowan, open YouTube and turn the volume up",
+      "expect_any": ["browser_control"],
+      "note": "two requests in one sentence: opening the page must still happen"
+    },
+    {
+      "id": "VE-52",
+      "said": "Rowan, open Spotify and play my playlist",
+      "expect_any": ["pc_control", "run_command"]
+    },
+    {
+      "id": "VE-53",
+      "said": "Rowan, what is the weather tomorrow?",
+      "forbid_tools": ["generate_image"],
+      "note": "a weather answer is words, never a paid picture"
+    },
+    {
+      "id": "VE-54",
+      "said": "Rowan, write hello in the search box and press enter",
+      "expect_any": ["browser_control"],
+      "forbid_tools": ["generate_image"]
+    },
+    {
+      "id": "VE-55",
+      "said": "Rowan, go back to the previous page",
+      "expect_any": ["browser_control"]
+    },
+    {
+      "id": "VE-56",
+      "said": "Rowan, close this window",
+      "expect_any": ["pc_control", "browser_control"]
+    },
+    {
+      "id": "VE-57",
+      "said": "Rowan, take a screenshot of my screen",
+      "expect_any": ["look_at_screen", "pc_control", "save_photo"]
+    },
+    {
+      "id": "VE-58",
+      "said": "Rowan, when I come home after ten in the evening, turn on the warm light",
+      "expect_any": ["create_rule", "set_light", "remember"]
+    },
+    {
+      "id": "VE-59",
+      "said": "Rowan, what time is it?",
+      "forbid_tools": ["generate_image", "browser_control", "telegram_send"]
+    },
+    {
+      "id": "VE-60",
+      "said": "Rowan, call Theodric Ted from now on",
+      "live_only": "renames a real enrolled profile in the live registry",
+      "expect_any": ["rename_person"]
+    },
+    {
+      "id": "VE-61",
+      "said": "Rowan, save the last picture to my desktop",
+      "live_only": "writes a file onto the room PC's desktop",
+      "expect_any": ["save_photo"]
+    },
+    {
+      "id": "VE-62",
+      "said": "Rowan, send me the last picture in Telegram",
+      "live_only": "delivers a photo to the owner's own Telegram chat",
+      "expect_any": ["telegram_send", "show_photo"]
+    },
+    {
+      "id": "VE-63",
+      "said": "Rowan, make Drew an admin",
+      "live_only": "changes a real role in the live registry",
+      "expect_any": ["set_role"]
+    },
+    {
+      "id": "VE-64",
+      "said": "Rowan, put the last picture on my desktop wallpaper",
+      "live_only": "changes the room PC's wallpaper",
+      "expect_any": ["set_wallpaper"]
+    },
+    {
+      "id": "VE-65",
+      "said": "Отредактирцй фото чтобы он сидел на диване",
+      "live_only": "edits a real attached photo on the room PC",
+      "expect_any": ["generate_image"]
     }
   ]
 }
