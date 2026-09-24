@@ -1,0 +1,94 @@
+{% extends "admin/base.html" %}
+{% block title %}Rowan · profile classifier{% endblock %}
+{% block head %}
+<style>
+  .stages { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: .8rem; }
+  .stage { background: var(--panel); border: 1px solid var(--line); border-radius: .8rem;
+    padding: .8rem .95rem; position: relative; overflow: hidden; }
+  .stage::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2), transparent); opacity: .6; }
+  .stage.off::before { background: linear-gradient(90deg, rgba(126,141,166,.7), transparent); }
+  .stage.degraded::before { background: linear-gradient(90deg, var(--warn), transparent); }
+  .stage h3 { display: flex; align-items: center; gap: .5rem; letter-spacing: .02em; }
+  .dot { width: .55rem; height: .55rem; border-radius: 50%; background: var(--good);
+    box-shadow: 0 0 9px currentColor; color: var(--good); flex: none; }
+  .dot.off { background: var(--dim); color: transparent; box-shadow: none; }
+  .dot.degraded { background: var(--warn); color: var(--warn); }
+  .stage .note { margin: .35rem 0 .55rem; }
+  .kv { display: flex; flex-wrap: wrap; gap: .3rem; }
+  .kv span { font-family: var(--mono); font-size: .72rem; color: var(--ink);
+    background: rgba(63, 227, 255, .08); border: 1px solid var(--line);
+    border-radius: .4rem; padding: .12rem .4rem; }
+  .kv span b { color: var(--dim); font-weight: 400; }
+  .people { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .9rem; }
+  .person { display: flex; gap: .8rem; align-items: center; background: var(--panel);
+    border: 1px solid var(--line); border-radius: .85rem; padding: .75rem; color: var(--ink); }
+  .person:hover { border-color: var(--line-2); box-shadow: 0 0 22px rgba(63, 227, 255, .12); }
+  .person .shot { width: 4.4rem; height: 4.4rem; flex: none; border-radius: .6rem;
+    object-fit: cover; background: rgba(4, 8, 15, .75); border: 1px solid var(--line);
+    display: grid; place-items: center; color: var(--dim); font-family: var(--mono); font-size: .7rem; }
+  .person b { font-size: .98rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .35rem; }
+  .chip { font-family: var(--mono); font-size: .68rem; color: var(--dim);
+    border: 1px solid var(--line); border-radius: 999px; padding: .05rem .45rem; }
+  .chip.on { color: var(--accent); border-color: rgba(63, 227, 255, .4); }
+</style>
+{% endblock %}
+{% block content %}
+  <h1>Profile classifier</h1>
+  <p class="note">How Rowan decides who is in the room, stage by stage, with the numbers
+    this hub is running on right now. Below the pipeline is everyone the hub knows:
+    the vectors a person carries (F-211) and the photographs the archive keeps (F-209).
+    Open a profile to spin its frames and see every look that was ever archived.</p>
+  {% if message %}<p class="note">{{ message }}</p>{% endif %}
+
+  <h2>Pipeline</h2>
+  <div class="stages">
+    {% for stage in stages %}
+    <div class="stage {{ stage.state }}">
+      <h3><span class="dot {{ stage.state }}"></span>{{ stage.title }}</h3>
+      <p class="note">{{ stage.note }}</p>
+      <div class="kv">
+        {% for label, value in stage.numbers %}
+        <span><b>{{ label }}</b> {{ value }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>People ({{ profiles|length }})</h2>
+  {% if profiles %}
+  <div class="people">
+    {% for person in profiles %}
+    <a class="person" href="/admin/profiles/{{ person.profile_id }}">
+      {% if person.gallery.cover %}
+      <img class="shot" src="{{ person.gallery.cover }}" alt="{{ person.name }}"
+           loading="lazy" referrerpolicy="no-referrer">
+      {% else %}
+      <span class="shot">no photo</span>
+      {% endif %}
+      <span>
+        <b>{{ person.name }}</b>
+        <span class="note">{{ person.role or "not a member" }}{% if person.homes %} ·
+          {{ person.homes|join(", ") }}{% endif %}</span>
+        <span class="chips">
+          <span class="chip {{ 'on' if person.gallery.samples }}">archive
+            {{ person.gallery.samples }}</span>
+          <span class="chip {{ 'on' if person.vectors.face }}">face
+            {{ person.vectors.face }}</span>
+          <span class="chip {{ 'on' if person.vectors.voice }}">voice
+            {{ person.vectors.voice }}</span>
+          <span class="chip {{ 'on' if person.vectors.body }}">body
+            {{ person.vectors.body }}</span>
+          <span class="chip">looks {{ person.gallery.outfits }}</span>
+          {% if person.labels %}<span class="chip on">labels {{ person.labels }}</span>{% endif %}
+        </span>
+      </span>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="note">Nobody is enrolled yet: no manual person and no archived frame.</p>
+  {% endif %}
+{% endblock %}

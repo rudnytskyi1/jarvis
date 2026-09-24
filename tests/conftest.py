@@ -11,6 +11,14 @@ import os
 import sys
 from pathlib import Path
 
+# ultralytics monkey-patches ``PIL.Image.open`` and, on any failure, asks pip to
+# install ``pi-heif`` - inside a sandbox without a network that call blocks the
+# whole run for tens of minutes (found on 2026-09-24: `pytest tests` hung at 55 %
+# in tests/test_image_difficulty.py, py-spy showed `subprocess.check_output` ->
+# `pip install pi-heif`). Rowan never installs packages at runtime, so the
+# auto-install stays off for the suite; the package itself is installed.
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

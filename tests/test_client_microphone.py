@@ -142,3 +142,44 @@ def test_no_microphone_at_all_gives_an_actionable_error(monkeypatch, caplog):
     assert "Microphones this PC offers" in caplog.text
     assert "allow microphone access" in caplog.text
     assert microphone.running is False
+
+
+def test_a_silent_stream_is_visible_and_can_be_reopened(monkeypatch):
+    """buro: the stream stayed open and delivered nothing for 17 minutes.
+
+    Windows leaves a WASAPI stream open and silent when the device is
+    re-enumerated; nothing raises, so the room has to time the frames itself.
+    """
+    fake = _install(monkeypatch, _FakeSd({(None, 16000)}))
+    microphone = client_audio.AudioInput()
+
+    microphone.start()
+    assert microphone.seconds_since_frame() is None, "no block has arrived yet"
+
+    stream = microphone._stream
+    assert stream is not None
+    stream.callback(b"\x00\x00" * 480, 480, None, None)
+    since = microphone.seconds_since_frame()
+    assert since is not None and since < 1.0
+
+    ok, detail = microphone.reopen()
+
+    assert ok is True and "16000" in detail
+    assert len(fake.opened) == 2, "the device must be opened again, not given up on"
+    assert microphone.running is True
+    assert microphone.seconds_since_frame() is None, "a fresh stream starts empty"
+    microphone.close()
+
+
+def test_reopening_a_lost_device_reports_it_instead_of_raising(monkeypatch):
+    fake = _FakeSd({(None, 16000)})
+    _install(monkeypatch, fake)
+    microphone = client_audio.AudioInput()
+    microphone.start()
+    fake.accepted.clear()  # another program took the microphone away
+
+    ok, detail = microphone.reopen()
+
+    assert ok is False and detail, "the client keeps retrying, it does not crash"
+    assert microphone.running is False
+    microphone.close()

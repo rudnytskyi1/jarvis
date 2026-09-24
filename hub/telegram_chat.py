@@ -29,6 +29,19 @@ from hub.telegram import TelegramError
 from hub.untrusted import TELEGRAM_SOURCE
 from hub.untrusted import wrap as wrap_untrusted
 
+# Anything that looks like a Telegram endpoint or a bot token is removed before a
+# provider error is written to the log: the transport sanitises the messages it
+# raises, but the transport is swappable, and the log must stay secret-free even
+# when a caller-supplied transport raises the raw URL (2026-09-24).
+_LOG_URL = re.compile(r'https?://[^\s"\'<>]+', re.I)
+_LOG_TOKEN = re.compile(r'[0-9]{6,}:[A-Za-z0-9_-]{20,}')
+
+
+def _log_safe(text):
+    """Return the provider error with endpoints, tokens and control chars removed."""
+    cleaned = _LOG_TOKEN.sub('[redacted]', _LOG_URL.sub('[endpoint]', str(text)))
+    return ''.join(c for c in cleaned if c in '\n\t' or ord(c) >= 32)[:200]
+
 log = logging.getLogger(__name__)
 PROMPT = Path(__file__).resolve().parents[1] / 'prompts' / 'telegram.md'
 MAX_PHOTO_BYTES = 8_000_000
@@ -759,9 +772,14 @@ class TelegramChat:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Exception strings may carry transport URLs/tokens. Log only type.
+                # Log the reason, not only the type: with just "TelegramError" a
+                # paused bot was undiagnosable - the owner saw "не отвечает в
+                # телеге" while the hub repeated the same line forever
+                # (2026-09-24). The text is sanitised first so a token or an
+                # endpoint URL can never reach the log.
                 self.last_error = type(exc).__name__
-                log.warning('Telegram polling paused (%s)', self.last_error)
+                log.warning('Telegram polling paused (%s: %s)', self.last_error,
+                            _log_safe(exc) or 'no message')
                 retry_after = getattr(exc, 'retry_after', None)
                 wait = retry_after if _integer(retry_after) and retry_after > 0 else delay
                 await asyncio.sleep(min(30.0, max(1.0, wait)))

@@ -9,6 +9,12 @@ Jev — семейство инструментов, «есть ли что де
     python scripts/jev_probe.py                      # фраза-пример
     python scripts/jev_probe.py "включи свет на кухне"
 
+Вторая половина скрипта — цепочка решений хаба целиком
+(``hub.app._decision_chain``): она спрашивает тип ``route`` у настоящей цепочки
+``[rules, jev]`` и печатает, КТО ответил. До AU-19 здесь всегда отвечал
+``rules``: правила закрывали вопрос своей догадкой 0.6, и Jev не спрашивали ни
+разу (5087 решений, все ``rules``).
+
 Ключ берётся из ``.env`` (``JEV_API_KEY``), как у хаба; в лог и на экран он не
 печатается — только признак «есть/нет».
 """
@@ -79,13 +85,70 @@ async def main() -> int:
         return 1
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     print(f"ответ за {elapsed_ms} мс (бюджет конфига {settings.timeout_ms} мс)")
-    for name in ("act", "family", "followup"):
+    for name in ("act", "family", "single", "followup"):
         item = found.get(name)
         if item is None:
             print(f"  {name}: (не ответил)")
             continue
         print(f"  {name}: {item['value']!r} (уверенность {float(item['confidence']):.2f})")
+    await _probe_chain(args.text)
     return 0
+
+
+async def _probe_chain(text: str) -> None:
+    """The hub's own decision chain, asked live: who answers ``route``?"""
+    from common.config import load_config
+    from hub import app as hub_app
+
+    # Решения этой пробы — настоящие, но это не ходы комнаты: они не должны
+    # попадать в калибровку владельца (DECISIONS.md TEST-DB-01). Первые прогоны
+    # AU-19 писали их в живую `data/hub.db`; теперь у пробы своя база, как у
+    # стенда (переменная ``ROWAN_HUB_DB`` — тот же выключатель, что у
+    # ``scripts/live-eval.py``).
+    probe_db = REPO / "data" / "audit" / "jev-probe-hub.db"
+    probe_db.parent.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault(hub_app.HUB_DB_ENV, str(probe_db))
+    cfg = load_config(REPO / "config.openai.yaml")
+    hub_app.configure(cfg)
+    # Свежая цепочка на каждый запуск: проба не должна пользоваться кэшем
+    # решений предыдущего прогона.
+    hub_app._decider = None
+    hub_app._jev_client = None
+    chain = hub_app._decision_chain(["rowan ai"])
+    if chain is None:
+        print("цепочка решений недоступна: провайдеров нет")
+        return
+    home = str((cfg.homes[0].home_id if cfg.homes else "") or "")
+    print(f"\nцепочка решений (home={home or 'нет дома'}):")
+    for question in (text, "rowan ai volume 20"):
+        started = time.perf_counter()
+        try:
+            decision = await chain.choose(
+                "fast command or model request?",
+                ["fast_command", "llm"],
+                {"text": question, "wake_words": ["rowan ai"], "home_id": home},
+                decision_type="route")
+        except Exception as exc:  # noqa: BLE001 - отчёт, а не падение
+            print(f"  {question!r}: цепочка не ответила ({type(exc).__name__}: {exc})")
+            continue
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        print(f"  route     {question!r}: {decision.provider} -> {decision.value!r} "
+              f"(уверенность {decision.confidence:.2f}, {elapsed_ms} мс)")
+    # ``addressed`` — та точка, где правила честно не уверены (0.6 без
+    # подтверждённого пробуждения), и второй провайдер цепочки обязан ответить.
+    started = time.perf_counter()
+    try:
+        decision = await chain.yes_no(
+            "Was this utterance addressed to the assistant?",
+            {"text": text, "wake_words": ["rowan ai"], "home_id": home,
+             "heuristic": False},
+            decision_type="addressed")
+    except Exception as exc:  # noqa: BLE001 - отчёт, а не падение
+        print(f"  addressed {text!r}: цепочка не ответила ({type(exc).__name__}: {exc})")
+        return
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    print(f"  addressed {text!r}: {decision.provider} -> {decision.value!r} "
+          f"(уверенность {decision.confidence:.2f}, {elapsed_ms} мс)")
 
 
 if __name__ == "__main__":

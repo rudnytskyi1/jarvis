@@ -1,6 +1,30 @@
 {% extends "admin/base.html" %}
 {% block content %}
-  <h2>Overview</h2>
-  <p>Homes: {{ counts.homes }} · Clients: {{ counts.clients }} · People: {{ counts.people }}</p>
-  <p>Waiting for a name today: <a href="/admin/tracks">{{ counts.pending }}</a></p>
+  <h1>Overview</h1>
+  <div class="kpis">
+    <div class="kpi"><span>homes</span><b>{{ counts.homes }}</b></div>
+    <div class="kpi"><span>clients</span><b>{{ counts.clients }}</b></div>
+    <div class="kpi"><span>people</span><b>{{ counts.people }}</b></div>
+    <div class="kpi"><span>profiles</span><b>{{ counts.profiles }}</b></div>
+    <div class="kpi"><span>in archive</span><b>{{ counts.archive }}</b></div>
+    <div class="kpi"><span>unnamed today</span><b>{{ counts.pending }}</b></div>
+  </div>
+  <h2>Where to look</h2>
+  <div class="grid">
+    <a class="card" href="/admin/turns">
+      <h3>Requests</h3>
+      <p class="note">Every request Rowan handled, with its whole chain: decisions,
+        tools, model rounds, the prompts that left the hub and what the room heard.</p>
+    </a>
+    <a class="card" href="/admin/profiles">
+      <h3>Profile classifier</h3>
+      <p class="note">How identity is decided (face, voice, body, fusion) and everyone
+        the hub knows, with the frames the archive kept of them.</p>
+    </a>
+    <a class="card" href="/admin/tracks">
+      <h3>Tracks</h3>
+      <p class="note">People the hub saw today and could not name. One click binds a
+        track to a person and keeps the label as data.</p>
+    </a>
+  </div>
 {% endblock %}

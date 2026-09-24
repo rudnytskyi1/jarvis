@@ -17,7 +17,7 @@
       <th>Decided by</th><th>Chain</th><th class="num">Took</th></tr>
     {% for turn in turns %}
     <tr class="row">
-      <td>{{ turn.when }}</td>
+      <td class="when">{{ turn.when }}</td>
       <td><a href="/admin/turns/{{ turn.href }}">{{ turn.turn_id }}</a></td>
       <td>{{ turn.request or "—" }}
         {% if turn.reply %}<br><span class="note">→ {{ turn.reply }}</span>{% endif %}</td>

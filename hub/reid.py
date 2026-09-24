@@ -266,9 +266,19 @@ class ReidEngine:
                 return self._extractor
             if self._failed:
                 return None
+            if not torchreid_installed():
+                # Missing library: no import attempt, no vector, and the answer
+                # stays "unknown" instead of a made-up match (AGENTS.md).
+                self._failed = True
+                return None
             try:
                 import torch  # noqa: PLC0415 - lazy: a hub without torch still starts
-                from torchreid.utils import FeatureExtractor  # noqa: PLC0415 - lazy
+                try:
+                    # torchreid 0.2.5 on PyPI moved its modules one level down;
+                    # the git layout the ТЗ names keeps them at the top.
+                    from torchreid.reid.utils import FeatureExtractor  # noqa: PLC0415
+                except ImportError:  # pragma: no cover - the older layout
+                    from torchreid.utils import FeatureExtractor  # noqa: PLC0415
             except Exception:
                 log.warning("torchreid is not installed - body ReID stays off "
                             "(pip install torchreid)", exc_info=True)
@@ -311,8 +321,11 @@ class ReidEngine:
             log.exception("OSNet failed on a %d byte crop", len(jpeg_bytes))
             return None
         try:
-            return normalise(np.asarray(features).ravel())
-        except ValueError as exc:
+            # The extractor answers on whichever device it was built for; the
+            # vector itself is a plain list of floats, so it comes home first.
+            host = features.detach().cpu().numpy() if hasattr(features, "detach") else features
+            return normalise(np.asarray(host).ravel())
+        except (TypeError, ValueError) as exc:
             log.warning("OSNet returned an unusable vector (%s)", exc)
             return None
 

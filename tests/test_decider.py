@@ -68,11 +68,12 @@ def test_rules_provider_only_answers_with_an_offered_option():
 
 
 class _Stub:
-    def __init__(self, name, *, answer=None, fail=False, delay=0.0):
+    def __init__(self, name, *, answer=None, fail=False, delay=0.0, confidence=0.7):
         self.name = name
         self.answer = answer
         self.fail = fail
         self.delay = delay
+        self.confidence = confidence
         self.calls = 0
 
     async def choose(self, question, options, context, *, decision_type):
@@ -82,7 +83,7 @@ class _Stub:
         if self.fail:
             raise NotImplementedError(decision_type)
         from hub.decider import _decision
-        return _decision(self.answer, 0.7, self.name, 0.0)
+        return _decision(self.answer, self.confidence, self.name, 0.0)
 
 
 def test_chain_falls_through_a_provider_that_cannot_answer():
@@ -144,3 +145,86 @@ def test_the_addressee_decision_uses_the_wake_words_of_this_utterance():
         "?", {"text": "rowan turn the light off", "wake_words": ["rowan"]},
         decision_type="addressed"))
     assert decision.value is True
+
+
+# --- второй провайдер в цепочке (AU-19) --------------------------------------
+
+
+def _uncertain_chain(second, *, seen=None):
+    """The production shape: rules first, Jev second, one policy for the type."""
+    from hub.decider import DecisionChain
+
+    recorder = None
+    if seen is not None:
+        recorder = lambda decision, kind, outcome: seen.append(
+            (decision.provider, kind, round(decision.confidence, 2), outcome))
+    return DecisionChain(
+        [_Stub("rules", answer="llm", confidence=0.6), second],
+        {"route": ["rules", "jev"]}, timeout_s=0.3,
+        policies={"route": Policy(auto_above=0.9, ask_below=0.6)},
+        recorder=recorder)
+
+
+def test_the_second_provider_is_asked_when_the_first_answer_is_unsure():
+    """AU-19: «правила ответили 0.6» — это догадка, а не решение.
+
+    До этой правки ``rules`` заканчивал цепочку всегда, и в живой базе все 5087
+    решений были от ``rules``, а Jev не спрашивали ни разу
+    (``scripts/jev_usage_report.py``).
+    """
+    cloud = _Stub("jev", answer="fast_command", confidence=0.9)
+    decision = asyncio.run(_uncertain_chain(cloud).choose(
+        "?", ROUTE_OPTIONS, {}, decision_type="route"))
+    assert cloud.calls == 1
+    assert decision.provider == "jev" and decision.value == "fast_command"
+
+
+def test_a_quiet_first_answer_stays_when_the_second_is_no_better():
+    """Спросили — но своё «0.6» оставили: второй ответ оказался не увереннее."""
+    cloud = _Stub("jev", answer="fast_command", confidence=0.5)
+    decision = asyncio.run(_uncertain_chain(cloud).choose(
+        "?", ROUTE_OPTIONS, {}, decision_type="route"))
+    assert cloud.calls == 1
+    assert decision.provider == "rules" and decision.value == "llm"
+
+
+def test_a_confident_first_answer_never_costs_a_cloud_call():
+    """0.95 — это «действуй»; платить за второе мнение не за что."""
+    from hub.decider import DecisionChain
+
+    cloud = _Stub("jev", answer="fast_command", confidence=0.99)
+    chain = DecisionChain([_Stub("rules", answer="fast_command", confidence=0.95), cloud],
+                          {"route": ["rules", "jev"]}, timeout_s=0.3,
+                          policies={"route": Policy(auto_above=0.9, ask_below=0.6)})
+    decision = asyncio.run(chain.choose("?", ROUTE_OPTIONS, {}, decision_type="route"))
+    assert cloud.calls == 0
+    assert decision.provider == "rules"
+
+
+def test_a_type_without_a_policy_still_stops_at_the_first_answer():
+    """Точки безопасности (admin_rights, injection) идут как раньше: 0.6 решает."""
+    from hub.decider import DecisionChain
+
+    cloud = _Stub("jev", answer="fast_command", confidence=0.99)
+    chain = DecisionChain([_Stub("rules", answer="llm", confidence=0.6), cloud],
+                          {"route": ["rules", "jev"]}, timeout_s=0.3)
+    decision = asyncio.run(chain.choose("?", ROUTE_OPTIONS, {}, decision_type="route"))
+    assert cloud.calls == 0 and decision.provider == "rules"
+
+
+def test_both_answers_are_recorded_when_the_second_provider_speaks():
+    """Панель должна показывать и переубеждённый ответ, а не только победителя."""
+    seen: list = []
+    cloud = _Stub("jev", answer="fast_command", confidence=0.9)
+    asyncio.run(_uncertain_chain(cloud, seen=seen).choose(
+        "?", ROUTE_OPTIONS, {}, decision_type="route"))
+    assert seen == [("rules", "route", 0.6, "log"), ("jev", "route", 0.9, "act")]
+
+
+def test_a_second_provider_that_fails_leaves_the_first_answer():
+    """Fail-open (ТЗ раздел 1): облако молчит — работает локальный ответ."""
+    cloud = _Stub("jev", fail=True)
+    decision = asyncio.run(_uncertain_chain(cloud).choose(
+        "?", ROUTE_OPTIONS, {}, decision_type="route"))
+    assert cloud.calls == 1
+    assert decision.provider == "rules" and decision.value == "llm"

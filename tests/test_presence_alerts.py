@@ -1,4 +1,5 @@
 ﻿import asyncio
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -282,6 +283,86 @@ def test_video_uses_clip_transport_and_fixed_group_destination(tmp_path):
         # bot has met (`group:<id>`), not only the one in the config.
         assert api.send_video.call_args.kwargs == {'group_chat_id': -456}
         assert alerts.status()['deliveries'][0]['status'] == 'sent'
+        await alerts.close()
+    asyncio.run(run())
+
+
+def test_the_clip_waits_for_the_name_so_the_box_is_labelled(tmp_path, monkeypatch):
+    """Владелец 2026-09-24: имя на трек приходит на секунду позже срабатывания.
+
+    Правило ждёт это короткое время и просит клип уже с подписями; ожидание не
+    удлиняет видео, потому что клип начинается из буфера прошлого на клиенте.
+    """
+    from hub import presence_alerts
+
+    monkeypatch.setattr(presence_alerts, 'NAME_WAIT_STEP_S', 0.01)
+
+    async def run():
+        api = provider()
+        api.send_video.return_value = {'ok': True, 'chat_id': -456, 'message_id': 3}
+        seen = {'asked': 0}
+
+        def track_names():
+            seen['asked'] += 1
+            return {'t1': 'Антон'} if seen['asked'] >= 3 else {}
+
+        room = SimpleNamespace(receiving=False, session=SimpleNamespace(client_id='room'),
+                               _track_names=track_names, _live_track_ids=lambda: ['t1'],
+                               _request_camera_clip=AsyncMock(return_value=b'mp4'))
+        alerts = engine(tmp_path, api, room)
+        alerts.save_rule({'enabled': True, 'media': 'video', 'destination': 'group',
+                          'min_stable_s': 0, 'min_frames': 1})
+        alerts.start()
+        alerts.observe(persons=1, source_id='room')
+        await alerts.drain()
+        assert seen['asked'] >= 3, "правило дождалось имени, а не спросило один раз"
+        assert room._request_camera_clip.call_args.kwargs['names'] == {'t1': 'Антон'}
+        api.send_video.assert_awaited_once()
+        await alerts.close()
+    asyncio.run(run())
+
+
+def test_an_unknown_person_does_not_hold_the_clip_forever(tmp_path, monkeypatch):
+    """Незнакомый человек не задерживает видео дольше предела ожидания."""
+    from hub import presence_alerts
+
+    monkeypatch.setattr(presence_alerts, 'NAME_WAIT_STEP_S', 0.01)
+    monkeypatch.setattr(presence_alerts, 'NAME_WAIT_S', 0.05)
+
+    async def run():
+        api = provider()
+        api.send_video.return_value = {'ok': True, 'chat_id': -456, 'message_id': 3}
+        room = SimpleNamespace(receiving=False, session=SimpleNamespace(client_id='room'),
+                               _track_names=lambda: {}, _live_track_ids=lambda: ['t1'],
+                               _request_camera_clip=AsyncMock(return_value=b'mp4'))
+        alerts = engine(tmp_path, api, room)
+        alerts.save_rule({'enabled': True, 'media': 'video', 'destination': 'group',
+                          'min_stable_s': 0, 'min_frames': 1})
+        alerts.start()
+        started = time.monotonic()
+        alerts.observe(persons=1, source_id='room')
+        await alerts.drain()
+        assert time.monotonic() - started < 2.0, "клип просится сразу после ожидания"
+        assert room._request_camera_clip.call_args.kwargs['names'] == {}
+        api.send_video.assert_awaited_once()
+        await alerts.close()
+    asyncio.run(run())
+
+
+def test_a_room_without_track_names_is_asked_exactly_as_before(tmp_path):
+    """Комната без карты имён (старый клиент) не ждёт ничего лишнего."""
+    async def run():
+        api = provider()
+        api.send_image.return_value = {'ok': True, 'chat_id': -456, 'message_id': 3}
+        room = SimpleNamespace(receiving=False, session=SimpleNamespace(client_id='room'),
+                               _request_camera_clip=AsyncMock(return_value=b'mp4'))
+        alerts = engine(tmp_path, api, room)
+        alerts.save_rule({'enabled': True, 'media': 'video', 'destination': 'group',
+                          'min_stable_s': 0, 'min_frames': 1})
+        alerts.start()
+        alerts.observe(persons=1, source_id='room')
+        await alerts.drain()
+        assert room._request_camera_clip.call_args.kwargs['names'] is None
         await alerts.close()
     asyncio.run(run())
 

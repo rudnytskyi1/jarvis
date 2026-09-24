@@ -36,6 +36,20 @@ _CHANGED = 'The element changed. Read the page again.'
 #: Enter instantly and loads afterwards, so reading the document once (as the
 #: first version did, 0.45 s later) sees the page that was already there.
 NAVIGATE_WAIT_S = 8.0
+#: How long the page the window is ALREADY on is given to stop changing before
+#: a new address is typed into that same window. buro failed twice in a row on
+#: "www.google.com" typed straight after "youtube.com"
+#: (data/room-eval/audit-buro.json, RA-035): the browser was still loading the
+#: previous page, the text never reached the address bar, and the window stayed
+#: on YouTube for the whole wait. A settled page repeats the same address and
+#: title, so this costs nothing on an idle window.
+NAVIGATE_SETTLE_S = 2.5
+NAVIGATE_SETTLE_POLL_S = 0.25
+#: How many times the WHOLE address entry is tried - Ctrl+L, type, Enter - when
+#: the page does not change. One swallowed entry is a race, two in a row is a
+#: real failure the room has to hear about. Two rounds of NAVIGATE_WAIT_S still
+#: fit the hub's own action budget (hub.app.ACTION_TIMEOUT_S = 35 s).
+NAVIGATE_ROUNDS = 2
 #: How long a window that shows no page at all is asked again before the tool
 #: admits it cannot read it. Chrome hands the document of a page it is still
 #: building over a moment after the first query, so one empty answer is not
@@ -89,6 +103,16 @@ def _host(url: str) -> str:
     """The host a navigation targets, without ``www.``; '' when there is none."""
     host = str(urlsplit(str(url)).netloc or '').casefold()
     return host[4:] if host.startswith('www.') else host
+
+
+def _page_point(page) -> tuple[str, str]:
+    """What a page shows, in the two fields a still page repeats.
+
+    Deliberately not the whole window key: Chrome hands out a new accessibility
+    runtime id on every read (see ``_WindowsUIA.page``), so comparing the key
+    would report a perfectly still page as busy forever.
+    """
+    return (str(page.get('url') or '').strip(), str(page.get('title') or '').strip())
 
 
 def _blank_url(url: object) -> bool:
@@ -435,14 +459,18 @@ class _WindowsUIA:
             elif not self._focused_within(window, address, stop):
                 log.info('UIA did not report the address bar as focused; typing anyway')
             self._type(window, url, stop)
-            if attempt == 1 and address is not None:
-                typed = self._value(address).strip()
+            if attempt == 1:
+                typed = self._value(address).strip() if address is not None else ''
                 host = _host(url)
-                # An address bar that reports something else (including
-                # nothing) did not take the text: ask for the focus once more.
-                if host and host not in typed.casefold():
-                    log.warning('The address bar shows %r after typing; pressing Ctrl+L again',
-                                typed[:60])
+                # An address bar that was not found yet - the page is still
+                # building its tree, and buro hit exactly this with a loading
+                # YouTube (RA-035) - or one that reports something else
+                # (including nothing) did not take the text: ask for the focus
+                # once more. The last attempt always types and presses Enter,
+                # and the loaded page is what proves the address opened.
+                if address is None or (host and host not in typed.casefold()):
+                    log.warning('The address bar does not show the typed address (%r); '
+                                'pressing Ctrl+L again', typed[:60])
                     continue
             break
         self.key(window, 'enter', stop)
@@ -529,6 +557,9 @@ class DesktopBrowserController:
         self._stop = None
         self._refs = {}
         self._choices = {}
+        #: The last page a failed navigation read, so the refusal can name the
+        #: page the browser was left on (AU-22).
+        self._last_page = {}
         self._revision = 0
         self._closed = False
 
@@ -736,9 +767,65 @@ class DesktopBrowserController:
         page (or the popup) it had before. Neither does every new document: a
         window that held no page yet renders its own new tab page first, and
         that start page was reported as the site that had just opened.
+
+        Two things were added for AU-22, after buro failed the same action
+        twice in a row (RA-035: ``www.google.com`` typed straight after
+        ``youtube.com``, and the window stayed on YouTube). First the page the
+        window is already on is given a moment to stop changing - the address
+        that was typed into a page still hydrating never reached the bar. Then
+        the WHOLE entry is repeated once when the new page does not arrive: one
+        swallowed Ctrl+L is a race, and the room hears about it only if the
+        second entry lands nothing either.
         """
         wanted = _host(url)
-        attempt(lambda: self._backend.navigate(window, url, stop), attempts=2)
+        page = before
+        for round_index in range(1, NAVIGATE_ROUNDS + 1):
+            if round_index == 1:
+                before = self._settled_page(window, before, stop)
+            attempt(lambda: self._backend.navigate(window, url, stop), attempts=2)
+            landed = self._wait_for_landing(window, before, wanted, stop)
+            if landed is not None:
+                return landed
+            page = self._last_page or page
+            if round_index < NAVIGATE_ROUNDS:
+                log.info('The address %r did not open in round %d; typing it once more',
+                         url, round_index)
+        still = self._still_on(page)
+        typed = str(page.get('typed') or '').strip()
+        raise ValueError(
+            f'The address bar did not open {wanted or url}: the browser is still on '
+            f'{still}' + (f' with {typed!r} typed in the address bar' if typed else '')
+            + '. Focus that browser window and retry.')
+
+    def _settled_page(self, window, page, stop):
+        """The page the window is already on, once it stops changing (AU-22).
+
+        A page still loading changes its address or its title between reads; a
+        page that has settled repeats the same pair. If it never settles the
+        last reading is returned anyway - the retry below is what really makes
+        the entry stick, and waiting forever would only cost the person time.
+        """
+        deadline = time.monotonic() + NAVIGATE_SETTLE_S
+        seen = _page_point(page)
+        while time.monotonic() < deadline:
+            stop.wait(NAVIGATE_SETTLE_POLL_S)
+            _cancelled(stop)
+            try:
+                page = attempt(lambda: self._backend.page(window, stop), attempts=2)
+            except Exception:  # noqa: BLE001 - a page still building its tree
+                continue
+            point = _page_point(page)
+            if point and point == seen:
+                return page
+            seen = point
+        return page
+
+    def _wait_for_landing(self, window, before, wanted, stop):
+        """The new page, or ``None`` when it did not arrive in NAVIGATE_WAIT_S.
+
+        The last reading is kept in :attr:`_last_page` so the failure message
+        can name the page the browser was left on.
+        """
         deadline = time.monotonic() + NAVIGATE_WAIT_S
         page = before
         while True:
@@ -757,13 +844,8 @@ class DesktopBrowserController:
             if landed or moved:
                 return page
             if time.monotonic() >= deadline:
-                break
-        still = self._still_on(page)
-        typed = str(page.get('typed') or '').strip()
-        raise ValueError(
-            f'The address bar did not open {wanted or url}: the browser is still on '
-            f'{still}' + (f' with {typed!r} typed in the address bar' if typed else '')
-            + '. Focus that browser window and retry.')
+                self._last_page = page
+                return None
 
     @staticmethod
     def _still_on(page) -> str:

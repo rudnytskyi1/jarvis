@@ -53,6 +53,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from functools import lru_cache
@@ -155,6 +156,23 @@ QUICK_PASS_IMGSZ = 640
 #: Two guard-triggered bursts closer than this are the same person walking
 #: through, not two people: the hub needs a burst, not a stream of them.
 QUICK_PASS_COOLDOWN_S = 4.0
+#: Владелец 2026-09-24: «если быстро перед камерой пройти то почему-то не
+#: записывает человека». Клип начинался в момент запроса, а правило
+#: срабатывает на кадр-два позже — человек к этому времени уже вышел, и в
+#: видео пустая комната. Поэтому поток захвата держит последние секунды
+#: маленьких JPEG (без рамок: рамки и имена рисуются при записи, когда хаб уже
+#: прислал, кого он узнал), и клип начинается с них.
+PREROLL_SECONDS = 4.0
+PREROLL_FPS = 8.0
+#: Side a pre-roll frame is scaled to before encoding; the same cap the clip
+#: writer scales live frames to, so the video keeps one constant size.
+PREROLL_MAX_SIDE = 960
+#: Владелец 2026-09-24: «открыть камеру и чтобы оно показывало видео с камеры на
+#: экране и все детекции». The live preview draws the boxes of the LAST inference
+#: straight from here: every class the detector saw (not only people and the
+#: attention groups), with its confidence. Only the newest frame is kept, so this
+#: costs one small list per inference and never touches the wire.
+LIVE_PREVIEW_MAX_DETECTIONS = 40
 
 SendJson = Callable[[dict[str, Any]], Awaitable[None]]
 SendBytes = Callable[[bytes], Awaitable[None]]
@@ -282,9 +300,19 @@ class CameraService:
         #: memory so a person who steps out and comes back keeps the same id.
         self.tracks = TrackRegistry()
         self._track_reports: list = []
+        #: Владелец 2026-09-24: the boxes of the last inference for the live
+        #: preview window (see :data:`LIVE_PREVIEW_MAX_DETECTIONS`).
+        self._last_detections: list[dict[str, Any]] = []
         self._sent_track_ids: tuple[str, ...] = ()
         self._sent_tracks_at = 0.0
         self._tracks_message = bool(_attr(cfg_camera, 'tracks_message', True))
+        #: Владелец 2026-09-24: the last seconds of frames, so an alert clip of
+        #: somebody who walked past quickly still shows that person (see
+        #: :data:`PREROLL_SECONDS`). Frames are small JPEGs; the boxes and the
+        #: names are drawn when the clip is written.
+        self._preroll: deque = deque(maxlen=max(2, int(PREROLL_SECONDS * PREROLL_FPS) + 2))
+        self._preroll_lock = threading.Lock()
+        self._preroll_at = 0.0
         #: ТЗ F-202: on appearance, every 2 s, and whenever the view changes.
         self._crop_schedule = CropSchedule()
         self._enabled = bool(_attr(cfg_camera, "enabled", False))
@@ -835,6 +863,10 @@ class CameraService:
                     self._frame = frame
                     self._frame_ts = time.monotonic()
                     self._captured_count += 1
+                # Владелец 2026-09-24: keep the recent past, so an alert clip
+                # that starts a second after somebody walked past still shows
+                # them (PREROLL_SECONDS). Cheap: a few small JPEGs per second.
+                self._sample_preroll(frame)
                 # read() waits for the device; extra sleeps reduce capture FPS.
                 self._new_frame.set()
         finally:
@@ -863,6 +895,66 @@ class CameraService:
         """
         with self._frame_lock:
             return self._frame, self._frame_ts
+
+    def _sample_preroll(self, frame: Any) -> None:
+        """Keep one small JPEG of the last :data:`PREROLL_SECONDS` seconds.
+
+        Runs in the capture thread, which must stay quick: one frame every
+        ``1 / PREROLL_FPS`` is scaled to at most :data:`PREROLL_MAX_SIDE` and
+        encoded once (a few milliseconds). The tracks of that moment are stored
+        beside the picture, not drawn into it - the names come from the hub with
+        the clip request, which happens later.
+        """
+        cv2 = self._cv2
+        if cv2 is None or frame is None or not getattr(frame, "size", 0):
+            return
+        if not self.privacy.allows_frames:
+            # Приватный режим: кадры комнаты не храним даже в памяти.
+            return
+        now = time.monotonic()
+        if now - self._preroll_at < 1.0 / PREROLL_FPS:
+            return
+        self._preroll_at = now
+        try:
+            height, width = frame.shape[:2]
+            scale = min(1.0, PREROLL_MAX_SIDE / float(max(width, height)))
+            small = frame
+            if scale < 1.0:
+                small = cv2.resize(frame, (max(2, int(width * scale) // 2 * 2),
+                                           max(2, int(height * scale) // 2 * 2)),
+                                   interpolation=cv2.INTER_AREA)
+            ok, encoded = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                return
+        except Exception:  # noqa: BLE001 - the buffer must never hurt the camera
+            log.debug("Could not keep a pre-roll frame", exc_info=True)
+            return
+        tracks = [dict(track) for track in list(getattr(self, "_tracks", []))]
+        with self._preroll_lock:
+            self._preroll.append((now, bytes(encoded), tracks))
+
+    def preroll_frames(self, seconds: float) -> list[tuple[float, Any, list[dict[str, Any]]]]:
+        """The stored frames of the last ``seconds``, oldest first.
+
+        Each item is ``(monotonic, image, tracks)``; an unreadable JPEG is
+        dropped instead of failing the clip. Called from the clip worker thread.
+        """
+        cv2 = self._cv2
+        if cv2 is None or seconds <= 0:
+            return []
+        try:
+            import numpy as np
+        except Exception:  # pragma: no cover - numpy ships with the client
+            return []
+        cutoff = time.monotonic() - float(seconds)
+        with self._preroll_lock:
+            kept = [item for item in self._preroll if item[0] >= cutoff]
+        frames: list[tuple[float, Any, list[dict[str, Any]]]] = []
+        for at, encoded, tracks in kept:
+            image = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is not None and getattr(image, "size", 0):
+                frames.append((at, image, [dict(track) for track in tracks]))
+        return frames
 
     def _await_fresh_frame(self, newer_than: float) -> tuple[Any, float]:
         """Block briefly for a capture-thread frame newer than ``newer_than``.
@@ -1378,6 +1470,22 @@ class CameraService:
         # полем, а не третьим значением, чтобы `_detect` остался тем же
         # вызовом, что и раньше (клиенты и тесты зовут его как пару).
         self._attention_found = attention
+        # Владелец 2026-09-24: the live preview shows EVERY box of the last
+        # inference, not only people and attention groups. Kept as plain floats
+        # so the drawing thread never touches torch tensors.
+        drawn: list[dict[str, Any]] = []
+        for box_index, (class_id, confidence) in enumerate(zip(class_list, conf_list)):
+            if float(confidence) < CONF_THRESHOLD or box_index >= len(positions):
+                continue
+            index = int(class_id)
+            label = str(names.get(index, index) if isinstance(names, dict) else index)
+            coords = [max(0., min(1., float(v))) for v in positions[box_index][:4]]
+            if len(coords) != 4:
+                continue
+            drawn.append({'label': label, 'box': coords, 'conf': float(confidence)})
+            if len(drawn) >= LIVE_PREVIEW_MAX_DETECTIONS:
+                break
+        self._last_detections = drawn
         return int(persons), counts
 
     def _report_performance(self):

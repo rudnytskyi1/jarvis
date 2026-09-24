@@ -86,19 +86,23 @@ from hub import (
 )
 from hub import automation as automation_mod
 from hub import briefing as briefing_mod
+from hub import co_watch as co_watch_mod
 from hub import computer_use as computer_use_mod
 from hub import device_state as device_state_mod
+from hub import do_not_disturb as dnd_mod
 from hub import emotions as emotions_mod
 from hub import games as games_mod
 from hub import greetings as greeting_mod
 from hub import guess_who as guess_who_mod
 from hub import intercom as intercom_mod
 from hub import metrics as metrics_mod
+from hub import notes as notes_mod
 from hub import ocr as ocr_mod
 from hub import privacy as privacy_mod
 from hub import reminders as reminders_mod
 from hub import segment as segment_mod
 from hub import shared_events as shared_events_mod
+from hub import shopping as shopping_mod
 from hub import skill_state as skill_state_mod
 from hub import speaker as speaker_mod
 from hub import untrusted as untrusted_mod
@@ -136,8 +140,9 @@ from hub.decision_points import (
     claim_guard_heuristic,
     continuation_heuristic,
     looks_like_injection,
+    site_step_unfinished,
     untrusted_text,
-)
+    )
 from hub.dialog_turns import DialogTurns
 from hub.diarization import DiarizationEngine
 from hub.early_start import (
@@ -177,7 +182,7 @@ from hub.languages import instruction as language_instruction
 from hub.languages import language_of as preferred_language_of
 from hub.languages import stt_hint as stt_language_hint
 from hub.live_transcript import LiveTranscript, PreviewSTT
-from hub.llm import LlmClient, LlmResult, is_imperative_request
+from hub.llm import LlmClient, LlmResult, is_imperative_request, sounds_like_the_self_check
 from hub.local_commands import direct_command
 from hub.model_router import LevelPool, LevelUnavailable, ModelRouter, RoutingReport
 from hub.multi_step import failure_report as multi_step_report
@@ -380,6 +385,10 @@ SAY_FALLBACK_GREETING_KNOWN = "Hello again, {name}."
 #: While voice enrollment is collecting samples the user needs room to speak:
 #: the follow-up window the client holds open after our reply (SPEC §4 say.listen_s).
 ENROLL_LISTEN_S = 12.0
+#: Владелец 2026-09-24: how often the hub refreshes the track names drawn on a
+#: room's live camera preview. Only a changed map is sent, so a quiet room costs
+#: one comparison every two seconds and nothing on the wire.
+PREVIEW_NAMES_INTERVAL_S = 2.0
 
 #: Cap for the self-check pass so it can never hang a reply.
 VERIFY_TIMEOUT_S = 60.0
@@ -865,6 +874,14 @@ _guest_grants: Any = None
 _preferences: Any = None
 #: ``IntercomStore`` — очередь сообщений между комнатами (F-601).
 _intercom: Any = None
+#: ТЗ F-609: очередь голосовых заметок друг другу (``VoiceNoteStore``).
+_notes: Any = None
+#: ТЗ F-609: служба заметок — запись голоса и очередь в одном месте.
+_notes_service_cache: Any = None
+#: ТЗ F-610: общий список покупок и дел группы домов (``ShoppingStore``).
+_shopping: Any = None
+#: ТЗ F-611: статусы «не беспокоить» (``DoNotDisturbStore``).
+_dnd: Any = None
 #: ``PollStore`` — опросы между комнатами (F-604).
 _polls: Any = None
 #: ``PushService`` — пуш-канал телефона: отправлено или очередь (F-712).
@@ -1634,6 +1651,217 @@ def _game_timeout_handler(engine: Any) -> Any:
     return handler
 
 
+def _notes_store(conn: Any = None) -> Any:
+    """ТЗ F-609: очередь голосовых заметок — или ``None`` без базы хаба."""
+    global _notes
+    if _notes is None:
+        try:
+            # Живое соединение хаба берётся первым: ``_hub_gateway()``
+            # открывает свою базу и подменил бы уже открытую.
+            if conn is None:
+                conn = _hub_conn
+            if conn is None:
+                _hub_gateway()  # готовит data/hub.db и оставляет соединение открытым
+                conn = _hub_conn
+            if conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            settings = getattr(get_config().server, "notes", None)
+            _notes = notes_mod.VoiceNoteStore(
+                conn,
+                queue_limit=int(getattr(settings, "queue_limit",
+                                        notes_mod.DEFAULT_QUEUE_LIMIT) or 1),
+                ttl_days=int(getattr(settings, "ttl_days",
+                                     notes_mod.DEFAULT_TTL_DAYS) or 1))
+        except Exception as exc:  # noqa: BLE001 - заметки не стоят работы хаба
+            log.info("The voice-note queue is unavailable (%s)", exc)
+            _notes = False
+    return _notes or None
+
+
+def _notes_service() -> Any:
+    """ТЗ F-609: служба заметок — медиаха, очередь и настройки в одном месте."""
+    global _notes_service_cache
+    if _notes_service_cache is None:
+        settings = getattr(get_config().server, "notes", None)
+        if settings is None or not bool(getattr(settings, "enabled", True)):
+            return None
+        store = _notes_store()
+        if store is None:
+            return None
+        _notes_service_cache = notes_mod.NoteService(
+            store=store, media=_media_store(), settings=settings, audit=_audit_log())
+    return _notes_service_cache
+
+
+async def _play_note_in_home(home_id: str, note: Any) -> bool:
+    """Проиграть ГОЛОСОВУЮ заметку в комнате получателя (ТЗ F-609).
+
+    Сначала комната слышит, от кого заметка, потом звучит сама запись —
+    настоящий WAV из медиаха хаба, а не пересказ. ``False`` значит «проиграть
+    не удалось»: заметка остаётся в очереди.
+    """
+    connection = _home_connection(home_id)
+    if connection is None:
+        log.info("No live client in %s to play voice note %s", home_id,
+                 getattr(note, "note_id", ""))
+        return False
+    data = _media_bytes(str(getattr(note, "media_ref", "") or ""))
+    if data is None:
+        log.info("The voice note %s has no recording left", getattr(note, "note_id", ""))
+        return False
+    try:
+        pcm, rate = notes_mod.wav_pcm(data)
+    except ValueError as exc:
+        log.warning("The voice note %s is unreadable (%s)",
+                    getattr(note, "note_id", ""), exc)
+        return False
+    recipient = str(getattr(note, "to_person", "") or "")
+    author = _person_display_name(str(getattr(note, "from_person", "") or ""))
+    language = _person_language(recipient, fallback=str(getattr(connection, "language", "")
+                                                         or "ru"))
+    try:
+        await connection._say_proactive(
+            notes_mod.incoming_line(author, language=language), name=author)
+        await connection._send_play_audio(
+            pcm, rate, seconds=float(getattr(note, "seconds", 0.0) or 0.0),
+            title=notes_mod.play_title(author, language=language))
+    except Exception as exc:  # noqa: BLE001 - одна заметка не рушит проход
+        log.info("Could not play voice note %s in %s (%s)",
+                 getattr(note, "note_id", ""), home_id, exc)
+        return False
+    return True
+
+
+def _notes_delivery_task(cfg: Any = None, *, conn: Any = None, audit: Any = None):
+    """ТЗ F-609: доставка заметок при появлении человека — задача планировщика."""
+    cfg = cfg or get_config()
+    settings = getattr(cfg.server, "notes", None)
+    if settings is None or not bool(getattr(settings, "enabled", True)):
+        return None
+    try:
+        store = _notes_store(conn)
+        if store is None:
+            raise RuntimeError("the hub database is unavailable")
+        homes = [str(home.home_id) for home in (getattr(cfg, "homes", []) or [])]
+        task = notes_mod.VoiceNoteDeliveryTask(
+            store, play=_play_note_in_home,
+            present=lambda home: _room_presence(home, None),
+            homes=homes, audit=audit if audit is not None else _audit_log(),
+            batch=int(getattr(settings, "queue_limit", 20) or 20),
+            interval_s=float(getattr(settings, "check_interval_s", 30.0) or 30.0))
+        service = _notes_service()
+        if service is not None:
+            service.delivery = task
+        return task
+    except Exception as exc:  # noqa: BLE001 - задача не стоит запуска хаба
+        log.info("The voice-note delivery task is unavailable (%s)", exc)
+        return None
+
+
+def _shopping_store(conn: Any = None) -> Any:
+    """ТЗ F-610: общий список покупок и дел — или ``None`` без базы хаба."""
+    global _shopping
+    if _shopping is None:
+        try:
+            # Уже открытое соединение хаба важнее шлюза: ``_hub_gateway()``
+            # открывает СВОЮ базу, и вызов его поверх живого соединения увёл бы
+            # строки списка в другую базу (та же ловушка, что в P5-19/P5-20).
+            if conn is None:
+                conn = _hub_conn
+            if conn is None:
+                _hub_gateway()  # готовит data/hub.db и оставляет соединение открытым
+                conn = _hub_conn
+            if conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            settings = getattr(get_config().server, "shopping", None)
+            _shopping = shopping_mod.ShoppingStore(
+                conn, list_limit=int(getattr(settings, "list_limit",
+                                              shopping_mod.DEFAULT_LIST_LIMIT) or 1))
+        except Exception as exc:  # noqa: BLE001 - список не стоит работы хаба
+            log.info("The shopping list is unavailable (%s)", exc)
+            _shopping = False
+    return _shopping or None
+
+
+def _dnd_store(conn: Any = None) -> Any:
+    """ТЗ F-611: статусы «не беспокоить» — или ``None`` без базы хаба."""
+    global _dnd
+    if _dnd is None:
+        try:
+            # Живое соединение хаба берётся первым: ``_hub_gateway()``
+            # открывает свою базу и подменил бы уже открытую (см. P5-23).
+            if conn is None:
+                conn = _hub_conn
+            if conn is None:
+                _hub_gateway()
+                conn = _hub_conn
+            if conn is None:
+                raise RuntimeError("the hub database is unavailable")
+            _dnd = dnd_mod.DoNotDisturbStore(conn)
+        except Exception as exc:  # noqa: BLE001 - статус не стоит работы хаба
+            log.info("The do-not-disturb statuses are unavailable (%s)", exc)
+            _dnd = False
+    return _dnd or None
+
+
+def _dnd_active(person_id: str, *, now: float | None = None) -> bool:
+    """«Не беспокоить» ли сейчас человек; без базы — нет (как раньше)."""
+    store = _dnd_store()
+    if store is None:
+        return False
+    try:
+        return bool(store.active(person_id, now=now))
+    except Exception as exc:  # noqa: BLE001 - статус не глушит связь навсегда
+        log.debug("Could not read the do-not-disturb status of %s (%s)", person_id, exc)
+        return False
+
+
+def _dnd_status(person_id: str, *, now: float | None = None) -> Any:
+    """Активный статус человека (ТЗ F-611) или ``None``."""
+    store = _dnd_store()
+    if store is None:
+        return None
+    try:
+        return store.status_of(person_id, now=now)
+    except Exception as exc:  # noqa: BLE001 - статус не стоит ответа
+        log.debug("Could not read the do-not-disturb status of %s (%s)", person_id, exc)
+        return None
+
+
+def _shopping_homes(cfg: Any = None) -> list[str]:
+    """Комнаты группы списка (F-610): конфиг, а пусто — все дома хаба."""
+    cfg = cfg or get_config()
+    settings = getattr(getattr(cfg, "server", None), "shopping", None)
+    named = [str(home) for home in (getattr(settings, "homes", []) or []) if str(home)]
+    if named:
+        return named
+    return [str(home.home_id) for home in (getattr(cfg, "homes", []) or [])
+            if str(getattr(home, "home_id", "") or "")]
+
+
+def _shopping_card_frame(items: Any, *, more: int = 0,
+                         language: str = "ru") -> dict[str, Any]:
+    """ТЗ F-709/F-610: карточка списка для HUD комнаты."""
+    return {"type": proto.MSG_CARD, "kind": "shopping", "id": "shopping",
+            "title": shopping_mod.card_title(language=language),
+            "text": shopping_mod.card_text(items, language=language, more=more),
+            "ttl_s": float(proto.DEFAULT_CARD_TTL_S)}
+
+
+async def _show_shopping_in_homes(items: Any, *, more: int = 0,
+                                  language: str = "ru") -> int:
+    """Показать список на HUD всех комнат группы; вернуть число дошедших."""
+    shown = 0
+    for home in _shopping_homes():
+        frame = _shopping_card_frame(items, more=more, language=language)
+        try:
+            if await _push_card_in_home(home, frame):
+                shown += 1
+        except Exception as exc:  # noqa: BLE001 - одна комната не отменяет список
+            log.debug("Could not show the shopping list in %s (%s)", home, exc)
+    return shown
+
+
 async def _say_in_home(home_id: str, line: str, *, name: str = "") -> bool:
     """Сказать строку в комнате ``home_id``; ``False`` — там нет живого клиента."""
     connection = _live_connection(home_id)
@@ -1821,6 +2049,76 @@ def _telegram_room(client_id=None):
                if connection.session is not None and (client_id is None or connection.session.client_id == client_id)
                and connection.ws.client_state is WebSocketState.CONNECTED]
     return matches[0] if len(matches) == 1 else None
+
+
+def _normalise_room_name(value: Any) -> str:
+    """A computer name as it is compared: casefolded, no trailing "pc"."""
+    text = " ".join(str(value or "").split()).casefold()
+    for suffix in (" pc", "-pc", "_pc"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)].strip()
+    return text
+
+
+def _room_name_keys(connection: Any) -> set[str]:
+    """Every name one connected computer is known by (ТЗ F-701)."""
+    session = getattr(connection, "session", None)
+    values = [getattr(connection, "workplace_name", ""),
+              getattr(connection, "camera_name", ""),
+              getattr(session, "client_id", "") if session is not None else "",
+              _home_name(getattr(connection, "home_id", ""))]
+    return {_normalise_room_name(value) for value in values if str(value or "").strip()}
+
+
+def _connection_matches_room(connection: Any, wanted: str) -> bool:
+    """Whether one connection answers to the name the owner said."""
+    if not wanted or getattr(connection, "session", None) is None:
+        return False
+    for key in _room_name_keys(connection):
+        if key == wanted or key.startswith(wanted) or wanted.startswith(key):
+            return True
+    return False
+
+
+async def _web_camera_preview(room: Any, on: bool) -> dict[str, Any]:
+    """Owner web panel: open or close the live camera view on a room's screen.
+
+    Владелец 2026-09-24: «можешь на пк buro открыть камеру...». The voice tool
+    ``camera_preview`` does the same thing; this is the same switch reached from
+    ``/admin/preview``, so the owner does not have to speak to see the room.
+    """
+    target = str(room or '').strip()
+    connection, error = _room_for_name(target) if target else (_telegram_room(), '')
+    if error:
+        return {'ok': False, 'error': error}
+    if connection is None:
+        return {'ok': False, 'error': 'No room is connected right now.'}
+    return await connection.set_camera_preview(bool(on))
+
+
+def _room_for_name(target: Any) -> tuple[Any, str]:
+    """The connected room the owner named, or a reason why it is not there.
+
+    Владелец 2026-09-24: «открыть камеру на пк buro». Одна и та же адресация
+    нужна голосовому инструменту и кнопке веб-панели, поэтому она живёт здесь:
+    имя сравнивается с названием рабочего места, именем компьютера, ``client_id``
+    и именем дома, без учёта регистра и хвоста «pc». Неизвестное имя — честный
+    отказ со списком того, что подключено сейчас, а не тихая команда не тому ПК.
+    """
+    wanted = _normalise_room_name(target)
+    if not wanted:
+        return None, 'Name the computer (for example "buro").'
+    matches = [connection for connection in list(_connections)
+               if _connection_matches_room(connection, wanted)]
+    if len(matches) == 1:
+        return matches[0], ''
+    known = sorted({str(getattr(connection, 'workplace_name', '') or connection.peer)
+                    for connection in list(_connections)})
+    if len(matches) > 1:
+        return None, (f'More than one computer matches "{target}": '
+                      + ', '.join(known) + '. Say which one.')
+    return None, (f'There is no connected computer called "{target}". '
+                  f'Connected now: {", ".join(known) or "none"}.')
 
 
 def _telegram_owner(sender: Any) -> bool:
@@ -2136,10 +2434,18 @@ def workplace_display_name(client_id: str, sent_name: Any = "", *, stored: Any =
     sent = " ".join(str(sent_name or "").split())[:80]
     if sent and sent.casefold() != key.casefold():
         return sent
-    for candidate in (stored, home):
-        value = " ".join(str(candidate or "").split())[:80]
-        if value and value.casefold() != key.casefold():
-            return value
+    # Владелец 2026-09-23: «почему buro pc называется anton». The name already
+    # stored for this workplace outranks the room's own name. buro has no home
+    # of its own: it shares Anton's, whose name is "anton", and its own config
+    # sends exactly "buro" - which the guard below reads as "no name sent".
+    # Skipping a stored name only because it repeats the client id therefore
+    # renamed the friend's PC "anton" on every single hello.
+    stored_name = " ".join(str(stored or "").split())[:80]
+    if stored_name:
+        return stored_name
+    home_name = " ".join(str(home or "").split())[:80]
+    if home_name and home_name.casefold() != key.casefold():
+        return home_name
     return sent or key or "Room"
 
 
@@ -2268,11 +2574,19 @@ def _named_workplace(text: str) -> str:
     haystack = _fold_place(text)
     if not haystack:
         return ''
-    found: tuple[int, str] | None = None
+    # A live room wins over an offline namesake (владелец 2026-09-24). buro had
+    # a phantom twin: the first client run registered the workplace as
+    # "room-9de3bed07b44" and also called it "buro", so the list held two
+    # workplaces with that name. The earliest mention decided, the stale entry
+    # came first, and "Say to buro: …" answered "the room is unreachable" while
+    # the real buro was connected and answering. Ties are still broken by the
+    # earliest mention (so "from buro, not antondorm" stays unambiguous).
+    found: tuple[int, int, str] | None = None
     for row in _workplaces():
         identifier = str(row.get('id') or '')
         if not identifier:
             continue
+        rank = 0 if row.get('connected') else 1
         for candidate in (identifier, row.get('name'), row.get('camera_name')):
             token = _fold_place(candidate)
             if len(token) < 3:
@@ -2280,9 +2594,9 @@ def _named_workplace(text: str) -> str:
             index = haystack.find(token)
             if index < 0:
                 continue
-            if found is None or index < found[0]:
-                found = (index, identifier)
-    return found[1] if found else ''
+            if found is None or (rank, index) < (found[0], found[1]):
+                found = (rank, index, identifier)
+    return found[2] if found else ''
 
 
 async def _admin_rename_profile(old, new):
@@ -3690,7 +4004,10 @@ def _home_intercom_quiet(home_id: str, person_id: str) -> bool:
     одного человека, а не для всего дома.
     """
     if not home_id or not _home_quiet_now(home_id):
-        return False
+        # ТЗ F-611: «я занят до 18» глушит и вне тихих часов — статус сильнее
+        # расписания дома, иначе человек, ушедший в работу, всё равно услышал бы
+        # интерком и вопрос опроса.
+        return _dnd_active(person_id)
     if _hub_conn is None:
         return True
     try:
@@ -4865,10 +5182,14 @@ def _hub_scheduler(cfg: Any = None, *, store: Any = None, audit: Any = None):
     if shared_events is not None:
         scheduler.add(Job(name=shared_events.name, interval_s=shared_events.interval_s,
                           run=shared_events.run))
+    # ТЗ F-609: голосовые заметки — человек услышит их, когда появится дома.
+    notes = _notes_delivery_task(cfg, audit=audit)
+    if notes is not None:
+        scheduler.add(Job(name=notes.name, interval_s=notes.interval_s, run=notes.run))
     if (media is None and nightly is None and delivery is None and rules is None
             and briefing is None and device_state is None and presence is None
             and intercom is None and polls is None and summaries is None and daily is None
-            and objects is None and shared_events is None):
+            and objects is None and shared_events is None and notes is None):
         return None
     return scheduler
 
@@ -4972,7 +5293,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             log.info("Telegram home owners seeded from config: %d grant(s)", seeded)
         _presence_alerts = PresenceAlerts(REPO_ROOT / 'data' / 'telegram' / 'alerts',
             get_provider=lambda: _telegram, get_room=_telegram_room,
-            owner_id=cfg.server.telegram.control_user_id, group_id=cfg.server.telegram.chat_id,
+            owner_id=cfg.server.telegram.control_user_id,
+            # Владелец 2026-09-23: «пусть уведомления в notification group chat
+            # шлёт». Уведомления (правила присутствия и «камера не работает»)
+            # уходят в отдельную группу, когда она названа в конфиге; без неё —
+            # прежнее поведение, основная группа.
+            group_id=(cfg.server.telegram.notifications_chat_id
+                      or cfg.server.telegram.chat_id),
             get_home=_alert_home,
             # ТЗ F-702: "Private chat (everyone)" — все, у кого есть доступ.
             get_private_recipients=lambda: _telegram_access.private_recipients())
@@ -5113,7 +5440,7 @@ def _mount_web_admin() -> None:
 
         _hub_gateway()
         data = WebAdminData(_hub_db_path()) if _hub_conn is not None else None
-        _web_admin_auth = mount(app, cfg=cfg, data=data)
+        _web_admin_auth = mount(app, cfg=cfg, data=data, preview=_web_camera_preview)
     except Exception as exc:  # noqa: BLE001 - the panel never blocks the hub
         log.warning("The owner web panel could not be mounted (%s)", exc)
 
@@ -5195,7 +5522,59 @@ async def health() -> dict[str, Any]:
         "emotion": _emotion_service().snapshot(),
         # ТЗ F-608/F-407: игры между комнатами — флаг, партия и таймеры скиллов.
         "games": _games_snapshot(),
+        # ТЗ F-609: голосовые заметки — флаг, очередь по состояниям и счёт.
+        "notes": _notes_snapshot(),
+        # ТЗ F-610: общий список покупок и дел — группа домов и состояния.
+        "shopping": _shopping_snapshot(),
+        # ТЗ F-611: кто сейчас «не беспокоить».
+        "do_not_disturb": _dnd_snapshot(),
     }
+
+
+def _dnd_snapshot() -> dict[str, Any]:
+    """ТЗ F-611: что хаб показывает про статусы «не беспокоить» (``/health``)."""
+    settings = getattr(get_config().server, "do_not_disturb", None)
+    enabled = bool(getattr(settings, "enabled", False)) if settings is not None else False
+    store = _dnd_store() if enabled else None
+    if store is None:
+        return {"enabled": enabled, "busy": [], "count": 0}
+    try:
+        snapshot = store.snapshot()
+    except Exception as exc:  # noqa: BLE001 - /health не стоит статуса
+        log.debug("Could not read the do-not-disturb statuses (%s)", exc)
+        snapshot = {"busy": [], "count": 0}
+    snapshot["enabled"] = enabled
+    return snapshot
+
+
+def _shopping_snapshot() -> dict[str, Any]:
+    """ТЗ F-610: что хаб показывает про общий список (``/health``)."""
+    settings = getattr(get_config().server, "shopping", None)
+    enabled = bool(getattr(settings, "enabled", False)) if settings is not None else False
+    store = _shopping_store() if enabled else None
+    counts = {str(status): 0 for status in shopping_mod.ItemStatus}
+    if store is not None:
+        try:
+            counts = store.counts()
+        except Exception as exc:  # noqa: BLE001 - /health не стоит списка
+            log.debug("Could not count the shopping list (%s)", exc)
+    return {"enabled": enabled, "homes": _shopping_homes(),
+            "group": shopping_mod.DEFAULT_GROUP, "counts": counts}
+
+
+def _notes_snapshot() -> dict[str, Any]:
+    """ТЗ F-609: что хаб показывает про голосовые заметки (``/health``)."""
+    settings = getattr(get_config().server, "notes", None)
+    enabled = bool(getattr(settings, "enabled", False)) if settings is not None else False
+    ttl_days = int(getattr(settings, "ttl_days", notes_mod.DEFAULT_TTL_DAYS) or 1)
+    service = _notes_service()
+    if service is None:
+        return {"enabled": enabled, "ttl_days": ttl_days, "recorded": 0, "refused": 0,
+                "counts": {str(status): 0 for status in notes_mod.NoteStatus},
+                "delivered": 0}
+    snapshot = service.snapshot()
+    snapshot["enabled"] = enabled
+    return snapshot
 
 
 def _games_snapshot() -> dict[str, Any]:
@@ -5689,6 +6068,8 @@ class Connection(CameraClipReceiver):
             self._on_image_header(SOURCE_CAMERA, payload)
         elif msg_type == proto.MSG_CAMERA_ERROR:
             self._on_image_error(SOURCE_CAMERA, payload)
+        elif msg_type == proto.MSG_ROOM_HEALTH:
+            await self._on_room_health(payload)
         elif msg_type == proto.MSG_CAMERA_CLIP:
             self._on_clip_header(payload)
         elif msg_type == proto.MSG_CAMERA_CLIP_ERROR:
@@ -5871,6 +6252,9 @@ class Connection(CameraClipReceiver):
                                         home_id=self.home_id or ''))
         self._can_confirm_voice = 'voice_confirmation' in (payload.get('capabilities') or [])
         self._can_live_transcribe = 'live_transcript' in (payload.get('capabilities') or [])
+        # Владелец 2026-09-24: live camera preview on the room screen.
+        self._can_camera_preview = ('camera_preview' in (payload.get('capabilities') or [])
+                                    and kind != proto.ClientKind.PHONE.value)
         # ТЗ F-303: приватность живёт на клиенте; клиент, который перезапустился
         # с включённым режимом, говорит об этом сам.
         self._privacy = bool(payload.get('privacy'))
@@ -6433,11 +6817,22 @@ class Connection(CameraClipReceiver):
             return None
         if not _needs_admin_identity(tool, args):
             return None
+        settings = getattr(self.cfg.server, 'identity', None)
+        # A Telegram turn has no microphone to match and no camera pointed at
+        # the sender: the account itself was already authenticated (numeric id
+        # plus the access store), and that IS the proof. Without this the
+        # owner's own request «закрой все Notepad на пк anton и пришли
+        # скриншот» died at 2026-09-24 00:07 with "nobody is identified".
+        if str(getattr(self, '_speaker_name', '')).startswith('telegram:'):
+            return None
+        # Владелец 2026-09-24: the extra voice+face proof for irreversible calls
+        # is his to switch off; the role matrix above still decides who may ask.
+        if not bool(getattr(settings, 'admin_second_factor', True)):
+            return None
         from hub.identity_fusion import admin_gate
 
         person_id = _person_id_of(self._known_speaker_name())
         face_score, body_linked = self._admin_evidence(person_id or '')
-        settings = getattr(self.cfg.server, 'identity', None)
         channel = self._client_channel()
         decision = admin_gate(
             person_id=person_id, voice_score=self._speaker_score, face_score=face_score,
@@ -7969,6 +8364,470 @@ class Connection(CameraClipReceiver):
                                       text=text, note="guess_no_rooms")
         return True
 
+    async def _notes_turn(self, text: str, language: str, voice: Any, started_at: float,
+                          session: Any, stt_ms: int, pcm: bytes) -> bool:
+        """ТЗ F-609: голосовые заметки друг другу — запись и выдача по приходу.
+
+        Заметка идёт тем же путём, что интерком: согласие (F-602) → запись
+        голоса в медиаха хаба (F-304, TTL 7 дней) → очередь дома ПОЛУЧАТЕЛЯ.
+        Прозвучит она при его появлении (задача ``notes.deliver``), то есть
+        через ``play_audio`` настоящей записью, а не пересказом словами.
+
+        Фраза «оставь Максу голосовое» только открывает запись: сама заметка —
+        СЛЕДУЮЩАЯ реплика человека (окно ``ARM_WINDOW_S``), иначе в заметку
+        попало бы и сама просьба.
+        """
+        settings = getattr(getattr(self, "cfg", None), "server", None)
+        settings = getattr(settings, "notes", None)
+        if settings is None or not bool(getattr(settings, "enabled", True)):
+            return False
+        service = _notes_service()
+        if service is None:
+            return False
+        home = str(getattr(self, "home_id", "") or "")
+        now = time.time()
+        armed_until = float(getattr(self, "_note_arm", 0.0) or 0.0)
+        lang = language or self._reply_language or "ru"
+
+        requested = notes_mod.note_request(text)
+        if requested is not None:
+            sender = _person_id_spoken(self._known_speaker_name())
+            if sender is None:
+                await self._guess_say(_interhome_refusal(lang, "unknown_speaker"),
+                                      language=language, voice=voice, started_at=started_at,
+                                      session=session, stt_ms=stt_ms, text=text,
+                                      note="note_unknown_speaker")
+                return True
+            recipient = _person_id_spoken(requested.to)
+            if recipient is None:
+                await self._guess_say(
+                    notes_mod.unknown_person_line(requested.to, language=language),
+                    language=language, voice=voice, started_at=started_at, session=session,
+                    stt_ms=stt_ms, text=text, note="note_unknown_person")
+                return True
+            if recipient == sender:
+                await self._guess_say(notes_mod.self_line(language=language),
+                                      language=language, voice=voice, started_at=started_at,
+                                      session=session, stt_ms=stt_ms, text=text, note="note_self")
+                return True
+            recipient_home = self._home_of_person(recipient)
+            name = _person_display_name(recipient) or requested.to
+            if not recipient_home:
+                await self._guess_say(notes_mod.no_home_line(name, language=language),
+                                      language=language, voice=voice, started_at=started_at,
+                                      session=session, stt_ms=stt_ms, text=text,
+                                      note="note_no_home")
+                return True
+            # F-602: без взаимного согласия заметка не записывается вовсе.
+            refusal = self._interhome_gate(recipient, lang)
+            if refusal:
+                _record_intercom_event("note.leave", sender, recipient, home,
+                                       result="denied", detail={"reason": "no consent"})
+                await self._guess_say(refusal, language=language, voice=voice,
+                                      started_at=started_at, session=session, stt_ms=stt_ms,
+                                      text=text, note="note_no_consent")
+                return True
+            self._note_arm = now + notes_mod.ARM_WINDOW_S
+            self._note_to = {"person": recipient, "home": recipient_home, "name": name}
+            self._mystery_arm = 0.0  # явная просьба о заметке важнее прошлой игры
+            await self._guess_say(
+                notes_mod.arm_line(name, language=language, seconds=service.max_note_s),
+                language=language, voice=voice, started_at=started_at, session=session,
+                stt_ms=stt_ms, text=text, note="note_armed")
+            return True
+
+        if not armed_until or now > armed_until:
+            return False
+        pending = getattr(self, "_note_to", None) or {}
+        if not pending:
+            return False
+        # Другая команда в окне записи — это не заметка: окно закрывается, а
+        # реплику разбирают остальные ветки (иначе «угадай, кто сказал» попал
+        # бы в чужое голосовое).
+        if (guess_who_mod.is_guess_start(text) or games_mod.is_quiz_start(text)
+                or intercom_mod.intercom_request(text) is not None):
+            self._note_arm, self._note_to = 0.0, {}
+            return False
+        recipient = str(pending.get("person") or "")
+        name = str(pending.get("name") or "")
+        minimum = int(service.min_note_s * max(1, int(getattr(self, "sample_rate", 0) or 16000))) * 2
+        if not pcm or len(bytes(pcm)) < minimum:
+            # Окно остаётся открытым: человек просто повторит заметку.
+            await self._guess_say(notes_mod.too_short_line(language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="note_too_short")
+            return True
+        refusal = self._interhome_gate(recipient, lang)
+        if refusal:
+            self._note_arm, self._note_to = 0.0, {}
+            await self._guess_say(refusal, language=language, voice=voice,
+                                  started_at=started_at, session=session, stt_ms=stt_ms,
+                                  text=text, note="note_lost_consent")
+            return True
+        sender = _person_id_spoken(self._known_speaker_name()) or ""
+        try:
+            note = service.record(
+                from_person=sender, to_person=recipient,
+                home_id=str(pending.get("home") or ""), audio_pcm=bytes(pcm),
+                sample_rate=int(getattr(self, "sample_rate", 0) or 16000),
+                origin_home=home)
+        except notes_mod.NoteUnavailable as exc:
+            self._note_arm, self._note_to = 0.0, {}
+            await self._guess_say(notes_mod.unavailable_line(str(exc), language=language),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="note_unavailable")
+            return True
+        self._note_arm, self._note_to = 0.0, {}
+        log.info("Voice note %s from %s waits for %s in %s", note.note_id, sender,
+                 recipient, note.home_id)
+        await self._guess_say(
+            notes_mod.saved_line(name, language=language, days=service.ttl_days,
+                                 truncated=note.truncated),
+            language=language, voice=voice, started_at=started_at, session=session,
+            stt_ms=stt_ms, text=text, note="note_saved")
+        return True
+
+    async def _co_watch_turn(self, text: str, language: str, voice: Any, started_at: float,
+                             session: Any, stt_ms: int) -> bool:
+        """ТЗ F-612: совместный просмотр — сцена в двух комнатах и старт плеера.
+
+        Как и интерком, это межкомнатное действие, поэтому оно проходит через
+        тот же гейт взаимного согласия (F-602). Сцена ставится обеим комнатам
+        ОДНОВРЕМЕННО (``asyncio.gather``), плеер открывается одной и той же
+        командой тоже одновременно — это и есть «синхронный старт». Где
+        адаптер не смог (нет клиента, приложение не приняли, плеер не назван),
+        хаб говорит это прямо и не выдаёт неудачу за кино.
+        """
+        settings = getattr(getattr(self, "cfg", None), "server", None)
+        settings = getattr(settings, "co_watch", None)
+        if settings is None or not bool(getattr(settings, "enabled", True)):
+            return False
+        request = co_watch_mod.co_watch_request(text)
+        if request is None:
+            return False
+        lang = language or self._reply_language or "ru"
+        person = _person_id_of(self._known_speaker_name())
+        if person is None:
+            await self._guess_say(_interhome_refusal(lang, "unknown_speaker"),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="cowatch_unknown_speaker")
+            return True
+        partner = _person_id_spoken(request.partner)
+        if partner is None:
+            await self._guess_say(
+                co_watch_mod.unknown_person_line(request.partner, language=lang),
+                language=language, voice=voice, started_at=started_at, session=session,
+                stt_ms=stt_ms, text=text, note="cowatch_unknown_person")
+            return True
+        if partner == person:
+            await self._guess_say(co_watch_mod.self_line(language=lang),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="cowatch_self")
+            return True
+        home_a = str(getattr(self, "home_id", "") or "")
+        home_b = self._home_of_person(partner)
+        partner_name = _person_display_name(partner) or request.partner
+        if not home_b:
+            await self._guess_say(co_watch_mod.no_home_line(partner_name, language=lang),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="cowatch_no_home")
+            return True
+        if home_b == home_a:
+            await self._guess_say(co_watch_mod.self_line(language=lang),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="cowatch_same_room")
+            return True
+        other = _live_connection(home_b)
+        if other is None:
+            await self._guess_say(co_watch_mod.no_room_line(partner_name, language=lang),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="cowatch_no_room")
+            return True
+        refusal = self._interhome_gate(partner, lang)
+        if refusal:
+            await self._guess_say(refusal, language=language, voice=voice,
+                                  started_at=started_at, session=session, stt_ms=stt_ms,
+                                  text=text, note="cowatch_no_consent")
+            return True
+
+        scene = str(getattr(settings, "scene", co_watch_mod.DEFAULT_SCENE) or
+                    co_watch_mod.DEFAULT_SCENE)
+        session_ = co_watch_mod.CoWatchSession(
+            home_a=home_a, home_b=home_b, person_a=person, person_b=partner,
+            title=request.title, scene=scene, started_at=time.time())
+        reports = await asyncio.gather(
+            _co_watch_scene_in(home_a, scene), _co_watch_scene_in(home_b, scene),
+            return_exceptions=True)
+        for home, report in ((home_a, reports[0]), (home_b, reports[1])):
+            scene_ok = isinstance(report, dict) and bool(report.get("ok"))
+            note = ""
+            if isinstance(report, BaseException):
+                note = f"{type(report).__name__}: {report}"
+            elif isinstance(report, dict):
+                note = str(report.get("message") or "")
+            session_.rooms.append(co_watch_mod.CoWatchRoom(
+                home_id=home, scene_ok=scene_ok, scene_note="" if scene_ok else note))
+
+        player = str(getattr(settings, "player", "") or "").strip()
+        if player:
+            players = await asyncio.gather(
+                _start_player_in(self, player, home_a),
+                _start_player_in(other, player, home_b), return_exceptions=True)
+            for room, outcome in zip(session_.rooms, players, strict=False):
+                room.player_ok = bool(outcome is True)
+                if not room.player_ok:
+                    room.player_note = str(outcome) if isinstance(outcome, str) else \
+                        (f"{type(outcome).__name__}: {outcome}"
+                         if isinstance(outcome, BaseException) else
+                         "the room refused to open the player")
+        else:
+            note = co_watch_mod.player_missing_line(language=lang)
+            for room in session_.rooms:
+                room.player_note = note
+
+        line = co_watch_mod.started_line(session_, language=lang)
+        notes = [co_watch_mod.room_note(room, language=lang) for room in session_.rooms]
+        notes = [note for note in notes if note]
+        if notes:
+            line = f"{line} {' '.join(notes)}"
+        self._note_co_watch(session_)
+        log.info("Co-watch %s: %s + %s (%s)", session_.session_id, home_a, home_b,
+                 session_.title or "no title")
+        await self._guess_say(line, language=language, voice=voice, started_at=started_at,
+                              session=session, stt_ms=stt_ms, text=text, note="cowatch")
+        return True
+
+    def _note_co_watch(self, session_: Any) -> None:
+        """ТЗ F-706: совместный просмотр — привилегированное межкомнатное действие."""
+        audit = _audit_log()
+        if audit is None:
+            return
+        try:
+            audit.record(action="co_watch.start", actor=session_.person_a,
+                         target=session_.person_b, home_id=session_.home_a or None,
+                         result="ok",
+                         detail={"session_id": session_.session_id,
+                                 "home_b": session_.home_b,
+                                 "title": session_.title,
+                                 "scene": session_.scene,
+                                 "player_rooms": [room.home_id for room in session_.rooms
+                                                  if room.player_ok]})
+        except Exception:  # noqa: BLE001 - журнал не отменяет кино
+            log.debug("Could not audit the co-watch session", exc_info=True)
+
+    async def _dnd_turn(self, text: str, language: str, voice: Any, started_at: float,
+                        session: Any, stt_ms: int) -> bool:
+        """ТЗ F-611: «я занят до 18» — статус между комнатами.
+
+        Статус ставит сам человек своим голосом (узнанная личность): иначе
+        любой гость мог бы «занять» чужую комнату. Срок берётся парсером
+        напоминаний (F-417); срока нет — хаб спрашивает, а не выбирает час за
+        человека. Пока статус активен, интерком и вопросы опросов ждут в
+        очереди, а друзья слышат «занят до 18» (F-602: посторонний не слышит).
+        """
+        settings = getattr(getattr(self, "cfg", None), "server", None)
+        settings = getattr(settings, "do_not_disturb", None)
+        if settings is None or not bool(getattr(settings, "enabled", True)):
+            return False
+        lang = language or self._reply_language or "ru"
+        request = dnd_mod.dnd_command(text, now=datetime.now(UTC),
+                                      tz=self._home_timezone() or "UTC")
+        if request is None:
+            return False
+        store = _dnd_store()
+        if store is None:
+            return False
+        person = _person_id_of(self._known_speaker_name())
+        if person is None:
+            await self._guess_say(_interhome_refusal(lang, "unknown_speaker"),
+                                  language=language, voice=voice, started_at=started_at,
+                                  session=session, stt_ms=stt_ms, text=text,
+                                  note="dnd_unknown_speaker")
+            return True
+        name = _person_display_name(person) or self._known_speaker_name()
+        if request.kind is dnd_mod.DndKind.WHO:
+            busy = store.busy()
+            line = dnd_mod.who_line(busy, _person_display_name,
+                                    tz=self._home_timezone() or "UTC", language=lang)
+        elif request.kind is dnd_mod.DndKind.FREE:
+            store.clear(person)
+            line = dnd_mod.cleared_line(name, language=lang)
+            self._note_dnd("dnd.clear", person, "", home=str(self.home_id or ""))
+        elif not request.until:
+            line = dnd_mod.missing_time_line(language=lang)
+        else:
+            try:
+                status = store.set(person, request.until,
+                                   note=str(self._known_speaker_name() or ""),
+                                   home_id=str(self.home_id or ""))
+            except dnd_mod.DndError as exc:
+                line = dnd_mod.unavailable_line(str(exc), language=lang)
+            else:
+                line = dnd_mod.set_line(name, status.until,
+                                        tz=self._home_timezone() or "UTC", language=lang)
+                self._note_dnd("dnd.set", person, str(status.until),
+                               home=str(self.home_id or ""),
+                               detail={"until": status.until})
+        await self._guess_say(line, language=language, voice=voice, started_at=started_at,
+                              session=session, stt_ms=stt_ms, text=text, note="dnd")
+        return True
+
+    def _note_dnd(self, action: str, actor: str, target: str, *, home: str = "",
+                  detail: dict[str, Any] | None = None) -> None:
+        """ТЗ F-706: у статуса «не беспокоить» свой след в журнале."""
+        audit = _audit_log()
+        if audit is None:
+            return
+        try:
+            audit.record(action=action, actor=actor, target=str(target)[:120],
+                         home_id=home or None, result="ok", detail=dict(detail or {}))
+        except Exception:  # noqa: BLE001 - журнал не отменяет статус
+            log.debug("Could not audit the do-not-disturb status", exc_info=True)
+
+    async def _shopping_turn(self, text: str, language: str, voice: Any, started_at: float,
+                             session: Any, stt_ms: int) -> bool:
+        """ТЗ F-610: общий список покупок и дел — добавление голосом из комнаты.
+
+        Список принадлежит ГРУППЕ домов (``server.shopping.homes``, пусто — все
+        дома хаба), поэтому добавленное здесь видно и в других комнатах, и в
+        Telegram (инструмент ``shopping_list``), а на HUD уходит карточкой
+        (F-709). Вычеркнуть можно только то, что в списке есть: «купил молоко»
+        при отсутствии молока отвечает честно, а не заводит новую строку.
+        """
+        settings = getattr(getattr(self, "cfg", None), "server", None)
+        settings = getattr(settings, "shopping", None)
+        if settings is None or not bool(getattr(settings, "enabled", True)):
+            return False
+        request = shopping_mod.shopping_command(text)
+        if request is None:
+            return False
+        store = _shopping_store()
+        if store is None:
+            return False
+        lang = language or self._reply_language or "ru"
+        home = str(getattr(self, "home_id", "") or "")
+        person = _person_id_of(self._known_speaker_name()) or ""
+        line, items, more = self._shopping_apply(
+            request, person=person, home=home, language=lang, settings=settings)
+        await self._guess_say(line, language=language, voice=voice, started_at=started_at,
+                              session=session, stt_ms=stt_ms, text=text,
+                              note=f"shopping_{request.action}")
+        if await _show_shopping_in_homes(items, more=more, language=lang) == 0:
+            log.info("No room of the shopping group could show the list")
+        return True
+
+    def _shopping_apply(self, request: Any, *, person: str, home: str,
+                        language: str, settings: Any = None
+                        ) -> tuple[str, list[Any], int]:
+        """Выполнить одну просьбу о списке и вернуть (строку, пункты, остаток).
+
+        Одна точка и для голоса (``_shopping_turn``), и для инструмента
+        ``shopping_list`` (Telegram), поэтому список не может «разойтись»
+        между двумя путями.
+        """
+        store = _shopping_store()
+        if store is None:
+            return (shopping_mod.unavailable_line("the hub database is unavailable",
+                                                  language=language), [], 0)
+        limit = int(getattr(settings, "list_limit", shopping_mod.DEFAULT_LIST_LIMIT) or 1)
+        cap = int(getattr(settings, "max_items", 200) or 0)
+        action = request.action
+        changed: Any = None
+        try:
+            if action is shopping_mod.ShoppingAction.ADD:
+                _, total = store.open_items(limit=limit)
+                if cap and total >= cap:
+                    return (shopping_mod.unavailable_line(
+                        f"the list already holds {total} items", language=language), [], 0)
+                changed = store.add(request.text, added_by=person, home_id=home)
+                self._note_shopping("shopping.add", person, changed.text, home)
+            elif action is shopping_mod.ShoppingAction.DONE:
+                hits = store.find(request.text)
+                if not hits:
+                    return (shopping_mod.not_found_line(request.text, language=language), [], 0)
+                if not store.mark_done(hits[0].item_id):
+                    return (shopping_mod.not_found_line(request.text, language=language), [], 0)
+                changed = hits[0]
+                self._note_shopping("shopping.done", person, changed.text, home)
+            elif action is shopping_mod.ShoppingAction.REMOVE:
+                hits = store.find(request.text)
+                if not hits:
+                    return (shopping_mod.not_found_line(request.text, language=language), [], 0)
+                store.remove(hits[0].item_id)
+                changed = hits[0]
+                self._note_shopping("shopping.remove", person, changed.text, home)
+            elif action is shopping_mod.ShoppingAction.CLEAR:
+                removed = store.clear()
+                self._note_shopping("shopping.clear", person, f"{removed} item(s)", home,
+                                    detail={"removed": removed})
+                items, total = store.open_items(limit=limit)
+                return (shopping_mod.cleared_line(language=language, removed=removed),
+                        items, max(0, total - len(items)))
+        except shopping_mod.ShoppingError as exc:
+            return (shopping_mod.unavailable_line(str(exc), language=language), [], 0)
+        items, total = store.open_items(limit=limit)
+        more = max(0, total - len(items))
+        if action is shopping_mod.ShoppingAction.ADD:
+            line = shopping_mod.added_line(changed, language=language)
+        elif action is shopping_mod.ShoppingAction.DONE:
+            line = shopping_mod.done_line(changed, language=language)
+        elif action is shopping_mod.ShoppingAction.REMOVE:
+            line = shopping_mod.removed_line(changed, language=language)
+        else:
+            line = shopping_mod.list_line(items, language=language, more=more)
+        return (line, items, more)
+
+    def _note_shopping(self, action: str, actor: str, target: str, home_id: str, *,
+                       detail: dict[str, Any] | None = None) -> None:
+        """ТЗ F-706: список — общий ресурс группы, у него свой журнал."""
+        audit = _audit_log()
+        if audit is None:
+            return
+        try:
+            audit.record(action=action, actor=actor, target=str(target)[:120],
+                         home_id=home_id or None, result="ok", detail=dict(detail or {}))
+        except Exception:  # noqa: BLE001 - журнал не отменяет список
+            log.debug("Could not audit the shopping list", exc_info=True)
+
+    def _shopping_tool(self, args: dict[str, Any]) -> dict[str, Any]:
+        """ТЗ F-610: инструмент ``shopping_list`` — тот же список, но из Telegram.
+
+        Модель может и добавить пункт, и прочитать список: ответ приходит
+        настоящими строками из ``shopping_items``, поэтому Telegram видит то же,
+        что комната, а не пересказ памяти.
+        """
+        settings = getattr(getattr(self, "cfg", None), "server", None)
+        settings = getattr(settings, "shopping", None)
+        if settings is None or not bool(getattr(settings, "enabled", True)):
+            return {"ok": False, "error": "The shared list is turned off for this home."}
+        action = str(args.get("action") or "list").strip().casefold()
+        item = " ".join(str(args.get("item") or "").split())
+        try:
+            parsed = shopping_mod.ShoppingRequest(
+                action=shopping_mod.ShoppingAction(action), text=item)
+        except ValueError:
+            return {"ok": False,
+                    "error": "action must be add, list, done, remove or clear"}
+        needs_item = parsed.action in (shopping_mod.ShoppingAction.ADD,
+                                       shopping_mod.ShoppingAction.DONE,
+                                       shopping_mod.ShoppingAction.REMOVE)
+        if needs_item and not item:
+            return {"ok": False, "error": f"an item is needed for action={action}"}
+        home = str(getattr(self, "home_id", "") or "")
+        person = _person_id_spoken(self._known_speaker_name()) or ""
+        language = _person_language(person, fallback=self._reply_language or "ru")
+        line, items, more = self._shopping_apply(
+            parsed, person=person, home=home, language=language, settings=settings)
+        return {"ok": True, "action": action, "spoken": line,
+                "list": [item.text for item in items], "more": more}
+
     async def _guess_play(self, round_: Any, *, prompt: str, language: str) -> int:
         """Проиграть запись загадки в остальных комнатах партии (F-608).
 
@@ -8602,6 +9461,51 @@ class Connection(CameraClipReceiver):
                                     source=source)
             log.debug("Presence frame from %s announced as event %s", self.peer, event_id,
                       extra={'event_id': event_id})
+
+    async def _on_room_health(self, payload: dict[str, Any]) -> None:
+        """A room reports its own gear: the camera is gone or it is back.
+
+        Владелец 2026-09-23: «оно должно постоянно ретраить и в тг увед слать в
+        группу уведов если чет не работает». The client retries the device on its
+        own (``client/camera.py``); this is the sentence that reaches the owner's
+        notification group, sent ONCE per episode — the hub keeps its own
+        cooldown, so a client that keeps reconnecting cannot spam the group.
+        """
+        kind = ' '.join(str(payload.get('kind') or 'device').split())[:40]
+        ok = payload.get('ok') is True
+        detail = ' '.join(str(payload.get('detail') or '').split())[:200]
+        device = ' '.join(str(payload.get('camera') or '').split())[:60]
+        room = (self.workplace_name or self.home_id
+                or (self.session.client_id if self.session else '') or self.peer)
+        log.warning('Room %s reports %s %s%s', room, kind, 'working' if ok else 'not working',
+                    f' ({detail})' if detail else '')
+        alerts = _presence_alerts
+        if alerts is None:
+            return
+        key = f'room-health:{room}:{kind}'
+        where = f' ({device})' if device else ''
+        if kind == 'microphone':
+            # A deaf room is the worse half: the camera failing still leaves a
+            # room you can talk to, while a silent microphone means nobody can
+            # wake Rowan at all - «rowanai buropc не отзывается» (2026-09-23).
+            failure = (f'Rowan · {room}: the microphone is not working{where} — '
+                       f'{detail or "no audio frames"}. The room cannot hear its wake '
+                       'word; Rowan reopens the microphone by itself.')
+            recovery = f'Rowan · {room}: the microphone is working again.'
+        else:
+            failure = (f'Rowan · {room}: the camera is not working{where} — '
+                       f'{detail or "no frames"}. '
+                       'Rowan keeps retrying by itself; voice still works in that room.')
+            recovery = f'Rowan · {room}: the camera is working again.'
+        if ok:
+            # Только если о поломке действительно сказали: мигающая камера не
+            # должна превращать группу в поток строк «снова работает».
+            if alerts.system_notice_sent(key + ':failed', within_s=900.0):
+                await alerts.notify_system(
+                    recovery, key=key + ':recovered', cooldown_s=600.0)
+            return
+        await alerts.notify_system(
+            failure, key=key + ':failed', cooldown_s=900.0)
 
     def _on_image_error(self, source: str, payload: dict[str, Any]) -> None:
         """The client could not capture the screen / a camera frame (SPEC §4, v1.4)."""
@@ -9270,6 +10174,10 @@ class Connection(CameraClipReceiver):
         pending_control = getattr(self, '_telegram_control_task', None)
         if pending_control is not None and not pending_control.done():
             return {'ok': False, 'error': 'Rowan is handling a Telegram command. Try again when it finishes.'}
+        # ТЗ F-610: общий список покупок и дел — путь для модели и Telegram.
+        # Голос идёт тем же хранилищем через ``_shopping_turn``.
+        if name == 'shopping_list':
+            return self._shopping_tool(args)
         if name == 'recall_conversation':
             # ТЗ 9.4 (F-414, P3-17): the table is the source of history when
             # ``server.memory.dialogs_from_db`` says so; without the flag this
@@ -9377,6 +10285,8 @@ class Connection(CameraClipReceiver):
             return await self._run_telegram_send(args)
         if name == 'say_in_room':
             return await self._run_say_in_room(args)
+        if name == 'camera_preview':
+            return await self._run_camera_preview(args)
         if name == 'inspect_photo':
             return {'ok': False, 'error': 'Attach a photo in Telegram and ask what to do with it.'}
         if name == 'browser_control':
@@ -10557,14 +11467,137 @@ class Connection(CameraClipReceiver):
         The room's own tracks carry the display names face recognition gave
         them (F-204); a track nobody was identified in is simply absent, so the
         HUD shows a box without a name instead of a made-up one.
+
+        Владелец 2026-09-24: «не видно label (имя) на bounding box». Причина
+        была не в рисовании, а здесь: имя на трек ставит только прямое
+        распознавание лица (``resolve_face``), а личность в этой комнате
+        подтверждает ещё и слияние F-206/F-207 - по лицу И по телу (ReID), - и
+        пишет она ``person_id``, не имя. Человек, которого узнали по телу или
+        через уже подтверждённое слияние, оставался без подписи. Поэтому трек
+        без имени получает имя своего подтверждённого ``person_id``: тот же
+        источник, которым хаб объявляет человека вслух, и та же планка
+        (``RECOGNIZE_P``), ниже которой слияние само не считает личность
+        известной. Ничего не выдумывается: нет уверенного ``person_id`` - нет и
+        подписи.
         """
         rows = getattr(getattr(self, 'room', None), 'tracks', None)
         if not isinstance(rows, dict):
             return {}
         names: dict[str, str] = {}
+        unnamed: list[str] = []
         for key, row in rows.items():
             if isinstance(row, dict) and row.get('name'):
                 names[str(key)] = str(row['name'])
+            else:
+                unnamed.append(str(key))
+        if unnamed:
+            names.update(self._fused_track_names(unnamed))
+        return names
+
+    def _live_track_ids(self) -> list[str]:
+        """The ids of the tracks this room has in frame right now."""
+        rows = getattr(getattr(self, 'room', None), 'tracks', None)
+        return [str(key) for key in rows] if isinstance(rows, dict) else []
+
+    # ------------------------------------------------------------------
+    # live camera preview (владелец, 2026-09-24)
+    # ------------------------------------------------------------------
+    async def set_camera_preview(self, on: bool) -> dict[str, Any]:
+        """Show (or close) the room's own camera as live video on its screen.
+
+        Владелец 2026-09-24: «открыть камеру и чтобы оно показывало видео с
+        камеры на экране и все детекции». The hub only toggles the window and
+        hands over the names it already knows (F-708) - the frames never leave
+        the room PC, so a live view costs no bandwidth and no GPU on the brain.
+        While the window is up, a small task keeps re-sending the names so a
+        person labelled by the fusion gets their name on screen too.
+        """
+        if on and not getattr(self, '_can_camera_preview', False):
+            return {'ok': False, 'error': 'This room client cannot show a live camera '
+                                          'preview (it has not been updated yet).'}
+        payload = {'type': proto.MSG_CAMERA_PREVIEW, 'on': bool(on),
+                   'label': str(getattr(self, 'workplace_name', '') or '')[:80]}
+        if on:
+            payload['names'] = self._track_names()
+        try:
+            await self.send_json(payload)
+        except Exception as exc:  # noqa: BLE001 - the tool reports, never raises
+            return {'ok': False, 'error': f'Could not reach the room: {type(exc).__name__}'}
+        if on:
+            self._start_preview_names_task()
+        else:
+            await self._stop_preview_names_task()
+        room = str(getattr(self, 'workplace_name', '') or self.peer)
+        return {'ok': True, 'running': bool(on), 'label': room,
+                'names': len(payload.get('names') or {})}
+
+    def _start_preview_names_task(self) -> None:
+        """Keep the labels on the live window current while it is open."""
+        task = getattr(self, '_preview_task', None)
+        if task is not None and not task.done():
+            return
+        self._preview_names_sent = dict(self._track_names())
+        self._preview_task = asyncio.create_task(self._preview_names_loop(),
+                                                 name='camera-preview-names')
+
+    async def _stop_preview_names_task(self) -> None:
+        task, self._preview_task = getattr(self, '_preview_task', None), None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - a stopped loop is not a failure
+            log.debug('The preview name loop ended with %s', exc)
+
+    async def _preview_names_loop(self) -> None:
+        """Re-send the track names only when they changed (every 2 s)."""
+        try:
+            while True:
+                await asyncio.sleep(PREVIEW_NAMES_INTERVAL_S)
+                names = self._track_names()
+                if names == getattr(self, '_preview_names_sent', None):
+                    continue
+                self._preview_names_sent = dict(names)
+                await self.send_json({'type': proto.MSG_CAMERA_PREVIEW, 'on': True,
+                                      'names': names,
+                                      'label': str(getattr(self, 'workplace_name', '') or '')[:80]})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the window keeps working without names
+            log.info('Live preview name updates stopped (%s)', exc)
+
+    def _fused_track_names(self, keys) -> dict[str, str]:
+        """The names of tracks the fusion confirmed, not only a matched face.
+
+        ``identity_belief`` already holds the person of a track that was
+        recognized by face, by body (ReID) or by the lead signal; the display
+        name lives in ``persons``. Only a confident belief counts (ТЗ F-206:
+        ``RECOGNIZE_P``), so a half-guess never turns into a label.
+        """
+        wanted = [str(key) for key in keys if str(key)]
+        if not wanted:
+            return {}
+        store = _identity_belief_store()
+        if store is None:
+            return {}
+        from hub.identity_fusion import RECOGNIZE_P
+
+        names: dict[str, str] = {}
+        for key in wanted:
+            try:
+                belief = store.get(key)
+            except Exception as exc:  # noqa: BLE001 - a label is never worth a fault
+                log.debug("Could not read the belief of track %s (%s)", key, exc)
+                return names
+            person = getattr(belief, 'person_id', None) if belief is not None else None
+            if not person or float(getattr(belief, 'p', 0.0) or 0.0) < RECOGNIZE_P:
+                continue
+            name = _person_display_name(str(person))
+            if name:
+                names[key] = name
         return names
 
     async def _show_camera_turn(self, text: str, language: str = "") -> str | None:
@@ -10726,6 +11759,15 @@ class Connection(CameraClipReceiver):
             if not shared:
                 log.info("The presence of %s is not shared with %s", person_id, speaker_id)
                 return questions.answer_home("hidden", name, lang)
+            # ТЗ F-611: друг получает честный статус «занят до 18» вместо «дома»,
+            # но только на том же праве, что и присутствие (F-602): посторонний
+            # не узнаёт ни того, ни другого.
+            status = _dnd_status(person_id)
+            if status is not None:
+                home_of_person = self._home_of_person(person_id)
+                return dnd_mod.status_line(
+                    name, status.until,
+                    tz=_home_timezone_of(home_of_person) or "UTC", language=lang)
         return questions.answer_home("yes" if homes else "no", name, lang)
 
     async def _where_turn(self, text: str, language: str = "") -> str | None:
@@ -11332,6 +12374,20 @@ class Connection(CameraClipReceiver):
             message = store.enqueue(to_person=recipient_id, from_person=sender_id,
                                     text=requested.text, home_id=recipient_home,
                                     origin_home=str(self.home_id or ""))
+            # ТЗ F-611: статус «не беспокоить» — друзьям честно говорится срок,
+            # а само сообщение ждёт в очереди и прозвучит, когда человек выйдет
+            # из статуса (его отдаёт задача доставки F-601).
+            status = _dnd_status(recipient_id)
+            if status is not None:
+                log.info("Intercom %s waits: %s is busy until %s", message.message_id,
+                         recipient_id, status.until)
+                _record_intercom_event("intercom.send", sender_id, recipient_id,
+                                       recipient_home, result="ok",
+                                       detail={"status": "busy",
+                                               "message_id": message.message_id})
+                return dnd_mod.status_line(
+                    name, status.until,
+                    tz=_home_timezone_of(recipient_home) or "UTC", language=lang)
             if self._intercom_quiet_now(recipient_home, recipient_id):
                 log.info("Intercom %s waits: quiet hours in %s", message.message_id,
                          recipient_home)
@@ -12899,6 +13955,36 @@ class Connection(CameraClipReceiver):
         log.info("Said in the room: %r", text)
         return {"ok": True, "note": "The room heard the text out loud."}
 
+    async def _run_camera_preview(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Turn a room's live camera view on or off (владелец, 2026-09-24).
+
+        Владелец 2026-09-24: «можешь на пк buro открыть камеру и чтобы оно
+        показывало видео с камеры на экране и все детекции?». The window belongs
+        to the room PC; this tool only tells it what to do. ``workplace`` names
+        the room ("buro", "anton PC"); without it the tool acts on the room the
+        request came from. Naming a room that does not exist is an honest
+        failure with the list of the computers that are connected, never a
+        silent "done" on the wrong screen.
+        """
+        wanted = args.get('on')
+        if not isinstance(wanted, bool):
+            return {'ok': False, 'error': 'Pass on: true to open the view, false to close it.'}
+        target = str(args.get('workplace') or args.get('pc') or '').strip()
+        room, error = await self._camera_preview_room(target, wanted)
+        if error:
+            return {'ok': False, 'error': error}
+        result = await room.set_camera_preview(wanted)
+        if result.get('ok'):
+            log.info('Live camera preview %s on %s', 'on' if wanted else 'off',
+                     result.get('label') or room.peer)
+        return result
+
+    async def _camera_preview_room(self, target: str, on: bool):
+        """The connection the live view must go to, or a reason why not."""
+        if not target:
+            return self, ''
+        return _room_for_name(target)
+
     async def _flush_push_outbox(self, person_id: str) -> int:
         """ТЗ F-712: hand a person the messages that waited for their phone.
 
@@ -14110,7 +15196,16 @@ class Connection(CameraClipReceiver):
         # фото в телеграм". Text keeps the strict destination wording.
         allowed = requested(literal) or (kind == 'image' and picture_send_requested(literal))
         if not allowed:
-            return done({'ok': False, 'error': 'Sending to Telegram requires an explicit user request in this turn. Do not post proactively.'})
+            # Владелец 2026-09-23: модель звала telegram_send, чтобы ОТВЕТИТЬ на
+            # запрос из телеги, получала этот отказ и делала из него вывод «значит,
+            # мне нечего отправлять» — а в итоге писала в чат «картинки нет».
+            # Отказ должен объяснять, что отвечать в этот чат этим инструментом
+            # не нужно вовсе: текст ответа доставляется сам.
+            return done({'ok': False, 'error': (
+                'Sending to Telegram is for a message the requester asked to send somewhere else. '
+                'Your own answer text is already delivered to the chat of this request, so answer in '
+                'words instead of posting it again - and never use this tool to hand over a photo you '
+                'were asked to create or edit (use generate_image with target=display/telegram).')})
         provider = getattr(self, '_telegram_provider', None) or _telegram
         if provider is None or not provider.ready:
             return done({'ok': False, 'error': 'Telegram is not configured on the brain server.'})
@@ -15532,6 +16627,24 @@ class Connection(CameraClipReceiver):
                                          session, stt_ms):
             return
 
+        # ТЗ F-609: голосовые заметки друг другу — запись голоса по просьбе и
+        # выдача по приходу получателя. Разбирается до игры: явная просьба
+        # «оставь Максу голосовое» не должна попасть в чужую загадку.
+        if await self._notes_turn(text, language, voice, started_at, session, stt_ms, pcm):
+            return
+
+        # ТЗ F-610: общий список покупок и дел — добавление и чтение голосом.
+        if await self._shopping_turn(text, language, voice, started_at, session, stt_ms):
+            return
+
+        # ТЗ F-611: «я занят до 18» — статус, при котором интерком и вопросы ждут.
+        if await self._dnd_turn(text, language, voice, started_at, session, stt_ms):
+            return
+
+        # ТЗ F-612: «смотрим фильм с Максом» — сцена «кино» в двух комнатах.
+        if await self._co_watch_turn(text, language, voice, started_at, session, stt_ms):
+            return
+
         # ТЗ F-608: «угадай, кто сказал» — игра по голосам; свои фразы разбирает
         # до квиза, потому что загадка — это данные хода (голос и согласие).
         if await self._guess_turn(text, language, voice, started_at, session, stt_ms, pcm):
@@ -15994,6 +17107,19 @@ class Connection(CameraClipReceiver):
             # times out of three (AU-21), so the steps the owner names by their
             # own words are checked too (`any_step_unfinished`).
             unfinished_step = any_step_unfinished(text, self._utterance_actions)
+            # What exactly is missing, in words the model can act on: a site
+            # the request named that no tool of this turn reached, or a step it
+            # named by its own words (see ``hub.decision_points``). Handing this
+            # to the judge is the difference between a forced self-check that
+            # finishes the job and one that only repeats "verify you did it".
+            missing_step = ''
+            if unfinished_step:
+                if site_step_unfinished(text, self._utterance_actions):
+                    missing_step = ("the site or address the request named was never "
+                                    "opened by any tool of this turn")
+                else:
+                    missing_step = ("a step the request named by its own words was "
+                                    "never carried out by any tool of this turn")
             judge_needed = await self._decide(
                 'action_result',
                 question='Does the result of this action match what was asked?',
@@ -16034,13 +17160,22 @@ class Connection(CameraClipReceiver):
                     verified = await asyncio.wait_for(
                         self._gpu(PRIORITY_UTTERANCE, "llm-verify",
                                   lambda: chat.verify(result.history, result.text,
-                                                      self._execute_tool)),
+                                                      self._execute_tool,
+                                                      note=missing_step)),
                         timeout=VERIFY_TIMEOUT_S,
                     )
-                    if verified.text.strip():
+                    if verified.text.strip() and not sounds_like_the_self_check(verified.text):
                         log.info("Self-check produced the final reply (%d extra action(s))",
                                  len(verified.tool_calls))
                         result = verified
+                    elif verified.text.strip():
+                        # The judge answered its own instruction instead of the
+                        # person ("I don't see any request from you - just a
+                        # system self-check"). Speaking that in the room is
+                        # worse than the reply it was asked to check, so the
+                        # turn keeps what it had.
+                        log.warning("Self-check answered its own prompt - keeping the "
+                                    "original reply (%r)", verified.text[:120])
                     # ТЗ 5.4: the self-check is the ground truth for the flag
                     # that asked for it — it found work to finish, or it
                     # confirmed there was nothing to fix.

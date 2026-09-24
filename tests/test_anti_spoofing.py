@@ -543,6 +543,31 @@ def test_the_check_can_be_switched_off_and_f208_decides_again(hub_db, monkeypatc
     assert denial and "face" in denial and connection._pending_challenge is None
 
 
+def test_a_telegram_account_needs_no_voice_and_face_proof(hub_db, monkeypatch):
+    """Владелец 2026-09-24: «закрой все Notepad на пк anton и пришли скриншот».
+
+    The request died with "nobody is identified for this action": a Telegram
+    turn has no microphone to match and no camera pointed at the sender, while
+    the account itself was already authenticated. The gate must not ask a chat
+    message to prove its voice.
+    """
+    connection = _connection(hub_db, monkeypatch)
+    connection.cfg.server.identity.enabled = True
+    connection._speaker_name = "telegram:8322835915"
+
+    assert _run(connection._admin_strength_check("run_command", {"command": "dir"})) is None
+
+
+def test_the_owner_can_switch_the_extra_proof_off(hub_db, monkeypatch):
+    """Владелец 2026-09-24: «иногда голос ... надо чтобы распознало выше порога
+    (для важных запросов), а мне это не надо»."""
+    connection = _connection(hub_db, monkeypatch)
+    connection.cfg.server.identity.enabled = True
+    connection.cfg.server.identity.admin_second_factor = False
+
+    assert _run(connection._admin_strength_check("run_command", {"command": "dir"})) is None
+
+
 def test_a_face_witness_is_not_enough_when_the_word_is_always_asked(hub_db, monkeypatch):
     import time
 

@@ -36,8 +36,11 @@ def report(path: Path) -> int:
     else:
         print("\nDecider: таблицы decisions нет")
 
-    trace_table = next((name for name in tables if name in ("turn_trace", "turns_trace")),
-                       None)
+    # ``turn_events`` — таблица миграции 0031, в неё пишет ``hub/turn_trace.py``;
+    # прежний список имён её не знал, поэтому отчёт говорил «трассы: таблицы
+    # нет» на живой базе, где 900+ событий уже лежали (AU-19).
+    trace_table = next((name for name in tables
+                        if name in ("turn_events", "turn_trace", "turns_trace")), None)
     if trace_table is None:
         candidates = [name for name in tables if "trace" in name]
         trace_table = candidates[0] if candidates else None
@@ -56,8 +59,17 @@ def report(path: Path) -> int:
     asked = conn.execute(
         f"select count(*) from {trace_table} where kind = 'understanding'").fetchone()[0]
     print(f"\nJev прочитал ходов (kind='understanding'): {asked}")
+    # AU-19: голосовой ход и Telegram-чат читаются одним кодом, поэтому видно,
+    # что читал Jev в каждой из двух дорог, а не «сколько-то вызовов вообще».
+    if "turn_id" in columns:
+        for label, clause in (("голос", "turn_id NOT LIKE 'telegram:%'"),
+                              ("Telegram", "turn_id LIKE 'telegram:%'")):
+            count = conn.execute(
+                f"select count(*) from {trace_table} where kind = 'understanding'"
+                f" and {clause}").fetchone()[0]
+            print(f"  из них {label}: {count}")
     for row in conn.execute(
-            f"select ts, payload from {trace_table} where kind = 'understanding' "
+            f"select ts, payload_json from {trace_table} where kind = 'understanding' "
             f"order by rowid desc limit 5"):
         print(f"  {row[0]}: {str(row[1])[:160]}")
     return 0

@@ -32,6 +32,56 @@ def test_capability_is_required_before_sending_request():
     asyncio.run(run())
 
 
+def test_the_request_carries_the_names_of_the_tracks_the_hub_knows():
+    """Владелец 2026-09-24: «видео с bounding box и идентификацией (label)»."""
+    async def run():
+        value = receiver()
+        pending = asyncio.create_task(value._request_camera_clip(
+            'clip1', 3, 5, names={'t-1': 'Антон', 't-2': '', 't-3': 'John', 't-4': None}))
+        await asyncio.sleep(0)
+        request = value.send_json.await_args.args[0]
+        assert request['names'] == {'t-1': 'Антон', 't-3': 'John'}, \
+            'имя идёт только для тех треков, кого хаб действительно узнал'
+        value._on_clip_header(header())
+        value._on_clip_binary(MP4)
+        assert await pending == MP4
+    asyncio.run(run())
+
+
+def test_a_request_without_names_has_no_names_field():
+    """A client that never heard of the field keeps working: nothing to draw."""
+    async def run():
+        value = receiver()
+        pending = asyncio.create_task(value._request_camera_clip('clip1', 3, 5))
+        await asyncio.sleep(0)
+        assert 'names' not in value.send_json.await_args.args[0]
+        value._on_clip_header(header())
+        value._on_clip_binary(MP4)
+        assert await pending == MP4
+    asyncio.run(run())
+
+
+def test_the_first_video_starts_in_the_past_and_the_next_parts_do_not():
+    """The pre-roll carries a quick pass; repeating it in part 2 would be noise."""
+    async def run():
+        value = receiver()
+        first = asyncio.create_task(value._request_camera_clip('clip1', 5, 8))
+        await asyncio.sleep(0)
+        assert 'preroll' not in value.send_json.await_args.args[0], \
+            'без просьбы клиент сам решает, сколько прошлого взять'
+        value._on_clip_header(header())
+        value._on_clip_binary(MP4)
+        assert await first == MP4
+
+        second = asyncio.create_task(value._request_camera_clip('clip2', 5, 8, preroll=0))
+        await asyncio.sleep(0)
+        assert value.send_json.await_args.args[0]['preroll'] == 0.0
+        value._on_clip_header(header('clip2'))
+        value._on_clip_binary(MP4)
+        assert await second == MP4
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('seconds,fps', [(2, 8), (61, 8), (float('nan'), 8), (True, 8), (5, 4), (5, 11), (5, False)])
 def test_invalid_bounds_do_not_start_capture(seconds, fps):
     async def run():

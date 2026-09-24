@@ -28,6 +28,7 @@ RUNTIME_FILES = (
     "client/ota.py",
     "client/vision_profile.py",
     "client/camera.py", "client/camera_clips.py", "client/frame_recording.py", "client/room-tracker.yaml",
+    "client/live_view.py",
     "client/screen.py", "client/viewer.py", "client/overlay.py", "client/overlay_web/chat.html",
     "client/actions/__init__.py", "client/actions/app_control.py", "client/actions/apps.py",
     "client/actions/browser.py", "client/actions/browser_desktop.py", "client/actions/dispatcher.py", "client/actions/photos.py", "client/actions/wallpaper.py",

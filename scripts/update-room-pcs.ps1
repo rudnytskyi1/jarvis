@@ -61,6 +61,16 @@ function New-ClientPackage {
     $scriptDir = Join-Path $stage 'scripts'
     New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
     Copy-Item -Path (Join-Path $Repo 'scripts\run-client.ps1') -Destination $scriptDir -Force
+    # 2026-09-24: правило владельца «громкость комнат всегда на нуле» держит
+    # сторожок keep-room-muted.ps1. Задача RowanKeepRoomsSilent на комнатных ПК
+    # запускает его из `data\`, поэтому он едет в пакете тем же путём, а не в
+    # `scripts\` (иначе на комнате оставалась бы работающая старая копия).
+    # Запускается он отдельной задачей, а не клиентом: см.
+    # docs/ROOM_CLIENT_UPDATES.md.
+    $dataDir = Join-Path $stage 'data'
+    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $Repo 'scripts\keep-room-muted.ps1') `
+        -Destination (Join-Path $dataDir 'keep-room-muted.ps1') -Force
     # Рантайм-состояние и кэши комнаты остаются её собственными.
     Remove-Item -Path (Join-Path $stage 'client\room-tracker.runtime.yaml') -Force -ErrorAction SilentlyContinue
     Get-ChildItem $stage -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
@@ -73,19 +83,30 @@ function New-ClientPackage {
 
 function Invoke-Remote {
     param([object]$Pc, [string]$Script)
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
-    # Один массив аргументов вместо продолжения строки обратной кавычкой:
-    # Windows PowerShell 5.1 в этом месте передавал ssh путь к ключу как имя
-    # хоста, и обновление комнатных ПК падало с "Could not resolve hostname
-    # C:\...\buro" (найдено аудитом 2026-09-23).
+    # Скрипт едет на ПК ФАЙЛОМ, а не внутри командной строки и не по stdin:
+    # `-EncodedCommand` с полным блоком раскатки перерос лимит cmd в 8191
+    # символ («The command line is too long», anton, 2026-09-24), а чтение
+    # скрипта со stdin обрывалось на первой же строке (`PROBE=ok`, потом
+    # только ZIP_HASH). Один массив аргументов - потому что Windows
+    # PowerShell 5.1 иначе передавал ssh путь к ключу как имя хоста
+    # (аудит 2026-09-23).
+    $local = Join-Path ([IO.Path]::GetTempPath()) (
+        'rowan-remote-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+    [IO.File]::WriteAllText($local, $Script, (New-Object System.Text.UTF8Encoding($true)))
+    $remoteScript = $Pc.root + '\data\rowan-update-remote.ps1'
+    & $scpExe -i $Pc.key -o BatchMode=yes -o StrictHostKeyChecking=no `
+        $local ($Pc.user + '@' + $Pc.host + ':' + $remoteScript.Replace('\', '/')) 2>&1 | Out-Null
     $arguments = @('-i', [string]$Pc.key, '-o', 'BatchMode=yes',
                    '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
                    "$($Pc.user)@$($Pc.host)",
-                   "powershell -NoProfile -EncodedCommand $encoded")
+                   ('powershell -NoProfile -ExecutionPolicy Bypass -File "' + $remoteScript + '"'))
     $shown = $arguments | ForEach-Object { $_.Substring(0, [Math]::Min(40, $_.Length)) }
     Write-Verbose ("ssh " + ($shown -join ' '))
     $out = & $sshExe @arguments 2>&1
-    return @{ code = $LASTEXITCODE; lines = @($out | ForEach-Object { "$_" }) }
+    $lines = @($out | ForEach-Object { "$_" })
+    Write-Verbose ("remote exit=$LASTEXITCODE lines=$($lines.Count): " +
+                   (($lines | Select-Object -First 4) -join ' | '))
+    return @{ code = $LASTEXITCODE; lines = $lines }
 }
 
 function Get-Line {
@@ -138,6 +159,10 @@ foreach ($pc in $pcs) {
 
     $remote = @'
 $ErrorActionPreference = 'Stop'
+# Владелец 2026-09-24: «что реально напечатал ПК, то и в отчёте» - раскатка
+# на anton падала с голым «код 1», потому что терминальная ошибка уносила
+# скрипт молча. trap печатает причину, которую видит оператор.
+trap { "ERROR=$($_.Exception.GetType().Name): $($_.Exception.Message)"; exit 1 }
 $root = 'ROOT_HERE'
 $task = 'TASK_HERE'
 $zip = Join-Path $root 'data\rowan-client-update.zip'
@@ -152,7 +177,17 @@ if ('KIND_HERE' -eq 'git') {
 } else {
     Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
-    Get-Process python -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+    # Владелец 2026-09-23: «когда перезапускаешь rowanai на buropc другие
+    # процессы питона не трогай». Раньше здесь стоял Stop-Process по ВСЕМ
+    # python.exe, и один запуск раскатки гасил чужие программы комнаты (на
+    # buro живёт camwatch друга) и любой другой python на этом ПК. Клиент
+    # опознаётся по своему запуску: `python -m client.main --config ...`
+    # (см. scripts\run-client.ps1), поэтому фильтр идёт по командной строке.
+    $mine = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -match '(?i)client[\\/\.]main' })
+    foreach ($item in $mine) { Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue }
+    "STOPPED_CLIENT=$($mine.Count)"
+    "PYTHON_OTHERS=$((Get-Process python -ErrorAction SilentlyContinue | Measure-Object).Count)"
     Start-Sleep -Seconds 2
     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
     Expand-Archive -Path $zip -DestinationPath $dest -Force

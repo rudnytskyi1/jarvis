@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from client.camera import CameraService
-from client.camera_clips import clip_settings, record_clip, serve_clip
+from client.camera_clips import clip_settings, draw_tracks, record_clip, serve_clip
 from common.protocol import MSG_CAMERA_CLIP, MSG_CAMERA_CLIP_ERROR
 
 
@@ -53,6 +53,120 @@ def test_encoder_uses_existing_fresh_frames_and_cleans_temporary_mp4(monkeypatch
     assert len(calls) == 15 and result['seconds'] == 3 and result['w'] == 960
     assert b'ftyp' in result['data'][:64]
     assert not paths[0].exists() and not camera._clip_lock.locked()
+
+
+def test_the_video_shows_the_boxes_and_the_names_of_the_people():
+    """Владелец 2026-09-24: клип с bounding box и именем человека над ним."""
+    import cv2
+    import numpy as np
+
+    frame = np.full((240, 320, 3), 30, dtype=np.uint8)
+    tracks = [{'id': 't-1', 'box': [0.25, 0.3, 0.75, 0.9]},
+              {'id': 't-2', 'box': [0.05, 0.2, 0.2, 0.5]}]
+    bare = draw_tracks(frame.copy(), tracks, None, cv2=cv2)
+    named = draw_tracks(frame.copy(), tracks, {'t-1': 'Антон'}, cv2=cv2)
+    assert np.array_equal(frame, np.full((240, 320, 3), 30, dtype=np.uint8)), \
+        "кадр камеры не разрисовывается на месте — он общий с детекцией"
+    assert not np.array_equal(bare, frame), "рамки нарисованы"
+    assert named.sum() != bare.sum(), "имя добавляет подпись над рамкой"
+    left = int(0.25 * 320), int(0.3 * 240)
+    assert not np.array_equal(bare[left[1], left[0]], frame[left[1], left[0]]), \
+        "угол рамки попадает точно по координатам трека"
+    assert np.array_equal(draw_tracks(frame.copy(), [], {'t-1': 'Антон'}, cv2=cv2), frame), \
+        "без треков кадр не трогаем"
+    assert np.array_equal(draw_tracks(frame.copy(), None, None, cv2=None), frame), \
+        "без cv2 рисовать нечем, но и падать нечему"
+
+
+def test_a_clip_starts_in_the_past_so_a_quick_pass_still_shows(monkeypatch):
+    """Правило срабатывает на секунду позже; без прошлого в кадре пустая комната."""
+    import cv2
+    import numpy as np
+
+    clock = [100.]
+    monkeypatch.setattr('client.camera_clips.time.monotonic', lambda: clock[0])
+
+    class Wait:
+        def wait(self, delay):
+            clock[0] += delay
+            return False
+
+    camera = CameraService(SimpleNamespace(enabled=True))
+    live = np.full((1080, 1920, 3), (10, 10, 200), dtype=np.uint8)     # красный (BGR)
+    past = [np.full((54, 96, 3), (200, 10, 10), dtype=np.uint8),       # синий
+            np.full((54, 96, 3), (200, 10, 10), dtype=np.uint8)]
+    camera.preroll_frames = lambda seconds: [(clock[0] - 2.0, past[0], [{'id': 't-1', 'box': [0.2, 0.2, 0.6, 0.9]}]),
+                                             (clock[0] - 1.0, past[1], [])]
+    camera._latest_frame_ts = lambda: (live, clock[0])
+    frames = []
+    sizes = []
+
+    class Writer:
+        def __init__(self, path, codec, fps, size):
+            assert fps == 5
+            self.path = Path(path)
+            sizes.append(size)
+
+        def isOpened(self):
+            return True
+
+        def write(self, frame):
+            frames.append(frame)
+
+        def release(self):
+            self.path.write_bytes(b'\x00\x00\x00\x18ftypmp42' + b'\0' * 30)
+
+    camera._cv2 = SimpleNamespace(VideoWriter=Writer, VideoWriter_fourcc=cv2.VideoWriter_fourcc,
+                                 resize=cv2.resize, INTER_AREA=cv2.INTER_AREA,
+                                 rectangle=cv2.rectangle, putText=cv2.putText,
+                                 FONT_HERSHEY_SIMPLEX=cv2.FONT_HERSHEY_SIMPLEX, LINE_AA=cv2.LINE_AA)
+    result = record_clip(camera, 3, 5, cancel=Wait())
+    assert len(frames) == 15, "клип остаётся той же длины, что и просили"
+    assert sizes == [(96, 54)], "размер клипа задаёт первый кадр и не меняется"
+    assert frames[0].mean(axis=(0, 1))[0] > frames[0].mean(axis=(0, 1))[2], \
+        "первым идёт кадр из прошлого, а не пустая комната"
+    assert frames[-1].mean(axis=(0, 1))[2] > frames[-1].mean(axis=(0, 1))[0], \
+        "после прошлого идёт живой кадр"
+    assert result['seconds'] == 3
+
+
+def test_the_second_video_of_one_visit_does_not_repeat_the_pre_roll(monkeypatch):
+    import cv2
+    import numpy as np
+
+    clock = [100.]
+    monkeypatch.setattr('client.camera_clips.time.monotonic', lambda: clock[0])
+
+    class Wait:
+        def wait(self, delay):
+            clock[0] += delay
+            return False
+
+    camera = CameraService(SimpleNamespace(enabled=True))
+    asked = []
+    camera.preroll_frames = lambda seconds: asked.append(seconds) or []
+    camera._latest_frame_ts = lambda: (np.full((360, 640, 3), 90, dtype=np.uint8), clock[0])
+    frames = []
+
+    class Writer:
+        def __init__(self, path, codec, fps, size):
+            self.path = Path(path)
+            self.size = size
+
+        def isOpened(self):
+            return True
+
+        def write(self, frame):
+            frames.append(frame)
+
+        def release(self):
+            self.path.write_bytes(b'\x00\x00\x00\x18ftypmp42' + b'\0' * 30)
+
+    camera._cv2 = SimpleNamespace(VideoWriter=Writer, VideoWriter_fourcc=cv2.VideoWriter_fourcc,
+                                 resize=cv2.resize, INTER_AREA=cv2.INTER_AREA)
+    record_clip(camera, 3, 5, cancel=Wait(), preroll=0)
+    assert asked == [], "вторая часть визита не берёт те же секунды ещё раз"
+    assert len(frames) == 15
 
 
 def test_stalled_capture_does_not_fake_video_by_repeating_frame(monkeypatch):

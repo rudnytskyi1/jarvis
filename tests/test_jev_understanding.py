@@ -32,7 +32,12 @@ def _understanding(**answers) -> httpx.Response:
 
 
 def test_the_whole_turn_is_read_in_one_request():
-    """Три вопроса — один HTTP-вызов: иначе бюджет хода 1.2 с не уложится."""
+    """Четыре вопроса — один HTTP-вызов: иначе бюджет хода 1.2 с не уложится.
+
+    Четвёртый вопрос (``single``, AU-10) отличает одну просьбу от нескольких в
+    одной реплике: «открой ютуб и сделай громче» просит две семьи, и сужение по
+    одной из них спрятало бы вторую половину.
+    """
     calls: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -40,6 +45,7 @@ def test_the_whole_turn_is_read_in_one_request():
         return _understanding(
             act={"type": "noul", "noul": 0.93},
             family={"type": "choice", "choice": "browser", "confidence": 0.88},
+            single={"type": "noul", "noul": 0.88},
             followup={"type": "noul", "noul": 0.2},
         )
 
@@ -47,10 +53,11 @@ def test_the_whole_turn_is_read_in_one_request():
         {"home_id": "livingroom", "text": "Rowan, open YouTube and search for MrBeast"},
         families=list(TOOL_FAMILY_NAMES)))
     assert len(calls) == 1
-    assert set(calls[0]["questions"]) == {"act", "family", "followup"}
+    assert set(calls[0]["questions"]) == {"act", "family", "single", "followup"}
     assert set(calls[0]["questions"]["family"]["criteria"]) == set(TOOL_FAMILY_NAMES)
     assert found["act"] == {"value": True, "confidence": 0.93}
     assert found["family"]["value"] == "browser" and found["family"]["confidence"] == 0.88
+    assert found["single"]["value"] is True
     assert found["followup"]["value"] is False
 
 
@@ -134,6 +141,80 @@ def test_a_confident_family_narrows_the_turn():
     names = {tool["function"]["name"] for tool in offered}
     assert "look_at_camera" in names and "find_object" in names
     assert "browser_control" not in names
+
+
+def test_a_question_with_a_named_family_keeps_that_family():
+    """AU-03: Jev отвечает «ничего делать не надо» и семейство одним чтением.
+
+    «who is in the room?» — это вопрос, но ответить на него можно только
+    взглядом. Старая ветка ``act=false`` отдавала модели одно ядро и прятала
+    ``look_at_camera``/``find_object`` (живой прогон зрением, массовый аудит
+    2026-09-23). Ядро входит в любой семейный набор, поэтому доверие
+    названному семейству ничего не стоит на разговоре.
+    """
+    offered = hub_app._narrow_tools_for(
+        {"act": {"value": False, "confidence": 0.97},
+         "family": {"value": "vision", "confidence": 0.96}})
+    names = {tool["function"]["name"] for tool in offered}
+    assert {"look_at_camera", "look_at_screen", "find_object"} <= names
+    assert set(CORE_TOOLS) <= names
+
+
+def test_a_pure_question_without_a_family_still_gets_only_the_core_tools():
+    offered = hub_app._narrow_tools_for(
+        {"act": {"value": False, "confidence": 0.97},
+         "family": {"value": "none", "confidence": 0.97}})
+    assert {tool["function"]["name"] for tool in offered} == set(CORE_TOOLS)
+
+
+def test_the_act_question_counts_looking_as_something_to_do():
+    """Слова, из-за которых зрение падало в AU-03: вопрос ≠ бездействие."""
+    text = JevDecider.ACT_QUESTION.casefold()
+    for phrase in ("who is in the room", "what is on the screen", "where are my keys"):
+        assert phrase in text
+
+
+def test_the_family_question_names_the_homes_own_skills():
+    """AU-06: «будет ли дождь» — это скилл дома, и Jev обязан это знать.
+
+    Живой прогон 2026-09-23: на «hey rowan, will it rain tomorrow» Jev отвечал
+    ``family=pc`` с уверенностью 0.56 — ниже порога, — и сужение отдавало модели
+    одно ядро без ``run_skill``; модель звала ``run_command`` вместо скилла
+    (``data/audit/runs/au-06-devices-skills-before.jsonl``). Вопрос о семействе
+    называл программы и провода, но не скиллы дома, хотя ``run_skill`` живёт
+    именно в семействе ``pc``. После правки то же чтение даёт 1.00.
+    """
+    text = " ".join(JevDecider.FAMILY_QUESTION.split()).casefold()
+    assert "skills" in text, "вопрос о семействе не называет скиллы дома"
+    assert "weather" in text
+    assert "run_skill" in TOOL_FAMILIES["pc"], "run_skill ушёл из семейства pc"
+
+
+def test_a_bare_request_for_a_picture_means_making_one_not_looking_at_one():
+    """AU-20: «picture of a dog» — это просьба нарисовать, а не посмотреть.
+
+    Живой прогон 2026-09-23 (`data/audit/runs/au-20-before.jsonl`, сценарий
+    ``AU-0977``): на «picture of a dog» без слова «нарисуй» Jev называл семейство
+    ``vision``, ``generate_image`` в набор не попадал, и модель искала картинку
+    (``look_at_screen``, ``find_object``) вместо того, чтобы её нарисовать.
+    Просьба без глагола — такая же просьба: значения семейств и вопрос о
+    семействе обязаны говорить это словами человека.
+    """
+    from hub.tools import TOOL_FAMILY_MEANINGS
+
+    media = " ".join(TOOL_FAMILY_MEANINGS["media"].split()).casefold()
+    vision = " ".join(TOOL_FAMILY_MEANINGS["vision"].split()).casefold()
+    question = " ".join(JevDecider.FAMILY_QUESTION.split()).casefold()
+
+    for phrase in ("picture of a dog", "pic of my cat", "image of a dragon"):
+        assert phrase in media, f"семейство media не знает просьбу {phrase!r}"
+        assert phrase in question, f"вопрос о семействе не знает {phrase!r}"
+    # Зрение — про картинку, которая уже есть; просьбу её сделать оно обязано
+    # отдать медиа, иначе набор спрячет generate_image (ровно AU-0977).
+    assert "make a picture" in vision
+    assert "nothing to look at yet" in vision
+    offered = {tool["function"]["name"] for tool in tools_for_family("media") or []}
+    assert "generate_image" in offered, "media потеряло generate_image"
 
 
 def test_the_config_can_switch_the_whole_reading_off(monkeypatch):

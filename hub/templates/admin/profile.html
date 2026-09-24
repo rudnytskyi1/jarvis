@@ -1,0 +1,717 @@
+{% extends "admin/base.html" %}
+{% block title %}Rowan · {{ person.name }}{% endblock %}
+{% block head %}
+<style>
+  .person-head { display: flex; gap: 1.2rem; align-items: flex-start; flex-wrap: wrap; }
+  .person-head .shot { width: 8.5rem; height: 8.5rem; object-fit: cover; border-radius: .8rem;
+    border: 1px solid var(--line-2); box-shadow: 0 0 26px rgba(63, 227, 255, .18); }
+  .person-head .kpis { flex: 1 1 22rem; }
+  /* --- the turntable ---------------------------------------------------- */
+  .turntable { position: relative; height: 27rem; border: 1px solid var(--line);
+    border-radius: .9rem; overflow: hidden; cursor: grab; touch-action: none;
+    background:
+      radial-gradient(60% 55% at 50% 48%, rgba(63, 227, 255, .13), transparent 70%),
+      radial-gradient(80% 60% at 50% 110%, rgba(161, 114, 255, .16), transparent 70%),
+      rgba(4, 7, 13, .82);
+    perspective: 1300px; }
+  .turntable.grabbing { cursor: grabbing; }
+  .turntable::after { content: ""; position: absolute; left: 8%; right: 8%; bottom: 1.1rem;
+    height: 1px; background: linear-gradient(90deg, transparent, var(--line-2), transparent); }
+  .ring { position: absolute; left: 50%; top: 45%; width: 11rem; height: 13rem;
+    margin: -6.5rem 0 0 -5.5rem; transform-style: preserve-3d; will-change: transform; }
+  .ring .frame { position: absolute; inset: 0; margin: 0; transform-style: preserve-3d; }
+  .ring .frame img { width: 100%; height: 100%; object-fit: cover; border-radius: .55rem;
+    border: 1px solid rgba(120, 180, 255, .35); background: #06090f;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, .55); }
+  .ring .frame.front img { border-color: var(--accent);
+    box-shadow: 0 0 30px rgba(63, 227, 255, .45); }
+  .hud { position: absolute; left: .9rem; top: .9rem; display: flex; gap: .35rem; z-index: 3; }
+  .hud button { background: rgba(6, 12, 22, .8); color: var(--ink);
+    border: 1px solid var(--line-2); font-family: var(--mono); }
+  .hud button:hover { box-shadow: 0 0 14px rgba(63, 227, 255, .35); }
+  .caption { position: absolute; right: .9rem; bottom: .9rem; left: .9rem; z-index: 3;
+    font-family: var(--mono); font-size: .74rem; color: var(--dim); text-align: center;
+    text-shadow: 0 1px 6px #000; }
+  .caption b { color: var(--accent); }
+  /* --- the strip of looks ----------------------------------------------- */
+  .looks { display: grid; grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr)); gap: .7rem; }
+  .look { background: var(--panel); border: 1px solid var(--line); border-radius: .7rem;
+    padding: .55rem .65rem; }
+  .look-head { display: flex; align-items: baseline; gap: .4rem; flex-wrap: wrap;
+    margin-bottom: .45rem; }
+  .look-head b { font-family: var(--mono); font-size: .86rem; }
+  .look-row { display: flex; gap: .25rem; flex-wrap: wrap; }
+  .look-row img { width: 3.4rem; height: 4.3rem; object-fit: cover; cursor: pointer; }
+  .look-row img:hover { outline: 1px solid var(--accent); }
+  .filmstrip { display: flex; gap: .35rem; overflow-x: auto; padding: .5rem;
+    border: 1px solid var(--line); border-radius: .7rem; background: rgba(4, 7, 13, .6); }
+  .filmstrip img { height: 5.2rem; width: 4rem; object-fit: cover; cursor: pointer; }
+  .filmstrip img:hover { outline: 1px solid var(--accent); }
+  /* --- lightbox --------------------------------------------------------- */
+  #lightbox { position: fixed; inset: 0; z-index: 50; display: none; place-items: center;
+    background: rgba(2, 4, 9, .88); backdrop-filter: blur(4px); }
+  #lightbox.open { display: grid; }
+  #lightbox .box { display: flex; gap: 1rem; max-width: 92vw; max-height: 92vh;
+    background: var(--panel); border: 1px solid var(--line-2); border-radius: .9rem;
+    padding: 1rem; }
+  #lightbox img { border-radius: .6rem; }
+  #lightbox img.main { max-height: 76vh; max-width: 46vw; object-fit: contain;
+    border: 1px solid var(--line); }
+  #lightbox .meta { font-family: var(--mono); font-size: .76rem; color: var(--dim);
+    max-width: 20rem; overflow-y: auto; }
+  #lightbox .meta b { color: var(--ink); display: block; }
+  #lightbox .meta img { width: 100%; max-height: 22vh; object-fit: contain; margin-top: .5rem;
+    border: 1px solid var(--line); }
+  td.thumb img { width: 3.4rem; height: 4.2rem; object-fit: cover; cursor: pointer; }
+  /* --- the 3D build ----------------------------------------------------- */
+  .model-wrap { position: relative; border: 1px solid var(--line); border-radius: .9rem;
+    overflow: hidden; background: radial-gradient(70% 60% at 50% 40%, rgba(63,227,255,.10),
+    transparent 70%), rgba(3, 6, 12, .9); }
+  .model-wrap canvas { display: block; width: 100%; height: 32rem; cursor: grab;
+    touch-action: none; }
+  .model-wrap canvas.grabbing { cursor: grabbing; }
+  .model-hud { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap;
+    padding: .5rem .7rem; border-top: 1px solid var(--line); background: rgba(4,7,13,.7); }
+  .model-hud button { background: rgba(6,12,22,.85); color: var(--ink);
+    border: 1px solid var(--line-2); font-family: var(--mono); }
+  .model-hud a { font-size: .8rem; }
+  .model-hud .note { margin: 0 0 0 auto; }
+  /* --- the page grid and the right-hand menu ---------------------------- */
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) 19rem; gap: 1.1rem;
+    align-items: start; }
+  .col-menu { position: sticky; top: 1rem; display: flex; flex-direction: column; gap: .8rem; }
+  .menu-card { background: var(--panel); border: 1px solid var(--line); border-radius: .8rem;
+    padding: .7rem .8rem; }
+  .menu-card h3 { font-size: .84rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--dim); margin-bottom: .5rem; }
+  .menu-card .field { display: block; margin-bottom: .5rem; font-size: .8rem; color: var(--dim); }
+  .menu-card select, .menu-card input[type=number] { width: 100%; margin-top: .2rem; }
+  .menu-card input[type=range] { width: 100%; }
+  .menu-card .menu-row { display: flex; gap: .35rem; flex-wrap: wrap; }
+  .menu-card .stat { display: flex; justify-content: space-between; font-size: .78rem;
+    color: var(--dim); font-family: var(--mono); }
+  .menu-card .stat b { color: var(--ink); }
+  .build-state { margin-top: .5rem; font-family: var(--mono); font-size: .76rem;
+    border-top: 1px solid var(--line); padding-top: .45rem; }
+  .build-state b { color: var(--accent); }
+  @media (max-width: 68rem) {
+    .cols { grid-template-columns: minmax(0, 1fr); }
+    .col-menu { position: static; }
+  }
+</style>
+{% endblock %}
+{% block content %}
+  <div class="cols">
+  <div class="col-main">
+  <h1>{{ person.name }}</h1>
+  <p><a href="/admin/profiles">← All profiles</a></p>
+
+  <div class="card person-head">
+    {% if person.gallery.cover %}
+    <img class="shot" src="{{ person.gallery.cover }}" alt="{{ person.name }}">
+    {% else %}
+    <span class="shot" style="display:grid;place-items:center;color:var(--dim)">no photo</span>
+    {% endif %}
+    <div class="kpis">
+      <div class="kpi"><span>role</span><b>{{ person.role or "not a member" }}</b></div>
+      <div class="kpi"><span>homes</span><b>{{ person.homes|join(", ") or "—" }}</b></div>
+      <div class="kpi"><span>face vectors</span><b>{{ person.vectors.face }}</b></div>
+      <div class="kpi"><span>voice vectors</span><b>{{ person.vectors.voice }}</b></div>
+      <div class="kpi"><span>body vectors</span><b>{{ person.vectors.body }}</b></div>
+      <div class="kpi"><span>archive frames</span><b>{{ person.stats.frames }}</b></div>
+      <div class="kpi"><span>looks</span><b>{{ person.gallery.outfits }}</b></div>
+      <div class="kpi"><span>days seen</span><b>{{ person.stats.days }}</b></div>
+      <div class="kpi"><span>best identity</span><b>{{ person.stats.best_identity }}</b></div>
+      <div class="kpi"><span>sharpest frame</span><b>{{ person.stats.best_sharpness }}</b></div>
+      <div class="kpi"><span>first kept</span><b>{{ person.stats.first }}</b></div>
+      <div class="kpi"><span>last kept</span><b>{{ person.stats.last }}</b></div>
+    </div>
+  </div>
+  <p class="note">Manual person row: <code>{{ person.person_id or "—" }}</code> ·
+    archive profile: <code>{{ person.gallery_id or "—" }}</code> ·
+    frames admitted by hand: {{ person.stats.manual }} · labels: {{ person.labels }}</p>
+
+  {% if person.ring %}
+  <h2>3D build</h2>
+  {% if person.model %}
+  {% if person.model.method == 'photos' %}
+  <p class="note">Built from {{ person.model.views }} real frames of
+    <b>{{ person.model.source }}</b>: a depth model turns each frame into relief, every
+    pixel of {{ person.name }} becomes a coloured point in space, and the frames are
+    turned into one body by the head angle each of them was photographed at. Drag to
+    turn it — the colours are the photographs themselves. Depth is monocular, so the
+    relief is scaled, not measured in metres, and frames of a moving body smear a
+    little; a filmed turn-around sharpens it (see
+    <code>docs/ADMIN_PANEL.md</code>).</p>
+  {% else %}
+  <p class="note">Carved from {{ person.model.views }} of {{ person.model.of_frames }} usable
+    frames of <b>{{ person.model.source }}</b> — every silhouette is cut out of its
+    background, the face in the same frame gives the angle, and the intersection of the
+    silhouettes is the body. Drag to turn it. This is real geometry made of real
+    photographs, but it is a rough statue: folds, hair and the face need either a filmed
+    turn-around or an image-to-3D model, see <code>docs/ADMIN_PANEL.md</code>.</p>
+  {% endif %}
+  <div class="model-wrap">
+    <canvas id="model" data-bin="{{ person.model.bin }}"></canvas>
+    <div class="model-hud">
+      <a href="{{ person.model.bin }}" download>download points</a>
+      <a href="{{ person.model.json }}" target="_blank" rel="noopener">metadata</a>
+      <span class="note">{{ person.model.points }} points ·
+        {{ person.model.triangles }} triangles · yaw
+        {{ person.model.yaw|join("…") }}° · built {{ person.model.built }}</span>
+    </div>
+  </div>
+  {% else %}
+  <p class="note">No 3D build of {{ person.name }} yet. Build one on the hub PC with
+    <code>python scripts/build-3d-profile.py --person {{ person.person_id or person.name }}</code>
+    — it reads this archive, needs no download, and the page shows the model on the next
+    load. A build needs the person at several angles; the angle comes from the face when
+    there is one and from the skeleton when there is not, so side and back views count
+    too. The more of a turn-around the archive holds, the more body and less slab the
+    statue has.</p>
+  {% endif %}
+
+  <h2>Turntable</h2>
+  <p class="note">The frames the archive kept of {{ person.name }}, hung on a ring —
+    drag to turn them, or spin it and watch. The ring carries
+    {{ person.ring|length }} of {{ person.stats.frames }} frames, sampled evenly; every
+    single one is in the strip and the table below. These are the real photographs the
+    hub archived (F-209), not a mesh scan: what you see is what Rowan saw.</p>
+  <div class="turntable" id="turntable">
+    <div class="ring" id="ring">
+      {% for frame in person.ring %}
+      <figure class="frame" data-when="{{ frame.captured_at }}" data-identity="{{ frame.identity }}"
+              data-sharpness="{{ frame.sharpness }}" data-pixels="{{ frame.pixels }}"
+              data-admission="{{ frame.admission }}" data-track="{{ frame.track }}"
+              data-face="{{ frame.face }}" data-body="{{ frame.body }}">
+        <img src="{{ frame.face or frame.body }}" alt="{{ person.name }} {{ frame.captured_at }}"
+             loading="lazy" draggable="false">
+      </figure>
+      {% endfor %}
+    </div>
+    <div class="hud">
+      <button type="button" id="prev" title="previous frame">‹</button>
+      <button type="button" id="playpause" title="spin or hold">❚❚ spin</button>
+      <button type="button" id="next" title="next frame">›</button>
+    </div>
+    <div class="caption" id="caption"></div>
+  </div>
+
+  <h2>Every frame ({{ person.samples|length }})</h2>
+  <div class="filmstrip" id="filmstrip">
+    {% for sample in person.samples %}
+    <img src="{{ sample.face or sample.body }}" alt="{{ sample.captured_at }}" loading="lazy"
+         data-when="{{ sample.captured_at }}" data-identity="{{ sample.identity }}"
+         data-sharpness="{{ sample.sharpness }}" data-pixels="{{ sample.pixels }}"
+         data-admission="{{ sample.admission }}" data-track="{{ sample.track }}"
+         data-face="{{ sample.face }}" data-body="{{ sample.body }}">
+    {% endfor %}
+  </div>
+
+  <h2>Looks — every outfit ({{ person.outfits|length }})</h2>
+  <p class="note">A look is a run of frames in the same clothes, found from the body crop
+    itself: the torso band in Lab colour. On this hub's own archive two frames two minutes
+    apart differ by 0.11 median and two frames of another day by 0.47, so the bar sits at
+    0.30 and a look starts only after two frames in a row disagree — a day with more than
+    one look means {{ person.name }} changed clothes. The newest usable frame of a look is
+    what generation is handed as a reference (F-209).</p>
+  {% if person.outfits %}
+  <div class="looks">
+    {% for look in person.outfits %}
+    <div class="look">
+      <div class="look-head">
+        <b>{{ look.day }}</b>
+        <span class="chip">look {{ look.index }}</span>
+        <span class="chip">{{ look.first }}–{{ look.last }}</span>
+        <span class="chip on">{{ look.count }} frame(s)</span>
+        <span class="chip">best identity {{ look.identity }}</span>
+        {% if look.changed %}<span class="chip on">clothes changed</span>{% endif %}
+      </div>
+      <div class="look-row">
+        {% for frame in look.frames %}
+        <img src="{{ frame.body or frame.face }}" alt="{{ person.name }} {{ frame.captured_at }}"
+             loading="lazy" data-when="{{ frame.captured_at }}" data-identity="{{ frame.identity }}"
+             data-sharpness="{{ frame.sharpness }}" data-pixels="{{ frame.pixels }}"
+             data-admission="{{ frame.admission }}" data-track="{{ frame.track }}"
+             data-face="{{ frame.face }}" data-body="{{ frame.body }}">
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}<p class="note">No archived frame yet.</p>{% endif %}
+
+  <h2>The numbers behind the frames</h2>
+  <table>
+    <tr><th>Frame</th><th>When</th><th>Identity</th><th>Margin</th><th>Detector</th>
+      <th>Sharpness</th><th>Face px</th><th>Admitted by</th><th>Track</th></tr>
+    {% for sample in person.samples %}
+    <tr>
+      <td class="thumb">
+        <img src="{{ sample.face or sample.body }}" alt="{{ sample.captured_at }}" loading="lazy"
+             data-when="{{ sample.captured_at }}" data-identity="{{ sample.identity }}"
+             data-sharpness="{{ sample.sharpness }}" data-pixels="{{ sample.pixels }}"
+             data-admission="{{ sample.admission }}" data-track="{{ sample.track }}"
+             data-face="{{ sample.face }}" data-body="{{ sample.body }}">
+      </td>
+      <td class="num">{{ sample.captured_at }}</td>
+      <td class="num">{{ sample.identity }}</td>
+      <td class="num">{{ sample.margin }}</td>
+      <td class="num">{{ sample.detector }}</td>
+      <td class="num">{{ sample.sharpness }}</td>
+      <td class="num">{{ sample.pixels }}</td>
+      <td>{{ sample.admission }}</td>
+      <td><code>{{ sample.track[:26] }}</code></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="note">The archive has no frame of {{ person.name }} yet. It fills itself only
+    when a manually enrolled face is seen again several frames in a row, so an empty
+    profile here means "no confirmed sighting was kept", not "unknown person".</p>
+  {% endif %}
+
+  <h2>Manual labels</h2>
+  {% if person.history %}
+  <table>
+    <tr><th>Day</th><th>Track</th><th>Bound by</th><th>Source</th><th>When</th></tr>
+    {% for label in person.history %}
+    <tr><td>{{ label.day }}</td><td><code>{{ label.track }}</code></td><td>{{ label.actor }}</td>
+      <td>{{ label.source }}</td><td>{{ label.when }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="note">Nobody had to name a track for {{ person.name }} by hand: everything here
+    came from enrollment or from confirmed sightings.</p>
+  {% endif %}
+  </div><!-- /col-main -->
+  <aside class="col-menu">
+    <div class="menu-card">
+      <h3>Build the 3D model</h3>
+      <p class="note">Pick what the model is made of, then build. The build runs on the hub
+        PC in the background, writes its progress here, and the viewer above shows the new
+        model the moment it is ready.</p>
+      <form method="post" action="/admin/profiles/{{ person.profile_id }}/build">
+        <label class="field">Source
+          <select name="source">
+            {% for source in sources %}
+            <option value="{{ source.key }}">{{ source.title }} — {{ source.frames }} frame(s)</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="field">Method
+          <select name="method">
+            <option value="photos" selected>Real photographs (depth relief)</option>
+            <option value="hull">Silhouette hull (fast, blocky)</option>
+          </select>
+        </label>
+        <label class="field">Frames to use
+          <input type="number" name="limit" value="600" min="8" max="20000" step="100">
+        </label>
+        <label class="field">Which frames
+          <select name="standing">
+            <option value="on" selected>Only standing, whole body (skeleton)</option>
+            <option value="off">Every frame, whatever the pose</option>
+          </select>
+        </label>
+        <label class="field">Clothes
+          <select name="look">
+            <option value="newest" selected>The look worn now</option>
+            <option value="biggest">The look with the most frames</option>
+            <option value="all">Every look mixed</option>
+          </select>
+        </label>
+        <label class="field">Pose
+          <select name="pose">
+            <option value="same" selected>One pose: same head, arms and legs</option>
+            <option value="any">Every pose mixed</option>
+          </select>
+        </label>
+        <label class="field">Point step (1 = every pixel)
+          <input type="number" name="step" value="3" min="1" max="12" step="1">
+        </label>
+        <label class="field">Where to compute
+          <select name="device">
+            <option value="auto" selected>Automatic — the GPU when it is free</option>
+            <option value="cuda">GPU (CUDA, this PC's card)</option>
+            <option value="cpu">CPU only (leaves the card to the rooms)</option>
+          </select>
+        </label>
+        <button type="submit">Build</button>
+      </form>
+      {% if message %}<p class="note">{{ message }}</p>{% endif %}
+      <div class="build-state" id="build-status"
+           data-url="/admin/profiles/{{ person.profile_id }}/build-status">
+        {% if status.state and status.state != 'never' %}
+        <b>{{ status.state }}</b> — {{ status.done or 0 }} / {{ status.total or 0 }}
+        {% if status.points %}, {{ status.points }} points{% endif %}
+        {% if status.device %} · {{ status.device }}{% endif %}
+        {% if status.error %}<br><span class="fail">{{ status.error }}</span>{% endif %}
+        {% else %}<span class="note">No build has run yet.</span>{% endif %}
+      </div>
+    </div>
+    <div class="menu-card">
+      <h3>Viewer</h3>
+      <label class="field">Point size
+        <input type="range" id="point-size" min="1" max="8" step="0.5" value="2.2">
+      </label>
+      <div class="menu-row">
+        <button type="button" id="model-spin">❚❚ spin</button>
+        <button type="button" id="model-reset">reset view</button>
+      </div>
+      <p class="note">Drag to turn, wheel to zoom. Six bytes per point: positions and the
+        colours of the real photographs.</p>
+    </div>
+    <div class="menu-card">
+      <h3>What is stored</h3>
+      {% for source in sources %}
+      <div class="stat"><span>{{ source.title }}</span><b>{{ source.frames }}</b></div>
+      {% endfor %}
+      <div class="stat"><span>appearance frames</span><b>{{ person.stats.frames }}</b></div>
+      <div class="stat"><span>looks</span><b>{{ person.outfits|length }}</b></div>
+      <div class="stat"><span>face vectors</span><b>{{ person.vectors.face }}</b></div>
+      <div class="stat"><span>voice vectors</span><b>{{ person.vectors.voice }}</b></div>
+    </div>
+  </aside>
+  </div><!-- /cols -->
+{% endblock %}
+{% block scripts %}
+<script>
+  // The ring is drawn from the archived frames themselves: every device shows the
+  // same pictures, no 3D engine and no CDN, because the panel lives on the overlay.
+  (function () {
+    const stage = document.getElementById("turntable");
+    if (!stage) { return; }
+    const ring = document.getElementById("ring");
+    const frames = Array.prototype.slice.call(ring.querySelectorAll(".frame"));
+    const count = frames.length;
+    if (!count) { return; }
+    const caption = document.getElementById("caption");
+    const toggle = document.getElementById("playpause");
+    const stepAngle = 360 / count;
+    const radius = count > 1 ? Math.max(240, 90 + (88 / Math.tan(Math.PI / count))) : 0;
+    frames.forEach(function (frame, index) {
+      frame.style.transform =
+        "rotateY(" + (index * stepAngle) + "deg) translateZ(" + radius + "px)";
+    });
+    let angle = 0, spinning = count > 1, dragging = false, lastX = 0, inertia = 0;
+    let moved = 0, last = performance.now();
+
+    function frontIndex() {
+      const front = ((-angle / stepAngle) % count + count) % count;
+      return (Math.round(front) % count + count) % count;
+    }
+    function paint() {
+      const front = ((-angle / stepAngle) % count + count) % count;
+      frames.forEach(function (frame, index) {
+        let delta = index - front;
+        delta -= count * Math.round(delta / count);
+        const facing = Math.cos(delta * stepAngle * Math.PI / 180);
+        frame.style.opacity = String(0.18 + 0.82 * Math.max(0, facing));
+        frame.classList.toggle("front", Math.abs(delta) < 0.5);
+      });
+      const data = frames[frontIndex()].dataset;
+      caption.innerHTML = "<b>" + data.when + "</b> · identity " + data.identity +
+        " · " + data.pixels + " px · sharpness " + data.sharpness + " · " + data.admission;
+    }
+    function draw() {
+      ring.style.transform =
+        "translateZ(" + (-radius) + "px) rotateY(" + angle + "deg)";
+      paint();
+    }
+    function tick(now) {
+      const seconds = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      if (!dragging) {
+        if (spinning) { angle -= seconds * 12; }
+        angle += inertia;
+        inertia *= 0.93;
+      }
+      draw();
+      requestAnimationFrame(tick);
+    }
+
+    const lightbox = document.createElement("div");
+    lightbox.id = "lightbox";
+    lightbox.innerHTML = '<div class="box"><img class="main" alt="">' +
+      '<div class="meta"></div></div>';
+    document.body.appendChild(lightbox);
+
+    function openLightbox(element) {
+      if (!element) { return; }
+      const data = element.dataset || {};
+      lightbox.querySelector("img.main").src = data.face || data.body || "";
+      lightbox.querySelector(".meta").innerHTML = "<b>" + (data.when || "") + "</b>" +
+        "identity " + (data.identity || "—") + "<br>sharpness " + (data.sharpness || "—") +
+        "<br>face box " + (data.pixels || "—") + " px<br>admitted by " +
+        (data.admission || "—") + "<br>track " + (data.track || "—") +
+        (data.body ? '<img src="' + data.body + '" alt="body crop">' : "");
+      lightbox.classList.add("open");
+    }
+
+    stage.addEventListener("pointerdown", function (event) {
+      dragging = true; moved = 0; lastX = event.clientX; inertia = 0;
+      stage.classList.add("grabbing");
+      try { stage.setPointerCapture(event.pointerId); } catch (error) { /* no capture */ }
+    });
+    stage.addEventListener("pointermove", function (event) {
+      if (!dragging) { return; }
+      const dx = event.clientX - lastX;
+      lastX = event.clientX;
+      moved += Math.abs(dx);
+      angle += dx * 0.45;
+      inertia = dx * 0.08;
+    });
+    function release(event) {
+      if (!dragging) { return; }
+      dragging = false;
+      stage.classList.remove("grabbing");
+      if (moved < 4) {
+        const frame = event.target.closest ? event.target.closest(".frame") : null;
+        openLightbox(frame || frames[frontIndex()]);
+      }
+    }
+    stage.addEventListener("pointerup", release);
+    stage.addEventListener("pointercancel", release);
+    document.getElementById("prev").addEventListener("click", function () {
+      inertia = 0; angle += stepAngle;
+    });
+    document.getElementById("next").addEventListener("click", function () {
+      inertia = 0; angle -= stepAngle;
+    });
+    toggle.addEventListener("click", function () {
+      spinning = !spinning;
+      toggle.textContent = spinning ? "❚❚ spin" : "▶ spin";
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "ArrowLeft") { inertia = 0; angle += stepAngle; }
+      if (event.key === "ArrowRight") { inertia = 0; angle -= stepAngle; }
+      if (event.key === "Escape") { lightbox.classList.remove("open"); }
+    });
+    document.addEventListener("click", function (event) {
+      const target = event.target;
+      if (target.tagName === "IMG" && target.dataset.face !== undefined &&
+          !target.closest("#ring") && !target.closest("#lightbox")) {
+        openLightbox(target);
+      }
+    });
+    lightbox.addEventListener("click", function () { lightbox.classList.remove("open"); });
+    requestAnimationFrame(tick);
+  })();
+
+  // --- the carved 3D build: raw WebGL, no engine and no CDN ------------------
+  (function () {
+    const canvas = document.getElementById("model");
+    if (!canvas) { return; }
+    const gl = canvas.getContext("webgl", { antialias: true, alpha: false });
+    if (!gl) {
+      canvas.parentNode.insertAdjacentHTML("beforebegin",
+        '<p class="note">This browser has no WebGL, so the carved model cannot be shown here.</p>');
+      canvas.remove();
+      return;
+    }
+    const vertex_source = [
+      "attribute vec3 a_pos;", "attribute vec3 a_col;",
+      "uniform mat4 u_mvp;", "uniform float u_size;",
+      "varying vec3 v_col;", "varying float v_depth;",
+      "void main() {",
+      "  gl_Position = u_mvp * vec4(a_pos, 1.0);",
+      "  gl_PointSize = u_size;",
+      "  v_col = a_col;",
+      "  v_depth = gl_Position.z / gl_Position.w;",
+      "}"].join("\n");
+    const fragment_source = [
+      "precision mediump float;",
+      "varying vec3 v_col;", "varying float v_depth;",
+      "void main() {",
+      "  float shade = 0.72 + 0.28 * clamp(1.0 + v_depth, 0.0, 1.0);",
+      "  gl_FragColor = vec4(v_col * shade, 1.0);",
+      "}"].join("\n");
+    function compile(kind, source) {
+      const shader = gl.createShader(kind);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      return shader;
+    }
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, vertex_source));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragment_source));
+    gl.linkProgram(program);
+    gl.useProgram(program);
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0.012, 0.024, 0.045, 1.0);
+
+    function mul(a, b) {
+      const out = new Float32Array(16);
+      for (let column = 0; column < 4; column++) {
+        for (let row = 0; row < 4; row++) {
+          let sum = 0;
+          for (let k = 0; k < 4; k++) { sum += a[k * 4 + row] * b[column * 4 + k]; }
+          out[column * 4 + row] = sum;
+        }
+      }
+      return out;
+    }
+    function perspective(field, aspect, near, far) {
+      const f = 1.0 / Math.tan(field / 2);
+      return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0,
+        0, 0, (far + near) / (near - far), -1, 0, 0, 2 * far * near / (near - far), 0]);
+    }
+    function rotation_x(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
+    }
+    function rotation_y(angle) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+    }
+    function translation(x, y, z) {
+      return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+    }
+
+    let yaw = 0.5, pitch = 0.08, distance = 1.7, spinning = true, dragging = false;
+    let point_size = 2.2;
+    let last_x = 0, last_y = 0;
+    const uniforms = {
+      mvp: gl.getUniformLocation(program, "u_mvp"),
+      size: gl.getUniformLocation(program, "u_size"),
+    };
+    function render() {
+      const ratio = Math.max(1, window.devicePixelRatio || 1);
+      const width = canvas.clientWidth * ratio, height = canvas.clientHeight * ratio;
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width; canvas.height = height;
+      }
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      const view = mul(mul(translation(0, -0.04, -distance), rotation_x(pitch)),
+                       rotation_y(yaw));
+      gl.uniformMatrix4fv(uniforms.mvp, false,
+        mul(perspective(0.9, canvas.width / canvas.height, 0.1, 20), view));
+      gl.uniform1f(uniforms.size, point_size * ratio);
+      gl.drawArrays(gl.POINTS, 0, canvas.dataset.count | 0);
+    }
+    function loop() {
+      if (spinning && !dragging) { yaw += 0.004; }
+      render();
+      requestAnimationFrame(loop);
+    }
+    fetch(canvas.dataset.bin).then(function (answer) { return answer.arrayBuffer(); })
+      .then(function (buffer) {
+        const view = new DataView(buffer);
+        const count = Math.floor(buffer.byteLength / 6);
+        const positions = new Float32Array(count * 3), colours = new Float32Array(count * 3);
+        for (let index = 0; index < count; index++) {
+          for (let axis = 0; axis < 3; axis++) {
+            positions[index * 3 + axis] = view.getUint8(index * 6 + axis) / 255 - 0.5;
+            colours[index * 3 + axis] = view.getUint8(index * 6 + 3 + axis) / 255;
+          }
+        }
+        const position_buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, position_buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(gl.getAttribLocation(program, "a_pos"));
+        gl.vertexAttribPointer(gl.getAttribLocation(program, "a_pos"), 3, gl.FLOAT, false, 0, 0);
+        const colour_buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, colour_buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colours, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(gl.getAttribLocation(program, "a_col"));
+        gl.vertexAttribPointer(gl.getAttribLocation(program, "a_col"), 3, gl.FLOAT, false, 0, 0);
+        canvas.dataset.count = String(count);
+        loop();
+      })
+      .catch(function () {
+        canvas.parentNode.insertAdjacentHTML("beforebegin",
+          '<p class="note">The carved model could not be loaded.</p>');
+        canvas.remove();
+      });
+
+    canvas.addEventListener("pointerdown", function (event) {
+      dragging = true; last_x = event.clientX; last_y = event.clientY;
+      canvas.classList.add("grabbing");
+      try { canvas.setPointerCapture(event.pointerId); } catch (error) { /* no capture */ }
+    });
+    canvas.addEventListener("pointermove", function (event) {
+      if (!dragging) { return; }
+      yaw += (event.clientX - last_x) * 0.01;
+      pitch = Math.max(-1.3, Math.min(1.3, pitch + (event.clientY - last_y) * 0.01));
+      last_x = event.clientX; last_y = event.clientY;
+    });
+    canvas.addEventListener("pointerup", function () {
+      dragging = false; canvas.classList.remove("grabbing");
+    });
+    canvas.addEventListener("wheel", function (event) {
+      event.preventDefault();
+      distance = Math.max(1.2, Math.min(6.0, distance + event.deltaY * 0.001));
+    }, { passive: false });
+    const spin_button = document.getElementById("model-spin");
+    if (spin_button) {
+      spin_button.addEventListener("click", function () {
+        spinning = !spinning;
+        spin_button.textContent = spinning ? "❚❚ spin" : "▶ spin";
+      });
+    }
+    const reset_button = document.getElementById("model-reset");
+    if (reset_button) {
+      reset_button.addEventListener("click", function () {
+        yaw = 0.5; pitch = 0.08; distance = 1.7;
+      });
+    }
+    const size_slider = document.getElementById("point-size");
+    if (size_slider) {
+      point_size = parseFloat(size_slider.value) || 2.2;
+      size_slider.addEventListener("input", function () {
+        point_size = parseFloat(size_slider.value) || 2.2;
+      });
+    }
+  })();
+
+  // --- the build status the menu shows --------------------------------------
+  (function () {
+    const box = document.getElementById("build-status");
+    if (!box || !box.dataset.url) { return; }
+    let wasRunning = false;
+    function paint(state) {
+      if (!state || !state.state || state.state === "never") {
+        box.innerHTML = '<span class="note">No build has run yet.</span>';
+        return false;
+      }
+      const parts = ["<b>" + state.state + "</b>"];
+      if (state.total) { parts.push(state.done + " / " + state.total); }
+      if (state.points) { parts.push(state.points + " points"); }
+      if (state.seconds) { parts.push(state.seconds + " s"); }
+      if (state.options) {
+        let how = state.options.source + "/" + state.options.method;
+        if (state.options.device) { how += " on " + state.options.device; }
+        parts.push(how);
+      }
+      if (state.device) { parts.push("ran on " + state.device); }
+      if (state.angles_from) {
+        const angles = Object.keys(state.angles_from).map(function (key) {
+          return state.angles_from[key] + "× " + key;
+        });
+        if (angles.length) { parts.push("angles: " + angles.join(", ")); }
+      }
+      let text = parts.join(" · ");
+      if (state.error) { text += '<br><span class="fail">' + state.error + "</span>"; }
+      box.innerHTML = text;
+      if (wasRunning && state.state !== "running") {
+        // The model on disk just changed: show it without asking the owner.
+        box.insertAdjacentHTML("beforeend",
+          '<br><span class="note">Reloading to show the new model…</span>');
+        setTimeout(function () { location.reload(); }, 1200);
+        return false;
+      }
+      if (state.state === "running") { wasRunning = true; }
+      return state.state === "running";
+    }
+    function poll() {
+      fetch(box.dataset.url, { headers: { "Accept": "application/json" } })
+        .then(function (answer) { return answer.json(); })
+        .then(function (state) { if (paint(state)) { setTimeout(poll, 3000); } })
+        .catch(function () { setTimeout(poll, 8000); });
+    }
+    poll();
+  })();
+</script>
+{% endblock %}

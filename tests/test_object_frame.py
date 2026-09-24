@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import io
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -22,7 +22,9 @@ from hub.migrations_runner import connect, migrate
 from hub.object_memory import ObjectMemoryStore, ObjectSighting
 
 HOME = "livingroom"
-MOMENT = datetime(2026, 9, 22, 14, 30, tzinfo=UTC).timestamp()
+# See test_object_embed.py: the hard-coded 2026-09-22 noon fell outside the
+# 48-hour freshness window on 2026-09-24 and the tests failed on the calendar.
+MOMENT = (datetime.now(UTC) - timedelta(minutes=5)).timestamp()
 def _jpeg(width: int = 8, height: int = 6) -> bytes:
     """Настоящий JPEG: хаб меряет его размер из заголовка, а не угадывает."""
     from PIL import Image

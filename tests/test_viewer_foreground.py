@@ -9,9 +9,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from PIL import Image
+import pytest
 
 from client import viewer
 from client.actions import photos
+
+
+@pytest.fixture(autouse=True)
+def _forget_pin_state():
+    """The photo's place is re-asserted at most twice a second, so a test that
+    just pinned the same place would skip the next one."""
+    viewer._LAST_PIN, viewer._LAST_PIN_AT = (0, 0), 0.0
+    yield
 
 
 def native_window_api(monkeypatch):
@@ -58,6 +67,22 @@ def test_missing_window_is_ignored(monkeypatch):
     viewer._make_borderless_topmost(viewer.WINDOW_NAME)
     viewer._keep_on_top(viewer.WINDOW_NAME)
     api.SetWindowPos.assert_not_called()
+
+
+def test_the_photo_does_not_re_pin_itself_sixty_times_a_second(monkeypatch):
+    """Владелец 2026-09-24: the overlay blinked while a picture was up.
+
+    The photo re-pinned itself on every message-loop pump and the HUD raised
+    itself four times a second, so the two windows traded the top slot in front
+    of the owner. The place only has to be settled, not enforced per frame.
+    """
+    api = native_window_api(monkeypatch)
+
+    viewer._keep_on_top(viewer.WINDOW_NAME)
+    for _ in range(20):  # the pumps of one 60 Hz second
+        viewer._keep_on_top(viewer.WINDOW_NAME)
+
+    assert api.SetWindowPos.call_count == 1, 'одно и то же место не переставляем каждый кадр'
     api.SetForegroundWindow.assert_not_called()
 
 

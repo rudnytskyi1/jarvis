@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Put a Google Cloud service-account key where Vertex image generation finds it.
 

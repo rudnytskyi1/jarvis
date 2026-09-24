@@ -299,7 +299,7 @@ def test_the_hub_shows_the_room_camera_with_the_names_it_knows():
     frame = _frame(tracks=[{"id": "t1", "box": [.1, .1, .3, .5]},
                            {"id": "t2", "box": [.6, .1, .8, .5]}])
     connection = _camera_connection(frame, tracks={"t1": {"name": "Макс", "box": [.1, .1, .3, .5]},
-                                                  "t2": {"name": None, "box": [.6, .1, .8, .5]}})
+                                                   "t2": {"name": None, "box": [.6, .1, .8, .5]}})
     spoken = asyncio.run(connection._show_camera_turn("Rowan, покажи камеру"))
     assert spoken == camera_view.showing_text("ru")
     (shown,) = connection.shown
@@ -307,6 +307,65 @@ def test_the_hub_shows_the_room_camera_with_the_names_it_knows():
     assert shown["title"] == camera_view.title_text("ru")
     assert shown["tracks"] == [{"name": "Макс", "box": [.1, .1, .3, .5]},
                                {"name": "", "box": [.6, .1, .8, .5]}]
+
+
+def test_a_track_the_fusion_recognized_is_labelled_too(monkeypatch):
+    """Владелец 2026-09-24: «не видно label (имя) на bounding box».
+
+    Имя на трек ставит прямое распознавание лица, а личность в комнате
+    подтверждает ещё и слияние F-206/F-207 - по лицу И по телу (ReID). Трек,
+    узнанный слиянием, тоже должен получать подпись, иначе рамка без имени.
+    """
+    from hub.identity_fusion import Belief
+
+    frame = _frame(tracks=[{"id": "t2", "box": [.6, .1, .8, .5]}])
+    connection = _camera_connection(frame, tracks={"t2": {"name": None, "box": [.6, .1, .8, .5]}})
+    believed = {"t2": Belief(track_id="t2", person_id="p-max", p=0.95, sources={"body": 1.0})}
+    monkeypatch.setattr(hub_app, "_identity_belief_store", lambda: SimpleNamespace(get=believed.get))
+    monkeypatch.setattr(hub_app, "_person_display_name",
+                        lambda person_id: {"p-max": "Макс"}.get(str(person_id), ""))
+
+    assert connection._track_names() == {"t2": "Макс"}
+    assert connection._live_track_ids() == ["t2"]
+    shown = asyncio.run(connection._show_camera_turn("покажи камеру"))
+    assert shown == camera_view.showing_text("ru")
+    assert connection.shown[0]["tracks"] == [{"name": "Макс", "box": [.6, .1, .8, .5]}]
+
+
+def test_a_weak_or_unknown_belief_never_becomes_a_label(monkeypatch):
+    """ТЗ F-206: подпись берётся только с уверенного belief, а не с догадки."""
+    from hub.identity_fusion import RECOGNIZE_P, Belief
+
+    connection = _camera_connection(_frame(), tracks={"t1": {"name": None, "box": [.1, .1, .3, .5]}})
+    weak = Belief(track_id="t1", person_id="p-max", p=RECOGNIZE_P - 0.01)
+    monkeypatch.setattr(hub_app, "_identity_belief_store", lambda: SimpleNamespace(get=lambda key: weak))
+    monkeypatch.setattr(hub_app, "_person_display_name", lambda person_id: "Макс")
+    assert connection._track_names() == {}
+
+    # Ни belief, ни имя человека - подписи нет: выдуманных имён в проекте нет.
+    monkeypatch.setattr(hub_app, "_identity_belief_store", lambda: None)
+    assert connection._track_names() == {}
+    monkeypatch.setattr(hub_app, "_identity_belief_store", lambda: SimpleNamespace(get=lambda key: None))
+    assert connection._track_names() == {}
+    monkeypatch.setattr(hub_app, "_identity_belief_store",
+                        lambda: SimpleNamespace(get=lambda key: Belief(track_id="t1",
+                                                                       person_id="p-max",
+                                                                       p=0.99)))
+    monkeypatch.setattr(hub_app, "_person_display_name", lambda person_id: "")
+    assert connection._track_names() == {}
+
+
+def test_a_face_name_wins_over_the_fused_one(monkeypatch):
+    """Прямое имя трека не переписывается слиянием - оно свежее и точнее."""
+    from hub.identity_fusion import Belief
+
+    connection = _camera_connection(_frame(),
+                                    tracks={"t1": {"name": "Антон", "box": [.1, .1, .3, .5]}})
+    monkeypatch.setattr(hub_app, "_identity_belief_store",
+                        lambda: SimpleNamespace(get=lambda key: Belief(track_id="t1",
+                                                                       person_id="p-max", p=0.99)))
+    monkeypatch.setattr(hub_app, "_person_display_name", lambda person_id: "Макс")
+    assert connection._track_names() == {"t1": "Антон"}
 
 
 def test_an_ordinary_request_never_touches_the_camera():

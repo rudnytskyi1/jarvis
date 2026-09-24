@@ -38,8 +38,37 @@ MEMORY_PLACEHOLDER = "{memory}"
 #: v1.4: placeholder filled with what the room camera currently sees.
 PRESENCE_PLACEHOLDER = "{presence}"
 
+#: Replies that were never an answer to anybody: the hub's own "this cannot be
+#: done right now" lines from older builds. They must not be replayed as
+#: assistant turns - see :meth:`Session.remember`.
+_HISTORY_POISON = (
+    'api allowance reached',
+    'too long for the configured api allowance',
+    'conversation is too long',
+    'start a new conversation',
+)
+
+
+def _worth_remembering(assistant_text: str) -> bool:
+    """Is this reply an exchange, or the hub talking about itself?"""
+    lowered = " ".join(str(assistant_text or "").casefold().split())
+    if not lowered:
+        return False
+    return not any(phrase in lowered for phrase in _HISTORY_POISON)
+
 #: Shown instead of the device list when the client reported no devices.
-NO_DEVICES_TEXT = "(no devices configured)"
+#:
+#: The room reported nothing, so the answer to "turn on the desk lamp" is one
+#: sentence, not a call: ``set_light``/``set_switch`` reach the room PC, and a
+#: room that never listed a lamp has none to switch. Two of the 64 mass-audit
+#: device phrasings still called the tool over an empty list (2026-09-23,
+#: AU-06), so the slot says plainly what an empty list means instead of only
+#: saying it is empty.
+NO_DEVICES_TEXT = (
+    "(this room has NO smart devices: no lights, no lamps, no switches, no "
+    "plugs. A request about one is answered in one sentence saying so, without "
+    "calling set_light or set_switch - there is nothing here to switch.)"
+)
 
 #: Static text put where ``{presence}`` sits in the prompt file — the live view
 #: itself rides in each user message's prefix so the system prompt never changes
@@ -372,7 +401,17 @@ class Session:
 
         Durable storage belongs to Conversations; trimming model context never
         deletes the person's older requests.
+
+        A turn whose reply was the hub's own failure line is not an exchange:
+        older builds stored «Monthly API allowance reached; local commands
+        remain available.» as an assistant message, and the buro prompt of
+        2026-09-24 held four of them in a row followed by an answer about smart
+        lights. Those lines are not answers, and replaying them teaches the
+        model to say them again.
         """
+        if not _worth_remembering(assistant_text):
+            log.debug("Not keeping this turn in the model history: %r", str(assistant_text)[:80])
+            return
         max_messages = self.history_turns * 2
         if max_messages <= 0:
             self._history.clear()

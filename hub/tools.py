@@ -125,6 +125,21 @@ TOOLS: list[dict[str, Any]] = [
                 "for anything inside a page (scrolling it, typing in one of its fields, "
                 "clicking its buttons, going back) use browser_control, which reads the "
                 "page back and can prove what happened. "
+                "\"Minimize everything\", \"hide all the windows\" or \"show me the "
+                "desktop\" is ONE call: hotkey with win+d hides every window at once. "
+                "Never list the open windows with run_command first, and never guess a "
+                "couple of application names to minimize one by one. "
+                "\"Play the music\", \"pause the music\", \"next track\" with no site "
+                "and no page named are the PC's own media keys: media_play_pause, "
+                "media_next or media_prev. A named site or page (\"play music on "
+                "YouTube\") is browser_control instead, never a shell command. "
+                "The clipboard belongs to this tool: clipboard_read reads what is on "
+                "it, clipboard_write puts text on it and clipboard_paste types that "
+                "text into the focused window. Reading the clipboard is NOT "
+                "look_at_screen — the clipboard is not the screen. "
+                "Never type a password, a card number, a one-time code or a PIN for "
+                "anyone: say in words that you will not type it and let the person "
+                "type it themselves. "
                 "lock and shutdown need the user's spoken yes first (they are asked "
                 "about automatically); unlock exists only for a home whose config "
                 "allows it and needs the owner's face and voice. "
@@ -319,8 +334,10 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Save a lasting fact to your permanent memory. Use it when someone shares "
                 "something worth keeping — names, preferences, schedules, where things are, "
-                "promises — or explicitly asks you to remember something. Do not use it for "
-                "one-off commands or small talk. "
+                "promises — or explicitly asks you to remember something: 'remember that …', "
+                "'don't forget that …', 'keep in mind that …' and 'note that …' are all that "
+                "request, so call this tool instead of only saying you will remember. Do not "
+                "use it for one-off commands or small talk. "
                 "Always set 'about': a fact belongs either to ONE person (their "
                 "preference, their habit, how they want you to behave with them) or "
                 "to the room as a whole. A personal fact is only ever read back "
@@ -392,7 +409,9 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Read back what the hub remembers about the current speaker. Use it "
                 "for questions like 'what do you know about me?'. It changes nothing "
-                "and is answered from the stored facts, so never guess a fact."
+                "and is answered from the stored facts, so never guess a fact. What "
+                "somebody SAID, or what the two of you talked about, is not a saved "
+                "fact: that is recall_conversation."
             ),
             "parameters": {
                 "type": "object",
@@ -452,7 +471,10 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Say a sentence OUT LOUD in this room: the room's speaker plays "
                 "exactly this text. Use it whenever somebody asks you to say, "
-                "speak or read something out in the room, including a Telegram "
+                "speak or read something out in the room - including "
+                "'announce it', 'tell everyone' or 'let the rooms know', which "
+                "is speaking out loud and never a Telegram message - and also "
+                "for a Telegram "
                 "request aimed at a room computer ('say TEST HELLO on the anton "
                 "PC', 'tell the room it is time to go'). The room says the text "
                 "in the language you write it in, so write the words to be "
@@ -486,11 +508,53 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "camera_preview",
+            "description": (
+                "Open or close the LIVE camera view on a room computer screen: "
+                "the room shows its own camera as video with a box on every "
+                "detection (people carry their name when the room knows them; "
+                "objects carry the class and confidence). Use it for 'open the "
+                "camera on the buro PC and show me the detections', 'show the "
+                "live camera of this room', 'покажи камеру вживую', and for "
+                "turning it off again ('close the camera view'). It is not "
+                "show_photo: that one puts a single still picture up. The video "
+                "stays inside the room PC - nothing is uploaded. Name the "
+                "computer in workplace when the request names one ('buro', "
+                "'anton'); leave it empty to act on this room. " + _COMMON_HINT
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "on": {
+                        "type": "boolean",
+                        "description": "true opens the live view, false closes it.",
+                    },
+                    "workplace": {
+                        "type": "string",
+                        "description": (
+                            "Optional: which computer, exactly as the request "
+                            "named it. Empty means the room of this conversation."
+                        ),
+                    },
+                },
+                "required": ["on"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "enroll_voice",
             "description": (
                 "Start guided recording of the CURRENT speaker's voice. "
                 "Call it when someone asks you to remember their voice or introduces "
                 "themselves for enrollment, or asks to add more voice samples. "
+                "Call it just as readily when the speaker introduces somebody "
+                "else by name - 'this is Max', 'enroll the voice of John', 'save "
+                "my voice as Sasha' - with the name they said: the tool is what "
+                "asks them to speak, so never answer that only the person "
+                "themselves can be enrolled and never ask them to introduce "
+                "themselves first. "
                 "The initial request is not saved as a sample. The server prompts "
                 "six separate sentences totaling at least twenty seconds of speech. "
                 "For an existing name, accepted samples are added to that profile. "
@@ -559,9 +623,15 @@ TOOLS: list[dict[str, Any]] = [
                 "the camera and turn their head slowly. If the camera sees more than "
                 "one person, nothing is stored: the result asks which numbered face is "
                 "theirs, and that answer is what finishes the enrollment. "
-                "Offer it right after their voice enrollment finished, and only with "
-                "their consent. Anyone may be enrolled, including a guest. If the "
-                "result says no face was visible, ask them to face the camera and try "
+                "Offer it right after their voice enrollment finished, and call "
+                "it just as readily when the speaker names somebody to remember "
+                "by sight: 'this is Max, memorize his face', 'remember this face "
+                "as John', 'save this person as my roommate' - call it with the "
+                "name the speaker said. Consent is the person agreeing in front "
+                "of the camera, which includes the owner introducing a guest "
+                "(F-210), so never answer that the person has to ask for it "
+                "themselves and never ask them to introduce themselves first. "
+                "If the result says no face was visible, ask them to face the camera and try "
                 "once more. " + _COMMON_HINT
             ),
             "parameters": {
@@ -585,13 +655,14 @@ TOOLS: list[dict[str, Any]] = [
             "name": "find_object",
             "description": (
                 "Count and locate specific physical objects with a real object "
-                "detector, instead of guessing from a general look-around. Use it "
-                "for questions like 'how many chairs are there', 'where is my "
-                "backpack', 'is there a water bottle here' — about the physical "
-                "room (source camera, the default) or about something visible on "
-                "the room PC's screen (source screen). It is slower than "
-                "look_at_camera or look_at_screen, so reach for it only when an "
-                "exact count or an exact location is actually needed. "
+                "detector, instead of guessing from a general look-around. Call it "
+                "FIRST whenever the request names one thing to count or find: "
+                "'how many chairs are there', 'where is my backpack', 'is there a "
+                "water bottle here', 'find my keys', 'do you see my phone', 'can "
+                "you see my laptop' — about the physical room (source camera, the "
+                "default) or about something visible on the room PC's screen "
+                "(source screen). look_at_camera is for an open question about "
+                "the whole room, not for a named object. "
                 + _COMMON_HINT
             ),
             "parameters": {
@@ -665,6 +736,8 @@ TOOLS: list[dict[str, Any]] = [
                 "(any role), or for an admin renaming anyone. Works even while "
                 "enrollment is still in progress. If new_name already belongs "
                 "to someone else, the two profiles are merged into one person. "
+                "The new name has to come from the person: when the request did "
+                "not say it, ask for it once instead of guessing. "
                 "Never tell someone a name cannot be changed — call this "
                 "instead."
             ),
@@ -690,7 +763,9 @@ TOOLS: list[dict[str, Any]] = [
             "name": "set_role",
             "description": (
                 "Change an enrolled person's role. Only an admin speaker may do this "
-                "(enforced by the system). Roles: admin (everything incl. running "
+                "- the system enforces it, so call the tool and relay its answer "
+                "instead of refusing on its behalf or asking who is speaking. "
+                "Roles: admin (everything incl. running "
                 "commands), trusted (computer use, screen, memory), user (volume, "
                 "media, lights, chat)."
             ),
@@ -725,8 +800,42 @@ TOOLS.append({'type': 'function', 'function': {
 #: Names of the tools the model may call.
 TOOLS.append({"type": "function", "function": {
     "name": "recall_conversation",
-    "description": "Search saved conversations, including earlier days. With permissions enabled, only the recognized speaker's own history is accessible. With permissions disabled, person may select an explicitly requested profile. Ask which profile if identity and person are both missing. Empty query returns recent exchanges.",
-    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+    "description": (
+        "Search the conversations you have kept, including earlier days, and answer from what "
+        "they really say. Use it for 'what did we talk about …', 'do you remember what I said "
+        "about …', 'find the conversation where we discussed …': the words of the request name "
+        "the subject, and a day ('yesterday') is a TIME filter, not a subject. This is history, "
+        "not saved facts — 'what do you know about me' is list_memory, and a saved fact is "
+        "never repeated as if somebody had said it in a conversation. With permissions enabled, "
+        "only the recognized speaker's own history is accessible. With permissions disabled, "
+        "person may select an explicitly requested profile. Ask which profile if identity and "
+        "person are both missing. An empty query returns the most recent exchanges."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "query": {
+            "type": "string",
+            "description": ("Words of the request that name what was discussed, e.g. 'the exam' "
+                            "or 'the dorm', or empty for the most recent exchanges."),
+        },
+        "person": {
+            "type": "string",
+            "description": ("Whose history to read, 'me' for the current speaker; only needed "
+                            "when the voice is not recognized."),
+        },
+        "since": {
+            "type": "string",
+            "description": ("Optional ISO date or date-time (YYYY-MM-DD or "
+                            "YYYY-MM-DDTHH:MM:SS). 'yesterday' belongs here, not in query."),
+        },
+        "until": {
+            "type": "string",
+            "description": "Optional ISO date or date-time; a plain date means its last second.",
+        },
+        "limit": {
+            "type": "integer", "minimum": 1, "maximum": 25,
+            "description": "How many exchanges to return, 1–25 (default 12).",
+        },
+    }, "required": ["query"]}
 }})
 TOOLS.append({'type': 'function', 'function': {
     'name': 'save_photo',
@@ -768,7 +877,7 @@ TOOLS.append({'type': 'function', 'function': {
 }})
 TOOLS.append({'type': 'function', 'function': {
     'name': 'set_wallpaper',
-    'description': 'Install an existing image as the real room PC Windows desktop wallpaper, transferring pixels from the brain and verifying Windows state. Use source=generated after image creation; this makes no paid generation call. Do not use run_command or a brain filesystem path. Confirm only when applied and verified are true. It does not change the lock screen.',
+    'description': 'Install an existing image as the real room PC Windows desktop wallpaper, transferring pixels from the brain and verifying Windows state. Use source=generated after image creation; this makes no paid generation call. Use it directly and do not call look_at_screen, look_at_camera or show_photo first to find the picture; a failed look is never a reason to skip the wallpaper. Do not use run_command or a brain filesystem path. Confirm only when applied and verified are true. It does not change the lock screen.',
     'parameters': {'type': 'object', 'properties': {
         'source': {'type': 'string', 'enum': ['generated', 'camera', 'screen']},
         'fresh': {'type': 'boolean', 'description': 'For camera/screen only: false (default) uses the exact cached frame; true captures a new one.'},
@@ -800,6 +909,9 @@ for _definition in TOOLS:
 TOOLS.append({'type': 'function', 'function': {
     'name': 'telegram_send',
     'description': 'Send a message or image to the one configured Telegram group, only when the user explicitly requests it. Never post proactively. '
+        'The home has exactly ONE chat, so a person named in the request ("tell John I am on my way") is not a destination the bot can reach: '
+        'there is no private channel to them, and this tool only ever posts to the group when THIS turn asks for the group. '
+        'Say plainly that the message cannot be passed on privately (and offer the group) instead of posting the private wording there or reading it out loud as if they had heard it. '
         'kind=text sends text (copy quoted wording exactly); kind=image sends camera/screen/generated/annotated pixels. '
         'Use source=generated to send the current speaker\'s Nano Banana result without generating again. '
         'fresh=false sends the exact cached photo; fresh=true captures only when a new camera photo/screenshot was requested. '
@@ -829,8 +941,20 @@ TOOLS.append({'type': 'function', 'function': {
         'optional critical), skill (skill, args). Use only names the person said; '
         'never invent a device, scene or skill. "Tell me when someone comes in" is a '
         'presence rule and needs no extra hardware: the room watches its own camera, '
-        'so propose the rule instead of saying the room has no sensors. Only an action '
-        'that names a device the home does not have is impossible.'),
+        'so propose the rule instead of saying the room has no sensors. A named place '
+        '- the door, the window, the desk - is one of the frame zones the owner marks '
+        '(F-309): watch it with event zone_entered and the zone the person named, and '
+        'put their words in the rule name. A standing request ("notify me when ...", '
+        '"send me a message when ...", "if X, do Y") ends in this call - the spoken yes '
+        '(F-113) is the confirmation - so never answer it with a question about what '
+        'the notification should look like. When only the action names something the '
+        'home does not have yet (a light), still propose the rule with a notify or say '
+        'action and mention the part that cannot run; never answer one of these requests '
+        'with a question such as "should I set it up with a notification instead?". A '
+        'trigger the room truly cannot see - light level, brightness, temperature, a '
+        'sensor that was never installed - does not exist here: say so in one sentence '
+        'instead of inventing a device, and never put a different trigger (a clock, a '
+        'sound) in its place as if the request had been met.'),
     'parameters': {'type': 'object', 'properties': {
         'rule': {'type': 'string', 'description': 'The rule as a JSON object string, e.g. {"name": "warm light", "trigger": {"kind": "presence", "event": "person_entered"}, "actions": [{"kind": "scene", "scene": "warm"}]}.'},
         'spoken': {'type': 'string', 'description': 'One short line naming the rule for the spoken confirmation.'},
@@ -893,6 +1017,25 @@ TOOLS.append({'type': 'function', 'function': {
     }, 'required': ['goal']},
 }})
 
+#: ТЗ F-610: общий список покупок и дел группы домов. Читается и из комнаты
+#: голосом, и в Telegram, и на HUD карточкой; хранит строки сам хаб.
+TOOLS.append({'type': 'function', 'function': {
+    'name': 'shopping_list',
+    'description': (
+        'The shared shopping and to-do list of this group of rooms. Use action=add '
+        'when somebody names a thing to buy or do ("add milk to the list"), '
+        'action=list to read the list back, action=done to tick an item off '
+        '("I bought milk"), action=remove to drop it and action=clear to empty '
+        'the list. The list is shared: what one room adds, the others and Telegram '
+        'read. Never invent items and never tick off something the list does not '
+        'contain - the tool answers honestly when it does not.'),
+    'parameters': {'type': 'object', 'properties': {
+        'action': {'type': 'string', 'enum': ['add', 'list', 'done', 'remove', 'clear'],
+                   'description': 'What to do with the list: add an item, read it, tick one off, remove one or empty it.'},
+        'item': {'type': 'string', 'description': 'The item itself for action=add/done/remove, exactly as the person said it, e.g. "молоко".'},
+    }, 'required': ['action']},
+}})
+
 TOOL_NAMES: tuple[str, ...] = tuple(tool["function"]["name"] for tool in TOOLS)
 for _tool in TOOLS:
     _tool['function']['parameters']['properties']['purpose'] = {
@@ -908,11 +1051,13 @@ TOOL_FAMILIES: dict[str, tuple[str, ...]] = {
     'browser': ('browser_control',),
     'pc': ('pc_control', 'run_command', 'computer_use', 'click_screen', 'run_skill'),
     'vision': ('look_at_screen', 'look_at_camera', 'find_object', 'inspect_photo'),
-    'media': ('show_photo', 'save_photo', 'generate_image', 'set_wallpaper', 'say_in_room'),
+    'media': ('show_photo', 'save_photo', 'generate_image', 'set_wallpaper', 'say_in_room',
+              'camera_preview'),
     'memory': ('remember', 'forget_fact', 'list_memory', 'recall_conversation'),
     'people': ('list_people', 'rename_person', 'set_role', 'enroll_voice', 'enroll_face'),
     'devices': ('set_light', 'set_switch'),
     'notify': ('telegram_send', 'create_rule'),
+    'lists': ('shopping_list',),
 }
 
 #: The family names Jev is asked to choose from, plus ``none`` meaning "this is
@@ -935,24 +1080,50 @@ TOOL_FAMILY_MEANINGS: dict[str, str] = {
                'opening the browser program itself',
     'pc': 'Programs and windows installed on the PC (Chrome, Notepad, Spotify, '
           'Steam), the desktop, files, folders, typing text, pressing keys, the '
-          'volume and the sound, or running one of the '
+          'volume and the sound, the media keys (play, pause, next track), the '
+          'clipboard (reading it, putting text on it, pasting), hiding every '
+          'window at once ("minimize everything", "show me the desktop"), or '
+          'running one of the '
           "home's own skills such as the weather - not a website, a page or a "
-          'search, and not a picture that Rowan itself put on the screen',
+          'search, and not a picture that Rowan itself put on the screen. '
+          'Reading the CLIPBOARD is this family, not looking at the screen: the '
+          'clipboard belongs to the PC',
     # "who is in the room", "what do you see", "read the screen" and "where are
     # my keys" were read as memory or people questions by Jev (mass audit
     # 2026-09-23) and lost the camera and screen tools entirely. The meaning now
     # says out loud that this is about looking right now.
-    'vision': 'Looking right now: what or who is in the room, what the camera '
-              'sees, who is standing in front of it, reading the screen, '
-              'finding a thing that is visible, inspecting an attached photo',
-    'media': 'Showing, saving, drawing or editing a picture, hiding a picture that is '
-             'already on the screen, or setting the wallpaper',
+    'vision': 'Looking right now and answering about it: what or who is in the '
+              'room, what the camera sees, who is standing in front of it, '
+              'reading the screen or the browser window, finding a thing that '
+              'is visible (keys, phone, laptop, remote, mug, backpack), '
+              'inspecting an attached photo - a question like "who is in the '
+              'room?" or "what is on the screen?" is still this, not memory. '
+              'A request to MAKE a picture ("a picture of a dog", "a pic of '
+              'my cat", "an image of a dragon") is NOT this family: there is '
+              'nothing to look at yet, the person wants it drawn, so that is '
+              'media. Vision is about a picture that already exists - the one '
+              'the person sent, the one just drawn, or what the camera and the '
+              'screen show right now. '
+              'The clipboard is not the screen and not a picture: "read my '
+              'clipboard" is the PC family',
+    'media': 'Making, showing, displaying, hiding, saving, drawing or editing '
+             'a picture or a camera view on the room overlay ("show me the '
+             'camera", "show the screen on the overlay", "hide that picture", '
+             '"draw a cat", "set a wallpaper"). A bare request for something '
+             'pictured needs no verb at all and is still this family: "picture '
+             'of a dog", "Rowan, picture of a dog", "a pic of my cat", "an '
+             'image of a dragon" - the person is asking for the picture to be '
+             'made, which is drawing, so it lands here and not in vision. This '
+             'is not vision: vision is when the person asks Rowan to look at a '
+             'picture that exists and then tell them what is there',
     'memory': 'Remembering something, forgetting it, or recalling what was said',
     'people': 'The saved people and their profiles: who Rowan knows, the list '
               'of names, enrolling or remembering a face or a voice, renaming '
               'someone, giving someone a role',
     'devices': 'The lights and switches of the room',
     'notify': 'Sending a message to the owner, or making a rule that watches something',
+    'lists': 'The shared shopping list: things to buy or do for the group of '
+             'rooms (adding an item, reading the list out, ticking one off)',
     'none': 'Nothing is to be done: an ordinary question, remark or conversation',
 }
 
@@ -1011,8 +1182,10 @@ SERVER_TOOLS: frozenset[str] = frozenset(
         "set_wallpaper",
         "list_people",
         "say_in_room",
+        "camera_preview",
         "run_skill",
         "computer_use",
+        "shopping_list",
     }
 )
 
@@ -1103,6 +1276,45 @@ WRONG_TOOL_FOR_PAGES = (
     "run_command did not run: opening a web page is browser_control's job. "
     "Call browser_control with command=navigate and the site URL.")
 
+#: Words that mean "every window", not the name of one program. "Minimize
+#: everything" arrived as ``minimize_app`` with ``value='all'``/``'everything'``,
+#: and the PC answered "no installed application matches 'all'" (ТЗ F-511,
+#: docs/REQUESTS_AUDIT.md). Win+D hides every window in one keystroke.
+ALL_WINDOWS_WORDS: frozenset[str] = frozenset({
+    "all", "everything", "all windows", "every window", "every windows",
+    "the windows", "windows", "all the windows", "all apps", "all applications",
+    "every app", "every application", "the desktop", "desktop", "my desktop",
+})
+
+#: What the model reads when it tried to type a secret with ``pc_control``.
+#: ТЗ F-512 forbids typing passwords and payment details in computer-use; the
+#: same rule holds for ``type_text``, where the room's own voice is the only
+#: source of the text — a secret typed once has already leaked into the
+#: transcript, the log and the training archive.
+WRONG_TOOL_FOR_SECRETS = (
+    "pc_control did not type it: Rowan never types a password, a card number, a "
+    "one-time code or a PIN. Say in words that you will not type it and let the "
+    "person type it themselves; everything after that is fine.")
+
+
+def types_a_secret(args: dict[str, Any] | None) -> str:
+    """The name of the secret a ``pc_control type_text`` call would type, or ``""``.
+
+    The word list is the hub's own (``common.computer_use.SENSITIVE_RULES``,
+    the rule F-512 applies to computer-use), so the two paths cannot drift
+    apart. Like there, the refusal fires on a MENTION rather than on a guess
+    about what is really a secret: a secret typed once is already spilled.
+    """
+    values = dict(args or {})
+    if str(values.get("command") or "").strip().casefold() != "type_text":
+        return ""
+    text = values.get("value")
+    if text is None:
+        text = values.get("target")
+    from common.computer_use import sensitive_reason
+
+    return sensitive_reason(text)
+
 
 def opening_a_web_page(args: dict[str, Any] | None) -> str:
     """The piece of a ``run_command`` that opens a page, or ``""``.
@@ -1139,9 +1351,19 @@ def normalize_pc_control_args(args: dict[str, Any]) -> dict[str, Any]:
     (``{'command': 'volume_set', 'target': '50'}``); one argument in the wrong
     slot must not turn into "the PC refused" when the person is one word away
     from what they asked for.
+
+    "Minimize everything" is a third case: the words name EVERY window, not an
+    application, and the PC has no program called ``all`` (ТЗ F-511,
+    docs/REQUESTS_AUDIT.md). Win+D does it in one keystroke, so the call is
+    rewritten rather than sent on to be refused.
     """
     cleaned = dict(args)
     command = str(cleaned.get("command") or "").strip().casefold()
+    if command in {"minimize_app", "hotkey"}:
+        whole = str(cleaned.get("value") or cleaned.get("target") or "").strip().casefold()
+        if whole in ALL_WINDOWS_WORDS:
+            log.info("pc_control %s %r: every window means win+d", command, whole)
+            return {"command": "hotkey", "value": "win+d"}
     if str(cleaned.get("value") or "").strip():
         return cleaned
     target = str(cleaned.get("target") or "").strip()
@@ -1278,6 +1500,9 @@ __all__ = [
     "normalize_click_button",
     "opening_a_web_page",
     "WRONG_TOOL_FOR_PAGES",
+    "ALL_WINDOWS_WORDS",
+    "WRONG_TOOL_FOR_SECRETS",
+    "types_a_secret",
     "mouse_click_args",
     "is_client_tool",
     "action_item",

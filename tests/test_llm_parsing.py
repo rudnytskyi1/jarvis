@@ -4,7 +4,22 @@ from hub.llm import (
     clean_reply,
     native_base_url,
     normalize_tool_calls,
+    sounds_like_the_self_check,
 )
+
+
+def test_a_reply_about_the_self_check_is_recognised():
+    """buro, 2026-09-24: this sentence was spoken instead of the real answer."""
+    assert sounds_like_the_self_check(
+        "I don't see any request from you — just a system self-check, and nothing "
+        "above shows a task I was given or started. What would you like me to do?")
+    assert sounds_like_the_self_check('Nothing above shows me doing that.')
+
+
+def test_an_ordinary_reply_is_not_taken_for_the_self_check():
+    assert not sounds_like_the_self_check('Firefox is open — opening MrBeast now.')
+    assert not sounds_like_the_self_check('')
+    assert not sounds_like_the_self_check(None)
 
 
 def test_native_base_url_strips_v1():

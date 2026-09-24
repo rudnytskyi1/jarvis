@@ -22,10 +22,19 @@ cannot see.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from common.config import LLMConfig
 from hub.vision import VisionClient
+
+#: ultralytics replaces ``PIL.Image.open`` with its own version that, when the
+#: picture cannot be read, tries to ``pip install pi-heif`` - a blocking network
+#: call inside a hub turn. Rowan never installs packages while it runs (the
+#: package is installed, not fetched), so the automatic install stays off. The
+#: variable is read by ultralytics when it is imported, and this module is one of
+#: the places a picture is opened.
+os.environ.setdefault("YOLO_AUTOINSTALL", "false")
 
 log = logging.getLogger(__name__)
 

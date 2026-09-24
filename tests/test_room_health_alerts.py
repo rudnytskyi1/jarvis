@@ -9,6 +9,7 @@ in the notification group (never one per retry).
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 from common import protocol as proto
@@ -98,6 +99,30 @@ def test_the_hub_turns_room_health_into_one_sentence_for_the_group(tmp_path, mon
     assert 'buro' in broken and 'camera is not working' in broken and 'usb:0' in broken
     assert 'retrying' in broken
     assert 'working again' in recovered
+    assert all(target == {'group_chat_id': -1003570242441} for _, target in provider.sent)
+
+
+def test_a_deaf_room_is_reported_as_a_microphone_problem(tmp_path, monkeypatch):
+    """«rowanai buropc не отзывается»: the room could not hear, not see."""
+    provider = FakeProvider()
+    service = alerts(tmp_path, provider)
+    monkeypatch.setattr(hub_app, '_presence_alerts', service)
+    connection = hub_app.Connection(SimpleNamespace(client=None), SimpleNamespace())
+    connection.workplace_name = 'buro'
+    connection.home_id = 'livingroom'
+
+    async def run():
+        await connection._on_room_health({'kind': 'microphone', 'ok': False,
+                                          'detail': 'no audio frames for 9 s'})
+        await connection._on_room_health({'kind': 'microphone', 'ok': True,
+                                          'detail': 'frames are back after 21 s'})
+
+    asyncio.run(run())
+    broken, recovered = provider.sent[0][0], provider.sent[1][0]
+    assert 'buro' in broken and 'microphone is not working' in broken
+    assert 'no audio frames for 9 s' in broken and 'wake word' in broken
+    assert 'voice still works in that room' not in broken, 'микрофон — это не камера'
+    assert 'microphone is working again' in recovered
     assert all(target == {'group_chat_id': -1003570242441} for _, target in provider.sent)
 
 
@@ -202,3 +227,96 @@ def test_the_client_tells_the_hub_that_the_camera_is_gone_and_back():
     assert [frame['ok'] for frame in frames] == [False, True]
     assert frames[0]['kind'] == 'camera' and frames[0]['camera'] == 'usb:0'
     assert 'stopped delivering' in frames[0]['detail']
+
+
+def bare_mic_client(client_main, microphone):
+    """A JarvisClient with only what the microphone watchdog touches."""
+    client = client_main.JarvisClient.__new__(client_main.JarvisClient)
+    client.audio_in = microphone
+    client.ws = _FrameSink()
+    client._wire_lock = asyncio.Lock()
+    client._mic_trouble = False
+    client._mic_trouble_since = 0.0
+    client._mic_stream_started = time.monotonic()
+    return client
+
+
+class _FrameSink:
+    def __init__(self):
+        self.frames: list[dict] = []
+
+    async def send_json(self, payload):
+        self.frames.append(payload)
+
+
+class _SilentMicrophone:
+    """A stream that reports silence and, once reopened, delivers frames."""
+
+    def __init__(self, silent_for: float, recovers: bool = True):
+        self.silent_for = silent_for
+        self.recovers = recovers
+        self.reopens = 0
+
+    def seconds_since_frame(self):
+        return self.silent_for
+
+    def reopen(self):
+        self.reopens += 1
+        self.silent_for = 0.0 if self.recovers else self.silent_for
+        return True, 'device=21 at 48000 Hz'
+
+
+def test_a_deaf_room_reopens_its_microphone_and_says_so(monkeypatch):
+    """The client notices the silence itself and tells the hub (2026-09-23)."""
+    from client import main as client_main
+
+    monkeypatch.setattr(client_main, 'MIC_STALL_S', 5.0)
+    monkeypatch.setattr(client_main, 'MIC_REOPEN_MIN_GAP_S', 10.0)
+    microphone = _SilentMicrophone(silent_for=30.0)
+    client = bare_mic_client(client_main, microphone)
+
+    async def run():
+        first = await client._microphone_watch_step(last_reopen=0.0)
+        # The reopen worked, so the next pass sees frames again.
+        return first, await client._microphone_watch_step(last_reopen=first)
+
+    asyncio.run(run())
+    assert microphone.reopens == 1, 'комната должна сама переоткрыть молчащий микрофон'
+    frames = client.ws.frames
+    assert [frame['type'] for frame in frames] == [proto.MSG_ROOM_HEALTH] * 2
+    assert [frame['ok'] for frame in frames] == [False, True]
+    assert all(frame['kind'] == 'microphone' for frame in frames)
+    assert 'no audio frames for 30 s' in frames[0]['detail']
+    assert 'frames are back' in frames[1]['detail']
+
+
+def test_a_microphone_that_stays_silent_is_not_reopened_in_a_tight_loop(monkeypatch):
+    from client import main as client_main
+
+    monkeypatch.setattr(client_main, 'MIC_STALL_S', 5.0)
+    monkeypatch.setattr(client_main, 'MIC_REOPEN_MIN_GAP_S', 60.0)
+    microphone = _SilentMicrophone(silent_for=30.0, recovers=False)
+    client = bare_mic_client(client_main, microphone)
+
+    async def run():
+        first = await client._microphone_watch_step(last_reopen=0.0)
+        second = await client._microphone_watch_step(last_reopen=first)
+        return first, second
+
+    asyncio.run(run())
+    assert microphone.reopens == 1, 'устройство, которое держит кто-то другой, не долбим в цикле'
+    assert len(client.ws.frames) == 1, 'одна поломка — одно сообщение в группу'
+
+
+def test_a_healthy_microphone_says_nothing(monkeypatch):
+    from client import main as client_main
+
+    monkeypatch.setattr(client_main, 'MIC_STALL_S', 5.0)
+    microphone = _SilentMicrophone(silent_for=0.4)
+    client = bare_mic_client(client_main, microphone)
+
+    async def run():
+        await client._microphone_watch_step(last_reopen=0.0)
+
+    asyncio.run(run())
+    assert microphone.reopens == 0 and client.ws.frames == []

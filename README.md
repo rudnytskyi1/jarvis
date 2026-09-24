@@ -786,3 +786,68 @@ jarvis/
 - SwitchBot: no password support and no hub (BLE only, near the PC).
 - IR strips and Bluetooth-only strips are not supported (a Wi-Fi controller is
   required).
+
+---
+
+## 13. Mass audit: what it is and how to run it
+
+The mass audit (23.09.2026) sends every kind of request a person actually makes
+through the same chain a live room uses — Jev reads the utterance once and
+narrows the tool set, then the real model answers and the real tools run — and
+writes one JSONL line per scenario. It is the check to run after touching the
+prompt, the understanding step or a tool. Full results and the repair list are
+in `docs/AUDIT_MASS.md`; the "before/after" family table is
+`docs/AUDIT_MASS_AFTER.md`; latency is `docs/AUDIT_LATENCY.md`; the decisions
+behind them are `DECISIONS.md` (AUDIT-01…AUDIT-19).
+
+```powershell
+$py = 'C:\Users\Anton\anaconda3\envs\jarvis\python.exe'   # the hub's own interpreter
+
+# 1. the corpus: every family x subject x phrasing (1112 utterances today)
+& $py scripts\gen-audit-scenarios.py            # -> data/audit/scenarios.jsonl
+
+# 2. the live run: real Jev, real model, real tools (--workers 6, as asked)
+& $py scripts\live-eval.py --scenarios data\audit\scenarios.jsonl `
+    --workers 6 --jsonl data\audit\runs\last.jsonl --quiet
+
+#    one family only (repeatable), or no Jev at all:
+& $py scripts\live-eval.py --family browser --family noisy --workers 6
+& $py scripts\live-eval.py --scenarios data\audit\scenarios.jsonl --no-understanding
+
+#    the same corpus asked the way the Telegram chat asks it (AU-19): the real
+#    TelegramController, the same Jev reading, the same model and tools
+& $py scripts\live-eval.py --scenarios data\audit\scenarios.jsonl `
+    --telegram --workers 6 --jsonl data\audit\runs\telegram.jsonl --quiet
+
+# 3. the summary the report is written from
+& $py scripts\audit-summary.py --runs data\audit\runs\last.jsonl --write docs\AUDIT_MASS.md
+
+# 4. the offline matrix: the same utterances checked without a model
+& $py -m pytest tests\audit -q
+
+# 5. latency: bench reports + the live hub's own turn trace + its log
+& $py scripts\audit-latency.py --runs data\audit\runs\last.jsonl --write docs\AUDIT_LATENCY.md
+
+# 6. the real room PCs: deploy the current client, then do 57 real actions there
+pwsh -File scripts\update-room-pcs.ps1
+pwsh -File scripts\room-audit.ps1
+```
+
+Three rules keep the numbers honest: the verdict separates the model's choice
+from the family narrowing (`offered` is written to every line, so "the wrong
+tool" and "the tool was never shown to the model" are different failures), a
+scenario the bench cannot test prints `SKIP` with a reason instead of passing,
+and a pair of requests counts as done only when **both** halves were called.
+The run of 23.09.2026 closed at **1071 of 1077** judged scenarios (99.4 %)
+against **812 of 1106** (73.4 %) in the first pass of the same night. What is
+left is listed in `docs/AUDIT_MASS.md` ("Остаток"): two stable scenarios, three
+that vary run to run, and one provider outage — none of them hidden.
+
+`--telegram` came out of the same night (AU-19): the owner asked that the
+Telegram chat have the same capabilities as the voice assistant, and the chat
+route was only reachable by hand. The real `hub.telegram_control.
+TelegramController` now runs against the bench room, reads the request with the
+same Jev call as a spoken turn and hands the model the same narrowed tool set;
+only the incoming message object is built by the bench. The first full run of
+the 1112-scenario corpus through that route is in `docs/AUDIT_MASS.md`
+(`data/audit/runs/au-19-telegram.jsonl`).

@@ -92,12 +92,17 @@ $ErrorActionPreference = 'Continue'
 $task = '__TASK__'
 Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
+# Только сам клиент Rowan: `python -m client.main --config ...`. Фильтр по
+# имени каталога проекта здесь не годится — «rowanai» в пути поймало бы любую
+# чужую программу, положенную рядом (владелец 2026-09-23: «другие процессы
+# питона не трогай»).
 $mine = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and ($_.CommandLine -match 'client\.main' -or $_.CommandLine -match 'rowanai') })
+    Where-Object { $_.CommandLine -and $_.CommandLine -match '(?i)client[\\/\.]main' })
 foreach ($item in $mine) {
     Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Write-Output ('stopped-client-processes=' + $mine.Count)
+Write-Output ('python-others-still-running=' + ([bool](Get-Process python -ErrorAction SilentlyContinue)))
 Start-Sleep -Seconds 2
 '@
 

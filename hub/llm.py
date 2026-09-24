@@ -206,6 +206,33 @@ VERIFY_MESSAGE = (
     "spoken sentences for the user - do not mention this self-check.]"
 )
 
+#: A weak model sometimes answers the verifier instead of the person: «I don't
+#: see any request from you - just a system self-check». That sentence reached
+#: the room (buro, 2026-09-24 23:35) in place of the real answer, because the
+#: self-check's text replaced whatever the turn had produced. Anything about
+#: the check itself is never a reply to the person.
+SELF_CHECK_MENTIONS = (
+    'self-check',
+    'self check',
+    'system check',
+    'system self',
+    "don't see any request",
+    'do not see any request',
+    'see no request',
+    'no request from you',
+    'no user request',
+    'nothing above shows',
+    'no task was given',
+    'no task to do',
+)
+
+
+def sounds_like_the_self_check(text: str | None) -> bool:
+    """Is the model talking to the verifier instead of to the person?"""
+    lowered = " ".join(str(text or "").casefold().split())
+    return any(mention in lowered for mention in SELF_CHECK_MENTIONS)
+
+
 BROWSER_REPAIR_MESSAGE = (
     "[system browser recovery: the last browser action was rejected because "
     "its element reference was stale, missing or changed. Continue the user's "
@@ -1180,6 +1207,7 @@ class LlmClient:
         history: list[dict[str, Any]],
         reply: str,
         executor: ToolExecutor | None = None,
+        note: str = "",
     ) -> LlmResult:
         """Self-check pass: did the model do everything asked/promised?
 
@@ -1188,10 +1216,23 @@ class LlmClient:
         verifier instruction, and runs the tool loop once more. If work was
         missing, the model finishes it here; otherwise it just confirms. The
         returned text replaces the spoken reply.
+
+        ``note`` names the step the pipeline already knows is missing (a site
+        the request named that no tool reached, a half of «save a photo and put
+        it on my wallpaper»). Without it a forced self-check only repeated the
+        generic instruction, and the model answered with a sentence about the
+        check itself instead of doing the missing step.
         """
         continued = list(history)
         continued.append({"role": "assistant", "content": reply})
-        continued.append({"role": "user", "content": VERIFY_MESSAGE})
+        instruction = VERIFY_MESSAGE
+        if str(note or "").strip():
+            instruction = VERIFY_MESSAGE + (
+                " [system: this step of the request provably did NOT happen yet: "
+                + " ".join(str(note).split())[:200]
+                + ". Carry it out NOW with the right tool, then give the final reply.]"
+            )
+        continued.append({"role": "user", "content": instruction})
         return await self.generate(continued, executor)
 
     async def generate(

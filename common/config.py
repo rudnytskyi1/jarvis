@@ -1650,6 +1650,12 @@ class IdentityConfig(_Strict):
     phone_admin_threshold: float = Field(default=0.65, gt=0.0, le=1.0)
     #: False lets a phone ask for admin actions without a PIN (ТЗ wants it on).
     phone_pin_required: bool = True
+    #: Владелец 2026-09-24: «иногда голос для каких-то запросов надо чтобы
+    #: распознало выше порога (для важных запросов), а мне это не надо». False
+    #: keeps D-07 (the role matrix: admin / guest / nobody) and drops only the
+    #: extra F-208 proof - a voice at ``admin_voice_threshold`` AND a face, or
+    #: the body of today, or the PIN - that an irreversible call used to need.
+    admin_second_factor: bool = True
     #: How long the room waits for the spoken PIN (per question).
     pin_window_s: float = Field(default=20.0, ge=5.0, le=120.0)
     #: Wrong tries before the person is locked out, and for how long.

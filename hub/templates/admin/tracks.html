@@ -18,9 +18,12 @@
       <td>{{ track.quality }}</td>
       <td>p {{ track.belief_p }} → {{ track.belief_person }}<br><span class="note">{{ track.sources }}</span></td>
       <td>
+        <span class="crops">
         {% for crop in track.crops %}
-        <img src="/admin/crop/{{ crop.crop_id }}.jpg" alt="{{ crop.crop_id }}" width="96">
+        <img class="crop" src="/admin/crop/{{ crop.crop_id }}.jpg" alt="{{ crop.crop_id }}"
+             loading="lazy">
         {% else %}<span class="note">no crop</span>{% endfor %}
+        </span>
       </td>
       <td>
         <form method="post" action="/admin/label">

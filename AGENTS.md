@@ -79,6 +79,26 @@ RTX 5090 обслуживает несколько комнат, в каждой
 Точная копия в `Makefile`: `make test`, `make hub`, `make client`,
 `make migrate`, `make skill name=<name>`, `make test-regress`.
 
+### Перезапуск хаба: только вне песочницы
+
+Процесс, запущенный из песочницы агента, **не имеет интернета**: соединение с
+`api.telegram.org` и с API моделей отклоняется (`WinError 10061`), поэтому бот
+в Telegram молчит, а комнаты не могут позвать LLM. Это уже случалось
+(2026-09-24: хаб перезапускали из песочницы, владелец весь вечер писал
+«не отвечает в телеге»). Поэтому хаб перезапускается только с эскалацией:
+
+```powershell
+$hubPid = (netstat -ano | Select-String ':8770.*LISTENING' | Select-Object -First 1).ToString().Trim() -split '\s+' | Select-Object -Last 1
+Stop-Process -Id $hubPid -Force
+Start-Process -FilePath 'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe' `
+  -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\Users\Anton\Desktop\jarvis\scripts\run-openai-server.ps1' `
+  -WorkingDirectory 'C:\Users\Anton\Desktop\jarvis' -WindowStyle Hidden
+```
+
+Проверка после старта: `/health` отвечает 200, в `data\logs\hub.err.log` нет
+строк `Telegram polling paused`, а у бота `getWebhookInfo` показывает
+`pending_update_count = 0`.
+
 ## Правила кода (из раздела 1 ТЗ)
 
 - Не ломать работающее: каждая фаза заканчивается запускаемой системой.

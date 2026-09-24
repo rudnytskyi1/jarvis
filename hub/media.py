@@ -8,10 +8,12 @@ presence events remain untouched.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
 import sqlite3
 import uuid
+import wave
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,13 +28,16 @@ _HOME_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 FRAME_KINDS = {"frame", "crop"}
 CLIP_KINDS = {"clip"}
-MEDIA_KINDS = FRAME_KINDS | CLIP_KINDS | {"audio"}
+#: ТЗ F-609: голосовая заметка другому человеку живёт 7 дней, а не 3, как кадр.
+NOTE_KINDS = {"note"}
+MEDIA_KINDS = FRAME_KINDS | CLIP_KINDS | NOTE_KINDS | {"audio"}
 
 _KIND_SUFFIX = {
     "frame": ".jpg",
     "crop": ".jpg",
     "clip": ".mp4",
     "audio": ".wav",
+    "note": ".wav",
 }
 
 log = logging.getLogger("jarvis.server.media")
@@ -40,6 +45,41 @@ log = logging.getLogger("jarvis.server.media")
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def pcm_to_wav(pcm: bytes, *, sample_rate: int, channels: int = 1,
+               width: int = 2) -> bytes:
+    """PCM комнаты → настоящий WAV: его читает и хаб, и человек на стенде."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(max(1, int(channels)))
+        handle.setsampwidth(max(1, int(width)))
+        handle.setframerate(max(1, int(sample_rate)))
+        handle.writeframes(bytes(pcm))
+    return buffer.getvalue()
+
+
+def wav_pcm(data: bytes) -> tuple[bytes, int]:
+    """PCM и частота из настоящего WAV; битый файл — названная ошибка."""
+    try:
+        with wave.open(io.BytesIO(bytes(data)), "rb") as handle:
+            rate = int(handle.getframerate())
+            channels = int(handle.getnchannels())
+            width = int(handle.getsampwidth())
+            frames = handle.readframes(handle.getnframes())
+    except Exception as exc:  # noqa: BLE001 - битая запись не «тишина»
+        raise ValueError(f"the recording is not a readable wav ({type(exc).__name__})") from exc
+    if not frames:
+        raise ValueError("the recording holds no audio")
+    if channels != 1 or width != 2:
+        raise ValueError("the recording is not mono pcm16")
+    return frames, rate
+
+
+def wav_seconds(data: bytes) -> float:
+    """Длительность настоящего WAV в секундах."""
+    frames, rate = wav_pcm(data)
+    return len(frames) / (2.0 * max(1, rate))
 
 
 class MediaStore:
@@ -52,12 +92,14 @@ class MediaStore:
         *,
         media_ttl_days: int = 3,
         clip_ttl_days: int = 7,
+        note_ttl_days: int = 7,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.conn = conn
         self.base = Path(data_dir)
         self.media_ttl_days = media_ttl_days
         self.clip_ttl_days = clip_ttl_days
+        self.note_ttl_days = note_ttl_days
         self.clock = clock
         self.homes_root = self.base / "homes"
 
@@ -79,6 +121,8 @@ class MediaStore:
     def ttl_days(self, kind: str) -> int:
         if kind in CLIP_KINDS:
             return self.clip_ttl_days
+        if kind in NOTE_KINDS:
+            return self.note_ttl_days
         if kind in FRAME_KINDS or kind == "audio":
             return self.media_ttl_days
         raise ValueError(f"unknown media kind: {kind!r}")

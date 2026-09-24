@@ -163,9 +163,12 @@ def test_an_unusable_query_matches_nobody():
 # --- the engine without torch -------------------------------------------------
 
 
-def test_the_engine_is_honest_without_torchreid():
+def test_the_engine_is_honest_without_torchreid(monkeypatch):
+    # This hub HAS torchreid (F-203 is live on it), so "the library is missing"
+    # is simulated here rather than assumed about the machine.
+    monkeypatch.setattr("hub.reid._installed", {"torchreid": False, "torch": False})
     engine = ReidEngine(SimpleNamespace(enabled=True))
-    assert torchreid_installed() is False, "this sandbox has no torchreid"
+    assert torchreid_installed() is False, "the missing library is simulated"
     assert engine.available is False and engine.loaded is False
     # No library means no vector - never a made-up one, and never an exception.
     assert engine.embed(_jpeg()) is None
@@ -367,7 +370,10 @@ def test_no_vector_is_written_when_reid_is_off(hub_db, tmp_path, monkeypatch):
     crops = BodyCropStore(hub_db, tmp_path / "data")
     saved = crops.save(home_id="livingroom", client_id="pc-1", track_id="a:1", jpeg=_jpeg())
     assert saved is not None
-    _wire(monkeypatch, tmp_path, hub_db, crops, BodyEmbeddingStore(hub_db), None)
+    # ``False`` is the module's own "ReID is off" sentinel; ``None`` means "not
+    # built yet" and the app would lazily build one - and on a hub where
+    # torchreid is installed (F-203 is live here) that engine really embeds.
+    _wire(monkeypatch, tmp_path, hub_db, crops, BodyEmbeddingStore(hub_db), False)
     asyncio.run(_connection()._embed_body_crop(saved))
     assert hub_db.execute("SELECT COUNT(*) FROM body_embeddings").fetchone()[0] == 0
 

@@ -19,12 +19,10 @@ TTL F-304), а не след в памяти: эту фразу должны у�
 """
 from __future__ import annotations
 
-import io
 import logging
 import math
 import re
 import time
-import wave
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Protocol
 
@@ -32,6 +30,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from common.ids import new_ulid
 from hub.games import answers_match
+
+#: Запись голоса — тот же настоящий WAV, что и у голосовых заметок (F-609):
+#: помощники живут в медиах хаба, а здесь остаются видимыми под прежними именами.
+from hub.media import pcm_to_wav, wav_pcm, wav_seconds
 from hub.skill_state import SkillSchedulerError, SkillStateError, SkillStateStore
 
 log = logging.getLogger(__name__)
@@ -64,40 +66,6 @@ class GuessError(RuntimeError):
 # ---------------------------------------------------------------------------
 # запись
 # ---------------------------------------------------------------------------
-
-
-def pcm_to_wav(pcm: bytes, *, sample_rate: int, channels: int = 1, width: int = 2) -> bytes:
-    """PCM16 комнаты → настоящий WAV: его читает и хаб, и человек на стенде."""
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as handle:
-        handle.setnchannels(max(1, int(channels)))
-        handle.setsampwidth(max(1, int(width)))
-        handle.setframerate(max(1, int(sample_rate)))
-        handle.writeframes(bytes(pcm))
-    return buffer.getvalue()
-
-
-def wav_pcm(data: bytes) -> tuple[bytes, int]:
-    """PCM и частота из настоящего WAV; битый файл — названная ошибка."""
-    try:
-        with wave.open(io.BytesIO(bytes(data)), "rb") as handle:
-            rate = int(handle.getframerate())
-            channels = int(handle.getnchannels())
-            width = int(handle.getsampwidth())
-            frames = handle.readframes(handle.getnframes())
-    except Exception as exc:  # noqa: BLE001 - битая запись не «тишина»
-        raise ValueError(f"the recording is not a readable wav ({type(exc).__name__})") from exc
-    if not frames:
-        raise ValueError("the recording holds no audio")
-    if channels != 1 or width != 2:
-        raise ValueError("the recording is not mono pcm16")
-    return frames, rate
-
-
-def wav_seconds(data: bytes) -> float:
-    """Длительность настоящего WAV в секундах."""
-    frames, rate = wav_pcm(data)
-    return len(frames) / (2.0 * max(1, rate))
 
 
 class AudioStore(Protocol):
@@ -555,10 +523,19 @@ class GuessEngine:
 
     # --- партия ------------------------------------------------------------
 
-    def start(self, *, speaker_id: str, speaker_name: str, home_id: str,
-              home_ids: Iterable[str] = (), audio_pcm: bytes, sample_rate: int,
-              aliases: Sequence[str] = (), language: str = "ru") -> tuple[GuessRound, str]:
-        """Записать загадку и открыть партию. Без согласия — честный отказ."""
+    async def start(self, *, speaker_id: str, speaker_name: str, home_id: str,
+                    home_ids: Iterable[str] = (), audio_pcm: bytes, sample_rate: int,
+                    aliases: Sequence[str] = (), language: str = "ru",
+                    ) -> tuple[GuessRound, str]:
+        """Записать загадку и открыть партию. Без согласия — честный отказ.
+
+        Метод асинхронный, потому что так его зовут комнаты и хаб; сама запись
+        фразы идёт в медиах хаба (:class:`hub.media.MediaStore`) на этом же
+        потоке: соединение с SQLite у хаба одно и живёт в потоке цикла, а
+        ``asyncio.to_thread`` увёл бы его в чужой поток и уронил запись
+        («SQLite objects created in a thread can only be used in that same
+        thread»). Так же поступает остальная работа хаба с медиа (F-304/F-305).
+        """
         if self.active() is not None:
             raise GuessError("a round is already running")
         home = str(home_id or "")

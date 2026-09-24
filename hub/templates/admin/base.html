@@ -3,50 +3,119 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Rowan · owner panel</title>
+  <title>{% block title %}Rowan · owner console{% endblock %}</title>
   <style>
     :root {
-      --ink: #16181d; --dim: #6b7280; --line: #e5e7eb; --bg: #f7f8fa;
-      --card: #fff; --accent: #2f5bd7; --good: #127c4a; --bad: #b4232c;
-      --turn: #2f5bd7; --decision: #7a5af8; --tool: #0b7285; --llm: #b8860b;
-      --prompt: #6b7280; --say: #127c4a; --image: #b4232c;
+      --void: #04060c; --void-2: #070b14; --panel: rgba(15, 23, 39, .72);
+      --panel-2: rgba(20, 30, 50, .55); --line: rgba(120, 180, 255, .16);
+      --line-2: rgba(120, 180, 255, .30); --ink: #dde7f7; --dim: #7e8da6;
+      --accent: #3fe3ff; --accent-2: #a172ff; --good: #29e6a2; --bad: #ff5f78;
+      --warn: #ffc24b;
+      --turn: #3fe3ff; --decision: #a172ff; --tool: #29e6a2; --llm: #ffc24b;
+      --prompt: #7e8da6; --say: #4fd1ff; --image: #ff5f78;
+      --mono: "Cascadia Mono", "JetBrains Mono", Consolas, ui-monospace, monospace;
     }
     * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink);
-      background: var(--bg); margin: 0 auto; max-width: 68rem; padding: 1.5rem 1rem 3rem; }
-    h1 { font-size: 1.4rem; margin: 0 0 .75rem; }
-    h2 { font-size: 1.15rem; margin: 1.5rem 0 .5rem; }
-    nav { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: 1.25rem; }
-    nav a { text-decoration: none; color: var(--accent); padding: .35rem .7rem;
-      border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
-    nav a:hover { border-color: var(--accent); }
-    .note { color: var(--dim); font-size: .88rem; line-height: 1.45; }
-    .card { background: var(--card); border: 1px solid var(--line); border-radius: .6rem;
-      padding: .8rem 1rem; margin-bottom: .9rem; }
-    table { border-collapse: collapse; width: 100%; background: var(--card);
-      border: 1px solid var(--line); border-radius: .6rem; overflow: hidden; }
-    th { text-align: left; font-size: .8rem; text-transform: uppercase;
-      letter-spacing: .03em; color: var(--dim); }
-    th, td { padding: .5rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0; color: var(--ink); background: var(--void);
+      background-image:
+        radial-gradient(900px 520px at 12% -8%, rgba(63, 227, 255, .14), transparent 62%),
+        radial-gradient(760px 460px at 96% 6%, rgba(161, 114, 255, .16), transparent 60%),
+        radial-gradient(700px 700px at 60% 120%, rgba(41, 230, 162, .07), transparent 65%),
+        repeating-linear-gradient(0deg, rgba(255, 255, 255, .022) 0 1px, transparent 1px 42px),
+        repeating-linear-gradient(90deg, rgba(255, 255, 255, .022) 0 1px, transparent 1px 42px);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .shell { display: grid; grid-template-columns: 15rem minmax(0, 1fr); min-height: 100vh; }
+    /* --- the rail --------------------------------------------------------- */
+    .rail {
+      position: sticky; top: 0; align-self: start; height: 100vh; padding: 1.1rem .85rem;
+      display: flex; flex-direction: column; gap: 1rem; overflow-y: auto;
+      background: linear-gradient(180deg, rgba(8, 12, 22, .92), rgba(6, 9, 17, .72));
+      border-right: 1px solid var(--line); backdrop-filter: blur(9px);
+    }
+    .brand { display: flex; align-items: center; gap: .6rem; padding: .2rem .35rem .55rem; }
+    .brand .mark {
+      width: 2.1rem; height: 2.1rem; display: grid; place-items: center; font-weight: 700;
+      font-family: var(--mono); color: #04121a; border-radius: .55rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      box-shadow: 0 0 18px rgba(63, 227, 255, .45);
+    }
+    .brand b { display: block; letter-spacing: .22em; font-size: .84rem; }
+    .brand small { color: var(--dim); font-size: .7rem; letter-spacing: .14em;
+      text-transform: uppercase; }
+    nav { display: flex; flex-direction: column; gap: .18rem; }
+    nav a {
+      display: flex; align-items: center; gap: .55rem; padding: .48rem .6rem; font-size: .88rem;
+      color: var(--ink); text-decoration: none; border: 1px solid transparent;
+      border-radius: .55rem; transition: background .15s, border-color .15s, transform .15s;
+    }
+    nav a .ic { width: 1.15rem; text-align: center; opacity: .75; }
+    nav a:hover { background: var(--panel-2); border-color: var(--line); transform: translateX(2px); }
+    nav a.here {
+      background: linear-gradient(90deg, rgba(63, 227, 255, .16), rgba(161, 114, 255, .10));
+      border-color: var(--line-2); box-shadow: inset 2px 0 0 var(--accent);
+    }
+    nav a.here .ic { opacity: 1; color: var(--accent); }
+    .rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: .4rem;
+      padding-top: .8rem; border-top: 1px solid var(--line); }
+    .rail-foot .stat { display: flex; justify-content: space-between; align-items: baseline;
+      font-size: .74rem; color: var(--dim); letter-spacing: .08em; text-transform: uppercase; }
+    .rail-foot .stat b { font-family: var(--mono); font-size: .95rem; color: var(--ink);
+      font-variant-numeric: tabular-nums; }
+    .signout { margin-top: .35rem; text-align: center; color: var(--dim); font-size: .78rem;
+      text-decoration: none; border: 1px solid var(--line); border-radius: .5rem; padding: .35rem; }
+    .signout:hover { color: var(--bad); border-color: rgba(255, 95, 120, .5); }
+    /* --- the page --------------------------------------------------------- */
+    main { padding: 1.6rem 1.8rem 3.5rem; max-width: 78rem; }
+    h1 { font-size: 1.18rem; letter-spacing: .06em; text-transform: uppercase; margin: 0 0 1rem; }
+    h2 { font-size: 1rem; letter-spacing: .1em; text-transform: uppercase; color: var(--ink);
+      margin: 1.9rem 0 .7rem; }
+    h2::after { content: ""; display: block; height: 1px; margin-top: .45rem;
+      background: linear-gradient(90deg, var(--line-2), transparent 70%); }
+    h3 { font-size: .92rem; margin: 0 0 .3rem; }
+    p { margin: .5rem 0; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .note { color: var(--dim); font-size: .84rem; line-height: 1.5; }
+    code, pre, .num { font-family: var(--mono); }
+    code { font-size: .82rem; color: #b7e8ff; }
+    pre { background: rgba(2, 5, 11, .82); color: #cfe6ff; padding: .75rem .85rem;
+      border: 1px solid var(--line); border-radius: .5rem; font-size: .78rem;
+      overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: .5rem 0 0; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: .8rem;
+      padding: .85rem 1rem; margin-bottom: .9rem; backdrop-filter: blur(7px); }
+    .card:hover { border-color: var(--line-2); }
+    table { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--panel);
+      border: 1px solid var(--line); border-radius: .8rem; overflow: hidden;
+      backdrop-filter: blur(7px); }
+    th { text-align: left; font-size: .72rem; text-transform: uppercase; letter-spacing: .1em;
+      color: var(--dim); background: rgba(10, 16, 28, .7); }
+    th, td { padding: .55rem .7rem; border-bottom: 1px solid rgba(120, 180, 255, .09);
+      vertical-align: top; }
     tr:last-child td { border-bottom: none; }
+    tbody tr:hover td, table tr:hover td { background: rgba(63, 227, 255, .045); }
     td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-    a { color: var(--accent); }
-    code, pre { font-family: "Cascadia Mono", Consolas, monospace; font-size: .8rem; }
-    pre { background: #0f1115; color: #e6e8ec; padding: .7rem .8rem; border-radius: .45rem;
-      overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: .45rem 0 0; }
-    details summary { cursor: pointer; color: var(--dim); font-size: .82rem; }
-    .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px;
-      font-size: .75rem; font-weight: 600; color: #fff; background: var(--dim); }
+    td.when, th.when { white-space: nowrap; font-family: var(--mono); font-size: .8rem; }
+    img.crop { width: 3.6rem; height: 4.6rem; object-fit: cover; cursor: pointer; }
+    .crops { display: flex; flex-wrap: wrap; gap: .25rem; }
+    img { border-radius: .45rem; display: block; }
+    details summary { cursor: pointer; color: var(--dim); font-size: .8rem; letter-spacing: .04em; }
+    .pill { display: inline-block; padding: .08rem .5rem; border-radius: 999px; font-size: .7rem;
+      font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: #04121a;
+      background: var(--dim); }
     .pill.turn { background: var(--turn); }
-    .pill.decision { background: var(--decision); }
+    .pill.decision { background: var(--decision); color: #fff; }
     .pill.tool { background: var(--tool); }
     .pill.llm { background: var(--llm); }
-    .pill.prompt { background: var(--prompt); }
+    .pill.prompt { background: var(--prompt); color: #fff; }
     .pill.say { background: var(--say); }
-    .pill.image { background: var(--image); }
+    .pill.image { background: var(--image); color: #fff; }
     .ok { color: var(--good); font-weight: 600; }
     .fail { color: var(--bad); font-weight: 600; }
-    .step { border-left: 4px solid var(--dim); }
+    .step { border-left: 3px solid var(--dim); }
     .step.turn { border-left-color: var(--turn); }
     .step.decision { border-left-color: var(--decision); }
     .step.tool { border-left-color: var(--tool); }
@@ -55,29 +124,86 @@
     .step.say { border-left-color: var(--say); }
     .step.image { border-left-color: var(--image); }
     .step-head { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline;
-      font-size: .82rem; color: var(--dim); }
-    .step-head .who { color: var(--ink); font-weight: 600; }
-    .summary { margin-top: .35rem; line-height: 1.45; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .6rem; }
-    input[type=search], input[type=date], select { padding: .35rem .5rem; font: inherit;
-      border: 1px solid var(--line); border-radius: .4rem; background: var(--card); }
-    button { padding: .35rem .8rem; font: inherit; border-radius: .4rem; cursor: pointer;
-      border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+      font-size: .8rem; color: var(--dim); font-family: var(--mono); }
+    .step-head .who { color: var(--ink); font-weight: 600; font-family: inherit; }
+    .summary { margin-top: .4rem; line-height: 1.5; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .8rem; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: .6rem; }
+    .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: .7rem;
+      padding: .6rem .75rem; }
+    .kpi span { display: block; color: var(--dim); font-size: .68rem; letter-spacing: .1em;
+      text-transform: uppercase; }
+    .kpi b { font-family: var(--mono); font-size: 1.12rem; font-variant-numeric: tabular-nums; }
+    .chips { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .35rem; }
+    .chip { font-family: var(--mono); font-size: .68rem; color: var(--dim);
+      border: 1px solid var(--line); border-radius: 999px; padding: .05rem .45rem; }
+    .chip.on { color: var(--accent); border-color: rgba(63, 227, 255, .4); }
+    input[type=search], input[type=date], input[type=text], input[type=password], select {
+      padding: .42rem .6rem; font: inherit; color: var(--ink); background: rgba(4, 8, 15, .8);
+      border: 1px solid var(--line-2); border-radius: .5rem; }
+    label { color: var(--dim); font-size: .82rem; }
+    button { padding: .42rem .95rem; font: inherit; font-size: .85rem; cursor: pointer;
+      border: 1px solid transparent; border-radius: .5rem; color: #04121a; font-weight: 600;
+      background: linear-gradient(135deg, var(--accent), #7fd8ff); }
+    button:hover { box-shadow: 0 0 16px rgba(63, 227, 255, .45); }
+    button.ghost { background: transparent; color: var(--ink); border-color: var(--line-2); }
+    .foot { margin-top: 2.5rem; padding-top: .9rem; border-top: 1px solid var(--line);
+      color: var(--dim); font-size: .76rem; }
+    @media (max-width: 62rem) {
+      .shell { grid-template-columns: 1fr; }
+      .rail { position: static; height: auto; }
+      nav { flex-direction: row; flex-wrap: wrap; }
+      main { padding: 1.2rem 1rem 3rem; }
+    }
   </style>
+  {% block head %}{% endblock %}
 </head>
 <body>
-  <h1>Rowan · owner panel</h1>
-  <nav>
-    <a href="/admin/turns">Requests</a>
-    <a href="/admin/homes">Homes</a>
-    <a href="/admin/clients">Clients</a>
-    <a href="/admin/people">People</a>
-    <a href="/admin/tracks">Tracks</a>
-    <a href="/admin/audit">Audit</a>
-    <a href="/admin/logout">Sign out</a>
-  </nav>
-  {% block content %}{% endblock %}
-  <p class="note">Reachable from the overlay network only. Tokens are shown as fingerprints
-    of their stored hashes — the tokens themselves are never kept.</p>
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">
+      <span class="mark">R</span>
+      <div><b>ROWAN</b><small>owner console</small></div>
+    </div>
+    <nav id="nav">
+      <a href="/admin/turns"><span class="ic">◎</span>Requests</a>
+      <a href="/admin/profiles"><span class="ic">◍</span>Profiles</a>
+      <a href="/admin/tracks"><span class="ic">◌</span>Tracks</a>
+      <a href="/admin/homes"><span class="ic">⌂</span>Homes</a>
+      <a href="/admin/clients"><span class="ic">▣</span>Clients</a>
+      <a href="/admin/people"><span class="ic">☰</span>People</a>
+      <a href="/admin/audit"><span class="ic">⎔</span>Audit</a>
+    </nav>
+    <div class="rail-foot">
+      <div class="stat"><span>homes</span><b>{{ counts.homes if counts else 0 }}</b></div>
+      <div class="stat"><span>clients</span><b>{{ counts.clients if counts else 0 }}</b></div>
+      <div class="stat"><span>profiles</span><b>{{ counts.profiles if counts else 0 }}</b></div>
+      <div class="stat"><span>in archive</span><b>{{ counts.archive if counts else 0 }}</b></div>
+      <div class="stat"><span>unnamed today</span><b>{{ counts.pending if counts else 0 }}</b></div>
+      <a class="signout" href="/admin/logout">Sign out</a>
+    </div>
+  </aside>
+  <main>
+    {% block content %}{% endblock %}
+    <p class="foot">Reachable from the overlay network only. Tokens are shown as fingerprints
+      of their stored hashes — the tokens themselves are never kept.</p>
+  </main>
+</div>
+<script>
+  // The rail marks where you are: the longest nav prefix wins, so a request
+  // detail page still lights up "Requests".
+  (function () {
+    const path = location.pathname;
+    let best = null;
+    document.querySelectorAll("#nav a").forEach(function (item) {
+      const target = new URL(item.href).pathname;
+      if (path === target || path.startsWith(target + "/")) {
+        if (!best || target.length > new URL(best.href).pathname.length) { best = item; }
+      }
+    });
+    if (best) { best.classList.add("here"); }
+  })();
+</script>
+{% block scripts %}{% endblock %}
 </body>
 </html>

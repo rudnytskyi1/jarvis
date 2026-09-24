@@ -51,6 +51,24 @@ class FakeAdapter:
 # --- the model ------------------------------------------------------------
 
 
+def test_an_empty_device_list_tells_the_model_to_answer_in_words():
+    """AU-06: дом без приборов — ответ словами, а не вызов над пустым списком.
+
+    Массовый аудит 2026-09-23: два сценария из 64 всё равно звали ``set_light``
+    и ``set_switch``, хотя список приборов комнаты был пуст и описание
+    инструмента это запрещает. Слот ``{devices}`` теперь говорит прямо, что
+    приборов нет, и что делать в этом случае, — а не только что список пуст.
+    """
+    from hub.session import NO_DEVICES_TEXT, format_devices
+
+    assert format_devices([]) == NO_DEVICES_TEXT
+    assert format_devices(None) == NO_DEVICES_TEXT
+    lowered = NO_DEVICES_TEXT.casefold()
+    assert "no smart devices" in lowered
+    assert "set_light" in NO_DEVICES_TEXT and "set_switch" in NO_DEVICES_TEXT
+    assert "one sentence" in lowered
+
+
 def test_the_capability_vocabulary_is_the_one_from_the_spec():
     assert CAPABILITIES == ("on_off", "brightness", "color_rgb", "color_temp", "media_play",
                             "volume", "input_select", "press", "sensor_read")

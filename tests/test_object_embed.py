@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import builtins
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -20,7 +20,10 @@ from hub.object_memory import ObjectMemoryStore
 from hub.vectors import pack_vector, unpack_vector
 
 HOME = "livingroom"
-MOMENT = datetime(2026, 9, 22, 14, 30, tzinfo=UTC).timestamp()
+# Sightings live inside a 48-hour freshness window, so a hard-coded noon
+# expired on 2026-09-24 and the tests started failing for a reason that had
+# nothing to do with the code. The timestamp is derived from now instead.
+MOMENT = (datetime.now(UTC) - timedelta(minutes=5)).timestamp()
 
 
 @pytest.fixture()

@@ -6,7 +6,8 @@
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -22,7 +23,15 @@ from hub.object_index import (
 from hub.object_memory import ObjectMemoryStore, answer_for, where_question
 
 HOME = "livingroom"
-NOON = datetime(2026, 9, 22, 14, 30, tzinfo=UTC)
+# The sighting table keeps a 48-hour freshness window: a hard-coded 2026-09-22
+# noon fell out of it on 2026-09-24 and the test failed on the calendar rather
+# than on the code, so the moment is derived from now.
+MOMENT = datetime.now(UTC) - timedelta(minutes=5)
+
+
+def _clock(moment: datetime) -> str:
+    """The time the answer shows: the room's own clock, not the test's."""
+    return moment.astimezone(ZoneInfo("America/Chicago")).strftime("%H:%M")
 
 
 @pytest.fixture()
@@ -63,7 +72,7 @@ def _desk_zone(home, bbox, size):
 def test_a_frame_becomes_real_rows_and_a_real_answer(store):
     memory, conn = store
     indexer = SceneIndexer(_Detector(_keys_on_the_desk()), memory, zone_of=_desk_zone)
-    result = indexer.index(HOME, b"jpeg-bytes", ts=NOON.timestamp(),
+    result = indexer.index(HOME, b"jpeg-bytes", ts=MOMENT.timestamp(),
                            media_ref="frames/2026-09-22/noon.jpg")
     assert result.ok is True and result.labels == ["keys", "cup"]
     rows = memory.sightings(HOME)
@@ -76,8 +85,8 @@ def test_a_frame_becomes_real_rows_and_a_real_answer(store):
     assert asked
     sighting = memory.last_seen(HOME, asked)
     answer = answer_for(sighting, asked, language="ru", tz="America/Chicago",
-                        moment=NOON.timestamp())
-    assert answer == "ключи — стол в 09:30. Кадр сохранён."
+                        moment=MOMENT.timestamp())
+    assert answer == f"ключи — стол в {_clock(MOMENT)}. Кадр сохранён."
 
 
 def test_a_silent_camera_is_not_an_empty_room(store):

@@ -121,6 +121,9 @@ _TOOL_CAPABILITIES = {
     'save_photo': {'pc'}, 'set_wallpaper': {'pc'}, 'generate_image': {'images'},
     'telegram_send': {'chat'}, 'inspect_photo': {'images'},
     'say_in_room': {'pc'},
+    # Владелец 2026-09-24: живое окно камеры на экране комнатного ПК - это
+    # управление тем самым компьютером, поэтому та же область, что у say_in_room.
+    'camera_preview': {'pc'},
 }
 
 

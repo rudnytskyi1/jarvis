@@ -29,6 +29,7 @@ OpenRouter (``base_url: https://openrouter.ai/api``): модель всё рав
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -84,6 +85,17 @@ class JevDecider:
         self._transport = transport
         #: ТЗ 5.5: ``cloud_decisions`` дома. Без явного разрешения не идём.
         self.allowed_for = allowed_for or (lambda _home: False)
+        #: Один HTTP-клиент на провайдера: соединение с облаком (TCP + TLS)
+        #: переиспользуется между ходами. Раньше на каждый ход создавался новый
+        #: ``AsyncClient`` и закрывался вместе с пулом соединений, поэтому ход
+        #: платил за рукопожатие целиком; на живом прогоне (шесть комнат) чтение
+        #: реплики стоило 0.6–1.8 с, а бюджет ТЗ 15.1 на «транскрипт → начало
+        #: генерации» — 400 мс (массовый аудит 2026-09-23, AU-11).
+        self._client: httpx.AsyncClient | None = None
+        #: ``AsyncClient`` привязан к циклу, в котором открыт: тесты поднимают
+        #: свой цикл на каждый случай, поэтому клиент пересоздаётся при смене
+        #: цикла, а не переиспользуется через границу ``asyncio.run``.
+        self._client_loop: Any = None
 
     # --- the three interfaces ----------------------------------------------
 
@@ -250,27 +262,56 @@ class JevDecider:
 
     # --- one batched reading of a whole utterance (U-10) --------------------
 
-    #: The three questions of one "understanding" call. They are asked together
+    #: The four questions of one "understanding" call. They are asked together
     #: because System One answers every question from the same reading of
-    #: ``state``: three separate calls cost three times the latency for the
+    #: ``state``: separate calls would cost that many times the latency for the
     #: same judgement, and the turn's budget is 1.2 s (ТЗ 15.1).
     ACT_QUESTION = (
-        "Is the person asking Rowan to DO something - to use a device, a computer, "
-        "a camera, a picture, the browser, or to send a message - rather than just "
-        "asking a question or making a remark?"
+        "Is the person asking Rowan to DO something - to use a device (lights, "
+        "switches), a computer, a camera, a screen, a picture, the browser, or to "
+        "send a message - rather than just chatting or asking about something "
+        "Rowan already knows? A request to look at, read, find or check something "
+        "with the camera or the screen counts as doing something, even when it is "
+        "phrased as a question - for example \"who is in the room?\", \"what is "
+        "on the screen?\", \"where are my keys?\"."
     )
     FAMILY_QUESTION = (
-        "Which kind of action does this request need? Choose browser for a web page "
-        "or a search, pc for programs, windows, files or typing on the computer, "
-        "vision for looking at the screen or the camera, media for showing, saving, "
-        "drawing or editing a picture, memory for remembering or recalling, people "
-        "for faces, voices and roles, devices for lights and switches, notify for "
-        "sending a message or making a rule, none when no action is asked for."
+        "Which kind of action does this request need? Choose browser for a web page, "
+        "a site, a search or something inside the browser window. Choose vision when "
+        "Rowan must LOOK and TELL: who or what is in the room, what the screen or "
+        "the browser window shows, what is in an attached photo, or where a physical "
+        "object (keys, phone, laptop, remote, mug, backpack) is - the clipboard is "
+        "NOT the screen, so reading it is not vision. Choose media when "
+        "Rowan must MAKE, show, hide, save, draw or edit a picture or a camera "
+        "view - including a bare request for something pictured with no verb at "
+        "all, such as \"picture of a dog\", \"a pic of my cat\" or \"an image of "
+        "a dragon\", because the person wants that picture made. Asking about a "
+        "picture that already exists (the one they sent, the last one drawn) or "
+        "about what the camera or the screen shows is vision, not media. Choose "
+        "memory only when the person asks what Rowan remembers or was told before. "
+        "Choose people only for the saved list of known faces and voices, enrolling, "
+        "renaming or roles. Choose pc for programs, windows, files, typing, volume "
+        "or keys on the computer, for the clipboard (reading it or putting text on "
+        "it), for hiding every window at once (\"minimize everything\", \"show me "
+        "the desktop\"), and for one of the home's own skills - the "
+        "weather or the forecast, the schedule, a game. Choose devices for lights "
+        "and switches, notify for sending a message or making a rule, none when no "
+        "action is asked for."
     )
     FOLLOWUP_QUESTION = (
         "Is this request a continuation of what Rowan was just doing or talking "
         "about (\"it\", \"that\", \"again\", \"the same\", \"close it\"), rather "
         "than a new request with no reference to the previous turn?"
+    )
+    #: The fourth question (UG-08 in PROGRESS_UNDERSTANDING.md): one request or
+    #: several in one sentence? "Open youtube and turn the volume up" is two
+    #: different families in one breath, and narrowing the tools to the one Jev
+    #: named first hides the other half of the request. "Yes" means ONE request.
+    SINGLE_QUESTION = (
+        "Is this ONE single request, or does one sentence ask for SEVERAL separate "
+        "things that would be done one after another - \"open youtube and turn the "
+        "volume up\", \"remember this and tell the group\", \"save the photo and put "
+        "it on my wallpaper\"? Answer yes only for a single request."
     )
 
     async def understand(self, context: Mapping[str, Any], *, families: Sequence[str],
@@ -293,6 +334,7 @@ class JevDecider:
                 "act": self._question("yes_no", self.ACT_QUESTION, None, None),
                 "family": self._question("choose", self.FAMILY_QUESTION, options, None,
                                          meanings=meanings),
+                "single": self._question("yes_no", self.SINGLE_QUESTION, None, None),
                 "followup": self._question("yes_no", self.FOLLOWUP_QUESTION, None, None),
             },
         }
@@ -303,6 +345,7 @@ class JevDecider:
         found: dict[str, Any] = {}
         for name, mode, offered in (("act", "yes_no", None),
                                     ("family", "choose", options),
+                                    ("single", "yes_no", None),
                                     ("followup", "yes_no", None)):
             item = answers.get(name)
             if not isinstance(item, Mapping):
@@ -326,6 +369,25 @@ class JevDecider:
         body = await self._post(payload, context, timeout_s=None)
         return self._answer_of(mode, body, options=options, scale=scale)
 
+    def _pooled_client(self) -> httpx.AsyncClient:
+        """The client this provider keeps between turns (one connection pool)."""
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._client.is_closed or self._client_loop is not loop:
+            self._client = httpx.AsyncClient(transport=self._transport,
+                                             timeout=self.timeout_s)
+            self._client_loop = loop
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the pooled connection (hub shutdown, or a new event loop)."""
+        client, self._client = self._client, None
+        self._client_loop = None
+        if client is not None and not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception as exc:  # noqa: BLE001 - a shutdown must not fail here
+                log.debug("Could not close the Jev connection (%s)", exc)
+
     async def _post(self, payload: Mapping[str, Any], context: Mapping[str, Any], *,
                     timeout_s: float | None = None) -> Mapping[str, Any]:
         """One System One request, with the room's permission checked first."""
@@ -340,13 +402,15 @@ class JevDecider:
         url = f"{self.base_url}{self.path if self.path.startswith('/') else '/' + self.path}"
         budget = self.timeout_s if timeout_s is None else max(0.05, float(timeout_s))
         try:
-            async with httpx.AsyncClient(transport=self._transport, timeout=budget) as client:
-                response = await client.post(
-                    url, json=payload,
-                    headers={"Authorization": f"Bearer {self._api_key}",
-                             "Accept": "application/json",
-                             "Content-Type": "application/json"})
+            response = await self._pooled_client().post(
+                url, json=payload, timeout=budget,
+                headers={"Authorization": f"Bearer {self._api_key}",
+                         "Accept": "application/json",
+                         "Content-Type": "application/json"})
         except httpx.HTTPError as exc:
+            # Соединение из пула могло умереть: следующий ход откроет новое, а
+            # не будет биться в то же самое (отказ всё равно честный).
+            await self.aclose()
             raise DecisionUnavailable(f"jev is unreachable: {type(exc).__name__}") from exc
         if response.status_code != 200:
             raise DecisionUnavailable(f"jev answered HTTP {response.status_code}")

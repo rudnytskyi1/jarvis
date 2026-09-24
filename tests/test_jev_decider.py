@@ -326,15 +326,68 @@ def test_the_rules_answer_first_and_the_cloud_is_not_called():
         calls.append(request)
         return httpx.Response(200, json=_body(type="noul", noul=0.1))
 
+    from hub.decider import Policy
+
     chain = DecisionChain(
         [RulesDecider(), _provider(handler)],
-        {"addressed": ["rules", "jev"]}, timeout_s=0.4)
+        {"addressed": ["rules", "jev"]}, timeout_s=0.4,
+        # The production policy of ``hub.app.DECISION_POLICIES``: 0.9 is an
+        # answer to act on, so the chain ends on the rules and the cloud is not
+        # paid for (AU-19).
+        policies={"addressed": Policy(auto_above=0.85, ask_below=0.5)})
     decision = asyncio.run(chain.yes_no(
         "addressed?", {"text": "rowan, lights off", "home_id": "livingroom",
                        "heuristic": True},
         decision_type="addressed"))
     assert decision.provider == "rules" and decision.value is True
     assert calls == [], "на готовом правиле облако не зовётся"
+
+
+def test_the_cloud_is_asked_when_the_rules_are_unsure():
+    """AU-19: «правила ответили 0.6» — догадка, и Jev получает свой шанс.
+
+    Владелец: «надеюсь, что TypeSafe Jev активно используется». Живая база
+    отвечала ему «нет»: 5087 решений и все от ``rules``
+    (``scripts/jev_usage_report.py``). Порядок тот же — ``[rules, jev]``, — но
+    цепочка теперь не заканчивается на ответе ниже полосы ``auto_above``.
+    """
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=_body(type="noul", noul=0.97))
+
+    from hub.decider import Policy
+
+    chain = DecisionChain(
+        [RulesDecider(), _provider(handler)],
+        {"addressed": ["rules", "jev"]}, timeout_s=0.4,
+        policies={"addressed": Policy(auto_above=0.85, ask_below=0.5)})
+    decision = asyncio.run(chain.yes_no(
+        "addressed?", {"text": "turn the lights off", "home_id": "livingroom",
+                       "heuristic": False},
+        decision_type="addressed"))
+    assert calls, "неуверенное правило обязано дойти до облака"
+    assert decision.provider == "jev" and decision.value is True
+    assert decision.confidence == pytest.approx(0.97)
+
+
+def test_the_rules_answer_stands_when_the_cloud_cannot_answer():
+    """Fail-open: облако молчит, таймаут или отказ — работает правило."""
+    from hub.decider import Policy
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={})
+
+    chain = DecisionChain(
+        [RulesDecider(), _provider(handler)],
+        {"addressed": ["rules", "jev"]}, timeout_s=0.4,
+        policies={"addressed": Policy(auto_above=0.85, ask_below=0.5)})
+    decision = asyncio.run(chain.yes_no(
+        "addressed?", {"text": "turn the lights off", "home_id": "livingroom",
+                       "heuristic": False},
+        decision_type="addressed"))
+    assert decision.provider == "rules" and decision.value is False
 
 
 def test_the_chain_falls_back_to_the_rules_when_the_home_forbids_cloud():
@@ -430,3 +483,66 @@ def test_the_hub_puts_the_home_into_every_decision(monkeypatch):
     assert value is True
     assert seen and seen[0]["home_id"] == "livingroom"
     assert seen[0]["heuristic"] is True
+
+
+# --- соединение с облаком живёт между ходами (ТЗ 15.1, AU-11) ----------------
+
+
+def test_the_cloud_connection_is_kept_between_turns(monkeypatch):
+    """Три хода — одно соединение: рукопожатие платится один раз, не каждый ход."""
+    created: list[httpx.AsyncClient] = []
+    real_client = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        client = real_client(*args, **kwargs)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    provider = _provider(_noul(0.95))
+
+    async def three_turns() -> None:
+        for _ in range(3):
+            decision = await provider.yes_no(
+                "is it addressed to Rowan?", {"text": "rowan, turn it up",
+                                              "home_id": "livingroom"},
+                decision_type="addressed")
+            assert decision.value is True
+        await provider.aclose()
+
+    asyncio.run(three_turns())
+    assert len(created) == 1
+    assert provider._client is None
+
+
+def test_a_dead_connection_is_replaced_on_the_next_turn(monkeypatch):
+    """Оборванное соединение не приговор: следующий ход открывает новое."""
+    created: list[httpx.AsyncClient] = []
+    real_client = httpx.AsyncClient
+    calls = {"n": 0}
+
+    def factory(*args, **kwargs):
+        client = real_client(*args, **kwargs)
+        created.append(client)
+        return client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("the pooled connection died", request=request)
+        return httpx.Response(200, json=_body(type="noul", noul=0.9))
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    provider = _provider(handler)
+
+    async def two_turns() -> None:
+        with pytest.raises(DecisionUnavailable):
+            await provider.yes_no("q", {"text": "x", "home_id": "livingroom"},
+                                  decision_type="addressed")
+        decision = await provider.yes_no("q", {"text": "x", "home_id": "livingroom"},
+                                         decision_type="addressed")
+        assert decision.value is True
+        await provider.aclose()
+
+    asyncio.run(two_turns())
+    assert len(created) == 2

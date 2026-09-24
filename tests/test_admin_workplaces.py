@@ -53,6 +53,16 @@ def test_the_room_name_is_the_fallback_when_nothing_was_set():
     assert hub_app.workplace_display_name("livingroom", "", home="anton") == "anton"
 
 
+def test_a_stored_name_that_repeats_the_client_id_is_still_the_name():
+    """buro: its own name is "buro", but the home it shares is called "anton".
+
+    Владелец 2026-09-23: «почему buro pc называется anton». The stored name used
+    to be skipped whenever it equalled the client id, so the friend's PC fell
+    through to the home's name — "anton" — on every hello.
+    """
+    assert hub_app.workplace_display_name("buro", "buro", stored="buro", home="anton") == "buro"
+
+
 def test_a_real_configured_name_from_the_client_still_wins():
     assert hub_app.workplace_display_name(
         "livingroom", "AntonDorm", stored="anton", home="anton") == "AntonDorm"
@@ -86,6 +96,37 @@ def _two_rooms(monkeypatch, *, dorm_online=True):
 
 def _message(text, chat=-100, sender=8322835915):
     return {'text': text, 'chat': {'id': chat}, 'from': {'id': sender}}
+
+
+def test_a_stale_offline_namesake_does_not_steal_the_request(monkeypatch):
+    """buro had a phantom twin: "room-9de3bed07b44", also called "buro".
+
+    Владелец 2026-09-24: «Say to buro: buro hello this is anton» answered "the
+    room is unreachable" while the real buro was online and answering - the
+    named lookup took the stale entry, because it came first in the list.
+    """
+    live = _connection("buro", "livingroom")
+    live.workplace_name, live.camera_name = "buro", "Buro camera"
+    stored = {"room-9de3bed07b44": {"id": "room-9de3bed07b44", "name": "buro",
+                                    "camera_name": "Buro camera", "home_id": ""}}
+    monkeypatch.setattr(hub_app, "_telegram_access",
+                        SimpleNamespace(get_setting=lambda key, default=None:
+                                        stored if key == "workplaces" else default))
+    monkeypatch.setattr(hub_app, "_connections", [live])
+
+    assert hub_app._named_workplace('say to buro: buro hello this is anton') == "buro"
+
+
+def test_an_offline_namesake_is_still_named_when_no_live_room_matches(monkeypatch):
+    """A computer the owner really named offline must still hear about itself."""
+    stored = {"room-9de3bed07b44": {"id": "room-9de3bed07b44", "name": "buro",
+                                    "camera_name": "Buro camera", "home_id": ""}}
+    monkeypatch.setattr(hub_app, "_telegram_access",
+                        SimpleNamespace(get_setting=lambda key, default=None:
+                                        stored if key == "workplaces" else default))
+    monkeypatch.setattr(hub_app, "_connections", [])
+
+    assert hub_app._named_workplace('photo from buro') == "room-9de3bed07b44"
 
 
 def test_a_request_that_names_a_computer_routes_that_turn_to_it(monkeypatch):

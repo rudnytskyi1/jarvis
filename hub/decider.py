@@ -256,6 +256,28 @@ class DecisionChain:
             raise DecisionUnavailable(f"no provider chain is configured for {decision_type!r}")
         return [self.providers[name] for name in names if name in self.providers]
 
+    def _settled(self, decision_type: str, decision: Decision[Any]) -> bool:
+        """Is this answer strong enough to end the chain (ТЗ 5.4)?
+
+        A decision type with no policy keeps the behaviour every chain had
+        before: the first provider that can answer ends it. A type WITH a policy
+        ends the chain only in its ``auto_above`` band - the confidence the
+        policy would act on. A weaker answer is a guess by the provider's own
+        calibration, so the next provider in the chain gets to judge the same
+        question, and the most confident answer wins.
+
+        Why this exists: the configured order is ``[rules, jev]`` and the rules
+        provider answers the four types Jev is configured for on its own
+        (0.6-0.9), so before this rule the second provider was never reached -
+        every row in ``decisions`` said ``rules`` and the owner's question "is
+        TypeSafe Jev actually used?" had the honest answer "no"
+        (``scripts/jev_usage_report.py``, 5087 rules / 0 jev; PROGRESS_AUDIT.md
+        AU-19). The rules answer still stands whenever the cloud is silent: a
+        provider that raises, times out or is never asked changes nothing.
+        """
+        policy = self.policies.get(decision_type)
+        return policy is None or decision.confidence >= policy.auto_above
+
     async def _ask(self, method: str, decision_type: str, *args: Any, **kwargs: Any) -> Decision[Any]:
         key: str | None = None
         if self.cache is not None:
@@ -265,6 +287,7 @@ class DecisionChain:
             hit = self.cache.get(key)
             if hit is not None:
                 return hit
+        best: Decision[Any] | None = None
         for provider in self._chain(decision_type):
             call = getattr(provider, method)
             budget = self.provider_timeout_s.get(provider.name, self.timeout_s)
@@ -281,11 +304,21 @@ class DecisionChain:
             except TimeoutError:
                 log.debug("decider %s timed out on %s", provider.name, decision_type)
                 continue
+            # Каждый ответ виден в ``decisions`` и в панели: вопрос «кто это
+            # решил» должен отвечаться и тогда, когда второй провайдер
+            # переубедил первого (AU-19).
             await self._record(result, decision_type)
-            if key is not None:
-                self.cache.put(key, result)
-            return result
-        raise DecisionUnavailable(f"no provider answered {decision_type!r}")
+            if best is None or result.confidence > best.confidence:
+                best = result
+            if self._settled(decision_type, best):
+                break
+            log.debug("decider %s answered %s with %.2f; asking the next provider",
+                      best.provider, decision_type, best.confidence)
+        if best is None:
+            raise DecisionUnavailable(f"no provider answered {decision_type!r}")
+        if key is not None:
+            self.cache.put(key, best)
+        return best
 
     async def _record(self, decision: Decision[Any], decision_type: str) -> None:
         if self.recorder is None:

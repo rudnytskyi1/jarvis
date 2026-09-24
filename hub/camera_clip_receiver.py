@@ -12,7 +12,17 @@ log = logging.getLogger("jarvis.server.app")
 
 
 class CameraClipReceiver:
-    async def _request_camera_clip(self, identifier, seconds=5, fps=8):
+    async def _request_camera_clip(self, identifier, seconds=5, fps=8, names=None,
+                                   preroll=None):
+        """Ask the room for a short video, with the names of the tracks it holds.
+
+        Владелец 2026-09-24: «можешь чтобы оно с bounding box видео записывало и
+        идентификацией человека над ним (label)». The room draws the boxes (only
+        it has a box per frame), and the hub tells it which track it already
+        recognised, so a name the identity layer confirmed shows up on the
+        video. A track nobody was identified in is simply absent from the map:
+        the room then draws its box without a name.
+        """
         if not getattr(self, '_can_camera_clip', False):
             return 'The room client does not support short video clips.'
         # ТЗ F-702: one video of an alert episode may be up to a minute long.
@@ -25,10 +35,24 @@ class CameraClipReceiver:
         self._clip_future, self._clip_id = future, identifier
         # ТЗ 4.5: a clip is a background camera event and owns an event id.
         self._clip_event_id = new_ulid()
+        labels = {}
+        for key, value in (names or {}).items():
+            if isinstance(key, str) and isinstance(value, str) and key and value:
+                labels[key[:100]] = value[:120]
+            if len(labels) >= 12:
+                break
         try:
-            await self.send_json({'type': proto.MSG_CAMERA_CLIP_REQUEST, 'id': identifier,
-                                  'event_id': self._clip_event_id,
-                                  'seconds': seconds, 'fps': fps})
+            request = {'type': proto.MSG_CAMERA_CLIP_REQUEST, 'id': identifier,
+                       'event_id': self._clip_event_id,
+                       'seconds': seconds, 'fps': fps}
+            if labels:
+                request['names'] = labels
+            if preroll is not None:
+                # Владелец 2026-09-24: the first video of a visit starts in the
+                # past (the client's pre-roll); the next parts of the same visit
+                # do not need those seconds again, so the hub asks for none.
+                request['preroll'] = max(0.0, min(10.0, float(preroll)))
+            await self.send_json(request)
             return await asyncio.wait_for(future, timeout=seconds + 25)
         except TimeoutError:
             record_event(self._clip_event_id, kind=KIND_CLIP, home_id=getattr(self, 'home_id', ''),

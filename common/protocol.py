@@ -210,6 +210,12 @@ MSG_CAMERA_ERROR = "camera_error"
 MSG_ROOM_HEALTH = "room_health"
 MSG_CAMERA_CLIP = "camera_clip"
 MSG_CAMERA_CLIP_ERROR = "camera_clip_error"
+#: Владелец 2026-09-24: «открыть камеру и чтобы оно показывало видео с камеры на
+#: экране и все детекции». Hub -> client: ``{"type": "camera_preview", "on": true,
+#: "names": {"<track_id>": "<display name>"}}``. ``on: false`` закрывает окно.
+#: The message only turns a local window on and off; no frame of the room leaves
+#: the PC because of it (the video is drawn from the client's own capture).
+MSG_CAMERA_PREVIEW = "camera_preview"
 
 # --- server -> client -------------------------------------------------------
 MSG_READY = "ready"
@@ -338,6 +344,8 @@ CAMERA_BURST_MAX = 5
 
 # Optional hello capability. A clip is one MP4 binary frame, never PCM audio.
 CAP_CAMERA_CLIP = "camera_clip"
+#: The room can show its own camera as live video on its own screen.
+CAP_CAMERA_PREVIEW = "camera_preview"
 CAMERA_CLIP_MAX_BYTES = 20_000_000
 
 #: Error message the server sends when STT produced nothing (false wake-word).
@@ -470,6 +478,8 @@ __all__ = [
     "MSG_TTS_PREFETCH",
     "MSG_TTS_PHRASE",
     "CAP_CAMERA_CLIP",
+    "CAP_CAMERA_PREVIEW",
+    "MSG_CAMERA_PREVIEW",
     "CAMERA_CLIP_MAX_BYTES",
     "MSG_READY",
     "MSG_TRANSCRIPT",

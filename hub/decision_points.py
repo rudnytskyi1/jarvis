@@ -247,6 +247,68 @@ def site_step_unfinished(text: str | None,
     return names_a_site_step(text) and not _reached_a_site(actions)
 
 
+#: A step the request names in its own words, with the tools that can carry it
+#: out. The site step above is one of these; the pair the mass audit kept
+#: losing is the reason for the rest (AU-21, docs/AUDIT_MASS.md): "save a photo
+#: and put it on my wallpaper" came back with only one half done, in three
+#: runs out of three, and the half that was lost was not the same one every
+#: time. The same sentence, the same rule as the site step (TG-06): the words
+#: are the owner's, the tools are the only ones that can satisfy the step, and
+#: ``verify_actions: false`` switches off the ROUTINE self-check, never a step
+#: that provably did not happen.
+_SAVE_PICTURE = re.compile(
+    r"\b(?:save|saving|store|keep)\b[^.!?;]{0,40}?"
+    r"\b(?:photo|photograph|picture|pic|image|screenshot|snapshot|frame)\b"
+    r"|\b(?:сохран\w*|сохрани|запиш\w*|запиши)\b[^.!?;]{0,40}?"
+    r"\b(?:фото|фотк\w*|картинк\w*|снимок|скриншот\w*)\b",
+    re.IGNORECASE,
+)
+_WALLPAPER = re.compile(
+    r"\b(?:wallpaper|desktop background)\b|\bобои\b|\bобоев\b|\bзаставк\w*\b",
+    re.IGNORECASE,
+)
+_SHOW_CAMERA = re.compile(
+    r"\b(?:show|display|put|open)\b[^.!?;]{0,30}?\b(?:camera|webcam)\b"
+    r"|\b(?:покаж\w*|вывед\w*|откр\w*)\b[^.!?;]{0,30}?\bкамер\w*\b",
+    re.IGNORECASE,
+)
+
+#: ``(what the step is, how the request names it, the tools that satisfy it)``.
+#: The satisfiers are deliberately wider than one tool where more than one call
+#: really finishes the step: a wallpaper can be made by drawing it, and a
+#: picture can be delivered by sending it.
+_NAMED_STEPS: tuple[tuple[str, re.Pattern[str], frozenset[str]], ...] = (
+    ("saving a picture", _SAVE_PICTURE, frozenset({"save_photo", "telegram_send"})),
+    ("putting a picture on the wallpaper", _WALLPAPER,
+     frozenset({"set_wallpaper", "generate_image"})),
+    ("showing the camera", _SHOW_CAMERA, frozenset({"show_photo", "say_in_room"})),
+)
+
+
+def named_step_unfinished(text: str | None,
+                          actions: Sequence[dict[str, Any]] | None) -> bool:
+    """A non-site step the request names that no action of this turn did (D-04).
+
+    Never raises, safe on ``None``, and deliberately narrow: it only fires on
+    the words the owner uses for a step ("save a photo", "wallpaper", "show the
+    camera"), so an ordinary conversation is never sent through the self-check.
+    """
+    value = str(text or "")
+    if not value:
+        return False
+    done = {str(record.get("tool") or "") for record in (actions or ())}
+    for _what, pattern, tools in _NAMED_STEPS:
+        if pattern.search(value) and not (tools & done):
+            return True
+    return False
+
+
+def any_step_unfinished(text: str | None,
+                        actions: Sequence[dict[str, Any]] | None) -> bool:
+    """Every step the request names by its own words (D-04, TG-06, AU-21)."""
+    return site_step_unfinished(text, actions) or named_step_unfinished(text, actions)
+
+
 def action_result_failed(actions: Sequence[dict[str, Any]] | None) -> bool:
     """D-04's ground truth (ТЗ 5.4): a tool of this turn reported a failure.
 
@@ -324,6 +386,7 @@ __all__ = [
     "action_result_heuristic",
     "addressed_heuristic",
     "admin_rights_heuristic",
+    "any_step_unfinished",
     "claim_guard_heuristic",
     "continuation_heuristic",
     "hallucination_heuristic",
@@ -331,6 +394,7 @@ __all__ = [
     "looks_like_injection",
     "names_a_site_step",
     "names_in_text",
+    "named_step_unfinished",
     "site_step_unfinished",
     "untrusted_text",
 ]

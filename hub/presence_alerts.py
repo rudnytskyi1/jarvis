@@ -50,6 +50,14 @@ CLIP_SECONDS_RANGE = (3, 60)
 #: who never leaves must not fill the disk or the chat, so the ceiling is the
 #: rule's own safety net, not a guess about how long a visit lasts.
 EPISODE_MAX_PARTS = 20
+#: Владелец 2026-09-24: «не видно label (имя) на bounding box». Имя на трек
+#: ставит слияние F-206 (лицо + тело, ReID) через несколько наблюдений после
+#: появления человека - то есть на секунду-две позже, чем срабатывает правило.
+#: Столько правило ждёт подписи перед запросом клипа; ожидание не удлиняет
+#: видео, потому что клип начинается из буфера прошлого на клиенте.
+NAME_WAIT_S = 2.5
+#: Шаг опроса имён во время этого ожидания.
+NAME_WAIT_STEP_S = 0.25
 #: The room counts as empty when its last presence frame is older than this.
 #: Presence frames arrive every second or so; a gap means the camera stopped
 #: telling us anything, which is not the same as "somebody is still there".
@@ -641,13 +649,24 @@ class PresenceAlerts:
             raise RuntimeError('The camera did not return usable alert media.')
         return data
 
-    async def _camera_video(self, delivery, rule):
+    async def _camera_video(self, delivery, rule, *, preroll=None):
         """One alert video from the room, at most ``clip_seconds`` long."""
         room = self._room(delivery['event']['source_id'])
         if room is None:
             raise RuntimeError('The observed room is no longer connected.')
+        # Владелец 2026-09-24: the video must show who was seen, so the room gets
+        # the names this connection already knows (F-204/F-708) with the request.
+        started = time.monotonic()
+        names = await self._clip_names(room)
+        # Видно, что именно уехало в клип: сколько подписей и сколько имя ждали
+        # (владелец 2026-09-24: «не видно label (имя) на bounding box»).
+        log.info('Alert clip of %s: %d name(s) after %.1f s%s',
+                 delivery['event']['source_id'], len(names or {}),
+                 time.monotonic() - started,
+                 '' if names else ' (nobody was identified yet)')
         result = await asyncio.wait_for(
-            room._request_camera_clip('alert-' + delivery['id'], seconds=rule['clip_seconds'], fps=8),
+            room._request_camera_clip('alert-' + delivery['id'], seconds=rule['clip_seconds'],
+                                      fps=8, names=names, preroll=preroll),
             rule['clip_seconds'] + 20)
         data = result.get('data') if isinstance(result, dict) else result
         if not isinstance(data, bytes) or not 0 < len(data) <= CAMERA_CLIP_MAX_BYTES:
@@ -658,6 +677,44 @@ class PresenceAlerts:
         # the recording, just not a version every phone can open.
         converted = await asyncio.to_thread(phone_ready_mp4, data)
         return converted if converted is not None else data
+
+    async def _clip_names(self, room):
+        """The names to draw on the alert video, after a short settle.
+
+        Владелец 2026-09-24: «не видно label (имя) на bounding box». Рамку клиент
+        рисует сразу по своим трекам, а имя хаб узнаёт на секунду-две позже:
+        слияние F-206 успевает посмотреть и лицо, и тело (ReID) только после
+        нескольких наблюдений. Здесь правило ждёт это короткое время (не больше
+        ``NAME_WAIT_S``) и запрашивает клип уже с подписями. Видео от этого не
+        укорачивается: клип начинается из буфера прошлого на клиенте
+        (``PREROLL_SECONDS``), поэтому момент появления человека в нём остаётся.
+        Незнакомого человека ожидание не задерживает дольше того же предела, и
+        отсутствие имени никогда не мешает самому клипу.
+        """
+        lookup = getattr(room, '_track_names', None)
+        if not callable(lookup):
+            return None
+        deadline = time.monotonic() + NAME_WAIT_S
+        while True:
+            try:
+                names = lookup() or {}
+            except Exception:  # noqa: BLE001 - a missing name is not a missing clip
+                return None
+            unnamed = await self._unnamed_tracks(room, names)
+            if not unnamed or time.monotonic() >= deadline:
+                return names
+            await asyncio.sleep(NAME_WAIT_STEP_S)
+
+    @staticmethod
+    async def _unnamed_tracks(room, names):
+        """The tracks in frame that still have no name (empty when unknown)."""
+        live = getattr(room, '_live_track_ids', None)
+        if not callable(live):
+            return []
+        try:
+            return [key for key in live() if str(key) not in names]
+        except Exception:  # noqa: BLE001 - the wait is an optimisation, not a rule
+            return []
 
     async def _next_episode_video(self, delivery, *, part):
         """The next video of one episode, or ``None`` when the room is clear.
@@ -680,7 +737,9 @@ class PresenceAlerts:
             return None
         if not await asyncio.to_thread(self._unchanged, delivery):
             return None
-        data = await self._camera_video(delivery, rule)
+        # A later part of the same visit must not repeat the seconds that were
+        # already sent: only the first video starts in the past.
+        data = await self._camera_video(delivery, rule, preroll=0)
         return data, self._caption(rule, delivery['event'], part=part + 1)
 
     async def _deliver(self, delivery):

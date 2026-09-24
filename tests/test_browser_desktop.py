@@ -118,6 +118,73 @@ def test_a_typed_address_that_never_loads_is_a_failure_not_a_success(monkeypatch
             await browser.execute({'command': 'navigate',
                                    'url': 'https://www.youtube.com/results?search_query=MrBeast'})
         await browser.close()
+
+
+def test_an_address_entry_swallowed_by_a_loading_page_is_typed_again(monkeypatch):
+    """AU-22: buro stayed on YouTube because the first Ctrl+L never took.
+
+    ``browser_control navigate www.google.com`` straight after ``youtube.com``
+    failed twice in a row with "The address bar did not open google.com: the
+    browser is still on (871) YouTube" (``data/room-eval/audit-buro.json``):
+    the page was still loading, the text never reached the address bar, and the
+    window never left YouTube. The whole entry is repeated once for exactly
+    that - one swallowed Ctrl+L is a race, two are a failure worth reporting.
+    """
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_WAIT_S', 0.2)
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_SETTLE_S', 0.05)
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_SETTLE_POLL_S', 0.01)
+
+    class Swallowing(FakeDesktop):
+        """The first entry is eaten by the still-loading page, the retry lands."""
+
+        def __init__(self):
+            super().__init__()
+            self.entries = 0
+
+        def navigate(self, window, url, stop):
+            self.entries += 1
+            if self.entries > 1:
+                self.url = url
+
+    async def run():
+        backend = Swallowing()
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        data = json.loads(await browser.execute(
+            {'command': 'navigate', 'url': 'https://www.google.com'}))
+        assert backend.entries == 2, 'the swallowed entry was not typed again'
+        assert 'google.com' in data['url']
+        await browser.close()
+
+    asyncio.run(run())
+
+
+def test_a_navigation_that_lands_nothing_is_tried_twice_and_then_named(monkeypatch):
+    """Два проглатывания подряд — уже отказ, и он называет страницу (RA-035)."""
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_WAIT_S', 0.2)
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_SETTLE_S', 0.05)
+    monkeypatch.setattr(browser_desktop, 'NAVIGATE_SETTLE_POLL_S', 0.01)
+
+    class Stuck(FakeDesktop):
+        """Firefox-style: every typed address is dropped while the page loads."""
+
+        def __init__(self):
+            super().__init__()
+            self.entries = 0
+
+        def navigate(self, window, url, stop):
+            self.entries += 1
+
+    async def run():
+        backend = Stuck()
+        browser = DesktopBrowserController(backend_factory=lambda: backend)
+        with pytest.raises(ValueError) as failure:
+            await browser.execute({'command': 'navigate', 'url': 'www.google.com'})
+        assert backend.entries == browser_desktop.NAVIGATE_ROUNDS
+        assert 'did not open google.com' in str(failure.value)
+        assert 'YouTube' in str(failure.value)
+        await browser.close()
+
+    asyncio.run(run())
     asyncio.run(run())
 
 
@@ -498,6 +565,12 @@ def test_the_address_is_typed_even_when_uia_never_reports_the_focus():
     and search for ...". Ctrl+L had focused the omnibox; UIA simply had not
     caught up, and the old code refused to type at all. The page that loads is
     still the proof (``_navigate``), so the text goes in.
+
+    An address bar that cannot be READ is also an address bar that cannot be
+    checked, so the entry is repeated once before Enter (AU-22, the same buro
+    race: a bar the tree has not handed over yet is what a still-loading page
+    looks like). A second Ctrl+L replaces the selection instead of appending,
+    so the address is typed once, not twice.
     """
     backend = object.__new__(_WindowsUIA)
     events = []
@@ -508,7 +581,8 @@ def test_the_address_is_typed_even_when_uia_never_reports_the_focus():
     backend._uia = SimpleNamespace(ElementFromHandle=lambda hwnd: object())
     window, stop = {'hwnd': 10, 'pid': 20}, threading.Event()
     backend.navigate(window, 'https://www.youtube.com/', stop)
-    assert events == ['ctrl+l', ('type', 'https://www.youtube.com/'), 'enter']
+    assert events == ['ctrl+l', ('type', 'https://www.youtube.com/'),
+                      'ctrl+l', ('type', 'https://www.youtube.com/'), 'enter']
 
 
 def test_an_address_bar_that_did_not_take_the_text_is_typed_again_once():
