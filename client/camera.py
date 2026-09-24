@@ -84,6 +84,7 @@ from common.protocol import (
     MSG_CAMERA_REQUEST,
     MSG_CAMERA_STATE,
     MSG_OBJECT_EVENT,
+    MSG_ROOM_HEALTH,
     MSG_TRACKS,
 )
 
@@ -120,6 +121,11 @@ ACTIVE_DETECTION_HOLD_S = 3.0
 #: How many consecutive failed ``VideoCapture.read()`` calls mean the device is
 #: gone (a C920 briefly stumbles when another app grabs it).
 MAX_READ_FAILURES = 30
+#: Reopening a local camera after that: first pause, and the ceiling the pause
+#: grows to. Владелец 2026-09-23: комната должна возвращаться сама, когда
+#: устройство освободится, а не ждать перезапуска клиента.
+CAMERA_RETRY_MIN_S = 2.0
+CAMERA_RETRY_MAX_S = 30.0
 #: How long :meth:`CameraService.stop` waits for its worker threads.
 JOIN_TIMEOUT_S = 3.0
 #: Burst extension (v1.4): how many frames one periodic presence push carries.
@@ -161,6 +167,7 @@ __all__ = [
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_REQUEST",
     "MSG_CAMERA_ERROR",
+    "MSG_ROOM_HEALTH",
     "CAMERA_REASON_PRESENCE",
     "CAMERA_REASON_REQUEST",
     "MAX_SIDE_PX",
@@ -510,6 +517,55 @@ class CameraService:
         else:  # pragma: no cover - a second failure after the first warning
             log.debug("Camera failure after it was already disabled: %s", message)
 
+    def _reconnect_capture(self, cv2: Any) -> Any:
+        """Keep trying to open the device again until it answers or we stop.
+
+        Deliberately endless: on a shared PC another program may hold the only
+        webcam for hours, and the room has to come back on its own the moment it
+        is free. The pause grows from :data:`CAMERA_RETRY_MIN_S` to
+        :data:`CAMERA_RETRY_MAX_S`, so a dead device is not hammered and a
+        camera that returns quickly is picked up in about two seconds.
+        """
+        delay = CAMERA_RETRY_MIN_S
+        attempts = 0
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(delay):
+                return None
+            try:
+                capture = self._open_capture(cv2)
+            except CameraUnavailable as exc:
+                attempts += 1
+                log.debug("Camera %d still unavailable (attempt %d): %s", self.index, attempts, exc)
+                delay = min(delay * 2, CAMERA_RETRY_MAX_S)
+                continue
+            log.info("Camera %d reopened after %d failed attempt(s)", self.index, attempts)
+            return capture
+        return None
+
+    def _report_health(self, ok: bool, detail: str) -> None:
+        """Tell the hub the camera went away or came back (ТЗ F-702 extension).
+
+        Владелец 2026-09-23: «в тг увед слать в группу уведов если чет не
+        работает». The camera thread cannot await anything, so the frame is
+        scheduled on the client's loop exactly like a presence state; the hub
+        decides who hears about it. Never raises: a room without a hub must keep
+        retrying silently.
+        """
+        send_json = self._send_json
+        if send_json is None:
+            return
+        payload = {
+            "type": MSG_ROOM_HEALTH,
+            "kind": "camera",
+            "ok": bool(ok),
+            "detail": str(detail)[:200],
+            "camera": f"usb:{self.index}" if not self.stream_url else "network",
+        }
+        try:
+            self._submit(send_json(payload))
+        except Exception as exc:  # noqa: BLE001 - a notice is never worth a crash
+            log.debug("Could not report camera health: %s", exc)
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
@@ -751,8 +807,27 @@ class CameraService:
                                 except CameraUnavailable:
                                     continue
                             continue
-                        self._fail("the camera stopped delivering frames")
-                        return
+                        # Владелец 2026-09-23: «там несколько камер… оно должно
+                        # постоянно ретраить и в тг увед слать». Локальная камера
+                        # раньше выключалась до конца процесса — на общем ПК
+                        # устройство может уйти другому приложению или отвалиться
+                        # на драйвере, и комната оставалась слепой до перезапуска.
+                        # Теперь поток освобождает устройство, говорит хабу о
+                        # поломке и открывает камеру заново с растущей паузой.
+                        capture.release()
+                        with self._frame_lock:
+                            self._frame = None
+                            self._frame_ts = 0.0
+                            self._detected_frame = None
+                        self._report_health(False, "the camera stopped delivering frames")
+                        log.warning('Camera %d stopped delivering frames; reopening', self.index)
+                        capture = self._reconnect_capture(cv2)
+                        if capture is None:
+                            return
+                        failures = 0
+                        self._report_health(True, 'the camera is delivering frames again')
+                        log.info('Camera %d is working again', self.index)
+                        continue
                     self._stop_event.wait(0.2)
                     continue
                 failures = 0

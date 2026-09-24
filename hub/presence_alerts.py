@@ -216,6 +216,9 @@ class PresenceAlerts:
         #: destination stays exactly the old behaviour, the owner's own DM.
         self.get_private_recipients = get_private_recipients or (lambda: ())
         self._lock = threading.RLock()
+        #: ``key -> когда уже сказали``: уведомление о поломке комнаты не
+        #: повторяется на каждый ретрай клиента (см. :meth:`notify_system`).
+        self._system_notices: dict[str, float] = {}
         self._db = sqlite3.connect(self.folder / 'alerts.sqlite3', check_same_thread=False, isolation_level=None)
         self._db.execute('PRAGMA journal_mode=WAL')
         self._db.execute('CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, settings TEXT NOT NULL, state TEXT NOT NULL)')
@@ -240,6 +243,67 @@ class PresenceAlerts:
         with self._lock:
             return [dict(id=row[0], **{**DEFAULT_RULE, **json.loads(row[1])}, last_attempt=json.loads(row[2]).get('last_attempt'))
                     for row in self._db.execute('SELECT id, settings, state FROM rules ORDER BY rowid')]
+
+    async def notify_system(self, text: str, *, key: str = '', cooldown_s: float = 900.0,
+                            group_chat_id: int | None = None) -> bool:
+        """One plain sentence about a room's health to the notification destination.
+
+        Владелец 2026-09-23: «в тг увед слать в группу уведов если чет не
+        работает». This is NOT a presence rule: a rule describes what the camera
+        sees, while this says the room's own gear is broken (camera gone,
+        microphone silent). It goes to the configured notification group, or to
+        every private chat with access when no group is configured, and it
+        honours a cooldown per ``key`` so a client that keeps retrying cannot
+        turn the group into a stream of identical messages.
+
+        :returns: ``True`` when the message really went out.
+        """
+        text = ' '.join(str(text or '').split())
+        if not text:
+            return False
+        now = time.time()
+        with self._lock:
+            if key:
+                last = self._system_notices.get(key, 0.0)
+                if now - last < float(cooldown_s):
+                    log.debug('Room health notice %r suppressed by the cooldown', key)
+                    return False
+            self._system_notices[key or text] = now
+        provider = self.get_provider()
+        if provider is None or not provider.ready:
+            log.info('Room health: %s (Telegram is unavailable, nothing was sent)', text)
+            return False
+        group = group_chat_id if type(group_chat_id) is int else self.group_id
+        targets = ([{'group_chat_id': group}] if type(group) is int
+                   else [{'private_reply_to_user_id': person}
+                         for person in self._private_recipients()])
+        if not targets:
+            log.info('Room health: %s (no destination is configured)', text)
+            return False
+        sent = False
+        async with self._send_lock:
+            for target in targets:
+                try:
+                    await provider.send_text(text, **target)
+                    sent = True
+                except Exception as exc:  # noqa: BLE001 - a notice is never fatal
+                    log.warning('Could not send a room health notice: %s', exc)
+        if not sent:
+            # Keep the moment free for the next attempt: nothing was delivered.
+            with self._lock:
+                self._system_notices.pop(key or text, None)
+        return sent
+
+    def system_notice_sent(self, key: str, *, within_s: float = 900.0) -> bool:
+        """Was a notice under this key really sent in the last ``within_s``?
+
+        The recovery sentence is only worth sending when the owner was actually
+        told about the failure; a camera that flaps every few seconds must not
+        turn the group into a stream of "working again" lines.
+        """
+        with self._lock:
+            last = self._system_notices.get(str(key or ''), 0.0)
+        return bool(last) and (time.time() - last) < float(within_s)
 
     def _people_now(self, source_id):
         """``(people, when)`` of a room's last presence frame (ТЗ F-702).

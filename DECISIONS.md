@@ -5639,3 +5639,29 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   `pytest tests/test_client_distribution.py tests/test_client_hello_token.py
   tests/test_cloud_decisions_always.py tests/test_admin_workplaces.py -q` → 59
   passed. Ссылка: ТЗ 4.3, F-701; DECISIONS.md CD-01, AUDIT-06.
+
+- **ROOM-HEALTH-01 — камера комнаты переподключается сама и говорит о поломке в
+  группу уведомлений (23.09.2026).** Владелец: «почему он щас выключен? оно
+  должно постоянно ретраить и в тг увед слать в группу уведов если чет не
+  работает… там несколько камер». Что было: у локальной камеры при серии
+  неудачных чтений поток снимался (`_fail(...)` + `return`), и комната оставалась
+  без зрения до перезапуска клиента (в логе buro — `Camera disabled: the camera
+  stopped delivering frames. The voice assistant keeps working.` в 22:55 и 23:03);
+  авто-переподключение было только у сетевой камеры. Сделано: (1) `client/camera.py`
+  освобождает устройство и открывает его заново с растущей паузой
+  (`CAMERA_RETRY_MIN_S` 2 с → `CAMERA_RETRY_MAX_S` 30 с) до остановки клиента;
+  (2) новый кадр протокола `MSG_ROOM_HEALTH` (`{kind, ok, detail, camera}`) —
+  клиент сообщает о поломке и о восстановлении, хаб пишет это в лог и отдаёт
+  уведомление; (3) `PresenceAlerts.notify_system()` шлёт одну фразу в
+  `notifications group chat` с кулдауном на эпизод (поломка — 15 минут,
+  «снова работает» — только если о поломке действительно сказали), поэтому
+  мигающая камера не превращает группу в поток сообщений. Куда именно слать:
+  новая настройка `server.telegram.notifications_chat_id` (у владельца —
+  `-1003570242441`, группа «RowanAI Notifications»), а без неё — прежняя
+  основная группа. Проверено живьём: 23:15–23:17 хаб получал
+  `Room anton reports camera not working/working`, бот подтверждён в группе
+  уведомлений (`getChat` → «RowanAI Notifications», тестовое сообщение
+  доставлено), клиент на buro после обновления снова отдаёт кадры (2–3 человека
+  в треках). Тесты: `pytest tests/test_room_health_alerts.py -q` → 9 passed;
+  набор alert/telegram/camera/protocol тестов → 170 passed; `ruff check` по
+  изменённым файлам чисто. Ссылка: ТЗ F-702, F-303; DECISIONS.md CD-03.

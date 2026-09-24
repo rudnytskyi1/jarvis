@@ -126,6 +126,9 @@ server:
   telegram:                  # fixed-group messages/photos and optional @mentions; docs/TELEGRAM.md
     enabled: false
     chat_id: null             # fixed negative group ID; tools cannot choose another destination
+    # Куда идут уведомления: правила присутствия и сообщения о поломке комнаты
+    # («камера не работает»). Пусто — основная группа из chat_id выше.
+    notifications_chat_id: null # e.g. -1003570242441
     control_user_id: null     # ONLY this numeric sender gets tools in the group and their private DM
     # Extra accounts with the hub admin's own rights: they may open /tools,
     # control the rooms and receive notifications in private. The owner stays

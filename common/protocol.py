@@ -201,6 +201,13 @@ MSG_BODY_CROP = "body_crop"
 MSG_CAMERA_FRAME = "camera_frame"
 #: v1.4: the client could not grab a camera frame; no binary frame follows.
 MSG_CAMERA_ERROR = "camera_error"
+#: A room saying something about its own gear is broken (ТЗ F-702 extension,
+#: владелец 2026-09-23: «оно должно постоянно ретраить и в тг увед слать в
+#: группу уведов если чет не работает»). Unlike ``camera_error`` this is not an
+#: answer to a request: it is the client volunteering that its camera went away
+#: or came back, so the hub can tell the owner instead of the room looking dead.
+#: ``{"type": MSG_ROOM_HEALTH, "kind": "camera", "ok": false, "detail": "…"}``
+MSG_ROOM_HEALTH = "room_health"
 MSG_CAMERA_CLIP = "camera_clip"
 MSG_CAMERA_CLIP_ERROR = "camera_clip_error"
 
@@ -356,6 +363,7 @@ CLIENT_MESSAGE_TYPES = frozenset(
         MSG_BODY_CROP,
         MSG_CAMERA_FRAME,
         MSG_CAMERA_ERROR,
+        MSG_ROOM_HEALTH,
         MSG_CAMERA_CLIP,
         MSG_CAMERA_CLIP_ERROR,
         MSG_OBJECT_EVENT,
@@ -447,6 +455,7 @@ __all__ = [
     "MSG_BODY_CROP",
     "MSG_CAMERA_FRAME",
     "MSG_CAMERA_ERROR",
+    "MSG_ROOM_HEALTH",
     "MSG_CAMERA_CLIP",
     "MSG_CAMERA_CLIP_ERROR",
     "MSG_CAMERA_CLIP_REQUEST",

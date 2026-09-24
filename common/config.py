@@ -336,6 +336,11 @@ class TelegramConfig(_Strict):
 
     enabled: bool = False
     chat_id: int | None = Field(default=None, lt=0, gt=-(2 ** 63))
+    #: Куда идут уведомления (правила присутствия, «камера не работает»).
+    #: Владелец 2026-09-23: «пусть уведомления в notification group chat шлёт» —
+    #: у него для этого отдельная группа, а в `chat_id` живёт основная, где с
+    #: ботом разговаривают. Пусто = прежнее поведение, основная группа.
+    notifications_chat_id: int | None = Field(default=None, lt=0, gt=-(2 ** 63))
     control_user_id: int | None = Field(default=None, strict=True, gt=0, lt=2 ** 63)
     #: Extra accounts with the hub admin's own rights (see DECISIONS.md TG-01):
     #: they may open ``/tools``, control the rooms and be written to in private.
