@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Starts the Jarvis room client (mic, wake word, speakers, devices).
 
@@ -66,17 +66,32 @@ function Get-CondaEnvPython {
 }
 
 function Resolve-Python {
+    # Комнатные ПК ставятся руками, и окружение на них называется по-разному:
+    # на Антоновом ПК это `jarvis`, на ПК buro — `rowanai` (аудит 2026-09-23:
+    # обновление положило запускатель, который искал только `jarvis`, задача
+    # клиента упала с кодом 1, и комната просто перестала подключаться).
+    # Поэтому: явный путь, известный интерпретатор, окружение по имени из
+    # списка известных, `.venv` рядом с проектом, и только в самом конце —
+    # тот `python`, что есть в PATH.
+    if (Test-Path -LiteralPath $EnvName -PathType Leaf) { return (Resolve-Path -LiteralPath $EnvName).Path }
     if ($EnvName -eq "jarvis" -and (Test-Path $KnownPython)) { return $KnownPython }
 
-    $venvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
     $conda = Find-CondaExe
+    $names = if ($EnvName -eq "jarvis") { @($EnvName, "rowanai", "rowan") } else { @($EnvName) }
     if ($conda) {
-        $python = Get-CondaEnvPython -CondaExe $conda -Name $EnvName
-        if ($python) { return $python }
+        foreach ($name in $names) {
+            $python = Get-CondaEnvPython -CondaExe $conda -Name $name
+            if ($python) { return $python }
+        }
     }
+    $venvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
     if (Test-Path $venvPython) { return $venvPython }
-
-    throw "Environment '$EnvName' not found. Run scripts\install-client.ps1 first."
+    $onPath = Get-Command python -ErrorAction SilentlyContinue
+    if ($onPath -and (Test-Path -LiteralPath $onPath.Source)) {
+        Write-Warning "No '$EnvName' environment found; starting with $($onPath.Source) from PATH."
+        return $onPath.Source
+    }
+    return $null
 }
 
 if (-not $Config) { $Config = Join-Path $RepoRoot "config.yaml" }
@@ -85,6 +100,22 @@ if (-not (Test-Path $Config)) {
 }
 
 $python = Resolve-Python
+if (-not $python) {
+    # Задача клиента запускается скрытым окном, поэтому ошибка запуска раньше
+    # пропадала бесследно: в логе клиента не появлялось ни строки. Короткий
+    # след рядом с логом говорит, чего именно не хватило.
+    $note = ("run-client.ps1: environment '" + $EnvName + "' not found (tried the known conda " +
+             "environment names, .venv next to the project, and python in PATH). " +
+             "Install the client environment first. " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    try {
+        $logDir = Join-Path $RepoRoot "data"
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        Add-Content -LiteralPath (Join-Path $logDir "run-client-error.log") -Value $note -Encoding UTF8
+    } catch {
+        Write-Warning "Could not write data\run-client-error.log: $($_.Exception.Message)"
+    }
+    throw "Environment '$EnvName' not found. Run scripts\install-client.ps1 first."
+}
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 

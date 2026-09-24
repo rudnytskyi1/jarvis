@@ -5611,3 +5611,31 @@ Qwen 35B-A3B, бюджет $18/мес общий, до 4 комнат, Jev за 
   tests/test_image_difficulty.py tests/test_screen_ocr.py
   tests/test_models_health.py -q` → 58 passed. Ссылка: ТЗ F-404; DECISIONS.md
   IMG-VERTEX-01.
+
+- **CD-03 — комната buro наконец подключена к своему дому (23.09.2026).**
+  Владелец: «на buro pc запусти». ПК в это время был выключен (Tailscale
+  `broanxl` — offline, ping и SSH молчали), потом вернулся, и картина оказалась
+  такой: задача `RowanRoomClient` **была отключена** (`Disabled`, прошлый запуск
+  09:10:20 с кодом 1), клиент подключался как `room-9de3bed07b44` без токена, а
+  хаб писал «not bound to a home» — то есть не записывал лица, тело и убеждения
+  (ТЗ 4.3) и не давал облачных решений (CD-01), из-за чего у друга «Rowan не
+  работает». Сделано: (1) `scripts/start-room-client.ps1` — новый скрипт
+  «просто запусти на этих ПК»: печатает состояние задачи ДО и ПОСЛЕ, **включает
+  отключённую** задачу (`Start-ScheduledTask` без этого падает с 0x80041326) и
+  честно говорит, если ПК не ответил; (2) выдан клиентский токен
+  (`issue-client-token.py --home livingroom --client-id buro`) — в базе хаба
+  лежит только хеш, на ПК строка `ROWAN_CLIENT_TOKEN` в `.env`; (3) на ПК
+  выставлены `client_id: buro` и `workplace_name: buro`; (4) `update-room-pcs.ps1`
+  теперь кладёт в пакет ещё и `scripts/run-client.ps1` — раньше обновлялись
+  только `client/` и `common/`, поэтому `.env` на комнате читать было нечем, и
+  токен просто не уезжал; (5) `run-client.ps1` больше не требует окружение с
+  именем `jarvis`: ищет известные имена (`jarvis`, `rowanai`, `rowan`), потом
+  `.venv`, потом `python` из PATH, а при полном провале пишет строку в
+  `data\run-client-error.log` — раньше скрытая задача падала бесследно (на buro
+  окружение называется `rowanai`, из-за этого после первого обновления задача
+  ушла в `Ready` с кодом 1). Проверено живьём: `Client buro authenticated for
+  home livingroom` (22:53:19 и 22:54:56), в базе `clients` строка
+  `buro → livingroom`, задача `Running`, хэш `client/camera.py` совпадает;
+  `pytest tests/test_client_distribution.py tests/test_client_hello_token.py
+  tests/test_cloud_decisions_always.py tests/test_admin_workplaces.py -q` → 59
+  passed. Ссылка: ТЗ 4.3, F-701; DECISIONS.md CD-01, AUDIT-06.

@@ -2245,3 +2245,18 @@ skipped; `ruff check .` → All checks passed; `mypy common` → Success.
   `pytest tests/test_vision_cloud.py tests/test_image_difficulty.py
   tests/test_screen_ocr.py tests/test_models_health.py -q` → 58 passed. Решение —
   `DECISIONS.md`, VISION-01.
+
+- **Комната buro подключена к дому с токеном (23.09.2026).** Задача клиента на
+  buro была отключена, клиент подключался как `room-9de3bed07b44` без токена, и
+  хаб писал «not bound to a home» (полный текст причины — `DECISIONS.md`,
+  CD-03). Сделано: новый `scripts/start-room-client.ps1` (состояние задачи до и
+  после, включение отключённой задачи), выдан токен
+  `--home livingroom --client-id buro`, на ПК выставлены `client_id: buro` и
+  `workplace_name: buro`, `update-room-pcs.ps1` кладёт в пакет
+  `scripts/run-client.ps1` (без него `.env` с токеном не читался), а сам
+  `run-client.ps1` ищет окружение по нескольким именам (`rowanai` на buro) и
+  оставляет след в `data\run-client-error.log`, если не нашёл. Проверено живьём:
+  `Client buro authenticated for home livingroom`, строка `buro → livingroom` в
+  `clients`, задача `Running`; `pytest tests/test_client_distribution.py
+  tests/test_client_hello_token.py tests/test_cloud_decisions_always.py
+  tests/test_admin_workplaces.py -q` → 59 passed.

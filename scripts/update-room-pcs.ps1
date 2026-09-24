@@ -52,6 +52,15 @@ function New-ClientPackage {
     foreach ($sub in 'client', 'common') {
         Copy-Item -Path (Join-Path $Repo $sub) -Destination $stage -Recurse -Force
     }
+    # 2026-09-23: run-client.ps1 читает `.env` (в нём лежит ROWAN_CLIENT_TOKEN),
+    # и клиент берёт токен из окружения. Пакет обновлял только `client/` и
+    # `common/`, поэтому на buro оставался старый запускатель: клиент
+    # подключался как «room-…» без токена, а хаб писал «not bound to a home» —
+    # то есть не записывал лица, тело и убеждения и не давал облачных решений.
+    # Запускатель обновляется вместе с клиентом.
+    $scriptDir = Join-Path $stage 'scripts'
+    New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+    Copy-Item -Path (Join-Path $Repo 'scripts\run-client.ps1') -Destination $scriptDir -Force
     # Рантайм-состояние и кэши комнаты остаются её собственными.
     Remove-Item -Path (Join-Path $stage 'client\room-tracker.runtime.yaml') -Force -ErrorAction SilentlyContinue
     Get-ChildItem $stage -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
