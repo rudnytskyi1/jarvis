@@ -22,7 +22,12 @@
 [CmdletBinding()]
 param(
     [string]$Inventory,
-    [string[]]$Only = @()
+    [string[]]$Only = @(),
+    # Перезапуск: остановить клиента и поднять заново (владелец: «запусти на buro pc
+    # (рестарт)»). Останавливается ТОЛЬКО процесс самого клиента: на комнатном ПК
+    # живут и чужие python-программы (на buro — camwatch друга), и глушить их
+    # нельзя.
+    [switch]$Restart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,6 +86,21 @@ Write-Output ('python-started=' + $(if ($process) { $process.StartTime.ToString(
 Write-Output ('hostname=' + $env:COMPUTERNAME)
 '@
 
+# Остановка клиента перед перезапуском: своя задача, свой процесс, ничего чужого.
+$restartScript = @'
+$ErrorActionPreference = 'Continue'
+$task = '__TASK__'
+Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+$mine = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and ($_.CommandLine -match 'client\.main' -or $_.CommandLine -match 'rowanai') })
+foreach ($item in $mine) {
+    Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Write-Output ('stopped-client-processes=' + $mine.Count)
+Start-Sleep -Seconds 2
+'@
+
 $inventoryItems = Get-Content -LiteralPath $Inventory -Raw | ConvertFrom-Json
 $failed = 0
 foreach ($pc in $inventoryItems) {
@@ -96,7 +116,16 @@ foreach ($pc in $inventoryItems) {
     $arguments = @('-i', [string]$pc.key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
                    '-o', 'ConnectTimeout=10', "$($pc.user)@$($pc.host)",
                    "powershell -NoProfile -EncodedCommand $encoded")
-    $output = & $sshExe @arguments 2>&1
+    $output = @()
+    if ($Restart) {
+        $stop = $restartScript.Replace("'__TASK__'", "'$([string]$pc.task)'")
+        $stopEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($stop))
+        $stopArguments = @('-i', [string]$pc.key, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                           '-o', 'ConnectTimeout=10', "$($pc.user)@$($pc.host)",
+                           "powershell -NoProfile -EncodedCommand $stopEncoded")
+        $output += & $sshExe @stopArguments 2>&1
+    }
+    $output += & $sshExe @arguments 2>&1
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         Write-Host "  ПК не ответил по SSH (код $code)" -ForegroundColor Red
