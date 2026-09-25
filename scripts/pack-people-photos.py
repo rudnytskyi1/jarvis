@@ -24,6 +24,7 @@ sha256, кладёт внутрь ``index.csv`` (что именно и когд
     python scripts/pack-people-photos.py                  # все, двумя архивами
     python scripts/pack-people-photos.py --named-only      # только узнанные
     python scripts/pack-people-photos.py --unknown-only --split 2   # unknown на два
+    python scripts/pack-people-photos.py --unknown-only --max-size 2.8  # не толще 2.8 ГБ
     python scripts/pack-people-photos.py --limit 500       # не больше 500 на категорию
 """
 from __future__ import annotations
@@ -192,6 +193,42 @@ def _share_out(items: list, parts: int) -> list[list]:
     return buckets
 
 
+def _share_by_size(items: list, cap_bytes: int) -> list[list]:
+    """Split the photos into as few archives as fit under ``cap_bytes`` each.
+
+    Частей ровно столько, сколько нужно по потолку, и каждая набирается до своей
+    доли (``total / parts``), а не до самого потолка: иначе вышло бы «два полных
+    архива и огрызок». Тяжёлые снимки идут первыми, поэтому делятся ровно.
+    Снимок, который сам больше потолка, уезжает в отдельную часть: резать файл
+    пополам нельзя.
+    """
+    unique = list(_unique(items))
+    if not unique:
+        return []
+    total = sum(item[2].stat().st_size for item in unique)
+    parts = max(1, -(-total // cap_bytes))
+    share = total / parts
+    buckets: list[list] = [[] for _ in range(parts)]
+    totals: list[int] = [0] * parts
+    for item in sorted(unique, key=lambda entry: entry[2].stat().st_size,
+                       reverse=True):
+        size = item[2].stat().st_size
+        fitting = [index for index, load in enumerate(totals)
+                   if load + size <= cap_bytes]
+        if not fitting:
+            buckets.append([item])
+            totals.append(size)
+            continue
+        under_share = [index for index in fitting if totals[index] < share]
+        index = min(under_share or fitting, key=lambda position: totals[position])
+        buckets[index].append(item)
+        totals[index] += size
+    for bucket in buckets:
+        bucket.sort(key=lambda entry: (str(entry[3]), str(entry[2])))
+    kept = [bucket for bucket in buckets if bucket]
+    return sorted(kept, key=lambda bucket: str(bucket[0][3]))
+
+
 def build_archive(*, out: Path, people: set[str] | None = None, limit: int = 0,
                   with_scenes: bool = False, include_gallery: bool = True,
                   unknown_name: str = 'unknown', items: list | None = None,
@@ -265,7 +302,7 @@ def known_people() -> tuple[set[str], set[str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--out-dir', default=str(ROOT / 'data' / 'people'))
+    parser.add_argument('--out-dir', default=str(ROOT / 'people-photos'))
     parser.add_argument('--named-only', action='store_true',
                         help='только люди с именем, без папки unknown')
     parser.add_argument('--unknown-only', action='store_true',
@@ -280,6 +317,8 @@ def main() -> int:
                         help='не брать эталонные снимки профилей')
     parser.add_argument('--split', type=int, default=1, metavar='N',
                         help='резать каждую группу на N архивов равного объёма')
+    parser.add_argument('--max-size', type=float, default=0, metavar='GB',
+                        help='потолок на архив в ГБ (0 — без потолка)')
     parser.add_argument('--out-name', metavar='STEM',
                         help='имя архива без даты и расширения (для одной группы)')
     arguments = parser.parse_args()
@@ -290,17 +329,26 @@ def main() -> int:
     gallery = not arguments.no_gallery
     split = max(1, arguments.split)
     report = []
+    cap = int(arguments.max_size * 1e9) if arguments.max_size else 0
+
+    def cut(items: list) -> list[list]:
+        if cap:
+            return _share_by_size(items, cap)
+        if split > 1:
+            return _share_out(items, split)
+        return [items]
 
     def emit(stem: str, people: set[str] | None, *, with_gallery: bool) -> None:
-        """One group of people, cut into `split` archives when asked."""
+        """One group of people, cut into several archives when asked."""
         items = _collect(people=people, with_scenes=arguments.with_scenes,
                          include_gallery=with_gallery)
-        buckets = _share_out(items, split) if split > 1 else [items]
+        buckets = cut(items)
+        several = len(buckets) > 1
         for number, bucket in enumerate(buckets, start=1):
-            part = f'-part{number}' if split > 1 else ''
+            part = f'-part{number}' if several else ''
             note = ''
-            if split > 1:
-                note = (f'Часть {number} из {split}: остальные фото лежат в '
+            if several:
+                note = (f'Часть {number} из {len(buckets)}: остальные фото лежат в '
                         f'соседних архивах {stem}-part*.zip.')
             report.append(build_archive(out=out_dir / f'{stem}{part}.zip',
                                         people=people, limit=arguments.limit,

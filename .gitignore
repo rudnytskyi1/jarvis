@@ -51,6 +51,7 @@ dist/
 
 # --- локальные архивы кода (бекапы перед крупными изменениями) ---
 *.zip
+people-photos/
 
 # --- scratch directories created by test runs inside the sandbox ---
 .tmp/

@@ -204,3 +204,44 @@ def test_a_big_group_is_cut_into_parts_without_losing_photos(tmp_path, monkeypat
         for _p, _c, path, _w, _d in part:
             together.add(path)
     assert len(together) == 4
+
+
+def test_the_size_cap_is_never_exceeded(tmp_path, monkeypatch):
+    """Потолок режет на столько частей, сколько нужно, и ни одна не толще."""
+    archive = _archive(tmp_path)
+    monkeypatch.setattr(packer, 'ARCHIVE', archive)
+    monkeypatch.setattr(packer, 'GALLERY', tmp_path / 'no-gallery')
+    # Шесть снимков по 100 байт: с потолком 250 байт в часть влезает два.
+    folder = tmp_path / 'bulk'
+    folder.mkdir()
+    items = []
+    for index in range(6):
+        blob = folder / f'body-{index}.png'
+        blob.write_bytes(b'z' * 100)
+        items.append((('Anton' if index % 2 else 'John'), 'body', blob,
+                      1_700_000_000 + index, f'sha-{blob.name}'))
+
+    parts = packer._share_by_size(items, 250)
+
+    assert len(parts) == 3, 'потолок меньше суммы — частей должно стать больше'
+    for part in parts:
+        volume = sum(item[2].stat().st_size for item in part)
+        assert volume <= 250, f'часть тяжелее потолка: {volume}'
+    packed = [item[2].name for part in parts for item in part]
+    assert sorted(packed) == sorted(item[2].name for item in items), \
+        'все снимки на месте, ни один не потерян и не удвоен'
+
+
+def test_a_photo_bigger_than_the_cap_gets_its_own_archive(tmp_path, monkeypatch):
+    """Снимок тяжелее потолка не режется: он уезжает в отдельную часть."""
+    big = tmp_path / 'huge.png'
+    big.write_bytes(b'x' * 400)
+    small = tmp_path / 'small.png'
+    small.write_bytes(b'y' * 10)
+    items = [('Anton', 'body', big, 1, 'sha-big'),
+             ('Anton', 'body', small, 2, 'sha-small')]
+
+    parts = packer._share_by_size(items, 100)
+
+    assert [[item[2].name for item in part] for part in parts] == \
+        [['huge.png'], ['small.png']]
