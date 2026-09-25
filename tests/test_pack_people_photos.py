@@ -170,3 +170,37 @@ def test_every_entry_name_stays_portable(tmp_path, monkeypatch):
             assert name.startswith(('Anton/', 'John/', 'unknown/',
                                     'index.csv', 'README.md')), name
             assert not set(name) & set('<>:"|?*\\')
+
+
+def test_a_big_group_is_cut_into_parts_without_losing_photos(tmp_path, monkeypatch):
+    """Части не пересекаются и вместе дают ровно те же снимки, что один архив."""
+    archive = _archive(tmp_path)
+    monkeypatch.setattr(packer, 'ARCHIVE', archive)
+    monkeypatch.setattr(packer, 'GALLERY', tmp_path / 'no-gallery')
+    whole = tmp_path / 'whole.zip'
+    packer.build_archive(out=whole, people=None, include_gallery=False)
+
+    items = packer._collect(people=None, include_gallery=False)
+    parts = packer._share_out(items, 2)
+    volumes = [sum(item[2].stat().st_size for item in part) for part in parts]
+
+    assert len(parts) == 2
+    assert sum(len(part) for part in parts) == 4, 'дедуп общий на все части'
+    digests = [digest for part in parts for _p, _c, _path, _w, digest in part]
+    assert len(digests) == len(set(digests)), 'один снимок не попадает в две части'
+    assert abs(volumes[0] - volumes[1]) <= max(volumes), 'части примерно равны'
+
+    with zipfile.ZipFile(whole) as bundle:
+        in_whole = {name for name in bundle.namelist() if name.endswith('.png')}
+    for number, part in enumerate(parts, start=1):
+        out = tmp_path / f'part{number}.zip'
+        packer.build_archive(out=out, items=part, note=f'Часть {number} из 2.')
+        with zipfile.ZipFile(out) as bundle:
+            names = {name for name in bundle.namelist() if name.endswith('.png')}
+            assert f'Часть {number} из 2.' in bundle.read('README.md').decode('utf-8')
+        assert names <= in_whole
+    together = set()
+    for part in parts:
+        for _p, _c, path, _w, _d in part:
+            together.add(path)
+    assert len(together) == 4

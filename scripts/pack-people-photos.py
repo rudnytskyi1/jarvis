@@ -23,6 +23,7 @@ sha256, кладёт внутрь ``index.csv`` (что именно и когд
 
     python scripts/pack-people-photos.py                  # все, двумя архивами
     python scripts/pack-people-photos.py --named-only      # только узнанные
+    python scripts/pack-people-photos.py --unknown-only --split 2   # unknown на два
     python scripts/pack-people-photos.py --limit 500       # не больше 500 на категорию
 """
 from __future__ import annotations
@@ -160,15 +161,45 @@ def _safe(name: str) -> str:
     return (cleaned or 'unknown')[:60]
 
 
-def build_archive(*, out: Path, people: set[str] | None = None, limit: int = 0,
-                  with_scenes: bool = False, include_gallery: bool = True,
-                  unknown_name: str = 'unknown') -> dict:
-    """Write one ZIP; return what went in (counts, bytes, the file)."""
+def _collect(*, people: set[str] | None = None, with_scenes: bool = False,
+             include_gallery: bool = True) -> list:
+    """Every photo that belongs in an archive, before dedupe."""
     items = list(iter_archive(with_scenes=with_scenes))
     if include_gallery:
         items.extend(iter_gallery())
     if people is not None:
         items = [item for item in items if item[0] in people]
+    return items
+
+
+def _share_out(items: list, parts: int) -> list[list]:
+    """Split the photos into ``parts`` archives of roughly equal volume.
+
+    Файлы разные по весу (лицо — 10 КБ, тело — 120 КБ), поэтому режем не по
+    количеству, а по байтам: тяжёлые кладём первыми в самую лёгкую часть.
+    Дедуп здесь общий на все части, иначе один снимок попал бы в две.
+    """
+    unique = list(_unique(items))
+    buckets: list[list] = [[] for _ in range(parts)]
+    totals = [0] * parts
+    for item in sorted(unique, key=lambda entry: entry[2].stat().st_size,
+                       reverse=True):
+        lightest = totals.index(min(totals))
+        buckets[lightest].append(item)
+        totals[lightest] += item[2].stat().st_size
+    for bucket in buckets:
+        bucket.sort(key=lambda entry: (str(entry[3]), str(entry[2])))
+    return buckets
+
+
+def build_archive(*, out: Path, people: set[str] | None = None, limit: int = 0,
+                  with_scenes: bool = False, include_gallery: bool = True,
+                  unknown_name: str = 'unknown', items: list | None = None,
+                  note: str = '') -> dict:
+    """Write one ZIP; return what went in (counts, bytes, the file)."""
+    if items is None:
+        items = _collect(people=people, with_scenes=with_scenes,
+                         include_gallery=include_gallery)
     out.parent.mkdir(parents=True, exist_ok=True)
     counts: dict[tuple[str, str], int] = {}
     index = io.StringIO()
@@ -190,16 +221,19 @@ def build_archive(*, out: Path, people: set[str] | None = None, limit: int = 0,
             total_bytes += size
             writer.writerow([person, category, name, when, digest, size])
         bundle.writestr('index.csv', index.getvalue())
-        bundle.writestr('README.md', _readme(counts, written, total_bytes, unknown_name))
+        bundle.writestr('README.md',
+                        _readme(counts, written, total_bytes, unknown_name, note))
     return {'zip': str(out), 'files': written, 'bytes': total_bytes,
             'counts': {f'{person}/{category}': number
                        for (person, category), number in sorted(counts.items())}}
 
 
-def _readme(counts, written: int, total_bytes: int, unknown_name: str) -> str:
+def _readme(counts, written: int, total_bytes: int, unknown_name: str,
+            note: str = '') -> str:
     lines = [
         '# Photos of people',
         '',
+        *([note, ''] if note else []),
         'Раскладка: `<человек>/<категория>/<дата>_<время>_<хеш>.png`.',
         '',
         '* `faces/` — обрезанные лица (то, по чему система узнаёт);',
@@ -244,29 +278,45 @@ def main() -> int:
                         help='включить кадры комнаты целиком (десятки ГБ)')
     parser.add_argument('--no-gallery', action='store_true',
                         help='не брать эталонные снимки профилей')
+    parser.add_argument('--split', type=int, default=1, metavar='N',
+                        help='резать каждую группу на N архивов равного объёма')
+    parser.add_argument('--out-name', metavar='STEM',
+                        help='имя архива без даты и расширения (для одной группы)')
     arguments = parser.parse_args()
 
     named, unknown = known_people()
     out_dir = Path(arguments.out_dir)
     stamp = dt.datetime.now().strftime('%Y%m%d')
     gallery = not arguments.no_gallery
+    split = max(1, arguments.split)
     report = []
+
+    def emit(stem: str, people: set[str] | None, *, with_gallery: bool) -> None:
+        """One group of people, cut into `split` archives when asked."""
+        items = _collect(people=people, with_scenes=arguments.with_scenes,
+                         include_gallery=with_gallery)
+        buckets = _share_out(items, split) if split > 1 else [items]
+        for number, bucket in enumerate(buckets, start=1):
+            part = f'-part{number}' if split > 1 else ''
+            note = ''
+            if split > 1:
+                note = (f'Часть {number} из {split}: остальные фото лежат в '
+                        f'соседних архивах {stem}-part*.zip.')
+            report.append(build_archive(out=out_dir / f'{stem}{part}.zip',
+                                        people=people, limit=arguments.limit,
+                                        include_gallery=with_gallery,
+                                        items=bucket, note=note))
+
     if arguments.single:
-        report.append(build_archive(out=out_dir / arguments.single, people=None,
-                                    limit=arguments.limit,
-                                    with_scenes=arguments.with_scenes,
-                                    include_gallery=gallery))
+        emit(Path(arguments.single).stem, None, with_gallery=gallery)
     else:
         if not arguments.unknown_only and named:
-            report.append(build_archive(out=out_dir / f'people-named-{stamp}.zip',
-                                        people=named, limit=arguments.limit,
-                                        with_scenes=arguments.with_scenes,
-                                        include_gallery=gallery))
+            emit(arguments.out_name or f'people-named-{stamp}', named,
+                 with_gallery=gallery)
         if not arguments.named_only and unknown:
-            report.append(build_archive(out=out_dir / f'people-unknown-{stamp}.zip',
-                                        people=unknown, limit=arguments.limit,
-                                        with_scenes=arguments.with_scenes,
-                                        include_gallery=False))
+            stem = arguments.out_name if arguments.out_name and arguments.unknown_only \
+                else f'people-unknown-{stamp}'
+            emit(stem, unknown, with_gallery=False)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
